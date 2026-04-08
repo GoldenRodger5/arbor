@@ -1,4 +1,5 @@
 import { useLocation, useNavigate } from 'react-router-dom';
+import { useScannerContext } from '@/context/ScannerContext';
 
 const navItems = [
   { label: 'Scanner', path: '/' },
@@ -11,6 +12,7 @@ const navItems = [
 export default function Sidebar() {
   const location = useLocation();
   const navigate = useNavigate();
+  const { stats, capital } = useScannerContext();
 
   return (
     <aside
@@ -64,21 +66,21 @@ export default function Sidebar() {
       <div style={{ padding: '16px 20px', borderTop: '1px solid var(--border)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
           <span
-            className="status-dot-live"
+            className={stats.isScanning ? 'status-dot-live' : undefined}
             style={{
               width: 8,
               height: 8,
               borderRadius: '50%',
-              background: 'var(--green)',
+              background: stats.isScanning ? 'var(--green)' : 'var(--text-tertiary)',
               display: 'inline-block',
             }}
           />
-          <span className="label">LIVE</span>
+          <span className="label">{stats.isScanning ? 'LIVE' : 'IDLE'}</span>
         </div>
         <div>
           <span className="label">CAPITAL</span>
           <div className="font-mono" style={{ fontSize: 13, color: 'var(--text-primary)', marginTop: 4 }}>
-            $340.00 deployed
+            ${(capital?.deployedCapital ?? 0).toFixed(2)} deployed
           </div>
         </div>
       </div>

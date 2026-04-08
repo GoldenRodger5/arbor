@@ -1,8 +1,59 @@
-import { useState } from 'react';
-import { opportunities, type Verdict } from '@/data/mock';
+import { useMemo, useState } from 'react';
+import { opportunities as mockOpportunities, type Verdict, type Opportunity } from '@/data/mock';
 import { useIsMobile } from '@/hooks/use-mobile';
+import { useScannerContext } from '@/context/ScannerContext';
+import type { ArbitrageOpportunity } from '@/types';
 
 type Filter = 'ALL' | 'SAFE' | 'CAUTION';
+
+function formatRelative(ts: number): string {
+  const diff = Date.now() - ts;
+  if (diff < 0 || !Number.isFinite(diff)) return 'just now';
+  const s = Math.floor(diff / 1000);
+  if (s < 5) return 'just now';
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  return `${h}h ago`;
+}
+
+function adaptOpportunity(opp: ArbitrageOpportunity, idx: number): Opportunity {
+  const best = opp.levels[0];
+  const polyYesPrice = best
+    ? (best.buyYesPlatform === 'polymarket' ? best.buyYesPrice : best.buyNoPrice)
+    : 0;
+  const kalshiNoPrice = best
+    ? (best.buyNoPlatform === 'kalshi' ? best.buyNoPrice : best.buyYesPrice)
+    : 0;
+
+  // Map orderbook-derived levels (which we don't ship from the engine in v1)
+  // by reusing the best arbitrage levels as a depth proxy.
+  const polyDepth = opp.levels.slice(0, 4).map((l) => ({
+    price: l.buyYesPlatform === 'polymarket' ? l.buyYesPrice : l.buyNoPrice,
+    qty: Math.round(l.quantity),
+  }));
+  const kalshiDepth = opp.levels.slice(0, 4).map((l) => ({
+    price: l.buyNoPlatform === 'kalshi' ? l.buyNoPrice : l.buyYesPrice,
+    qty: Math.round(l.quantity),
+  }));
+
+  const verdict: Verdict = opp.verdict === 'PENDING' ? 'CAUTION' : opp.verdict;
+
+  return {
+    id: idx + 1,
+    event: opp.kalshiMarket.title,
+    polyYes: polyYesPrice,
+    kalshiNo: kalshiNoPrice,
+    rawSpread: best ? best.grossProfitPct * 100 : 0,
+    netSpread: opp.bestNetSpread * 100,
+    maxDollar: Math.round(opp.totalMaxProfit),
+    verdict,
+    scanned: formatRelative(opp.scannedAt),
+    polyDepth,
+    kalshiDepth,
+  };
+}
 
 function VerdictBadge({ verdict }: { verdict: Verdict }) {
   const colors: Record<Verdict, string> = {
@@ -62,6 +113,15 @@ export default function Opportunities() {
   const [filter, setFilter] = useState<Filter>('ALL');
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const isMobile = useIsMobile();
+  const { opportunities: ctxOpps, stats, startScan, stopScan } = useScannerContext();
+
+  // Use live opportunities when available; otherwise fall back to mock data
+  // (only when not actively scanning).
+  const opportunities = useMemo<Opportunity[]>(() => {
+    if (ctxOpps.length > 0) return ctxOpps.map(adaptOpportunity);
+    if (!stats.isScanning) return mockOpportunities;
+    return [];
+  }, [ctxOpps, stats.isScanning]);
 
   const filtered = opportunities.filter((o) => {
     if (filter === 'ALL') return true;
@@ -95,6 +155,21 @@ export default function Opportunities() {
         >
           {liveCount} LIVE
         </span>
+        <button
+          onClick={() => (stats.isScanning ? stopScan() : startScan())}
+          className="font-mono"
+          style={{
+            fontSize: 11, textTransform: 'uppercase',
+            padding: '2px 10px', borderRadius: 6,
+            border: 'none',
+            cursor: 'pointer',
+            color: stats.isScanning ? 'var(--red)' : 'var(--accent)',
+            background: stats.isScanning ? 'rgba(239,68,68,0.12)' : 'rgba(99,102,241,0.12)',
+            marginLeft: 'auto',
+          }}
+        >
+          {stats.isScanning ? 'STOP SCAN' : 'START SCAN'}
+        </button>
       </div>
 
       {/* Filters */}

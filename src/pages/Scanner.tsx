@@ -1,5 +1,6 @@
 import { kalshiMarkets, polyMarkets } from '@/data/mock';
 import { useIsMobile } from '@/hooks/use-mobile';
+import { useScannerContext } from '@/context/ScannerContext';
 
 function formatVolume(v: number) {
   if (v >= 1000000) return `$${(v / 1000000).toFixed(1)}M`;
@@ -116,12 +117,13 @@ const tdStyle: React.CSSProperties = {
 
 export default function Scanner() {
   const isMobile = useIsMobile();
+  const { stats: scannerStats } = useScannerContext();
   const matchedCount = kalshiMarkets.filter((m) => m.matched).length;
 
   const stats = [
-    { label: 'KALSHI MARKETS', value: '847' },
-    { label: 'POLY MARKETS', value: '1,203' },
-    { label: 'MATCHED PAIRS', value: '34' },
+    { label: 'KALSHI MARKETS', value: scannerStats.kalshiCount > 0 ? scannerStats.kalshiCount.toLocaleString() : '—' },
+    { label: 'POLY MARKETS', value: scannerStats.polyCount > 0 ? scannerStats.polyCount.toLocaleString() : '—' },
+    { label: 'MATCHED PAIRS', value: scannerStats.matchedCount > 0 ? scannerStats.matchedCount.toLocaleString() : '—' },
   ];
 
   return (

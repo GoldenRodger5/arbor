@@ -1,4 +1,5 @@
-import { useState, useCallback } from 'react';
+import { useState } from 'react';
+import { useScannerContext } from '@/context/ScannerContext';
 
 function MaskedInput({ label, placeholder }: { label: string; placeholder?: string }) {
   const [value, setValue] = useState('');
@@ -57,16 +58,45 @@ function TextInput({ label, placeholder, type = 'text', mono }: { label: string;
   );
 }
 
+const intervalToSeconds = (i: string): number => {
+  if (i === '30s') return 30;
+  if (i === '60s') return 60;
+  if (i === '5min') return 300;
+  return 60;
+};
+
+const secondsToInterval = (s: number): string => {
+  if (s <= 30) return '30s';
+  if (s <= 60) return '60s';
+  return '5min';
+};
+
 export default function Settings() {
-  const [spreadThreshold, setSpreadThreshold] = useState(2.0);
-  const [scanInterval, setScanInterval] = useState('60s');
-  const [autoScan, setAutoScan] = useState(true);
-  const [capital, setCapital] = useState('500');
-  const [reserve, setReserve] = useState('20');
+  const { config, capital: ctxCapital, stats, startScan, stopScan, updateConfig } = useScannerContext();
+
+  const [spreadThreshold, setSpreadThreshold] = useState(config.minNetSpread * 100);
+  const [scanInterval, setScanInterval] = useState(secondsToInterval(config.intervalSeconds));
+  const [capital, setCapital] = useState(String(ctxCapital.totalCapital));
+  const [reserve, setReserve] = useState(String(Math.round(ctxCapital.safetyReservePct * 100)));
 
   const activeCapital = (parseFloat(capital || '0') * (1 - parseFloat(reserve || '0') / 100)).toFixed(2);
 
   const intervals = ['30s', '60s', '5min'];
+
+  const handleSpreadChange = (v: number) => {
+    setSpreadThreshold(v);
+    updateConfig({ minNetSpread: v / 100 });
+  };
+
+  const handleIntervalChange = (i: string) => {
+    setScanInterval(i);
+    updateConfig({ intervalSeconds: intervalToSeconds(i) });
+  };
+
+  const toggleScan = () => {
+    if (stats.isScanning) stopScan();
+    else startScan();
+  };
 
   return (
     <div style={{ maxWidth: 640 }}>
@@ -96,7 +126,7 @@ export default function Settings() {
           max="10"
           step="0.5"
           value={spreadThreshold}
-          onChange={(e) => setSpreadThreshold(parseFloat(e.target.value))}
+          onChange={(e) => handleSpreadChange(parseFloat(e.target.value))}
           style={{ width: '100%', accentColor: 'var(--accent)' }}
         />
       </div>
@@ -107,7 +137,7 @@ export default function Settings() {
           {intervals.map((int) => (
             <button
               key={int}
-              onClick={() => setScanInterval(int)}
+              onClick={() => handleIntervalChange(int)}
               style={{
                 background: scanInterval === int ? 'var(--bg-elevated)' : 'transparent',
                 color: scanInterval === int ? 'var(--text-primary)' : 'var(--text-tertiary)',
@@ -124,10 +154,10 @@ export default function Settings() {
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
         <button
-          onClick={() => setAutoScan(!autoScan)}
+          onClick={toggleScan}
           style={{
             width: 40, height: 20, borderRadius: 10, border: 'none',
-            background: autoScan ? 'var(--accent)' : 'var(--text-tertiary)',
+            background: stats.isScanning ? 'var(--accent)' : 'var(--text-tertiary)',
             position: 'relative', cursor: 'pointer', transition: 'background 200ms',
           }}
         >
@@ -135,11 +165,11 @@ export default function Settings() {
             style={{
               width: 16, height: 16, borderRadius: '50%', background: 'var(--text-primary)',
               position: 'absolute', top: 2,
-              left: autoScan ? 22 : 2, transition: 'left 200ms',
+              left: stats.isScanning ? 22 : 2, transition: 'left 200ms',
             }}
           />
         </button>
-        <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>Auto-scan on launch</span>
+        <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{stats.isScanning ? 'Scanning' : 'Idle'}</span>
       </div>
 
       <div style={{ height: 32 }} />
