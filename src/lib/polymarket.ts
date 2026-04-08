@@ -1,3 +1,8 @@
+// NOTE: This module's logic has been moved to
+// supabase/functions/scanner/index.ts
+// This file is kept for reference only.
+// It is NOT imported by the frontend.
+
 import config from '@/config';
 import type { Orderbook, OrderbookLevel, UnifiedMarket } from '@/types';
 import { RateLimiter } from './rateLimiter';

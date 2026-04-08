@@ -13,7 +13,7 @@ import type {
   ScannerConfig,
   ScannerStats,
 } from '@/types';
-import { startScanner } from '@/lib/scanner';
+import { getLatestScanResult, startScanner, triggerScan } from '@/lib/scanner';
 import { getCapital } from '@/lib/supabase';
 
 const defaultStats: ScannerStats = {
@@ -43,8 +43,9 @@ interface ScannerContextValue {
   stats: ScannerStats;
   config: ScannerConfig;
   capital: CapitalState;
-  startScan: () => void;
-  stopScan: () => void;
+  refresh: () => Promise<void>;
+  trigger: () => Promise<{ ok: boolean; error?: string }>;
+  triggering: boolean;
   updateConfig: (patch: Partial<ScannerConfig>) => void;
 }
 
@@ -55,25 +56,31 @@ export function ScannerProvider({ children }: { children: ReactNode }) {
   const [stats, setStats] = useState<ScannerStats>(defaultStats);
   const [config, setConfig] = useState<ScannerConfig>(defaultConfig);
   const [capital, setCapital] = useState<CapitalState>(defaultCapital);
+  const [triggering, setTriggering] = useState(false);
 
   const cleanupRef = useRef<(() => void) | null>(null);
-  const configRef = useRef<ScannerConfig>(defaultConfig);
-  configRef.current = config;
 
-  const startScan = useCallback(() => {
-    if (cleanupRef.current) return; // already scanning
-    setStats((s) => ({ ...s, isScanning: true }));
-    cleanupRef.current = startScanner(configRef.current, (result) => {
-      setOpportunities(result.opportunities);
-      setStats({ ...result.stats, isScanning: true });
-    });
+  const refresh = useCallback(async () => {
+    const result = await getLatestScanResult();
+    setOpportunities(result.opportunities);
+    setStats(result.stats);
   }, []);
 
-  const stopScan = useCallback(() => {
-    cleanupRef.current?.();
-    cleanupRef.current = null;
-    setStats((s) => ({ ...s, isScanning: false }));
-  }, []);
+  const trigger = useCallback(async () => {
+    setTriggering(true);
+    try {
+      const result = await triggerScan();
+      // Refresh shortly after the function returns so the new row is visible.
+      if (result.ok) {
+        setTimeout(() => {
+          refresh().catch(() => {});
+        }, 3000);
+      }
+      return result;
+    } finally {
+      setTriggering(false);
+    }
+  }, [refresh]);
 
   const updateConfig = useCallback((patch: Partial<ScannerConfig>) => {
     setConfig((prev) => ({ ...prev, ...patch }));
@@ -94,11 +101,12 @@ export function ScannerProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  // Auto-start if Kalshi key is configured.
+  // Start polling Supabase on mount; tear down on unmount.
   useEffect(() => {
-    if (import.meta.env.VITE_KALSHI_API_KEY_ID) {
-      startScan();
-    }
+    cleanupRef.current = startScanner(config, (result) => {
+      setOpportunities(result.opportunities);
+      setStats(result.stats);
+    });
     return () => {
       cleanupRef.current?.();
       cleanupRef.current = null;
@@ -111,8 +119,9 @@ export function ScannerProvider({ children }: { children: ReactNode }) {
     stats,
     config,
     capital,
-    startScan,
-    stopScan,
+    refresh,
+    trigger,
+    triggering,
     updateConfig,
   };
 

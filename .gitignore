@@ -17,6 +17,14 @@ dist-ssr
 .env.local
 .env.*.local
 
+# Secrets and signing keys (Kalshi RSA private key, etc.)
+*.pem
+*.key
+Arbor.txt
+
+# Claude Code local state
+.claude/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -27,3 +35,4 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+.vercel

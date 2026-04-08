@@ -72,7 +72,7 @@ const secondsToInterval = (s: number): string => {
 };
 
 export default function Settings() {
-  const { config, capital: ctxCapital, stats, startScan, stopScan, updateConfig } = useScannerContext();
+  const { config, capital: ctxCapital, stats, trigger, triggering, updateConfig } = useScannerContext();
 
   const [spreadThreshold, setSpreadThreshold] = useState(config.minNetSpread * 100);
   const [scanInterval, setScanInterval] = useState(secondsToInterval(config.intervalSeconds));
@@ -93,10 +93,10 @@ export default function Settings() {
     updateConfig({ intervalSeconds: intervalToSeconds(i) });
   };
 
-  const toggleScan = () => {
-    if (stats.isScanning) stopScan();
-    else startScan();
-  };
+  const lastScanLabel =
+    stats.lastScanAt === null
+      ? 'No scans yet'
+      : `Last scan: ${new Date(stats.lastScanAt).toLocaleTimeString()}`;
 
   return (
     <div style={{ maxWidth: 640 }}>
@@ -154,22 +154,22 @@ export default function Settings() {
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
         <button
-          onClick={toggleScan}
+          onClick={() => trigger()}
+          disabled={triggering}
           style={{
-            width: 40, height: 20, borderRadius: 10, border: 'none',
-            background: stats.isScanning ? 'var(--accent)' : 'var(--text-tertiary)',
-            position: 'relative', cursor: 'pointer', transition: 'background 200ms',
+            background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+            color: 'var(--accent)', padding: '8px 16px', fontSize: 12,
+            textTransform: 'uppercase', fontFamily: "'JetBrains Mono', monospace",
+            letterSpacing: '0.05em', cursor: triggering ? 'wait' : 'pointer',
+            opacity: triggering ? 0.6 : 1,
           }}
         >
-          <div
-            style={{
-              width: 16, height: 16, borderRadius: '50%', background: 'var(--text-primary)',
-              position: 'absolute', top: 2,
-              left: stats.isScanning ? 22 : 2, transition: 'left 200ms',
-            }}
-          />
+          {triggering ? 'Triggering…' : 'Trigger Scan Now'}
         </button>
-        <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{stats.isScanning ? 'Scanning' : 'Idle'}</span>
+        <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{lastScanLabel}</span>
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 12 }}>
+        Scans run automatically every 5 minutes via Supabase cron.
       </div>
 
       <div style={{ height: 32 }} />

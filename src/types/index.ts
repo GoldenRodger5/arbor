@@ -52,6 +52,14 @@ export interface ArbitrageOpportunity {
   bestNetSpread: number;
   totalMaxProfit: number;
   scannedAt: number;
+  // Capital-efficiency fields populated by the edge function as of 2026-04.
+  // Optional so older scan_results rows still parse cleanly.
+  daysToClose?: number;
+  annualizedReturn?: number;
+  effectiveCloseDate?: string;
+  kalshiCloseDate?: string;
+  polyCloseDate?: string;
+  belowThreshold?: boolean;
 }
 
 export interface ScannerStats {

@@ -36,6 +36,13 @@ export interface Opportunity {
   scanned: string;
   polyDepth: { price: number; qty: number }[];
   kalshiDepth: { price: number; qty: number }[];
+  // Capital-efficiency fields populated from live scan_results.
+  // Optional so the existing mock data still type-checks.
+  daysToClose?: number;
+  annualizedReturn?: number;
+  effectiveCloseDate?: string;
+  kalshiCloseDate?: string;
+  polyCloseDate?: string;
 }
 
 export const opportunities: Opportunity[] = [

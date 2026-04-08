@@ -9,6 +9,19 @@ const navItems = [
   { label: 'Settings', path: '/settings' },
 ];
 
+function formatLastScan(ts: number | null): string {
+  if (ts === null) return 'never';
+  const diff = Date.now() - ts;
+  if (diff < 0 || !Number.isFinite(diff)) return 'just now';
+  const s = Math.floor(diff / 1000);
+  if (s < 5) return 'just now';
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  return `${h}h ago`;
+}
+
 export default function Sidebar() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -66,16 +79,22 @@ export default function Sidebar() {
       <div style={{ padding: '16px 20px', borderTop: '1px solid var(--border)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
           <span
-            className={stats.isScanning ? 'status-dot-live' : undefined}
+            className="status-dot-live"
             style={{
               width: 8,
               height: 8,
               borderRadius: '50%',
-              background: stats.isScanning ? 'var(--green)' : 'var(--text-tertiary)',
+              background: 'var(--green)',
               display: 'inline-block',
             }}
           />
-          <span className="label">{stats.isScanning ? 'LIVE' : 'IDLE'}</span>
+          <span className="label">LIVE</span>
+        </div>
+        <div style={{ marginBottom: 12 }}>
+          <span className="label">LAST SCAN</span>
+          <div className="font-mono" style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
+            {formatLastScan(stats.lastScanAt)}
+          </div>
         </div>
         <div>
           <span className="label">CAPITAL</span>

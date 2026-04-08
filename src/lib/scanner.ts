@@ -1,255 +1,99 @@
-import config from '@/config';
+// Frontend scanner — polls scan_results from Supabase.
+// All actual scanning happens in supabase/functions/scanner (cron-driven).
+// The browser never calls Kalshi, Polymarket, or Anthropic directly.
+
 import type {
-  ArbitrageLevel,
   ArbitrageOpportunity,
-  Orderbook,
   ScannerConfig,
   ScannerStats,
-  UnifiedMarket,
 } from '@/types';
-import * as kalshi from './kalshi';
-import * as poly from './polymarket';
-import { calculateOpportunity } from './calculator';
-import { findCandidatePairs, type CandidatePair } from './matcher';
-import { verifyPair } from './resolver';
-import {
-  getCachedVerdict,
-  logSpread,
-  upsertMarketPair,
-} from './supabase';
-import type { ResolutionVerdict } from '@/types';
+import { safeSupabase } from './supabase';
 
-interface PreparedPair {
-  pair: CandidatePair;
-  pairId: string | null;
-  verdict: ResolutionVerdict;
-  reasoning?: string;
-  riskFactors?: string[];
-}
+const POLL_INTERVAL_MS = 30_000;
 
-async function fetchMarketsSafe(): Promise<{
-  kalshiMarkets: UnifiedMarket[];
-  polyMarkets: UnifiedMarket[];
-}> {
-  const [kalshiResult, polyResult] = await Promise.allSettled([
-    kalshi.getMarkets(),
-    poly.getMarkets(),
-  ]);
+const emptyStats: ScannerStats = {
+  kalshiCount: 0,
+  polyCount: 0,
+  matchedCount: 0,
+  opportunityCount: 0,
+  lastScanAt: null,
+  isScanning: false,
+};
 
-  const kalshiMarkets =
-    kalshiResult.status === 'fulfilled' ? kalshiResult.value : [];
-  const polyMarkets =
-    polyResult.status === 'fulfilled' ? polyResult.value : [];
-
-  if (kalshiResult.status === 'rejected') {
-    console.error('[scanner] kalshi.getMarkets failed', kalshiResult.reason);
-  }
-  if (polyResult.status === 'rejected') {
-    console.error('[scanner] poly.getMarkets failed', polyResult.reason);
-  }
-
-  return { kalshiMarkets, polyMarkets };
-}
-
-async function resolvePair(pair: CandidatePair): Promise<PreparedPair> {
-  // Cache lookup first.
-  const cached = await getCachedVerdict(
-    pair.kalshi.marketId,
-    pair.poly.marketId,
-  );
-  if (cached) {
-    return {
-      pair,
-      pairId: cached.id,
-      verdict: cached.verdict,
-      reasoning: cached.reasoning,
-    };
-  }
-
-  // No cache — call Claude (or get PENDING if no API key).
-  let verdict: ResolutionVerdict = 'PENDING';
-  let reasoning = '';
-  let riskFactors: string[] = [];
-  try {
-    const result = await verifyPair(pair.kalshi, pair.poly);
-    verdict = result.verdict;
-    reasoning = result.reasoning;
-    riskFactors = result.riskFactors;
-  } catch (err) {
-    console.error('[scanner] verifyPair failed', err);
-    verdict = 'CAUTION';
-  }
-
-  let pairId: string | null = null;
-  try {
-    pairId = await upsertMarketPair({
-      kalshiMarketId: pair.kalshi.marketId,
-      kalshiTitle: pair.kalshi.title,
-      kalshiResolutionCriteria: pair.kalshi.resolutionCriteria,
-      polyMarketId: pair.poly.marketId,
-      polyTitle: pair.poly.title,
-      polyResolutionCriteria: pair.poly.resolutionCriteria,
-      verdict,
-      verdictReasoning: reasoning,
-      riskFactors,
-      matchScore: pair.score,
-    });
-  } catch (err) {
-    console.error('[scanner] upsertMarketPair failed', err);
-  }
-
-  return { pair, pairId, verdict, reasoning, riskFactors };
-}
-
-function bestNetSpread(levels: ArbitrageLevel[]): number {
-  if (levels.length === 0) return 0;
-  return levels[0].netProfitPct;
-}
-
-function totalMaxProfit(levels: ArbitrageLevel[]): number {
-  return levels.reduce((acc, l) => acc + l.maxProfitDollars, 0);
-}
-
-function isStale(book: Orderbook): boolean {
-  return Date.now() - book.fetchedAt > config.scanner.stalenessThresholdMs;
-}
-
-export async function runScanCycle(scanConfig: ScannerConfig): Promise<{
+export interface ScanResult {
   opportunities: ArbitrageOpportunity[];
   stats: ScannerStats;
-}> {
-  const startedAt = Date.now();
+}
 
-  // 1. Fetch markets concurrently.
-  const { kalshiMarkets, polyMarkets } = await fetchMarketsSafe();
+export async function getLatestScanResult(): Promise<ScanResult> {
+  const sb = safeSupabase();
+  if (!sb) return { opportunities: [], stats: emptyStats };
 
-  // 2. Find candidate pairs by fuzzy match.
-  const candidates = findCandidatePairs(kalshiMarkets, polyMarkets);
+  const { data, error } = await sb
+    .from('scan_results')
+    .select(
+      'opportunities, kalshi_count, poly_count, matched_count, opportunity_count, scanned_at',
+    )
+    .order('scanned_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
 
-  // 3. Resolve verdicts (cache or Claude) for each candidate, in parallel.
-  const prepared = await Promise.all(candidates.map(resolvePair));
-
-  // Filter out SKIP verdicts.
-  const validPairs = prepared.filter((p) => p.verdict !== 'SKIP');
-
-  // 4. Fetch orderbooks for SAFE/CAUTION/PENDING pairs concurrently.
-  const orderbookResults = await Promise.all(
-    validPairs.map(async (p) => {
-      const { pair } = p;
-      try {
-        if (!pair.poly.yesTokenId || !pair.poly.noTokenId) return null;
-        const [kalshiBook, polyBook] = await Promise.all([
-          kalshi.getOrderbook(pair.kalshi.marketId),
-          poly.getOrderbook(
-            pair.poly.yesTokenId,
-            pair.poly.noTokenId,
-            pair.poly.marketId,
-          ),
-        ]);
-        return { kalshiBook, polyBook };
-      } catch (err) {
-        console.error('[scanner] orderbook fetch failed', err);
-        return null;
-      }
-    }),
-  );
-
-  // 5. Build opportunities.
-  const opportunities: ArbitrageOpportunity[] = [];
-
-  for (let i = 0; i < validPairs.length; i++) {
-    const prep = validPairs[i];
-    const books = orderbookResults[i];
-    if (!books) continue;
-
-    const { kalshiBook, polyBook } = books;
-
-    // Staleness check.
-    if (isStale(kalshiBook) || isStale(polyBook)) continue;
-
-    const levels = calculateOpportunity(
-      kalshiBook,
-      polyBook,
-      scanConfig.minNetSpread,
-    );
-    if (levels.length === 0) continue;
-
-    const best = levels[0];
-    const opp: ArbitrageOpportunity = {
-      id: `${prep.pair.kalshi.marketId}:${prep.pair.poly.marketId}`,
-      kalshiMarket: prep.pair.kalshi,
-      polyMarket: prep.pair.poly,
-      matchScore: prep.pair.score,
-      verdict: prep.verdict,
-      verdictReasoning: prep.reasoning,
-      riskFactors: prep.riskFactors,
-      levels,
-      bestNetSpread: bestNetSpread(levels),
-      totalMaxProfit: totalMaxProfit(levels),
-      scannedAt: Date.now(),
-    };
-    opportunities.push(opp);
-
-    if (prep.pairId) {
-      const polyYesPrice =
-        best.buyYesPlatform === 'polymarket' ? best.buyYesPrice : best.buyNoPrice;
-      const polyNoPrice =
-        best.buyNoPlatform === 'polymarket' ? best.buyNoPrice : best.buyYesPrice;
-      const kalshiYesPrice =
-        best.buyYesPlatform === 'kalshi' ? best.buyYesPrice : best.buyNoPrice;
-      const kalshiNoPrice =
-        best.buyNoPlatform === 'kalshi' ? best.buyNoPrice : best.buyYesPrice;
-
-      try {
-        await logSpread(prep.pairId, {
-          polyYesPrice,
-          polyNoPrice,
-          kalshiYesPrice,
-          kalshiNoPrice,
-          rawSpread: best.grossProfitPct,
-          estimatedFees: best.estimatedFees,
-          netSpread: best.netProfitPct,
-          availableQuantity: best.quantity,
-          maxProfitDollars: best.maxProfitDollars,
-        });
-      } catch (err) {
-        console.error('[scanner] logSpread failed', err);
-      }
-    }
+  if (error) {
+    console.error('[scanner] getLatestScanResult failed', error);
+    return { opportunities: [], stats: emptyStats };
   }
+  if (!data) return { opportunities: [], stats: emptyStats };
 
-  // 6. Sort opportunities by best net spread descending.
-  opportunities.sort((a, b) => b.bestNetSpread - a.bestNetSpread);
+  const rawOpps = (data.opportunities as ArbitrageOpportunity[] | null) ?? [];
+  const scannedAtMs = data.scanned_at
+    ? new Date(data.scanned_at as string).getTime()
+    : null;
 
-  // 7. Stats.
-  const stats: ScannerStats = {
-    kalshiCount: kalshiMarkets.length,
-    polyCount: polyMarkets.length,
-    matchedCount: candidates.length,
-    opportunityCount: opportunities.length,
-    lastScanAt: startedAt,
-    isScanning: false,
+  return {
+    opportunities: rawOpps,
+    stats: {
+      kalshiCount: (data.kalshi_count as number | null) ?? 0,
+      polyCount: (data.poly_count as number | null) ?? 0,
+      matchedCount: (data.matched_count as number | null) ?? 0,
+      opportunityCount: (data.opportunity_count as number | null) ?? 0,
+      lastScanAt: scannedAtMs,
+      isScanning: false,
+    },
   };
+}
 
-  return { opportunities, stats };
+export async function triggerScan(): Promise<{ ok: boolean; error?: string }> {
+  const sb = safeSupabase();
+  if (!sb) return { ok: false, error: 'Supabase not configured' };
+  try {
+    const { error } = await sb.functions.invoke('scanner');
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: message };
+  }
 }
 
 export function startScanner(
-  scanConfig: ScannerConfig,
-  onUpdate: (result: {
-    opportunities: ArbitrageOpportunity[];
-    stats: ScannerStats;
-  }) => void,
+  _config: ScannerConfig,
+  onUpdate: (result: ScanResult) => void,
 ): () => void {
+  let cancelled = false;
   const tick = () => {
-    runScanCycle(scanConfig).then(onUpdate).catch((err) => {
-      console.error('[scanner] runScanCycle failed', err);
-    });
+    if (cancelled) return;
+    getLatestScanResult()
+      .then((result) => {
+        if (!cancelled) onUpdate(result);
+      })
+      .catch((err) => {
+        console.error('[scanner] poll failed', err);
+      });
   };
-
-  // Run once immediately.
   tick();
-
-  const id = setInterval(tick, scanConfig.intervalSeconds * 1000);
-  return () => clearInterval(id);
+  const id = setInterval(tick, POLL_INTERVAL_MS);
+  return () => {
+    cancelled = true;
+    clearInterval(id);
+  };
 }

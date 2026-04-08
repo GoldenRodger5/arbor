@@ -18,6 +18,43 @@ function formatRelative(ts: number): string {
   return `${h}h ago`;
 }
 
+function formatDays(days: number | undefined): string {
+  if (days === undefined || !Number.isFinite(days)) return '—';
+  if (days < 1) return '<1d';
+  return `${Math.round(days)}d`;
+}
+
+function daysColor(days: number | undefined): string {
+  if (days === undefined) return 'var(--text-tertiary)';
+  if (days <= 7) return 'var(--green)';
+  if (days <= 30) return 'var(--text-primary)';
+  return 'var(--text-secondary)';
+}
+
+function formatAnnualized(annReturn: number | undefined): string {
+  if (annReturn === undefined || !Number.isFinite(annReturn)) return '—';
+  const pct = annReturn * 100;
+  return `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%`;
+}
+
+function annualizedColor(annReturn: number | undefined): string {
+  if (annReturn === undefined) return 'var(--text-tertiary)';
+  if (annReturn > 0.5) return 'var(--green)';
+  if (annReturn >= 0.15) return 'var(--text-primary)';
+  return 'var(--red)';
+}
+
+function formatCloseDate(iso: string | undefined): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleDateString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  });
+}
+
 function adaptOpportunity(opp: ArbitrageOpportunity, idx: number): Opportunity {
   const best = opp.levels[0];
   const polyYesPrice = best
@@ -52,6 +89,11 @@ function adaptOpportunity(opp: ArbitrageOpportunity, idx: number): Opportunity {
     scanned: formatRelative(opp.scannedAt),
     polyDepth,
     kalshiDepth,
+    daysToClose: opp.daysToClose,
+    annualizedReturn: opp.annualizedReturn,
+    effectiveCloseDate: opp.effectiveCloseDate,
+    kalshiCloseDate: opp.kalshiCloseDate,
+    polyCloseDate: opp.polyCloseDate,
   };
 }
 
@@ -113,15 +155,36 @@ export default function Opportunities() {
   const [filter, setFilter] = useState<Filter>('ALL');
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const isMobile = useIsMobile();
-  const { opportunities: ctxOpps, stats, startScan, stopScan } = useScannerContext();
+  const {
+    opportunities: ctxOpps,
+    stats,
+    refresh,
+    trigger,
+    triggering,
+  } = useScannerContext();
 
   // Use live opportunities when available; otherwise fall back to mock data
-  // (only when not actively scanning).
+  // until the first real scan_results row exists. Live opportunities are
+  // sorted by annualized return (capital efficiency) descending — raw spread
+  // is now a secondary metric.
   const opportunities = useMemo<Opportunity[]>(() => {
-    if (ctxOpps.length > 0) return ctxOpps.map(adaptOpportunity);
-    if (!stats.isScanning) return mockOpportunities;
+    if (ctxOpps.length > 0) {
+      const adapted = ctxOpps.map(adaptOpportunity);
+      adapted.sort((a, b) => {
+        const ar = a.annualizedReturn ?? -Infinity;
+        const br = b.annualizedReturn ?? -Infinity;
+        return br - ar;
+      });
+      return adapted;
+    }
+    if (stats.lastScanAt === null) return mockOpportunities;
     return [];
-  }, [ctxOpps, stats.isScanning]);
+  }, [ctxOpps, stats.lastScanAt]);
+
+  const lastScanLabel =
+    stats.lastScanAt === null
+      ? 'no scans yet'
+      : `updated ${formatRelative(stats.lastScanAt)}`;
 
   const filtered = opportunities.filter((o) => {
     if (filter === 'ALL') return true;
@@ -155,21 +218,43 @@ export default function Opportunities() {
         >
           {liveCount} LIVE
         </span>
-        <button
-          onClick={() => (stats.isScanning ? stopScan() : startScan())}
+        <span
           className="font-mono"
-          style={{
-            fontSize: 11, textTransform: 'uppercase',
-            padding: '2px 10px', borderRadius: 6,
-            border: 'none',
-            cursor: 'pointer',
-            color: stats.isScanning ? 'var(--red)' : 'var(--accent)',
-            background: stats.isScanning ? 'rgba(239,68,68,0.12)' : 'rgba(99,102,241,0.12)',
-            marginLeft: 'auto',
-          }}
+          style={{ fontSize: 11, color: 'var(--text-tertiary)', textTransform: 'uppercase' }}
         >
-          {stats.isScanning ? 'STOP SCAN' : 'START SCAN'}
-        </button>
+          {lastScanLabel}
+        </span>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          <button
+            onClick={() => refresh()}
+            className="font-mono"
+            style={{
+              fontSize: 11, textTransform: 'uppercase',
+              padding: '2px 10px', borderRadius: 6,
+              border: 'none', cursor: 'pointer',
+              color: 'var(--text-secondary)',
+              background: 'var(--bg-elevated)',
+            }}
+          >
+            REFRESH
+          </button>
+          <button
+            onClick={() => trigger()}
+            disabled={triggering}
+            className="font-mono"
+            style={{
+              fontSize: 11, textTransform: 'uppercase',
+              padding: '2px 10px', borderRadius: 6,
+              border: 'none',
+              cursor: triggering ? 'wait' : 'pointer',
+              color: 'var(--accent)',
+              background: 'rgba(99,102,241,0.12)',
+              opacity: triggering ? 0.6 : 1,
+            }}
+          >
+            {triggering ? 'TRIGGERING…' : 'TRIGGER SCAN'}
+          </button>
+        </div>
       </div>
 
       {/* Filters */}
@@ -198,6 +283,8 @@ export default function Opportunities() {
             <tr>
               {!isMobile && <th style={{ ...th, width: 32 }}>#</th>}
               <th style={th}>Event</th>
+              <th style={{ ...th, width: 64 }}>Closes</th>
+              <th style={{ ...th, width: 96 }}>Ann. Return</th>
               {!isMobile && <th style={{ ...th, width: 72 }}>Poly YES</th>}
               {!isMobile && <th style={{ ...th, width: 72 }}>Kalshi NO</th>}
               {!isMobile && <th style={{ ...th, width: 80 }}>Raw Spread</th>}
@@ -225,6 +312,18 @@ export default function Opportunities() {
                   <td style={{ ...td, color: 'var(--text-primary)', fontSize: 13, maxWidth: isMobile ? 140 : 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {o.event}
                   </td>
+                  <td
+                    className="font-mono"
+                    style={{ ...td, fontSize: 13, fontWeight: 600, color: daysColor(o.daysToClose) }}
+                  >
+                    {formatDays(o.daysToClose)}
+                  </td>
+                  <td
+                    className="font-mono"
+                    style={{ ...td, fontSize: 13, fontWeight: 700, color: annualizedColor(o.annualizedReturn) }}
+                  >
+                    {formatAnnualized(o.annualizedReturn)}
+                  </td>
                   {!isMobile && <td className="font-mono" style={{ ...td, fontSize: 13, color: 'var(--text-secondary)' }}>${o.polyYes.toFixed(2)}</td>}
                   {!isMobile && <td className="font-mono" style={{ ...td, fontSize: 13, color: 'var(--text-secondary)' }}>${o.kalshiNo.toFixed(2)}</td>}
                   {!isMobile && <td className="font-mono" style={{ ...td, fontSize: 13, color: 'var(--text-primary)' }}>{o.rawSpread.toFixed(1)}%</td>}
@@ -245,7 +344,44 @@ export default function Opportunities() {
                 </tr>
                 {expandedId === o.id && (
                   <tr key={`${o.id}-exp`}>
-                    <td colSpan={isMobile ? 4 : 9} style={{ padding: 16, background: 'var(--bg-surface)', borderBottom: '1px solid var(--border)' }}>
+                    <td colSpan={isMobile ? 6 : 11} style={{ padding: 16, background: 'var(--bg-surface)', borderBottom: '1px solid var(--border)' }}>
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                          gap: 16,
+                          marginBottom: 16,
+                          fontSize: 12,
+                          fontFamily: 'JetBrains Mono, ui-monospace, monospace',
+                        }}
+                      >
+                        <div>
+                          <div className="label" style={{ marginBottom: 4 }}>Kalshi closes</div>
+                          <div style={{ color: 'var(--text-primary)' }}>{formatCloseDate(o.kalshiCloseDate)}</div>
+                        </div>
+                        <div>
+                          <div className="label" style={{ marginBottom: 4 }}>Polymarket closes</div>
+                          <div style={{ color: 'var(--text-primary)' }}>{formatCloseDate(o.polyCloseDate)}</div>
+                        </div>
+                        <div>
+                          <div className="label" style={{ marginBottom: 4 }}>Effective settlement</div>
+                          <div style={{ color: 'var(--text-primary)' }}>{formatCloseDate(o.effectiveCloseDate)}</div>
+                        </div>
+                        <div>
+                          <div className="label" style={{ marginBottom: 4 }}>Days remaining</div>
+                          <div style={{ color: daysColor(o.daysToClose) }}>{formatDays(o.daysToClose)}</div>
+                        </div>
+                        <div>
+                          <div className="label" style={{ marginBottom: 4 }}>Capital locked for</div>
+                          <div style={{ color: 'var(--text-primary)' }}>~{formatDays(o.daysToClose)}</div>
+                        </div>
+                        <div>
+                          <div className="label" style={{ marginBottom: 4 }}>Annualized return</div>
+                          <div style={{ color: annualizedColor(o.annualizedReturn), fontWeight: 700 }}>
+                            {formatAnnualized(o.annualizedReturn)}
+                          </div>
+                        </div>
+                      </div>
                       <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
                         <DepthBar label="POLYMARKET DEPTH" depth={o.polyDepth} />
                         <DepthBar label="KALSHI DEPTH" depth={o.kalshiDepth} />
