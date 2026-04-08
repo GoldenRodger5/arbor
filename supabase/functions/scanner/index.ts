@@ -24,6 +24,16 @@ interface UnifiedMarket {
   noAsk?: number;
   resolutionCriteria?: string;
   url?: string;
+  // Source category — Kalshi event.category for kalshi markets, Polymarket
+  // tag slug for poly markets. Used to detect sports pairs and to drive
+  // future per-category fee adjustments.
+  category?: string;
+  // Pre-detected sports info, populated at fetch time so the matcher and
+  // resolver don't have to re-tokenize titles. `sportLeague` is one of
+  // 'mlb' | 'nba' | 'nfl' | 'nhl'; `sportTeams` are canonical lowercase
+  // team nicknames ('mets', 'red sox', 'lakers', etc.).
+  sportLeague?: string;
+  sportTeams?: string[];
 }
 
 interface OrderbookLevel {
@@ -88,6 +98,12 @@ const POLY_GAMMA = 'https://gamma-api.polymarket.com';
 const POLY_CLOB = 'https://clob.polymarket.com';
 
 const FUZZY_THRESHOLD = 0.40;
+// Sports titles format very differently across platforms (Kalshi:
+// "Chiefs ML vs Eagles 04/13" vs Poly: "Will Kansas City Chiefs beat
+// Philadelphia Eagles on April 13?"). Token overlap on team names alone
+// usually only gives 0.30-0.40, so we lower the threshold for any pair
+// where both titles share a recognizable team from the same league.
+const SPORTS_FUZZY_THRESHOLD = 0.30;
 const STALENESS_THRESHOLD_MS = 120_000;
 // TEMP: diagnostic, raise to 0.02 once spread distribution is understood.
 const MIN_NET_SPREAD = 0.005;
@@ -96,10 +112,14 @@ const MIN_NET_SPREAD = 0.005;
 // pairs with `belowThreshold = true` instead of dropping them.
 const DIAGNOSTIC_WALK_THRESHOLD = -1.0;
 // Capital efficiency: only scan markets that settle inside this window.
-// Markets closing in < 24h are too risky (resolution timing); markets > 90d
+// Markets closing in < 24h are too risky (resolution timing); markets > 365d
 // out tie up capital for negligible annualized return.
 const MIN_DAYS_TO_CLOSE = 1;
 const MAX_DAYS_TO_CLOSE = 365;
+// Sports markets get a tighter window: anything beyond 14 days is too
+// speculative (lineups, injuries, weather all unknown) and typically
+// illiquid. Sports >14d out are dropped at the date filter.
+const MAX_DAYS_TO_CLOSE_SPORTS = 14;
 // 15% annualized minimum to be flagged as actionable. A 1% spread closing in
 // 3 days (~121% annualized) ranks above a 5% spread closing in 200 days (~9%).
 const MIN_ANNUALIZED_RETURN = 0.15;
@@ -139,6 +159,194 @@ function effectiveCloseMs(pair: CandidatePair): number | null {
   if (p === null) return k;
   return Math.min(k, p);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sports team detection
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// We detect sports pairs by checking if both titles contain the same team
+// name from the same league. This is robust because team names are unique
+// per league (no two NFL teams are called "chiefs"). Substring matching on
+// the lowercased title catches both "Chiefs" and "Kansas City Chiefs".
+//
+// Multi-word team names like "red sox" and "blue jays" are matched as
+// substrings so they work in either order.
+
+type Sport = 'nfl' | 'nba' | 'mlb' | 'nhl';
+
+const NFL_TEAMS: ReadonlySet<string> = new Set([
+  'chiefs', 'eagles', 'cowboys', 'patriots', 'packers', 'rams', '49ers',
+  'bills', 'ravens', 'bengals', 'browns', 'steelers', 'texans', 'colts',
+  'jaguars', 'titans', 'broncos', 'raiders', 'chargers', 'seahawks',
+  'cardinals', 'falcons', 'saints', 'panthers', 'buccaneers', 'bears',
+  'lions', 'vikings', 'giants', 'commanders', 'jets', 'dolphins',
+]);
+
+const NBA_TEAMS: ReadonlySet<string> = new Set([
+  'lakers', 'celtics', 'warriors', 'nets', 'knicks', 'bulls', 'heat',
+  'bucks', 'nuggets', 'suns', 'mavs', 'mavericks', 'clippers', 'sixers',
+  'raptors', 'hawks', 'hornets', 'pistons', 'pacers', 'cavaliers',
+  'magic', 'wizards', 'pelicans', 'grizzlies', 'spurs', 'thunder',
+  'blazers', 'jazz', 'kings', 'rockets', 'timberwolves',
+]);
+
+const MLB_TEAMS: ReadonlySet<string> = new Set([
+  'yankees', 'red sox', 'dodgers', 'giants', 'cubs', 'cardinals',
+  'braves', 'mets', 'phillies', 'nationals', 'marlins', 'brewers',
+  'pirates', 'reds', 'astros', 'rangers', 'angels', 'athletics',
+  'mariners', 'padres', 'rockies', 'diamondbacks', 'twins', 'white sox',
+  'tigers', 'guardians', 'royals', 'orioles', 'rays', 'blue jays',
+]);
+
+interface DetectedTeams {
+  nfl: string[];
+  nba: string[];
+  mlb: string[];
+}
+
+const EMPTY_TEAMS: DetectedTeams = { nfl: [], nba: [], mlb: [] };
+
+function hasAnyTeam(t: DetectedTeams): boolean {
+  return t.nfl.length + t.nba.length + t.mlb.length > 0;
+}
+
+function detectTeams(title: string): DetectedTeams {
+  if (!title) return EMPTY_TEAMS;
+  const lower = ' ' + title.toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ') + ' ';
+  const nfl: string[] = [];
+  const nba: string[] = [];
+  const mlb: string[] = [];
+  // Pad with spaces so 'rays' doesn't match 'arrays', etc.
+  for (const team of NFL_TEAMS) if (lower.includes(' ' + team + ' ')) nfl.push(team);
+  for (const team of NBA_TEAMS) if (lower.includes(' ' + team + ' ')) nba.push(team);
+  for (const team of MLB_TEAMS) if (lower.includes(' ' + team + ' ')) mlb.push(team);
+  return { nfl, nba, mlb };
+}
+
+interface SharedTeamInfo {
+  sport: Sport;
+  team: string;
+}
+
+/**
+ * Returns the shared team if both titles mention at least one team from
+ * the same league, else null. NBA "cardinals" / NFL "cardinals" /
+ * MLB "cardinals" all collide — that's intentional, the shared sport
+ * disambiguates.
+ */
+function findSharedTeam(a: DetectedTeams, b: DetectedTeams): SharedTeamInfo | null {
+  for (const t of a.nfl) if (b.nfl.includes(t)) return { sport: 'nfl', team: t };
+  for (const t of a.nba) if (b.nba.includes(t)) return { sport: 'nba', team: t };
+  for (const t of a.mlb) if (b.mlb.includes(t)) return { sport: 'mlb', team: t };
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kalshi sports event_ticker parsing
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Kalshi sports event tickers look like KXMLBGAME-26APR111610ATHNYM where the
+// trailing 6 chars are two 3-letter team codes. The market title gets
+// truncated to ~10 chars per side ("New York M") so we can't reliably detect
+// teams from the title alone — we have to parse the ticker.
+
+const MLB_CODE_TO_TEAM: Readonly<Record<string, string>> = {
+  ARI: 'diamondbacks', ATL: 'braves', BAL: 'orioles', BOS: 'red sox',
+  CHC: 'cubs', CIN: 'reds', CLE: 'guardians', COL: 'rockies',
+  CWS: 'white sox', CHW: 'white sox', DET: 'tigers', HOU: 'astros',
+  KCR: 'royals', KCO: 'royals', LAA: 'angels', LAD: 'dodgers',
+  MIA: 'marlins', MIL: 'brewers', MIN: 'twins', NYM: 'mets',
+  NYY: 'yankees', OAK: 'athletics', ATH: 'athletics', PHI: 'phillies',
+  PIT: 'pirates', SDP: 'padres', SEA: 'mariners', SFG: 'giants',
+  STL: 'cardinals', TBR: 'rays', TEX: 'rangers', TOR: 'blue jays',
+  WSH: 'nationals', WAS: 'nationals',
+};
+
+const NBA_CODE_TO_TEAM: Readonly<Record<string, string>> = {
+  ATL: 'hawks', BOS: 'celtics', BKN: 'nets', BRK: 'nets',
+  CHA: 'hornets', CHO: 'hornets', CHI: 'bulls', CLE: 'cavaliers',
+  DAL: 'mavericks', DEN: 'nuggets', DET: 'pistons', GSW: 'warriors',
+  HOU: 'rockets', IND: 'pacers', LAC: 'clippers', LAL: 'lakers',
+  MEM: 'grizzlies', MIA: 'heat', MIL: 'bucks', MIN: 'timberwolves',
+  NOP: 'pelicans', NYK: 'knicks', OKC: 'thunder', ORL: 'magic',
+  PHI: 'sixers', PHX: 'suns', POR: 'blazers', SAC: 'kings',
+  SAS: 'spurs', TOR: 'raptors', UTA: 'jazz', WAS: 'wizards',
+};
+
+const NFL_CODE_TO_TEAM: Readonly<Record<string, string>> = {
+  ARI: 'cardinals', ATL: 'falcons', BAL: 'ravens', BUF: 'bills',
+  CAR: 'panthers', CHI: 'bears', CIN: 'bengals', CLE: 'browns',
+  DAL: 'cowboys', DEN: 'broncos', DET: 'lions', GB: 'packers',
+  GNB: 'packers', HOU: 'texans', IND: 'colts', JAC: 'jaguars',
+  JAX: 'jaguars', KC: 'chiefs', KAN: 'chiefs', LV: 'raiders',
+  LVR: 'raiders', LAC: 'chargers', LAR: 'rams', MIA: 'dolphins',
+  MIN: 'vikings', NE: 'patriots', NWE: 'patriots', NO: 'saints',
+  NOR: 'saints', NYG: 'giants', NYJ: 'jets', PHI: 'eagles',
+  PIT: 'steelers', SF: '49ers', SFO: '49ers', SEA: 'seahawks',
+  TB: 'buccaneers', TAM: 'buccaneers', TEN: 'titans', WAS: 'commanders',
+};
+
+const NHL_CODE_TO_TEAM: Readonly<Record<string, string>> = {
+  ANA: 'ducks', ARI: 'coyotes', BOS: 'bruins', BUF: 'sabres',
+  CGY: 'flames', CAR: 'hurricanes', CHI: 'blackhawks', COL: 'avalanche',
+  CBJ: 'blue jackets', DAL: 'stars', DET: 'red wings', EDM: 'oilers',
+  FLA: 'panthers', LAK: 'kings', MIN: 'wild', MTL: 'canadiens',
+  NSH: 'predators', NJD: 'devils', NYI: 'islanders', NYR: 'rangers',
+  OTT: 'senators', PHI: 'flyers', PIT: 'penguins', SJS: 'sharks',
+  SEA: 'kraken', STL: 'blues', TBL: 'lightning', TOR: 'maple leafs',
+  VAN: 'canucks', VGK: 'golden knights', WSH: 'capitals', WPG: 'jets',
+  UTA: 'utah hockey',
+};
+
+interface KalshiSportInfo {
+  sport: 'mlb' | 'nba' | 'nfl' | 'nhl';
+  teams: string[];
+}
+
+/**
+ * Parses a Kalshi event_ticker like KXMLBGAME-26APR111610ATHNYM into the
+ * sport and the canonical team names. Returns null if not a recognized
+ * sports ticker.
+ */
+function parseKalshiSportTicker(eventTicker: string): KalshiSportInfo | null {
+  if (!eventTicker) return null;
+  const m = eventTicker.match(/^KX(MLB|NBA|NFL|NHL)GAME-/);
+  if (!m) return null;
+  const sport = m[1].toLowerCase() as 'mlb' | 'nba' | 'nfl' | 'nhl';
+  // Take the trailing alpha suffix (codes are letters only) — strip any
+  // single-team disambiguator like "-NOP" first.
+  const tail = eventTicker.split('-').pop() ?? '';
+  // Find the last contiguous alpha run.
+  const alphaMatch = tail.match(/[A-Z]+$/);
+  if (!alphaMatch) return null;
+  const codes = alphaMatch[0];
+  // Codes are 2-4 chars; standard MLB/NBA/NHL is 3 chars, NFL has 2-3 char
+  // codes (KC, NE, SF, etc). When 6 chars total, it's two 3-char codes.
+  // When 5 chars (e.g., NEKAN, NEMIA), it could be 2+3 or 3+2. We try the
+  // most common splits.
+  const map = sport === 'mlb' ? MLB_CODE_TO_TEAM
+    : sport === 'nba' ? NBA_CODE_TO_TEAM
+    : sport === 'nfl' ? NFL_CODE_TO_TEAM
+    : NHL_CODE_TO_TEAM;
+  const tryParse = (a: string, b: string): string[] | null => {
+    const ta = map[a];
+    const tb = map[b];
+    if (ta && tb) return [ta, tb];
+    return null;
+  };
+  let teams: string[] | null = null;
+  if (codes.length === 6) {
+    teams = tryParse(codes.slice(0, 3), codes.slice(3));
+  } else if (codes.length === 5) {
+    teams = tryParse(codes.slice(0, 2), codes.slice(2)) ??
+      tryParse(codes.slice(0, 3), codes.slice(3));
+  } else if (codes.length === 4) {
+    teams = tryParse(codes.slice(0, 2), codes.slice(2));
+  }
+  if (!teams) return null;
+  return { sport, teams };
+}
+
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -262,7 +470,18 @@ const KALSHI_CATEGORIES = new Set([
   'Science',
   'Awards',
   'Culture',
+  'Sports',
 ]);
+
+// Series tickers Kalshi uses for individual sports games. Fetched
+// unconditionally alongside /events because some game-level series may
+// not be reachable through the events endpoint with the same coverage.
+const KALSHI_SPORTS_SERIES = [
+  'KXNFLGAME', // NFL game lines
+  'KXNBAGAME', // NBA game lines
+  'KXMLBGAME', // MLB game lines
+  'KXNHLGAME', // NHL game lines
+];
 
 // Series tickers known to contain political/macro/crypto markets — used as a
 // fallback when /events filtering doesn't yield enough markets.
@@ -359,6 +578,7 @@ function pushKalshiMarket(
   list: UnifiedMarket[],
   seen: Set<string>,
   m: KalshiMarketRaw,
+  category?: string,
 ): void {
   if (!m.ticker) return;
   if (m.mve_collection_ticker) return;
@@ -366,6 +586,12 @@ function pushKalshiMarket(
   seen.add(m.ticker);
   const yesAsk = typeof m.yes_ask === 'number' ? m.yes_ask / 100 : undefined;
   const noAsk = typeof m.no_ask === 'number' ? m.no_ask / 100 : undefined;
+  let sportInfo: KalshiSportInfo | null = null;
+  try {
+    sportInfo = parseKalshiSportTicker(m.event_ticker ?? m.ticker);
+  } catch (err) {
+    console.error('[scanner] parseKalshiSportTicker threw', err);
+  }
   list.push({
     platform: 'kalshi',
     marketId: m.ticker,
@@ -374,6 +600,9 @@ function pushKalshiMarket(
     yesAsk,
     noAsk,
     url: buildKalshiUrl(m),
+    category: category ?? (sportInfo ? 'Sports' : undefined),
+    sportLeague: sportInfo?.sport,
+    sportTeams: sportInfo?.teams,
   });
 }
 
@@ -382,7 +611,7 @@ async function kalshiGetMarkets(): Promise<UnifiedMarket[]> {
   const seen = new Set<string>();
   const categoriesSeen = new Set<string>();
 
-  // Approach A: /events with category filter (politics/economics/etc.).
+  // Approach A: /events with category filter (politics/economics/sports/etc.).
   const MAX_EVENT_PAGES = 8;
   let cursor: string | null = null;
   let pagesFetched = 0;
@@ -398,7 +627,9 @@ async function kalshiGetMarkets(): Promise<UnifiedMarket[]> {
     for (const ev of page.events) {
       if (ev.category) categoriesSeen.add(ev.category);
       if (!ev.category || !KALSHI_CATEGORIES.has(ev.category)) continue;
-      for (const m of ev.markets ?? []) pushKalshiMarket(markets, seen, m);
+      for (const m of ev.markets ?? []) {
+        pushKalshiMarket(markets, seen, m, ev.category);
+      }
     }
     cursor = page.cursor;
     if (!cursor) break;
@@ -429,6 +660,30 @@ async function kalshiGetMarkets(): Promise<UnifiedMarket[]> {
       await sleep(KALSHI_PAGE_DELAY_MS);
     }
   }
+
+  // Approach C (sports specifically): always pull the per-game sports series
+  // tickers. /events surfaces season-long props with non-parseable tickers
+  // (KXNBATEAM-30, KXCANADACUP-30) but the per-game KX{SPORT}GAME-DATETEAMS
+  // tickers — the high-value short-dated markets — only show up via /markets.
+  const sportsBefore = markets.length;
+  for (const series of KALSHI_SPORTS_SERIES) {
+    try {
+      const seriesMarkets = await kalshiFetchSeriesMarkets(series);
+      const before = markets.length;
+      for (const m of seriesMarkets) {
+        pushKalshiMarket(markets, seen, m, 'Sports');
+      }
+      console.log(
+        `[scanner] kalshi sports series ${series}: +${markets.length - before} markets (raw ${seriesMarkets.length})`,
+      );
+    } catch (err) {
+      console.error(`[scanner] kalshi sports series ${series} fetch failed`, err);
+    }
+    await sleep(KALSHI_PAGE_DELAY_MS);
+  }
+  console.log(
+    `[scanner] kalshi sports series total: +${markets.length - sportsBefore} markets`,
+  );
 
   return markets;
 }
@@ -568,8 +823,27 @@ function buildPolyUrl(raw: PolyMarketRaw): string | undefined {
   return undefined;
 }
 
-// Polymarket tag slugs that overlap with Kalshi inventory.
-const POLY_TAG_SLUGS = ['politics', 'crypto', 'economics', 'finance', 'science'];
+// Polymarket tag slugs that overlap with Kalshi inventory. Sport-specific
+// slugs (nfl/nba/mlb/nhl/soccer) are listed BEFORE the generic 'sports' slug
+// so when the same market appears under both, the more specific category
+// wins the dedupe.
+const POLY_TAG_SLUGS = [
+  'politics',
+  'crypto',
+  'economics',
+  'finance',
+  'science',
+  // Sport-specific slugs FIRST so they win the dedupe over the generic
+  // 'sports' slug below.
+  'nfl',
+  'nba',
+  'mlb',
+  'nhl',
+  'soccer',
+  'sports',
+];
+
+const POLY_SPORT_SLUGS = new Set(['nfl', 'nba', 'mlb', 'nhl', 'soccer', 'sports']);
 
 interface PolyEventRaw {
   slug?: string;
@@ -579,6 +853,7 @@ interface PolyEventRaw {
 function polyMarketToUnified(
   m: PolyMarketRaw,
   eventSlug: string | undefined,
+  category?: string,
 ): UnifiedMarket | null {
   if (!m.enableOrderBook || !m.acceptingOrders) return null;
   const conditionId = m.conditionId ?? '';
@@ -592,16 +867,34 @@ function polyMarketToUnified(
     return null;
   }
   if (tokenIds.length < 2) return null;
+  const title = m.question ?? '';
+  // Polymarket titles are full text ("Will the New York Mets beat the
+  // Athletics on April 11?") so direct team-name detection works. We pick
+  // the first sport that has a hit; per-sport disambiguation is then
+  // handled by findSharedSportTeam.
+  let sportLeague: string | undefined;
+  let sportTeams: string[] | undefined;
+  if (POLY_SPORT_SLUGS.has(category ?? '')) {
+    const detected = detectTeams(title);
+    if (detected.mlb.length > 0) { sportLeague = 'mlb'; sportTeams = detected.mlb; }
+    else if (detected.nba.length > 0) { sportLeague = 'nba'; sportTeams = detected.nba; }
+    else if (detected.nfl.length > 0) { sportLeague = 'nfl'; sportTeams = detected.nfl; }
+    // NHL detection from titles isn't reliable yet (no team list above),
+    // but the tag itself flags this as a sports market.
+  }
   return {
     platform: 'polymarket',
     marketId: conditionId,
-    title: m.question ?? '',
+    title,
     yesTokenId: tokenIds[0],
     noTokenId: tokenIds[1],
     closeTime: m.endDate,
     url: eventSlug
       ? `https://polymarket.com/event/${eventSlug}`
       : buildPolyUrl(m),
+    category,
+    sportLeague,
+    sportTeams,
   };
 }
 
@@ -609,7 +902,11 @@ async function polyFetchEventsByTag(slug: string): Promise<UnifiedMarket[]> {
   const out: UnifiedMarket[] = [];
   const limit = 100;
   let offset = 0;
-  const MAX_PAGES = 4;
+  // 1 page (100 events) per tag — with 11 tags fetched in parallel, the
+  // total payload (~12k markets) sits right at the edge of the worker
+  // budget. Page 1 of each tag is sorted by volume so it's the highest-
+  // value slice anyway.
+  const MAX_PAGES = 1;
   let pages = 0;
   while (pages < MAX_PAGES) {
     const params = new URLSearchParams({
@@ -636,7 +933,7 @@ async function polyFetchEventsByTag(slug: string): Promise<UnifiedMarket[]> {
     if (!data || data.length === 0) break;
     for (const ev of data) {
       for (const m of ev.markets ?? []) {
-        const u = polyMarketToUnified(m, ev.slug);
+        const u = polyMarketToUnified(m, ev.slug, slug);
         if (u) out.push(u);
       }
     }
@@ -649,13 +946,14 @@ async function polyFetchEventsByTag(slug: string): Promise<UnifiedMarket[]> {
 }
 
 async function polyGetMarkets(): Promise<UnifiedMarket[]> {
-  const tagResults = await Promise.all(
-    POLY_TAG_SLUGS.map((slug) =>
-      polyFetchEventsByTag(slug).catch((err) => {
-        console.error(`[scanner] poly tag ${slug} failed`, err);
-        return [] as UnifiedMarket[];
-      }),
-    ),
+  // Bounded concurrency: with sports added we now have 11 tag slugs and
+  // running all in parallel pushed the worker over its memory budget.
+  // 4 in flight at a time is plenty for the Gamma API.
+  const tagResults = await mapPool(POLY_TAG_SLUGS, 4, (slug) =>
+    polyFetchEventsByTag(slug).catch((err) => {
+      console.error(`[scanner] poly tag ${slug} failed`, err);
+      return [] as UnifiedMarket[];
+    }),
   );
   const seen = new Set<string>();
   const markets: UnifiedMarket[] = [];
@@ -670,6 +968,8 @@ async function polyGetMarkets(): Promise<UnifiedMarket[]> {
       `[scanner] poly tag ${POLY_TAG_SLUGS[i]}: +${markets.length - before} markets (raw ${tagResults[i].length})`,
     );
   }
+  const polySportsCount = markets.filter(isSportsMarket).length;
+  console.log(`[scanner] poly sports total: ${polySportsCount}`);
   return markets;
 }
 
@@ -885,6 +1185,64 @@ function findCandidatePairs(
     return { pairs: [], topPairs: [] };
   }
 
+  // Sports join pass — before the general fuzzy matcher.
+  // Sports titles use abbreviated team names on Kalshi ("New York M") and
+  // full names on Polymarket ("New York Mets"), so token overlap is too
+  // weak to surface them via the fuzzy matcher. Instead, do a direct
+  // league+team join using the precomputed `sportLeague` / `sportTeams`
+  // fields. We claim the poly index here so the fuzzy pass doesn't
+  // double-pair it.
+  const claimedPoly = new Set<number>();
+  const sportsResults: CandidatePair[] = [];
+  // Build per-(league:team) → poly index list.
+  const polyTeamIndex = new Map<string, number[]>();
+  for (let j = 0; j < polyMarkets.length; j++) {
+    const pm = polyMarkets[j];
+    if (!pm.sportLeague || !pm.sportTeams) continue;
+    for (const t of pm.sportTeams) {
+      const key = pm.sportLeague + ':' + t;
+      let arr = polyTeamIndex.get(key);
+      if (!arr) { arr = []; polyTeamIndex.set(key, arr); }
+      arr.push(j);
+    }
+  }
+  for (let i = 0; i < kalshiMarkets.length; i++) {
+    const km = kalshiMarkets[i];
+    if (!km.sportLeague || !km.sportTeams) continue;
+    // For team-pair sports, we want both teams to match for the strongest
+    // signal. Score = (number of overlapping teams) / 2.
+    const candidatesByPoly = new Map<number, number>(); // polyIdx → overlap count
+    for (const t of km.sportTeams) {
+      const key = km.sportLeague + ':' + t;
+      const list = polyTeamIndex.get(key);
+      if (!list) continue;
+      for (const j of list) {
+        if (claimedPoly.has(j)) continue;
+        candidatesByPoly.set(j, (candidatesByPoly.get(j) ?? 0) + 1);
+      }
+    }
+    if (candidatesByPoly.size === 0) continue;
+    // Pick the poly with the highest overlap, breaking ties by closest
+    // close-time (we don't have that here yet; use first).
+    let bestJ = -1;
+    let bestOv = 0;
+    for (const [j, ov] of candidatesByPoly) {
+      if (ov > bestOv) { bestOv = ov; bestJ = j; }
+    }
+    if (bestJ === -1) continue;
+    claimedPoly.add(bestJ);
+    // Sports pairs get a high explicit score (0.95 base, 0.99 for both
+    // teams matching) so they always sort to the front and make it past
+    // MAX_PAIRS_TO_RESOLVE. Sports markets are the highest-priority
+    // category — short-dated, unambiguous, less arbitraged — so we
+    // don't want them displaced by long-dated political fuzzy matches.
+    const score = bestOv === 2 ? 0.99 : 0.95;
+    sportsResults.push({ kalshi: km, poly: polyMarkets[bestJ], score });
+  }
+  console.log(
+    `[scanner] sports join pass: ${sportsResults.length} pairs from ${claimedPoly.size} claimed poly markets`,
+  );
+
   const kalshiTok = kalshiMarkets.map((m) => tokenize(m.title));
   const polyTok = polyMarkets.map((m) => tokenize(m.title));
   const polySizes = new Int32Array(polyMarkets.length);
@@ -977,11 +1335,13 @@ function findCandidatePairs(
   }));
   console.log('[scanner] top fuzzy pairs:', JSON.stringify(topPairs));
 
-  const claimed = new Set<number>();
+  // Start with the sports join results so they can't get displaced.
+  const claimed = new Set<number>(claimedPoly);
   const results: CandidatePair[] = [];
+  for (const sp of sportsResults) results.push(sp);
   for (const entry of order) {
-    if (entry.score < FUZZY_THRESHOLD) continue;
     if (entry.polyIdx < 0) continue;
+    if (entry.score < FUZZY_THRESHOLD) continue;
     if (claimed.has(entry.polyIdx)) continue;
     claimed.add(entry.polyIdx);
     results.push({
@@ -992,6 +1352,31 @@ function findCandidatePairs(
   }
   results.sort((a, b) => b.score - a.score);
   return { pairs: results, topPairs };
+}
+
+/**
+ * Returns the shared sport+team if both markets in a pair are pre-tagged
+ * with the same sport league and at least one common team. Uses the
+ * precomputed `sportLeague` / `sportTeams` set on each UnifiedMarket so
+ * this is O(team_count) per pair with no string parsing.
+ */
+function pairSharedTeam(pair: CandidatePair): SharedTeamInfo | null {
+  const k = pair.kalshi;
+  const p = pair.poly;
+  if (!k.sportLeague || !p.sportLeague) return null;
+  if (k.sportLeague !== p.sportLeague) return null;
+  if (!k.sportTeams || !p.sportTeams) return null;
+  for (const t of k.sportTeams) {
+    if (p.sportTeams.includes(t)) {
+      return { sport: k.sportLeague as Sport, team: t };
+    }
+  }
+  return null;
+}
+
+function isSportsMarket(m: UnifiedMarket): boolean {
+  return !!m.sportLeague || m.category === 'Sports' ||
+    (m.category !== undefined && POLY_SPORT_SLUGS.has(m.category));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1191,6 +1576,20 @@ async function resolvePair(
   pair: CandidatePair,
   skipClaude: boolean,
 ): Promise<PreparedPair> {
+  // Sports fast-path runs BEFORE the verdict cache because (a) sports
+  // resolutions are unambiguous so we always want SAFE here regardless of
+  // any stale cached PENDING/CAUTION from prior Claude runs, and (b) it
+  // saves a DB roundtrip when both pre-conditions hold.
+  const sharedTeam = pairSharedTeam(pair);
+  if (sharedTeam !== null) {
+    const verdict: ResolutionVerdict = 'SAFE';
+    const reasoning = `sports fast-path: both markets reference ${sharedTeam.sport.toUpperCase()} ${sharedTeam.team}; resolution unambiguous`;
+    console.log(
+      `[resolver] SAFE (sports fast-path, ${sharedTeam.sport}/${sharedTeam.team}) | ${pair.kalshi.title} → ${pair.poly.title}`,
+    );
+    const pairId = await upsertMarketPair(sb, pair, verdict, reasoning, []);
+    return { pair, pairId, verdict, reasoning, riskFactors: [] };
+  }
   const cached = await getCachedVerdict(sb, pair.kalshi.marketId, pair.poly.marketId);
   if (cached) {
     console.log(
@@ -1267,10 +1666,12 @@ async function runScanCycle(
   pairsFilteredByDate: number;
   avgDaysToClose: number;
   dateBuckets: {
+    expired: number;
     within7days: number;
     within30days: number;
     within90days: number;
-    beyond90days: number;
+    within365days: number;
+    beyond365days: number;
     missing: number;
   };
   clearedSpreadCount: number;
@@ -1280,6 +1681,14 @@ async function runScanCycle(
   matchedPairs: Array<{ score: number; kalshi: string; poly: string }>;
   pairSummaries: PairSummary[];
   verdictDist: VerdictDistribution;
+  sportsStats: {
+    kalshiSportsCount: number;
+    polySportsCount: number;
+    sportsPairsMatched: number;
+    sportsClosingWithin7d: number;
+    bestSportsSpread: number | null;
+    bestSportsAPY: number | null;
+  };
   errors: string[];
 }> {
   const errors: string[] = [];
@@ -1322,6 +1731,13 @@ async function runScanCycle(
   );
   console.log(`[scanner] fuzzy threshold: ${FUZZY_THRESHOLD}`);
 
+  // Sports market counts using precomputed sport metadata on each market.
+  const kalshiSportsCount = kalshiMarkets.filter(isSportsMarket).length;
+  const polySportsCount = polyMarkets.filter(isSportsMarket).length;
+  console.log(
+    `[sports] kalshi=${kalshiSportsCount} poly=${polySportsCount}`,
+  );
+
   // 2. Fuzzy match.
   const matchResult = findCandidatePairs(kalshiMarkets, polyMarkets);
   const allCandidates = matchResult.pairs;
@@ -1362,16 +1778,28 @@ async function runScanCycle(
   console.log(`[date-analysis] avgDaysToClose=${avgDaysToClose.toFixed(1)}`);
 
   // 2.6 Hard date filter — drop any pair where EITHER market closes outside
-  // the [MIN_DAYS_TO_CLOSE, MAX_DAYS_TO_CLOSE] window.
+  // the date window. Sports pairs (shared team detected) use a tighter
+  // [MIN_DAYS_TO_CLOSE, MAX_DAYS_TO_CLOSE_SPORTS] window since sports markets
+  // resolve in hours/days and anything further out is too speculative.
+  // All other categories use [MIN_DAYS_TO_CLOSE, MAX_DAYS_TO_CLOSE].
   const beforeDateFilter = allCandidates.length;
+  let sportsDroppedByDate = 0;
   const candidates = allCandidates.filter((p) => {
     const k = parseCloseTimeMs(p.kalshi.closeTime);
     const pl = parseCloseTimeMs(p.poly.closeTime);
     if (k === null || pl === null) return false;
     const kDays = daysFromNow(k);
     const pDays = daysFromNow(pl);
-    if (kDays < MIN_DAYS_TO_CLOSE || kDays > MAX_DAYS_TO_CLOSE) return false;
-    if (pDays < MIN_DAYS_TO_CLOSE || pDays > MAX_DAYS_TO_CLOSE) return false;
+    const isSports = pairSharedTeam(p) !== null;
+    const maxDays = isSports ? MAX_DAYS_TO_CLOSE_SPORTS : MAX_DAYS_TO_CLOSE;
+    if (kDays < MIN_DAYS_TO_CLOSE || kDays > maxDays) {
+      if (isSports) sportsDroppedByDate++;
+      return false;
+    }
+    if (pDays < MIN_DAYS_TO_CLOSE || pDays > maxDays) {
+      if (isSports) sportsDroppedByDate++;
+      return false;
+    }
     return true;
   });
   const pairsFilteredByDate = beforeDateFilter - candidates.length;
@@ -1381,7 +1809,9 @@ async function runScanCycle(
       before: beforeDateFilter,
       after: candidates.length,
       filteredOut: pairsFilteredByDate,
-      reason: `outside ${MIN_DAYS_TO_CLOSE}-${MAX_DAYS_TO_CLOSE} day window`,
+      sportsDroppedByDate,
+      sportsMaxDays: MAX_DAYS_TO_CLOSE_SPORTS,
+      otherMaxDays: MAX_DAYS_TO_CLOSE,
     }),
   );
 
@@ -1676,6 +2106,46 @@ async function runScanCycle(
     `[scanner] stored ${opportunities.length} opportunities (${clearedBoth.length} actionable, ${opportunities.length - clearedBoth.length} below threshold)`,
   );
 
+  // Sports stats — drawn from candidates (post date filter) and scoredSpreads.
+  const sportsPairsMatched = candidates.filter(
+    (p) => pairSharedTeam(p) !== null,
+  ).length;
+  const sportsClosingWithin7d = candidates.filter((p) => {
+    if (pairSharedTeam(p) === null) return false;
+    const closeMs = effectiveCloseMs(p);
+    if (closeMs === null) return false;
+    const d = daysFromNow(closeMs);
+    return d > 0 && d <= 7;
+  }).length;
+  const sportsScored = scoredSpreads.filter(
+    (r) => pairSharedTeam(r.prep.pair) !== null,
+  );
+  let bestSportsSpread: number | null = null;
+  let bestSportsAPY: number | null = null;
+  if (sportsScored.length > 0) {
+    bestSportsSpread = sportsScored.reduce(
+      (max, r) => (r.bestNet > max ? r.bestNet : max),
+      -Infinity,
+    );
+    bestSportsAPY = sportsScored.reduce(
+      (max, r) => (r.annReturn > max ? r.annReturn : max),
+      -Infinity,
+    );
+    if (!Number.isFinite(bestSportsSpread)) bestSportsSpread = null;
+    if (!Number.isFinite(bestSportsAPY)) bestSportsAPY = null;
+  }
+  const sportsStats = {
+    kalshiSportsCount,
+    polySportsCount,
+    sportsPairsMatched,
+    sportsClosingWithin7d,
+    bestSportsSpread:
+      bestSportsSpread !== null ? Number(bestSportsSpread.toFixed(4)) : null,
+    bestSportsAPY:
+      bestSportsAPY !== null ? Number(bestSportsAPY.toFixed(4)) : null,
+  };
+  console.log('[sports]', JSON.stringify(sportsStats));
+
   return {
     opportunities,
     kalshiCount: kalshiMarkets.length,
@@ -1692,6 +2162,7 @@ async function runScanCycle(
     matchedPairs,
     pairSummaries,
     verdictDist,
+    sportsStats,
     errors,
   };
 }
@@ -1780,6 +2251,7 @@ serve(async (req) => {
       filteredByAnnReturn: result.filteredByAnnReturn,
       actionableCount: result.actionableCount,
       verdictDist: result.verdictDist,
+      sportsStats: result.sportsStats,
       errors: result.errors,
     };
     if (diag) {
