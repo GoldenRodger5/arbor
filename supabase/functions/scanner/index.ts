@@ -133,6 +133,16 @@ const SPORTS_FUZZY_THRESHOLD = 0.30;
 // across platforms ("April CPI" vs "CPI YoY > 3.2%") so the fuzzy matcher
 // has weaker signal than politics, but Claude verifies polarity downstream.
 const ECONOMIC_FUZZY_THRESHOLD = 0.30;
+// Entertainment/awards: nominee-name overlap is the main signal
+// ("Will Beyoncé win Album of the Year?") so 0.30 captures it.
+const ENTERTAINMENT_FUZZY_THRESHOLD = 0.30;
+// Science/tech: drug names, mission names, model versions vary; 0.30 is
+// the lower bound that still admits matches.
+const SCIENCE_FUZZY_THRESHOLD = 0.30;
+// Financial: index/commodity markets share strong tokens (S&P 500, 4500,
+// %, etc.) so a slightly higher 0.35 threshold reduces noise while
+// keeping the matcher sensitive.
+const FINANCIAL_FUZZY_THRESHOLD = 0.35;
 const STALENESS_THRESHOLD_MS = 120_000;
 // TEMP: diagnostic, raise to 0.02 once spread distribution is understood.
 const MIN_NET_SPREAD = 0.005;
@@ -152,12 +162,26 @@ const MAX_DAYS_TO_CLOSE = 365;
 const MIN_HOURS_TO_CLOSE_SPORTS = 3;
 // Per-category date filter ceilings — the further out a market closes,
 // the more its annualized return decays and the more category-specific
-// resolution risk creeps in. Sports get the tightest window because games
-// resolve in hours/days; crypto price markets get 30 days (most are weekly
-// or monthly); economic releases get 60 days (covers next CPI/NFP cycle);
-// politics/everything else keeps the 365-day default.
-const MAX_DAYS_TO_CLOSE_SPORTS = 14;
+// resolution risk creeps in. Sports used to be capped at 14d to focus on
+// game-day markets, but that killed legitimate season futures (Pennant,
+// World Series, Cy Young, MVP — all close in Oct/Nov, often 200+ days
+// out). Raised to 365 to keep season-long sports futures alive; the
+// proposition mismatch between game-winner and season-futures is
+// prevented earlier in the join pass via the prop-noise filter.
+// Economic releases get 60 days (covers next CPI/NFP cycle); politics/
+// everything else keeps the 365-day default.
+const MAX_DAYS_TO_CLOSE_SPORTS = 365;
 const MAX_DAYS_TO_CLOSE_ECONOMIC = 60;
+// New category windows added Apr 2026.
+// Entertainment/awards: 6 months — most awards (Oscars, Grammys, Emmys)
+// resolve once a year, so a 180d window picks up the next ceremony.
+// Science/tech: 4 months — FDA decisions, SpaceX launches, AI benchmarks
+// move on a quarterly cadence.
+// Financial: 1 month — index/commodity price markets are weekly or
+// monthly. 30d window keeps them tight enough to avoid stale verdicts.
+const MAX_DAYS_TO_CLOSE_ENTERTAINMENT = 180;
+const MAX_DAYS_TO_CLOSE_SCIENCE = 120;
+const MAX_DAYS_TO_CLOSE_FINANCIAL = 30;
 // 15% annualized minimum is the politics floor (current default).
 // Sports/economic categories deserve different floors because their
 // average days-to-close is shorter, so even small spreads still produce
@@ -166,22 +190,28 @@ const MIN_ANNUALIZED_RETURN = 0.15;
 const MIN_APY_SPORTS = 0.50;
 const MIN_APY_ECONOMIC = 0.20;
 const MIN_APY_POLITICS = 0.15;
+const MIN_APY_ENTERTAINMENT = 0.10;
+const MIN_APY_SCIENCE = 0.12;
+const MIN_APY_FINANCIAL = 0.20;
 // Priority = annualizedReturn * categoryMultiplier. Faster-recycling
 // categories rank above equivalent-APY long-dated ones because the same
 // dollar can be redeployed sooner.
 const CATEGORY_MULTIPLIER_SPORTS = 1.5;
 const CATEGORY_MULTIPLIER_ECONOMIC = 1.2;
 const CATEGORY_MULTIPLIER_POLITICS = 1.0;
+const CATEGORY_MULTIPLIER_ENTERTAINMENT = 1.1;
+const CATEGORY_MULTIPLIER_SCIENCE = 1.1;
+const CATEGORY_MULTIPLIER_FINANCIAL = 1.3;
 const REQUEST_DELAY_MS = 50; // gentle pacing between orderbook calls
 const KALSHI_PAGE_DELAY_MS = 250; // Kalshi rate limit ~5 req/s
 // Lowered Apr 2026 from 250 → 40 because fast-paths were removed: every
 // pair now spends one Claude call. At 250 the worker hit WORKER_LIMIT
-// (~150s wallclock + memory). 40 fits under the 150s wallclock budget at
-// CLAUDE_CONCURRENCY=5 (~6 batches × 4s/call = ~24s of Claude wait, plus
-// fetch + orderbook). Steady-state coverage doesn't drop because the cache
-// holds 24h of verdicts and the highest-priority pairs come first.
-const MAX_PAIRS_TO_RESOLVE = 40;
-const MAX_ORDERBOOKS_TO_FETCH = 40;
+// (~150s wallclock + memory). Raised back to 80 once cache + sports-first
+// sort proved that the long tail is mostly cache hits — only the first
+// scan after cold start has to spend the full Claude budget. CLAUDE_CONCURRENCY
+// stays at 5 to keep wallclock under the 150s worker budget.
+const MAX_PAIRS_TO_RESOLVE = 80;
+const MAX_ORDERBOOKS_TO_FETCH = 60;
 const CLAUDE_CONCURRENCY = 5;
 const ORDERBOOK_CONCURRENCY = 3;
 const TOP_SPREADS_STORED = 20;
@@ -415,11 +445,33 @@ function parseKalshiSportTicker(eventTicker: string): KalshiSportInfo | null {
 // practice, and even when they do the resolution sources differ enough
 // that Claude has to SKIP them. We'll revisit if Kalshi adds longer-dated
 // strikes that line up with Poly's grid.
-type PairCategory = 'sports' | 'economic' | 'politics';
+type PairCategory =
+  | 'sports'
+  | 'economic'
+  | 'politics'
+  | 'entertainment'
+  | 'science'
+  | 'financial';
 
+// Strings here mix Kalshi raw category names (e.g. 'Economics') and
+// Polymarket tag slugs (e.g. 'economics'), so the same Set works for
+// both sides regardless of which platform fetched the market.
 const ECONOMIC_CATEGORIES = new Set([
   'economics', 'finance',
   'Economics', 'Finance',
+]);
+const ENTERTAINMENT_CATEGORIES = new Set([
+  'awards', 'entertainment', 'pop-culture', 'music', 'film',
+  'Awards', 'Culture', 'Entertainment',
+]);
+const SCIENCE_CATEGORIES = new Set([
+  'science', 'technology', 'space', 'biotech',
+  'Science', 'Climate',
+]);
+const FINANCIAL_CATEGORIES = new Set([
+  'stocks', 'commodities',
+  // Kalshi sometimes uses "Financials" as the category for index markets.
+  'Financials', 'Stocks', 'Commodities',
 ]);
 
 function isEconomicMarket(m: UnifiedMarket): boolean {
@@ -427,12 +479,35 @@ function isEconomicMarket(m: UnifiedMarket): boolean {
   if (!cat) return false;
   return ECONOMIC_CATEGORIES.has(cat);
 }
+function isEntertainmentMarket(m: UnifiedMarket): boolean {
+  const cat = m.category;
+  if (!cat) return false;
+  return ENTERTAINMENT_CATEGORIES.has(cat);
+}
+function isScienceMarket(m: UnifiedMarket): boolean {
+  const cat = m.category;
+  if (!cat) return false;
+  return SCIENCE_CATEGORIES.has(cat);
+}
+function isFinancialMarket(m: UnifiedMarket): boolean {
+  const cat = m.category;
+  if (!cat) return false;
+  return FINANCIAL_CATEGORIES.has(cat);
+}
 
 function pairCategory(pair: CandidatePair): PairCategory {
   // Sports first — most specific signal (precomputed shared team).
   if (pairSharedTeamFast(pair)) return 'sports';
+  // Financial before economic: index/commodity markets often carry both
+  // 'finance' AND 'stocks' tags on Polymarket; we want the financial
+  // bucket (tighter window, higher APY floor) to win.
+  if (isFinancialMarket(pair.kalshi) || isFinancialMarket(pair.poly)) return 'financial';
   // Economic — either side tagged in Economics/Finance.
   if (isEconomicMarket(pair.kalshi) || isEconomicMarket(pair.poly)) return 'economic';
+  // Science/tech — FDA/SpaceX/AI markets.
+  if (isScienceMarket(pair.kalshi) || isScienceMarket(pair.poly)) return 'science';
+  // Entertainment/awards — Oscars, Grammys, charts.
+  if (isEntertainmentMarket(pair.kalshi) || isEntertainmentMarket(pair.poly)) return 'entertainment';
   return 'politics';
 }
 
@@ -450,9 +525,14 @@ function pairSharedTeamFast(pair: CandidatePair): boolean {
 }
 
 function maxDaysForCategory(cat: PairCategory): number {
-  if (cat === 'sports') return MAX_DAYS_TO_CLOSE_SPORTS;
-  if (cat === 'economic') return MAX_DAYS_TO_CLOSE_ECONOMIC;
-  return MAX_DAYS_TO_CLOSE;
+  switch (cat) {
+    case 'sports': return MAX_DAYS_TO_CLOSE_SPORTS;
+    case 'economic': return MAX_DAYS_TO_CLOSE_ECONOMIC;
+    case 'entertainment': return MAX_DAYS_TO_CLOSE_ENTERTAINMENT;
+    case 'science': return MAX_DAYS_TO_CLOSE_SCIENCE;
+    case 'financial': return MAX_DAYS_TO_CLOSE_FINANCIAL;
+    default: return MAX_DAYS_TO_CLOSE;
+  }
 }
 
 // Earliest acceptable close time, expressed as ms-from-now. Sports uses an
@@ -465,21 +545,36 @@ function minMsFromNowForCategory(cat: PairCategory): number {
 }
 
 function minApyForCategory(cat: PairCategory): number {
-  if (cat === 'sports') return MIN_APY_SPORTS;
-  if (cat === 'economic') return MIN_APY_ECONOMIC;
-  return MIN_APY_POLITICS;
+  switch (cat) {
+    case 'sports': return MIN_APY_SPORTS;
+    case 'economic': return MIN_APY_ECONOMIC;
+    case 'entertainment': return MIN_APY_ENTERTAINMENT;
+    case 'science': return MIN_APY_SCIENCE;
+    case 'financial': return MIN_APY_FINANCIAL;
+    default: return MIN_APY_POLITICS;
+  }
 }
 
 function categoryMultiplier(cat: PairCategory): number {
-  if (cat === 'sports') return CATEGORY_MULTIPLIER_SPORTS;
-  if (cat === 'economic') return CATEGORY_MULTIPLIER_ECONOMIC;
-  return CATEGORY_MULTIPLIER_POLITICS;
+  switch (cat) {
+    case 'sports': return CATEGORY_MULTIPLIER_SPORTS;
+    case 'economic': return CATEGORY_MULTIPLIER_ECONOMIC;
+    case 'entertainment': return CATEGORY_MULTIPLIER_ENTERTAINMENT;
+    case 'science': return CATEGORY_MULTIPLIER_SCIENCE;
+    case 'financial': return CATEGORY_MULTIPLIER_FINANCIAL;
+    default: return CATEGORY_MULTIPLIER_POLITICS;
+  }
 }
 
 function fuzzyThresholdForCategory(cat: PairCategory): number {
-  if (cat === 'sports') return SPORTS_FUZZY_THRESHOLD;
-  if (cat === 'economic') return ECONOMIC_FUZZY_THRESHOLD;
-  return FUZZY_THRESHOLD;
+  switch (cat) {
+    case 'sports': return SPORTS_FUZZY_THRESHOLD;
+    case 'economic': return ECONOMIC_FUZZY_THRESHOLD;
+    case 'entertainment': return ENTERTAINMENT_FUZZY_THRESHOLD;
+    case 'science': return SCIENCE_FUZZY_THRESHOLD;
+    case 'financial': return FINANCIAL_FUZZY_THRESHOLD;
+    default: return FUZZY_THRESHOLD;
+  }
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -629,6 +724,36 @@ const KALSHI_ECONOMIC_SERIES = [
   'KXGDP',       // GDP growth
   'KXFOMC',      // Fed meeting outcomes
   'KXRATE',      // Interest rates
+];
+
+// Entertainment / awards series.
+const KALSHI_ENTERTAINMENT_SERIES = [
+  'KXOSCARS',
+  'KXGRAMMYS',
+  'KXEMMYS',
+  'KXGOLDEN',
+  'KXBAFTA',
+];
+
+// Science / tech series — FDA, SpaceX, AI, NASA.
+const KALSHI_SCIENCE_SERIES = [
+  'KXSPACEX',
+  'KXFDA',
+  'KXAI',
+  'KXNASA',
+];
+
+// Financial / index / commodity series. Distinct from KALSHI_ECONOMIC_SERIES
+// (which is macro releases like CPI/NFP) — these are price markets where
+// the underlying is a stock index or commodity. Crypto stays excluded.
+const KALSHI_FINANCIAL_SERIES = [
+  'KXSP',      // S&P 500
+  'KXNASDAQ',  // Nasdaq
+  'KXDOW',     // Dow Jones
+  'KXOIL',     // Oil
+  'KXGOLD',    // Gold
+  'KXUSD',     // USD index
+  'KXVIX',     // Volatility index
 ];
 
 // Series tickers known to contain political/macro markets — used as a
@@ -892,6 +1017,72 @@ async function kalshiGetMarkets(): Promise<UnifiedMarket[]> {
     `[scanner] kalshi economic series total: +${markets.length - econBefore} markets`,
   );
 
+  // Approach E (entertainment/awards): Oscars, Grammys, Emmys, etc.
+  // If a series returns 0 markets, log it once and move on silently.
+  const entBefore = markets.length;
+  for (const series of KALSHI_ENTERTAINMENT_SERIES) {
+    try {
+      const seriesMarkets = await kalshiFetchSeriesMarkets(series);
+      const before = markets.length;
+      for (const m of seriesMarkets) {
+        pushKalshiMarket(markets, seen, m, 'Awards');
+      }
+      console.log(
+        `[scanner] kalshi entertainment series ${series}: +${markets.length - before} markets (raw ${seriesMarkets.length})`,
+      );
+    } catch (err) {
+      console.error(`[scanner] kalshi entertainment series ${series} fetch failed`, err);
+    }
+    await sleep(KALSHI_PAGE_DELAY_MS);
+  }
+  console.log(
+    `[scanner] kalshi entertainment series total: +${markets.length - entBefore} markets`,
+  );
+
+  // Approach F (science/tech): SpaceX, FDA, AI, NASA.
+  const sciBefore = markets.length;
+  for (const series of KALSHI_SCIENCE_SERIES) {
+    try {
+      const seriesMarkets = await kalshiFetchSeriesMarkets(series);
+      const before = markets.length;
+      for (const m of seriesMarkets) {
+        pushKalshiMarket(markets, seen, m, 'Science');
+      }
+      console.log(
+        `[scanner] kalshi science series ${series}: +${markets.length - before} markets (raw ${seriesMarkets.length})`,
+      );
+    } catch (err) {
+      console.error(`[scanner] kalshi science series ${series} fetch failed`, err);
+    }
+    await sleep(KALSHI_PAGE_DELAY_MS);
+  }
+  console.log(
+    `[scanner] kalshi science series total: +${markets.length - sciBefore} markets`,
+  );
+
+  // Approach G (financial / index / commodity). Stamped with the
+  // 'Financials' category so pairCategory routes them to the financial
+  // bucket.
+  const finBefore = markets.length;
+  for (const series of KALSHI_FINANCIAL_SERIES) {
+    try {
+      const seriesMarkets = await kalshiFetchSeriesMarkets(series);
+      const before = markets.length;
+      for (const m of seriesMarkets) {
+        pushKalshiMarket(markets, seen, m, 'Financials');
+      }
+      console.log(
+        `[scanner] kalshi financial series ${series}: +${markets.length - before} markets (raw ${seriesMarkets.length})`,
+      );
+    } catch (err) {
+      console.error(`[scanner] kalshi financial series ${series} fetch failed`, err);
+    }
+    await sleep(KALSHI_PAGE_DELAY_MS);
+  }
+  console.log(
+    `[scanner] kalshi financial series total: +${markets.length - finBefore} markets`,
+  );
+
   return markets;
 }
 
@@ -1047,19 +1238,49 @@ function buildPolyUrl(raw: PolyMarketRaw): string | undefined {
 // detection downstream).
 //
 // Crypto slugs removed Apr 2026 — see PairCategory comment.
+// IMPORTANT: ordering controls dedupe priority. The first slug to claim
+// a marketId wins its category assignment. Put MORE-SPECIFIC slugs above
+// MORE-GENERAL ones (e.g. 'stocks' before 'finance' so a market tagged
+// both gets routed to the financial bucket; sport-specific slugs before
+// the generic 'sports' slug).
 const POLY_TAG_SLUGS = [
+  // International politics first — these are subsets of the generic
+  // 'politics' tag and we still want them to route to politics, but
+  // surfacing them up front lets the diag show how many markets each
+  // regional slug pulls in.
+  'uk-politics',
+  'european-politics',
+  'global-elections',
+  'canada',
+  'middle-east',
+  'asia',
   'politics',
+  // Financial / index / commodity. Stocks/commodities come BEFORE the
+  // generic 'finance' slug so a market tagged both gets categorized as
+  // financial (tighter window, higher APY floor) instead of economic.
+  'stocks',
+  'commodities',
   'economics',
   'finance',
+  // Science / tech. Biotech/space/technology come before the generic
+  // 'science' slug for the same reason.
+  'biotech',
+  'space',
+  'technology',
   'science',
-  // Sport-specific slugs FIRST so they win the dedupe over the generic
-  // 'sports' slug below.
+  // Sport-specific slugs before the generic 'sports' slug.
   'mlb',
   'nba',
   'nfl',
   'nhl',
   'soccer',
   'sports',
+  // Entertainment / awards
+  'awards',
+  'entertainment',
+  'pop-culture',
+  'music',
+  'film',
 ];
 
 // Slugs that imply the market is sports — used to gate per-title team
@@ -1318,6 +1539,15 @@ function polyFeeCoefficient(category?: PairCategory): number {
       return 0.04;
     case 'economic':
       return 0.05;
+    case 'entertainment':
+      // Awards/entertainment maps to Polymarket "mentions" tier.
+      return 0.04;
+    case 'science':
+      // Science/tech maps to Polymarket "tech/other" tier.
+      return 0.05;
+    case 'financial':
+      // Stocks/commodities maps to Polymarket "finance" tier.
+      return 0.05;
     default:
       // Unknown category — be conservative (max observed coefficient).
       return 0.072;
@@ -1477,11 +1707,34 @@ function findCandidatePairs(
   // claimedPoly set prevents the fuzzy pass from double-pairing.
   const claimedPoly = new Set<number>();
   const sportsResults: CandidatePair[] = [];
-  // Build per-(league:team) → poly index list.
+  // Polymarket sports markets include a lot of derivative props ("1H O/U
+  // 116.5", "Race to 20", "Lakers -3.5", "Margin of Victory") that share
+  // both teams with the parent game-winner market. Joining a Kalshi
+  // game-winner against a Poly prop produces a phantom arb because the
+  // propositions are different. Filter Poly markets out of the team
+  // index when their title contains prop-market noise. The Kalshi side
+  // is fine because Kalshi sport tickers are KX*GAME-* (game-winners
+  // only); other Kalshi sports tickers parse to a different sport.
+  const PROP_NOISE_RE =
+    /\b(o\/u|over\/under|1h|2h|1q|2q|3q|4q|race to|margin|first to|spread|handicap|alt|points?|total|prop|to score|to win mvp|moneyline|first half|second half|first quarter|fourth quarter)\b/i;
+  const PROP_PUNCT_RE = /[+\-]\d|±\d/;
+  function isPropMarket(title: string): boolean {
+    if (!title) return false;
+    if (PROP_NOISE_RE.test(title)) return true;
+    if (PROP_PUNCT_RE.test(title)) return true;
+    return false;
+  }
+  // Build per-(league:team) → poly index list. Skip prop markets so
+  // they can't claim a Kalshi game-winner.
   const polyTeamIndex = new Map<string, number[]>();
+  let propsSkipped = 0;
   for (let j = 0; j < polyMarkets.length; j++) {
     const pm = polyMarkets[j];
     if (!pm.sportLeague || !pm.sportTeams) continue;
+    if (isPropMarket(pm.title)) {
+      propsSkipped++;
+      continue;
+    }
     for (const t of pm.sportTeams) {
       const key = pm.sportLeague + ':' + t;
       let arr = polyTeamIndex.get(key);
@@ -1489,6 +1742,9 @@ function findCandidatePairs(
       arr.push(j);
     }
   }
+  console.log(
+    `[scanner] sports join pass: skipped ${propsSkipped} poly prop markets from team index`,
+  );
   for (let i = 0; i < kalshiMarkets.length; i++) {
     const km = kalshiMarkets[i];
     if (!km.sportLeague || !km.sportTeams) continue;
@@ -1506,11 +1762,29 @@ function findCandidatePairs(
     }
     if (candidatesByPoly.size === 0) continue;
     // Pick the poly with the highest overlap, breaking ties by closest
-    // close-time (we don't have that here yet; use first).
+    // close-time. The closeTime tiebreak is what protects us from MLB
+    // series mismatches: when Kalshi has KXMLBGAME-26APR14ATHNYY and
+    // KXMLBGAME-26APR15ATHNYY (consecutive games of the same series),
+    // and Polymarket has matching markets for each game, we want to
+    // pair the Apr-14 Kalshi with the Apr-14 Poly, not the Apr-15 Poly.
+    const kCloseMs = parseCloseTimeMs(km.closeTime);
     let bestJ = -1;
     let bestOv = 0;
+    let bestGap = Number.POSITIVE_INFINITY;
     for (const [j, ov] of candidatesByPoly) {
-      if (ov > bestOv) { bestOv = ov; bestJ = j; }
+      const pmClose = parseCloseTimeMs(polyMarkets[j].closeTime);
+      const gap =
+        kCloseMs !== null && pmClose !== null
+          ? Math.abs(kCloseMs - pmClose)
+          : Number.POSITIVE_INFINITY;
+      if (
+        ov > bestOv ||
+        (ov === bestOv && gap < bestGap)
+      ) {
+        bestOv = ov;
+        bestJ = j;
+        bestGap = gap;
+      }
     }
     if (bestJ === -1) continue;
     claimedPoly.add(bestJ);
@@ -2313,6 +2587,27 @@ async function runScanCycle(
     priority: number;
     days: number;
   } | null;
+  // [FIX 1 DIAGNOSTIC] Surfaced in diag response so we can see why
+  // pairCategory misclassifies sports pairs without scraping function logs.
+  sportsDiag?: {
+    polyWithSportTagged: number;
+    kalshiWithSportTagged: number;
+    polySamples: Array<{ title: string; league?: string; teams?: string[]; category?: string }>;
+    kalshiSamples: Array<{ title: string; ticker?: string; league?: string; teams?: string[] }>;
+    dateDebug: Array<{
+      kalshiTitle: string;
+      polyTitle: string;
+      kalshiLeague?: string;
+      polyLeague?: string;
+      kalshiTeams?: string[];
+      polyTeams?: string[];
+      polyCategory?: string;
+      detectedCat: PairCategory;
+      effectiveMinHours: number;
+    }>;
+    sportsJoinPassResults: number;
+    dropDetail: Record<string, Record<PairCategory, number>>;
+  };
   errors: string[];
 }> {
   const errors: string[] = [];
@@ -2360,6 +2655,38 @@ async function runScanCycle(
   const polySportsCount = polyMarkets.filter(isSportsMarket).length;
   console.log(
     `[sports] kalshi=${kalshiSportsCount} poly=${polySportsCount}`,
+  );
+
+  // [FIX 1 DIAGNOSTIC] Strict counts: how many markets have BOTH
+  // sportLeague AND sportTeams populated (the join key). This is what
+  // pairSharedTeamFast / pairCategory actually rely on.
+  const polyWithSportTagged = polyMarkets.filter(
+    (m) => !!m.sportLeague && !!m.sportTeams && m.sportTeams.length > 0,
+  ).length;
+  const kalshiWithSportTagged = kalshiMarkets.filter(
+    (m) => !!m.sportLeague && !!m.sportTeams && m.sportTeams.length > 0,
+  ).length;
+  const polySamples = polyMarkets
+    .filter((m) => !!m.sportLeague)
+    .slice(0, 10)
+    .map((m) => ({
+      title: m.title.slice(0, 60),
+      league: m.sportLeague,
+      teams: m.sportTeams,
+      category: m.category,
+    }));
+  const kalshiSamples = kalshiMarkets
+    .filter((m) => !!m.sportLeague)
+    .slice(0, 10)
+    .map((m) => ({
+      title: m.title.slice(0, 60),
+      ticker: (m as { eventTicker?: string; marketId?: string }).eventTicker ??
+        (m as { marketId?: string }).marketId,
+      league: m.sportLeague,
+      teams: m.sportTeams,
+    }));
+  console.log(
+    `[fix1] polyWithSportTagged=${polyWithSportTagged} kalshiWithSportTagged=${kalshiWithSportTagged}`,
   );
 
   // 2. Fuzzy match.
@@ -2412,18 +2739,66 @@ async function runScanCycle(
   // keep all categories.
   const filterNow = Date.now();
   const beforeDateFilter = allCandidates.length;
-  let droppedByDate = { sports: 0, economic: 0, politics: 0 };
+  const droppedByDate: Record<PairCategory, number> = {
+    sports: 0,
+    economic: 0,
+    politics: 0,
+    entertainment: 0,
+    science: 0,
+    financial: 0,
+  };
   let droppedSportsInProgress = 0; // sports pairs killed by the new 3h floor
   let droppedByCategoryThreshold = 0;
-  // Sports proximity floor: same teams + 3-day close-time gap means we
+  // Sports proximity floor: same teams + large close-time gap means we
   // matched DIFFERENT games of the same series (e.g. Athletics vs Mets
-  // April 14 paired against Athletics vs Mets April 17). Polarity is
-  // correct on each book, but the prices reflect different events, so
-  // the calculator hallucinates 25% spreads. MLB games typically close
-  // within an hour of first pitch — 24h is the natural cutoff that
-  // keeps same-day pairs and rejects series mismatches.
-  const SPORTS_MAX_CLOSE_GAP_MS = 24 * 60 * 60 * 1000;
+  // April 14 paired against Athletics vs Mets April 17). The join pass
+  // already prefers the closest-closeTime Poly when multiple candidates
+  // share both teams, so this is just a backstop. NBA Polymarket close
+  // times often trail Kalshi by 1-2 days (Kalshi closes at tip-off,
+  // Poly closes after game finalization), so the gate has to be wide
+  // enough to keep legitimate same-game pairs. 5 days catches the
+  // common platform offset while still rejecting wrong-week pairings.
+  const SPORTS_MAX_CLOSE_GAP_MS = 5 * 24 * 60 * 60 * 1000;
   let droppedBySportsProximity = 0;
+  const sportsProximityGapsHours: number[] = [];
+  // [FIX 1] Per-category silent-drop counters so we can see exactly where
+  // each candidate falls out of the date filter. Reason × category matrix.
+  const newCatRecord = (): Record<PairCategory, number> => ({
+    sports: 0,
+    economic: 0,
+    politics: 0,
+    entertainment: 0,
+    science: 0,
+    financial: 0,
+  });
+  const dropDetail = {
+    fuzzy: newCatRecord(),
+    nullClose: newCatRecord(),
+    minFloor: newCatRecord(),
+    maxDays: newCatRecord(),
+    proximity: newCatRecord(),
+  };
+  // [FIX 1 DIAGNOSTIC] Show what pairCategory() returns for the first 20
+  // candidate pairs and WHY (sport league + teams on each side). The user's
+  // hypothesis is that sports pairs are misclassified as politics — likely
+  // because Polymarket markets are missing sportLeague/sportTeams (they're
+  // only set when the market was fetched via a POLY_SPORT_SLUGS slug AND
+  // detectTeams() found a match in the title). If pairSharedTeamFast()
+  // returns false for what should be a sports pair, it falls through to
+  // 'politics' which uses the 24h floor instead of the 3h sports floor.
+  const dateDebug = allCandidates.slice(0, 20).map((p) => ({
+    kalshiTitle: p.kalshi.title.slice(0, 40),
+    polyTitle: p.poly.title.slice(0, 40),
+    kalshiLeague: p.kalshi.sportLeague,
+    polyLeague: p.poly.sportLeague,
+    kalshiTeams: p.kalshi.sportTeams,
+    polyTeams: p.poly.sportTeams,
+    polyCategory: p.poly.category,
+    detectedCat: pairCategory(p),
+    effectiveMinHours:
+      pairCategory(p) === 'sports' ? MIN_HOURS_TO_CLOSE_SPORTS : 24,
+  }));
+  console.log('[date-debug]', JSON.stringify(dateDebug));
   const candidates = allCandidates.filter((p) => {
     const cat = pairCategory(p);
     // Per-category fuzzy threshold re-check. Sports/crypto join-pass
@@ -2431,15 +2806,20 @@ async function runScanCycle(
     const fuzzyMin = fuzzyThresholdForCategory(cat);
     if (p.score < fuzzyMin) {
       droppedByCategoryThreshold++;
+      dropDetail.fuzzy[cat]++;
       return false;
     }
     const k = parseCloseTimeMs(p.kalshi.closeTime);
     const pl = parseCloseTimeMs(p.poly.closeTime);
-    if (k === null || pl === null) return false;
+    if (k === null || pl === null) {
+      dropDetail.nullClose[cat]++;
+      return false;
+    }
     const minMs = minMsFromNowForCategory(cat);
     const earliestAllowed = filterNow + minMs;
     if (k < earliestAllowed || pl < earliestAllowed) {
       droppedByDate[cat]++;
+      dropDetail.minFloor[cat]++;
       if (cat === 'sports') droppedSportsInProgress++;
       return false;
     }
@@ -2448,14 +2828,28 @@ async function runScanCycle(
     const pDays = daysFromNow(pl, filterNow);
     if (kDays > maxDays || pDays > maxDays) {
       droppedByDate[cat]++;
+      dropDetail.maxDays[cat]++;
       return false;
     }
     if (cat === 'sports' && Math.abs(k - pl) > SPORTS_MAX_CLOSE_GAP_MS) {
       droppedBySportsProximity++;
+      dropDetail.proximity[cat]++;
+      if (sportsProximityGapsHours.length < 20) {
+        sportsProximityGapsHours.push(
+          Math.round(Math.abs(k - pl) / 36e5),
+        );
+      }
       return false;
     }
     return true;
   });
+  console.log('[dropDetail]', JSON.stringify(dropDetail));
+  if (sportsProximityGapsHours.length > 0) {
+    console.log(
+      '[sports-proximity-gaps-h]',
+      JSON.stringify(sportsProximityGapsHours),
+    );
+  }
   const pairsFilteredByDate = beforeDateFilter - candidates.length;
   console.log(
     '[date-filter]',
@@ -2491,10 +2885,20 @@ async function runScanCycle(
   // and they expire fast (often within hours), so they MUST be at the
   // front of the resolution queue regardless of how many politics pairs
   // share the same fuzzy band. Sort sports-first, then by score desc.
+  // 3-tier sort: sports first (rank 2), economic next (rank 1), politics
+  // last (rank 0). Tie-break by score desc. Sports MUST be at the front
+  // of the resolution queue because they're shared-team deterministic
+  // matches that expire fast.
+  const catRank = (p: CandidatePair): number => {
+    const c = pairCategory(p);
+    if (c === 'sports') return 2;
+    if (c === 'economic') return 1;
+    return 0;
+  };
   candidates.sort((a, b) => {
-    const catA = pairCategory(a) === 'sports' ? 1 : 0;
-    const catB = pairCategory(b) === 'sports' ? 1 : 0;
-    if (catA !== catB) return catB - catA;
+    const ra = catRank(a);
+    const rb = catRank(b);
+    if (ra !== rb) return rb - ra;
     return b.score - a.score;
   });
   const toResolve = candidates.slice(0, MAX_PAIRS_TO_RESOLVE);
@@ -2855,6 +3259,9 @@ async function runScanCycle(
     sports: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
     economic: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
     politics: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
+    entertainment: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
+    science: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
+    financial: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
   };
   for (const c of candidates) {
     categoryBreakdown[pairCategory(c)].pairs++;
@@ -2907,6 +3314,17 @@ async function runScanCycle(
     sportsStats,
     categoryBreakdown,
     bestOverall,
+    sportsDiag: {
+      polyWithSportTagged,
+      kalshiWithSportTagged,
+      polySamples,
+      kalshiSamples,
+      dateDebug,
+      sportsJoinPassResults: matchResult.pairs.filter(
+        (p) => p.score >= 0.95 && pairSharedTeamFast(p),
+      ).length,
+      dropDetail,
+    },
     errors,
   };
 }
@@ -3006,6 +3424,7 @@ serve(async (req) => {
       body.matchedPairs = result.matchedPairs;
       body.pairSummaries = result.pairSummaries;
       body.kalshiOrderbookSamples = _kalshiRawSamples;
+      body.sportsDiag = result.sportsDiag;
       body.opportunitiesPreview = result.opportunities.map((o) => ({
         kalshi: o.kalshiMarket.title,
         poly: o.polyMarket.title,
