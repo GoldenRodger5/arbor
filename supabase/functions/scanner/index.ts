@@ -1137,13 +1137,19 @@ function polyMarketToUnified(
 
 async function polyFetchEventsByTag(slug: string): Promise<UnifiedMarket[]> {
   const out: UnifiedMarket[] = [];
-  // 50 events per tag (was 100) — with 13 tag slugs we hit WORKER_LIMIT
-  // at the higher limit. Page 1 is sorted by volume so the top-50 slice
-  // is still the highest-value markets.
-  const limit = 50;
+  // Sport-specific slugs get a deeper fetch (2 pages × 100) because Kalshi
+  // covers every game on the slate but the top-50-by-volume Poly slice
+  // misses the lower-volume game-of-the-day markets that we need to pair
+  // against. Non-sports slugs stay at 1×50 to keep the worker comfortably
+  // under WORKER_LIMIT (the matching politics/economics tags are already
+  // dense at the top of the volume curve).
+  const sportsLikeSlugs = new Set(['mlb', 'nba', 'nfl', 'nhl', 'soccer', 'sports']);
+  const isSportsSlug = sportsLikeSlugs.has(slug);
+  const limit = isSportsSlug ? 100 : 50;
+  const MAX_PAGES = isSportsSlug ? 2 : 1;
   let offset = 0;
-  const MAX_PAGES = 1;
   let pages = 0;
+  let fetched = 0;
   while (pages < MAX_PAGES) {
     const params = new URLSearchParams({
       limit: String(limit),
@@ -1195,11 +1201,15 @@ async function polyFetchEventsByTag(slug: string): Promise<UnifiedMarket[]> {
         if (u) out.push(u);
       }
     }
+    fetched += data.length;
     pages++;
     offset += limit;
     if (data.length < limit) break;
     await sleep(REQUEST_DELAY_MS);
   }
+  console.log(
+    `[poly] ${slug} fetched ${out.length} markets (${fetched} events across ${pages} page${pages === 1 ? '' : 's'})`,
+  );
   return out;
 }
 
@@ -1298,18 +1308,34 @@ function kalshiFee(contracts: number, price: number): number {
 // Per-category coefficients (taker):
 //   crypto 0.072, economics/culture/weather/other 0.05,
 //   politics/finance/tech/mentions 0.04, sports 0.03, geopolitics 0.
-// We don't pass category through the calculator yet, so default to the
-// MAX observed coefficient (0.072) — conservative on purpose: it never
-// understates fees, the worst it does is hide marginal opportunities.
-const POLY_FEE_COEFFICIENT = 0.072;
-function polyFee(contracts: number, price: number): number {
-  return POLY_FEE_COEFFICIENT * contracts * price * (1 - price);
+// The category here is the PAIR's category (sports/economic/politics)
+// computed from pairCategory(), NOT the per-market raw category string.
+function polyFeeCoefficient(category?: PairCategory): number {
+  switch (category) {
+    case 'sports':
+      return 0.03;
+    case 'politics':
+      return 0.04;
+    case 'economic':
+      return 0.05;
+    default:
+      // Unknown category — be conservative (max observed coefficient).
+      return 0.072;
+  }
+}
+function polyFee(contracts: number, price: number, category?: PairCategory): number {
+  return polyFeeCoefficient(category) * contracts * price * (1 - price);
 }
 
-function feeForLeg(platform: Platform, contracts: number, price: number): number {
+function feeForLeg(
+  platform: Platform,
+  contracts: number,
+  price: number,
+  category?: PairCategory,
+): number {
   return platform === 'kalshi'
     ? kalshiFee(contracts, price)
-    : polyFee(contracts, price);
+    : polyFee(contracts, price, category);
 }
 
 function walkOrderbook(
@@ -1318,6 +1344,7 @@ function walkOrderbook(
   yesPlatform: Platform,
   noPlatform: Platform,
   minThreshold: number,
+  category?: PairCategory,
 ): ArbitrageLevel[] {
   const levels: ArbitrageLevel[] = [];
   const yesRemaining = yesAsks.map((l) => ({ price: l.price, size: l.size }));
@@ -1332,8 +1359,8 @@ function walkOrderbook(
     if (grossProfitPct < minThreshold) break;
     const qty = Math.min(y.size, n.size);
     if (qty > 0) {
-      const yesFee = feeForLeg(yesPlatform, qty, y.price);
-      const noFee = feeForLeg(noPlatform, qty, n.price);
+      const yesFee = feeForLeg(yesPlatform, qty, y.price, category);
+      const noFee = feeForLeg(noPlatform, qty, n.price, category);
       const totalFees = yesFee + noFee;
       const feePct = qty > 0 ? totalFees / qty : 0;
       const netProfitPct = grossProfitPct - feePct;
@@ -1362,9 +1389,10 @@ function calculateOpportunity(
   kalshiBook: Orderbook,
   polyBook: Orderbook,
   minThreshold: number,
+  category?: PairCategory,
 ): ArbitrageLevel[] {
-  const a = walkOrderbook(kalshiBook.yesAsks, polyBook.noAsks, 'kalshi', 'polymarket', minThreshold);
-  const b = walkOrderbook(polyBook.yesAsks, kalshiBook.noAsks, 'polymarket', 'kalshi', minThreshold);
+  const a = walkOrderbook(kalshiBook.yesAsks, polyBook.noAsks, 'kalshi', 'polymarket', minThreshold, category);
+  const b = walkOrderbook(polyBook.yesAsks, kalshiBook.noAsks, 'polymarket', 'kalshi', minThreshold, category);
   const all = [...a, ...b];
   all.sort((x, y) => y.netProfitPct - x.netProfitPct);
   return all;
@@ -1753,11 +1781,23 @@ async function verifyPair(
     return emptyVerifyResult('CAUTION', 'Polymarket outcome metadata missing');
   }
 
+  // Sport teams parsed from the Kalshi ticker — these are the canonical
+  // full team names ("athletics", "yankees") even when the title text
+  // truncates them ("A's vs New York Y Winner?"). Without this hint,
+  // Claude can't tell whether "New York Y" means Yankees or some other
+  // team and refuses to commit a polarity.
+  const kalshiTeamLine =
+    kalshi.sportTeams && kalshi.sportTeams.length > 0
+      ? `  Teams (parsed from ticker): ${kalshi.sportTeams.join(' vs ')}\n` +
+        (kalshi.sportLeague ? `  League: ${kalshi.sportLeague}\n` : '')
+      : '';
+
   const userMessage =
     'Compare these two prediction markets and decide whether they resolve ' +
     'to the same outcome AND which Polymarket outcome corresponds to Kalshi YES.\n\n' +
     'KALSHI:\n' +
     `  Title: ${kalshi.title}\n` +
+    kalshiTeamLine +
     `  Resolution criteria: ${kalshi.resolutionCriteria ?? 'Not explicitly stated'}\n` +
     `  Closes: ${kalshi.closeTime ?? 'unknown'}\n\n` +
     'POLYMARKET:\n' +
@@ -1797,6 +1837,29 @@ async function verifyPair(
     '  SKIP = the markets do not resolve on the same event, OR polarity is\n' +
     '         ambiguous, OR thresholds differ materially. Do not trade.\n' +
     'If polarity_confirmed is false, the caller will force SKIP regardless of verdict.';
+
+  // Sports diagnostic: log exactly what Claude sees so we can debug why
+  // a sports pair came back polarity_confirmed=false. This fires once per
+  // Claude call (not per cache hit) so the volume is bounded by the
+  // resolution queue cap.
+  const isSportsPair =
+    !!(kalshi.sportLeague && poly.sportLeague &&
+       kalshi.sportLeague === poly.sportLeague &&
+       kalshi.sportTeams && poly.sportTeams &&
+       kalshi.sportTeams.some((t) => poly.sportTeams!.includes(t)));
+  if (isSportsPair) {
+    console.log(
+      '[claude-input] sports pair:',
+      JSON.stringify({
+        kalshiTitle: kalshi.title,
+        kalshiTeams: kalshi.sportTeams,
+        kalshiLeague: kalshi.sportLeague,
+        polyTitle: poly.title,
+        polyOutcome0: poly.outcome0Label,
+        polyOutcome1: poly.outcome1Label,
+      }),
+    );
+  }
 
   let response;
   try {
@@ -2352,6 +2415,15 @@ async function runScanCycle(
   let droppedByDate = { sports: 0, economic: 0, politics: 0 };
   let droppedSportsInProgress = 0; // sports pairs killed by the new 3h floor
   let droppedByCategoryThreshold = 0;
+  // Sports proximity floor: same teams + 3-day close-time gap means we
+  // matched DIFFERENT games of the same series (e.g. Athletics vs Mets
+  // April 14 paired against Athletics vs Mets April 17). Polarity is
+  // correct on each book, but the prices reflect different events, so
+  // the calculator hallucinates 25% spreads. MLB games typically close
+  // within an hour of first pitch — 24h is the natural cutoff that
+  // keeps same-day pairs and rejects series mismatches.
+  const SPORTS_MAX_CLOSE_GAP_MS = 24 * 60 * 60 * 1000;
+  let droppedBySportsProximity = 0;
   const candidates = allCandidates.filter((p) => {
     const cat = pairCategory(p);
     // Per-category fuzzy threshold re-check. Sports/crypto join-pass
@@ -2378,6 +2450,10 @@ async function runScanCycle(
       droppedByDate[cat]++;
       return false;
     }
+    if (cat === 'sports' && Math.abs(k - pl) > SPORTS_MAX_CLOSE_GAP_MS) {
+      droppedBySportsProximity++;
+      return false;
+    }
     return true;
   });
   const pairsFilteredByDate = beforeDateFilter - candidates.length;
@@ -2389,6 +2465,7 @@ async function runScanCycle(
       filteredOut: pairsFilteredByDate,
       droppedByDate,
       droppedSportsInProgress,
+      droppedBySportsProximity,
       droppedByCategoryThreshold,
       minClose: {
         sports: `${MIN_HOURS_TO_CLOSE_SPORTS}h`,
@@ -2410,8 +2487,28 @@ async function runScanCycle(
   console.log('[scanner] matched pairs (top 10):', JSON.stringify(matchedPairs));
 
   // 3. Resolve verdicts in parallel (cache check inside resolvePair).
+  // Sports pairs are deterministic shared-team matches with score ≥ 0.95
+  // and they expire fast (often within hours), so they MUST be at the
+  // front of the resolution queue regardless of how many politics pairs
+  // share the same fuzzy band. Sort sports-first, then by score desc.
+  candidates.sort((a, b) => {
+    const catA = pairCategory(a) === 'sports' ? 1 : 0;
+    const catB = pairCategory(b) === 'sports' ? 1 : 0;
+    if (catA !== catB) return catB - catA;
+    return b.score - a.score;
+  });
   const toResolve = candidates.slice(0, MAX_PAIRS_TO_RESOLVE);
   const skipClaude = opts.skipClaude ?? false;
+  console.log(
+    '[scanner] resolution queue top 10:',
+    JSON.stringify(
+      toResolve.slice(0, 10).map((p) => ({
+        cat: pairCategory(p),
+        score: Number(p.score.toFixed(3)),
+        kalshi: p.kalshi.title.slice(0, 40),
+      })),
+    ),
+  );
   console.log(
     `[scanner] resolving ${toResolve.length} pairs (skipClaude=${skipClaude}, concurrency=${CLAUDE_CONCURRENCY})`,
   );
@@ -2498,6 +2595,7 @@ async function runScanCycle(
         kalshiBook,
         polyBook,
         DIAGNOSTIC_WALK_THRESHOLD,
+        pairCategory(pair),
       );
       const bestLevel = levels[0];
       const bestNet = bestLevel?.netProfitPct ?? -Infinity;
