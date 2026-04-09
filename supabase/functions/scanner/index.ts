@@ -34,6 +34,12 @@ interface UnifiedMarket {
   // team nicknames ('mets', 'red sox', 'lakers', etc.).
   sportLeague?: string;
   sportTeams?: string[];
+  // Pre-detected crypto info, populated at fetch time. Crypto fast-path
+  // requires both sides to have asset, price, and dateRef populated AND to
+  // match exactly. Otherwise the pair falls through to Claude as normal.
+  cryptoAsset?: 'btc' | 'eth';
+  cryptoPrice?: number;
+  cryptoDateRef?: string;
 }
 
 interface OrderbookLevel {
@@ -97,6 +103,9 @@ const KALSHI_BASE = 'https://api.elections.kalshi.com/trade-api/v2';
 const POLY_GAMMA = 'https://gamma-api.polymarket.com';
 const POLY_CLOB = 'https://clob.polymarket.com';
 
+// Default fuzzy threshold for politics/macro pairs. Sports/crypto/economic
+// use the per-category override below since their titles overlap less
+// cleanly across platforms.
 const FUZZY_THRESHOLD = 0.40;
 // Sports titles format very differently across platforms (Kalshi:
 // "Chiefs ML vs Eagles 04/13" vs Poly: "Will Kansas City Chiefs beat
@@ -104,6 +113,12 @@ const FUZZY_THRESHOLD = 0.40;
 // usually only gives 0.30-0.40, so we lower the threshold for any pair
 // where both titles share a recognizable team from the same league.
 const SPORTS_FUZZY_THRESHOLD = 0.30;
+// Crypto and economic categories use a 0.35 threshold — slightly lower
+// than politics (0.40) because price/release-date wording differs more
+// across platforms but slightly higher than sports because the underlying
+// fuzzy matcher still has signal to work with (no team-name truncation).
+const CRYPTO_FUZZY_THRESHOLD = 0.35;
+const ECONOMIC_FUZZY_THRESHOLD = 0.35;
 const STALENESS_THRESHOLD_MS = 120_000;
 // TEMP: diagnostic, raise to 0.02 once spread distribution is understood.
 const MIN_NET_SPREAD = 0.005;
@@ -116,13 +131,31 @@ const DIAGNOSTIC_WALK_THRESHOLD = -1.0;
 // out tie up capital for negligible annualized return.
 const MIN_DAYS_TO_CLOSE = 1;
 const MAX_DAYS_TO_CLOSE = 365;
-// Sports markets get a tighter window: anything beyond 14 days is too
-// speculative (lineups, injuries, weather all unknown) and typically
-// illiquid. Sports >14d out are dropped at the date filter.
+// Per-category date filter ceilings — the further out a market closes,
+// the more its annualized return decays and the more category-specific
+// resolution risk creeps in. Sports get the tightest window because games
+// resolve in hours/days; crypto price markets get 30 days (most are weekly
+// or monthly); economic releases get 60 days (covers next CPI/NFP cycle);
+// politics/everything else keeps the 365-day default.
 const MAX_DAYS_TO_CLOSE_SPORTS = 14;
-// 15% annualized minimum to be flagged as actionable. A 1% spread closing in
-// 3 days (~121% annualized) ranks above a 5% spread closing in 200 days (~9%).
+const MAX_DAYS_TO_CLOSE_CRYPTO = 30;
+const MAX_DAYS_TO_CLOSE_ECONOMIC = 60;
+// 15% annualized minimum is the politics floor (current default).
+// Sports/crypto/economic categories deserve different floors because
+// their average days-to-close is shorter, so even small spreads still
+// produce huge APYs (50%/30%/20% respectively).
 const MIN_ANNUALIZED_RETURN = 0.15;
+const MIN_APY_SPORTS = 0.50;
+const MIN_APY_CRYPTO = 0.30;
+const MIN_APY_ECONOMIC = 0.20;
+const MIN_APY_POLITICS = 0.15;
+// Priority = annualizedReturn * categoryMultiplier. Faster-recycling
+// categories rank above equivalent-APY long-dated ones because the same
+// dollar can be redeployed sooner.
+const CATEGORY_MULTIPLIER_SPORTS = 1.5;
+const CATEGORY_MULTIPLIER_CRYPTO = 1.3;
+const CATEGORY_MULTIPLIER_ECONOMIC = 1.2;
+const CATEGORY_MULTIPLIER_POLITICS = 1.0;
 const REQUEST_DELAY_MS = 50; // gentle pacing between orderbook calls
 const KALSHI_PAGE_DELAY_MS = 250; // Kalshi rate limit ~5 req/s
 const MAX_PAIRS_TO_RESOLVE = 250; // soft cap; cache covers steady state
@@ -348,6 +381,172 @@ function parseKalshiSportTicker(eventTicker: string): KalshiSportInfo | null {
 }
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Crypto market detection
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// We extract the asset (BTC/ETH), price level (e.g. 100000 for "$100K"),
+// and a coarse date reference (e.g. "jul-2025" or "2025") from each title
+// at fetch time. The crypto fast-path requires both sides to have all
+// three populated AND to match exactly. Anything else falls through to
+// Claude.
+
+interface CryptoInfo {
+  asset: 'btc' | 'eth';
+  price: number | null;
+  dateRef: string | null;
+}
+
+const MONTH_MAP: Record<string, string> = {
+  jan: 'jan', january: 'jan',
+  feb: 'feb', february: 'feb',
+  mar: 'mar', march: 'mar',
+  apr: 'apr', april: 'apr',
+  may: 'may',
+  jun: 'jun', june: 'jun',
+  jul: 'jul', july: 'jul',
+  aug: 'aug', august: 'aug',
+  sep: 'sep', sept: 'sep', september: 'sep',
+  oct: 'oct', october: 'oct',
+  nov: 'nov', november: 'nov',
+  dec: 'dec', december: 'dec',
+};
+
+function detectCrypto(title: string): CryptoInfo | null {
+  if (!title) return null;
+  const lower = title.toLowerCase();
+  let asset: 'btc' | 'eth' | null = null;
+  if (/\b(bitcoin|btc)\b/.test(lower)) asset = 'btc';
+  else if (/\b(ethereum|eth|ether)\b/.test(lower)) asset = 'eth';
+  if (!asset) return null;
+
+  // Extract first price level. Patterns:
+  //   $100K, $100,000, 100K, $4500, $100000
+  // We require BTC ≥ 1000 and ETH ≥ 100 to filter out years and small ints.
+  let price: number | null = null;
+  const priceRe = /\$?\s*(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(k|m)?\b/gi;
+  let match: RegExpExecArray | null;
+  while ((match = priceRe.exec(lower)) !== null) {
+    const cleanedNum = match[1].replace(/,/g, '');
+    let val = parseFloat(cleanedNum);
+    if (!Number.isFinite(val)) continue;
+    const suffix = match[2]?.toLowerCase();
+    if (suffix === 'k') val *= 1000;
+    else if (suffix === 'm') val *= 1_000_000;
+    if (asset === 'btc' && val < 1000) continue;
+    if (asset === 'eth' && val < 100) continue;
+    if (val > 10_000_000) continue;
+    // Reject likely-year matches (4 digits 2000-2099 with no $ or K/M).
+    if (val >= 2000 && val <= 2099 && !match[0].includes('$') && !suffix) continue;
+    price = val;
+    break;
+  }
+
+  // Extract date reference: "by July 2025", "Dec 31 2025", "EOY 2025",
+  // "end of 2025", or just a bare year. Canonicalize to mon-YYYY when both
+  // are present, else just YYYY.
+  let dateRef: string | null = null;
+  const monthYearRe =
+    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s*(?:\d{1,2},?\s*)?(\d{4})\b/i;
+  const my = lower.match(monthYearRe);
+  if (my) {
+    const m = MONTH_MAP[my[1].toLowerCase()] ?? my[1].toLowerCase();
+    dateRef = `${m}-${my[2]}`;
+  } else {
+    const eoyMatch = lower.match(/\b(?:eoy|end of(?:\s+the)?(?:\s+year)?)\s*(\d{4})\b/);
+    if (eoyMatch) {
+      dateRef = `dec-${eoyMatch[1]}`;
+    } else {
+      const yearMatch = lower.match(/\b(20\d{2})\b/);
+      if (yearMatch) dateRef = yearMatch[1];
+    }
+  }
+
+  return { asset, price, dateRef };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pair category classification
+// ─────────────────────────────────────────────────────────────────────────────
+
+type PairCategory = 'sports' | 'crypto' | 'economic' | 'politics';
+
+const ECONOMIC_CATEGORIES = new Set([
+  'economics', 'finance',
+  'Economics', 'Finance',
+]);
+
+const CRYPTO_CATEGORIES = new Set([
+  'crypto', 'bitcoin', 'ethereum',
+  'Crypto', 'Bitcoin', 'Ethereum',
+]);
+
+function isEconomicMarket(m: UnifiedMarket): boolean {
+  const cat = m.category;
+  if (!cat) return false;
+  return ECONOMIC_CATEGORIES.has(cat);
+}
+
+function isCryptoMarket(m: UnifiedMarket): boolean {
+  if (m.cryptoAsset) return true;
+  const cat = m.category;
+  if (!cat) return false;
+  return CRYPTO_CATEGORIES.has(cat);
+}
+
+function pairCategory(pair: CandidatePair): PairCategory {
+  // Sports first — most specific signal (precomputed shared team).
+  if (pairSharedTeamFast(pair)) return 'sports';
+  // Crypto second — at least one side has asset detected OR has crypto
+  // category tag. Same-asset detection on both sides is what triggers the
+  // FAST-PATH; here we just need to bucket the pair correctly.
+  if (isCryptoMarket(pair.kalshi) || isCryptoMarket(pair.poly)) return 'crypto';
+  // Economic — either side tagged in Economics/Finance.
+  if (isEconomicMarket(pair.kalshi) || isEconomicMarket(pair.poly)) return 'economic';
+  return 'politics';
+}
+
+// Lightweight shared-team check used during categorization (no allocation).
+// The full pairSharedTeam below is the canonical version that returns the
+// actual team info for fast-path messaging.
+function pairSharedTeamFast(pair: CandidatePair): boolean {
+  const k = pair.kalshi;
+  const p = pair.poly;
+  if (!k.sportLeague || !p.sportLeague) return false;
+  if (k.sportLeague !== p.sportLeague) return false;
+  if (!k.sportTeams || !p.sportTeams) return false;
+  for (const t of k.sportTeams) if (p.sportTeams.includes(t)) return true;
+  return false;
+}
+
+function maxDaysForCategory(cat: PairCategory): number {
+  if (cat === 'sports') return MAX_DAYS_TO_CLOSE_SPORTS;
+  if (cat === 'crypto') return MAX_DAYS_TO_CLOSE_CRYPTO;
+  if (cat === 'economic') return MAX_DAYS_TO_CLOSE_ECONOMIC;
+  return MAX_DAYS_TO_CLOSE;
+}
+
+function minApyForCategory(cat: PairCategory): number {
+  if (cat === 'sports') return MIN_APY_SPORTS;
+  if (cat === 'crypto') return MIN_APY_CRYPTO;
+  if (cat === 'economic') return MIN_APY_ECONOMIC;
+  return MIN_APY_POLITICS;
+}
+
+function categoryMultiplier(cat: PairCategory): number {
+  if (cat === 'sports') return CATEGORY_MULTIPLIER_SPORTS;
+  if (cat === 'crypto') return CATEGORY_MULTIPLIER_CRYPTO;
+  if (cat === 'economic') return CATEGORY_MULTIPLIER_ECONOMIC;
+  return CATEGORY_MULTIPLIER_POLITICS;
+}
+
+function fuzzyThresholdForCategory(cat: PairCategory): number {
+  if (cat === 'sports') return SPORTS_FUZZY_THRESHOLD;
+  if (cat === 'crypto') return CRYPTO_FUZZY_THRESHOLD;
+  if (cat === 'economic') return ECONOMIC_FUZZY_THRESHOLD;
+  return FUZZY_THRESHOLD;
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function mapPool<T, R>(
@@ -483,6 +682,31 @@ const KALSHI_SPORTS_SERIES = [
   'KXNHLGAME', // NHL game lines
 ];
 
+// Series tickers Kalshi uses for crypto price markets. Daily variants
+// (D suffix) are the highest-value short-dated markets. Fetched
+// unconditionally alongside /events because daily markets churn through
+// /events fast and we don't want to miss them.
+const KALSHI_CRYPTO_SERIES = [
+  'KXBTC',  // Bitcoin price (weekly/longer)
+  'KXBTCD', // Bitcoin daily
+  'KXETH',  // Ethereum price
+  'KXETHD', // Ethereum daily
+];
+
+// Series tickers Kalshi uses for economic data releases. These are the
+// highest-edge category — release dates are public, agencies are
+// authoritative, and Kalshi typically posts before Polymarket so the
+// initial spreads can be wide.
+const KALSHI_ECONOMIC_SERIES = [
+  'KXCPI',       // CPI inflation
+  'KXPCE',       // PCE inflation
+  'KXJOBS',      // Jobs report / NFP
+  'KXUNEMPLOY',  // Unemployment rate
+  'KXGDP',       // GDP growth
+  'KXFOMC',      // Fed meeting outcomes
+  'KXRATE',      // Interest rates
+];
+
 // Series tickers known to contain political/macro/crypto markets — used as a
 // fallback when /events filtering doesn't yield enough markets.
 const HIGH_OVERLAP_SERIES = [
@@ -525,11 +749,22 @@ async function kalshiFetchEventsPage(
   const signPath = '/events';
   let attempt = 0;
   while (true) {
-    const headers = await kalshiAuthHeaders('GET', signPath);
-    const response = await fetch(
-      `${KALSHI_BASE}${signPath}?${params.toString()}`,
-      { headers },
-    );
+    let response: Response;
+    try {
+      const headers = await kalshiAuthHeaders('GET', signPath);
+      response = await fetch(
+        `${KALSHI_BASE}${signPath}?${params.toString()}`,
+        { headers },
+      );
+    } catch (err) {
+      if (attempt < 1) {
+        attempt++;
+        console.warn('[scanner] kalshi /events threw — retrying in 2s', err);
+        await sleep(2000);
+        continue;
+      }
+      throw err;
+    }
     if (response.ok) {
       const data = await response.json();
       return { events: data.events ?? [], cursor: data.cursor || null };
@@ -537,6 +772,14 @@ async function kalshiFetchEventsPage(
     if (response.status === 429 && attempt < 2) {
       attempt++;
       await sleep(1000 * attempt);
+      continue;
+    }
+    if (response.status >= 500 && attempt < 1) {
+      attempt++;
+      console.warn(
+        `[scanner] kalshi /events ${response.status} — retrying in 2s`,
+      );
+      await sleep(2000);
       continue;
     }
     throw new Error(
@@ -556,11 +799,25 @@ async function kalshiFetchSeriesMarkets(
   const signPath = '/markets';
   let attempt = 0;
   while (true) {
-    const headers = await kalshiAuthHeaders('GET', signPath);
-    const response = await fetch(
-      `${KALSHI_BASE}${signPath}?${params.toString()}`,
-      { headers },
-    );
+    let response: Response;
+    try {
+      const headers = await kalshiAuthHeaders('GET', signPath);
+      response = await fetch(
+        `${KALSHI_BASE}${signPath}?${params.toString()}`,
+        { headers },
+      );
+    } catch (err) {
+      if (attempt < 1) {
+        attempt++;
+        console.warn(
+          `[scanner] kalshi /markets ${seriesTicker} threw — retrying in 2s`,
+          err,
+        );
+        await sleep(2000);
+        continue;
+      }
+      return [];
+    }
     if (response.ok) {
       const data = await response.json();
       return (data.markets ?? []) as KalshiMarketRaw[];
@@ -568,6 +825,11 @@ async function kalshiFetchSeriesMarkets(
     if (response.status === 429 && attempt < 2) {
       attempt++;
       await sleep(1000 * attempt);
+      continue;
+    }
+    if (response.status >= 500 && attempt < 1) {
+      attempt++;
+      await sleep(2000);
       continue;
     }
     return [];
@@ -592,6 +854,15 @@ function pushKalshiMarket(
   } catch (err) {
     console.error('[scanner] parseKalshiSportTicker threw', err);
   }
+  // Crypto detection runs on every Kalshi market title (not just Crypto
+  // category) because some events sit under "Finance" or no category at
+  // all but are clearly crypto price markets.
+  let cryptoInfo: CryptoInfo | null = null;
+  try {
+    cryptoInfo = detectCrypto(m.title ?? '');
+  } catch (err) {
+    console.error('[scanner] detectCrypto threw', err);
+  }
   list.push({
     platform: 'kalshi',
     marketId: m.ticker,
@@ -600,9 +871,12 @@ function pushKalshiMarket(
     yesAsk,
     noAsk,
     url: buildKalshiUrl(m),
-    category: category ?? (sportInfo ? 'Sports' : undefined),
+    category: category ?? (sportInfo ? 'Sports' : cryptoInfo ? 'Crypto' : undefined),
     sportLeague: sportInfo?.sport,
     sportTeams: sportInfo?.teams,
+    cryptoAsset: cryptoInfo?.asset,
+    cryptoPrice: cryptoInfo?.price ?? undefined,
+    cryptoDateRef: cryptoInfo?.dateRef ?? undefined,
   });
 }
 
@@ -683,6 +957,52 @@ async function kalshiGetMarkets(): Promise<UnifiedMarket[]> {
   }
   console.log(
     `[scanner] kalshi sports series total: +${markets.length - sportsBefore} markets`,
+  );
+
+  // Approach D (crypto): always pull KX{BTC,ETH}{,D} series. /events
+  // sometimes serves these under "Crypto" category but daily markets
+  // churn faster than /events pages and we don't want to miss any.
+  const cryptoBefore = markets.length;
+  for (const series of KALSHI_CRYPTO_SERIES) {
+    try {
+      const seriesMarkets = await kalshiFetchSeriesMarkets(series);
+      const before = markets.length;
+      for (const m of seriesMarkets) {
+        pushKalshiMarket(markets, seen, m, 'Crypto');
+      }
+      console.log(
+        `[scanner] kalshi crypto series ${series}: +${markets.length - before} markets (raw ${seriesMarkets.length})`,
+      );
+    } catch (err) {
+      console.error(`[scanner] kalshi crypto series ${series} fetch failed`, err);
+    }
+    await sleep(KALSHI_PAGE_DELAY_MS);
+  }
+  console.log(
+    `[scanner] kalshi crypto series total: +${markets.length - cryptoBefore} markets`,
+  );
+
+  // Approach E (economic releases): Kalshi's strongest category. Same
+  // pattern — fetch the per-release series unconditionally so we don't
+  // miss CPI/NFP cycles between /events pagination passes.
+  const econBefore = markets.length;
+  for (const series of KALSHI_ECONOMIC_SERIES) {
+    try {
+      const seriesMarkets = await kalshiFetchSeriesMarkets(series);
+      const before = markets.length;
+      for (const m of seriesMarkets) {
+        pushKalshiMarket(markets, seen, m, 'Economics');
+      }
+      console.log(
+        `[scanner] kalshi economic series ${series}: +${markets.length - before} markets (raw ${seriesMarkets.length})`,
+      );
+    } catch (err) {
+      console.error(`[scanner] kalshi economic series ${series} fetch failed`, err);
+    }
+    await sleep(KALSHI_PAGE_DELAY_MS);
+  }
+  console.log(
+    `[scanner] kalshi economic series total: +${markets.length - econBefore} markets`,
   );
 
   return markets;
@@ -823,27 +1143,45 @@ function buildPolyUrl(raw: PolyMarketRaw): string | undefined {
   return undefined;
 }
 
-// Polymarket tag slugs that overlap with Kalshi inventory. Sport-specific
-// slugs (nfl/nba/mlb/nhl/soccer) are listed BEFORE the generic 'sports' slug
-// so when the same market appears under both, the more specific category
-// wins the dedupe.
+// Polymarket tag slugs that overlap with Kalshi inventory.
+//
+// Per-sport slugs (mlb/nba/nfl/nhl/soccer) are required even though they
+// overlap with 'sports' — the generic 'sports' tag only surfaces ~40% of
+// per-game markets in practice (mostly futures and headline events). The
+// per-sport slugs are fetched first so when a market appears under both,
+// the per-sport category wins the dedupe (this matters for league
+// detection downstream).
+//
+// Crypto-specific slugs (bitcoin/ethereum) are kept separate from the
+// generic 'crypto' slug because Polymarket sometimes promotes a crypto
+// price market under the asset slug only.
 const POLY_TAG_SLUGS = [
   'politics',
   'crypto',
+  'bitcoin',
+  'ethereum',
   'economics',
   'finance',
   'science',
   // Sport-specific slugs FIRST so they win the dedupe over the generic
   // 'sports' slug below.
-  'nfl',
-  'nba',
   'mlb',
+  'nba',
+  'nfl',
   'nhl',
   'soccer',
   'sports',
 ];
 
+// Slugs that imply the market is sports — used to gate per-title team
+// detection. Includes the per-sport slugs even though we no longer fetch
+// them, in case a Polymarket market gets a sport-specific tag through
+// some other path.
 const POLY_SPORT_SLUGS = new Set(['nfl', 'nba', 'mlb', 'nhl', 'soccer', 'sports']);
+
+// Slugs that imply the market is crypto — used to seed crypto detection
+// at fetch time on titles that don't explicitly mention BTC/ETH.
+const POLY_CRYPTO_SLUGS = new Set(['crypto', 'bitcoin', 'ethereum']);
 
 interface PolyEventRaw {
   slug?: string;
@@ -882,6 +1220,22 @@ function polyMarketToUnified(
     // NHL detection from titles isn't reliable yet (no team list above),
     // but the tag itself flags this as a sports market.
   }
+  // Crypto detection: always run on every Polymarket title (since price
+  // markets sometimes show up under non-crypto categories).
+  let cryptoInfo: CryptoInfo | null = null;
+  try {
+    cryptoInfo = detectCrypto(title);
+  } catch (err) {
+    console.error('[scanner] detectCrypto threw (poly)', err);
+  }
+  // Normalize the category for poly-side classification: Polymarket sends
+  // tag slugs in lowercase; we keep them lowercase so isEconomicMarket
+  // matches both 'Economics' (kalshi) and 'finance' (poly).
+  let resolvedCategory = category;
+  if (POLY_CRYPTO_SLUGS.has(category ?? '') && !cryptoInfo) {
+    // Tag says crypto but title didn't parse — still flag it.
+    resolvedCategory = 'crypto';
+  }
   return {
     platform: 'polymarket',
     marketId: conditionId,
@@ -892,20 +1246,22 @@ function polyMarketToUnified(
     url: eventSlug
       ? `https://polymarket.com/event/${eventSlug}`
       : buildPolyUrl(m),
-    category,
+    category: resolvedCategory,
     sportLeague,
     sportTeams,
+    cryptoAsset: cryptoInfo?.asset,
+    cryptoPrice: cryptoInfo?.price ?? undefined,
+    cryptoDateRef: cryptoInfo?.dateRef ?? undefined,
   };
 }
 
 async function polyFetchEventsByTag(slug: string): Promise<UnifiedMarket[]> {
   const out: UnifiedMarket[] = [];
-  const limit = 100;
+  // 50 events per tag (was 100) — with 13 tag slugs we hit WORKER_LIMIT
+  // at the higher limit. Page 1 is sorted by volume so the top-50 slice
+  // is still the highest-value markets.
+  const limit = 50;
   let offset = 0;
-  // 1 page (100 events) per tag — with 11 tags fetched in parallel, the
-  // total payload (~12k markets) sits right at the edge of the worker
-  // budget. Page 1 of each tag is sorted by volume so it's the highest-
-  // value slice anyway.
   const MAX_PAGES = 1;
   let pages = 0;
   while (pages < MAX_PAGES) {
@@ -916,19 +1272,41 @@ async function polyFetchEventsByTag(slug: string): Promise<UnifiedMarket[]> {
       closed: 'false',
       tag_slug: slug,
     });
-    let response: Response;
-    try {
-      response = await fetch(`${POLY_GAMMA}/events?${params.toString()}`);
-    } catch (err) {
-      console.error(`[scanner] poly /events ${slug} fetch error`, err);
-      break;
+    // Single auto-retry with 2s delay on transient failure. The Gamma
+    // API occasionally returns 5xx or drops the connection mid-cold-start,
+    // and the previous behavior (silent break) was a major contributor to
+    // sparse fetch results.
+    let response: Response | null = null;
+    let attempt = 0;
+    while (attempt < 2) {
+      try {
+        response = await fetch(`${POLY_GAMMA}/events?${params.toString()}`);
+        if (response.ok) break;
+        if (attempt === 0 && response.status >= 500) {
+          console.warn(
+            `[scanner] poly /events ${slug} ${response.status} — retrying in 2s`,
+          );
+          response = null;
+          attempt++;
+          await sleep(2000);
+          continue;
+        }
+        console.error(
+          `[scanner] poly /events ${slug} non-200: ${response.status}`,
+        );
+        return out;
+      } catch (err) {
+        if (attempt === 0) {
+          console.warn(`[scanner] poly /events ${slug} threw — retrying in 2s`, err);
+          attempt++;
+          await sleep(2000);
+          continue;
+        }
+        console.error(`[scanner] poly /events ${slug} fetch error`, err);
+        return out;
+      }
     }
-    if (!response.ok) {
-      console.error(
-        `[scanner] poly /events ${slug} non-200: ${response.status}`,
-      );
-      break;
-    }
+    if (!response) return out;
     const data = (await response.json()) as PolyEventRaw[];
     if (!data || data.length === 0) break;
     for (const ev of data) {
@@ -946,10 +1324,10 @@ async function polyFetchEventsByTag(slug: string): Promise<UnifiedMarket[]> {
 }
 
 async function polyGetMarkets(): Promise<UnifiedMarket[]> {
-  // Bounded concurrency: with sports added we now have 11 tag slugs and
-  // running all in parallel pushed the worker over its memory budget.
-  // 4 in flight at a time is plenty for the Gamma API.
-  const tagResults = await mapPool(POLY_TAG_SLUGS, 4, (slug) =>
+  // Bounded concurrency: 2 in flight at a time keeps the worker well
+  // under its memory budget. The previous setting of 4 was at the edge
+  // and caused intermittent WORKER_LIMIT failures on cold start.
+  const tagResults = await mapPool(POLY_TAG_SLUGS, 2, (slug) =>
     polyFetchEventsByTag(slug).catch((err) => {
       console.error(`[scanner] poly tag ${slug} failed`, err);
       return [] as UnifiedMarket[];
@@ -1185,13 +1563,10 @@ function findCandidatePairs(
     return { pairs: [], topPairs: [] };
   }
 
-  // Sports join pass — before the general fuzzy matcher.
-  // Sports titles use abbreviated team names on Kalshi ("New York M") and
-  // full names on Polymarket ("New York Mets"), so token overlap is too
-  // weak to surface them via the fuzzy matcher. Instead, do a direct
-  // league+team join using the precomputed `sportLeague` / `sportTeams`
-  // fields. We claim the poly index here so the fuzzy pass doesn't
-  // double-pair it.
+  // Direct join passes run BEFORE the general fuzzy matcher for categories
+  // where titles overlap weakly across platforms (sports has abbreviated
+  // team names on Kalshi; crypto has different price phrasings). The
+  // claimedPoly set prevents the fuzzy pass from double-pairing.
   const claimedPoly = new Set<number>();
   const sportsResults: CandidatePair[] = [];
   // Build per-(league:team) → poly index list.
@@ -1241,6 +1616,48 @@ function findCandidatePairs(
   }
   console.log(
     `[scanner] sports join pass: ${sportsResults.length} pairs from ${claimedPoly.size} claimed poly markets`,
+  );
+
+  // Crypto join pass — match by (asset, price, dateRef) tuple. Both sides
+  // must have all three populated AND match exactly. The matcher only
+  // produces a pair when there's a clean signal; anything else falls
+  // through to the fuzzy pass. We boost the score so crypto pairs always
+  // make MAX_PAIRS_TO_RESOLVE.
+  const cryptoResults: CandidatePair[] = [];
+  // Build poly crypto index keyed by asset|price|date.
+  const polyCryptoIndex = new Map<string, number[]>();
+  for (let j = 0; j < polyMarkets.length; j++) {
+    const pm = polyMarkets[j];
+    if (!pm.cryptoAsset || pm.cryptoPrice === undefined || !pm.cryptoDateRef) continue;
+    const key = `${pm.cryptoAsset}|${pm.cryptoPrice}|${pm.cryptoDateRef}`;
+    let arr = polyCryptoIndex.get(key);
+    if (!arr) { arr = []; polyCryptoIndex.set(key, arr); }
+    arr.push(j);
+  }
+  for (let i = 0; i < kalshiMarkets.length; i++) {
+    const km = kalshiMarkets[i];
+    if (!km.cryptoAsset || km.cryptoPrice === undefined || !km.cryptoDateRef) continue;
+    const key = `${km.cryptoAsset}|${km.cryptoPrice}|${km.cryptoDateRef}`;
+    const list = polyCryptoIndex.get(key);
+    if (!list) continue;
+    // Pick the first unclaimed match. Crypto markets don't typically
+    // have ambiguity at the (asset, price, date) tuple level.
+    let bestJ = -1;
+    for (const j of list) {
+      if (claimedPoly.has(j)) continue;
+      bestJ = j;
+      break;
+    }
+    if (bestJ === -1) continue;
+    claimedPoly.add(bestJ);
+    cryptoResults.push({
+      kalshi: km,
+      poly: polyMarkets[bestJ],
+      score: 0.97, // between sports (0.95-0.99) and politics fuzzy max
+    });
+  }
+  console.log(
+    `[scanner] crypto join pass: ${cryptoResults.length} pairs (poly index size ${polyCryptoIndex.size})`,
   );
 
   const kalshiTok = kalshiMarkets.map((m) => tokenize(m.title));
@@ -1335,13 +1752,22 @@ function findCandidatePairs(
   }));
   console.log('[scanner] top fuzzy pairs:', JSON.stringify(topPairs));
 
-  // Start with the sports join results so they can't get displaced.
+  // Start with the join-pass results so they can't get displaced.
   const claimed = new Set<number>(claimedPoly);
   const results: CandidatePair[] = [];
   for (const sp of sportsResults) results.push(sp);
+  for (const cr of cryptoResults) results.push(cr);
+  // Lowered to the loosest per-category threshold so crypto/economic
+  // fuzzy matches survive. The per-category re-check happens in the
+  // date filter step in runScanCycle.
+  const LOWER_BOUND = Math.min(
+    FUZZY_THRESHOLD,
+    CRYPTO_FUZZY_THRESHOLD,
+    ECONOMIC_FUZZY_THRESHOLD,
+  );
   for (const entry of order) {
     if (entry.polyIdx < 0) continue;
-    if (entry.score < FUZZY_THRESHOLD) continue;
+    if (entry.score < LOWER_BOUND) continue;
     if (claimed.has(entry.polyIdx)) continue;
     claimed.add(entry.polyIdx);
     results.push({
@@ -1590,6 +2016,32 @@ async function resolvePair(
     const pairId = await upsertMarketPair(sb, pair, verdict, reasoning, []);
     return { pair, pairId, verdict, reasoning, riskFactors: [] };
   }
+  // Crypto fast-path: SAFE only if both sides have asset+price+dateRef
+  // AND all three match exactly. Anything else (different asset, missing
+  // price, different date reference) falls through to Claude. Same
+  // ordering rationale as sports — don't trust stale cached PENDING.
+  const k = pair.kalshi;
+  const p = pair.poly;
+  if (
+    k.cryptoAsset && p.cryptoAsset &&
+    k.cryptoAsset === p.cryptoAsset &&
+    k.cryptoPrice !== undefined && p.cryptoPrice !== undefined &&
+    k.cryptoPrice === p.cryptoPrice &&
+    k.cryptoDateRef && p.cryptoDateRef &&
+    k.cryptoDateRef === p.cryptoDateRef
+  ) {
+    const verdict: ResolutionVerdict = 'SAFE';
+    const reasoning =
+      `crypto fast-path: both markets reference ${k.cryptoAsset.toUpperCase()} at $${k.cryptoPrice} on ${k.cryptoDateRef}`;
+    console.log(
+      `[resolver] SAFE (crypto fast-path, ${k.cryptoAsset}/${k.cryptoPrice}/${k.cryptoDateRef}) | ${k.title} → ${p.title}`,
+    );
+    const pairId = await upsertMarketPair(sb, pair, verdict, reasoning, []);
+    return { pair, pairId, verdict, reasoning, riskFactors: [] };
+  }
+  // Economic markets: NEVER fast-path. Resolution differs by agency,
+  // seasonal-adjustment flag, and exact threshold wording. Always send
+  // to Claude. (No early return here — falls through to cache + verifyPair.)
   const cached = await getCachedVerdict(sb, pair.kalshi.marketId, pair.poly.marketId);
   if (cached) {
     console.log(
@@ -1689,6 +2141,19 @@ async function runScanCycle(
     bestSportsSpread: number | null;
     bestSportsAPY: number | null;
   };
+  categoryBreakdown: Record<
+    PairCategory,
+    { pairs: number; opportunities: number; bestAPY: number | null; bestPriority: number | null }
+  >;
+  bestOverall: {
+    category: PairCategory;
+    kalshi: string;
+    poly: string;
+    netSpread: number;
+    annualizedReturn: number;
+    priority: number;
+    days: number;
+  } | null;
   errors: string[];
 }> {
   const errors: string[] = [];
@@ -1777,27 +2242,35 @@ async function runScanCycle(
       : 0;
   console.log(`[date-analysis] avgDaysToClose=${avgDaysToClose.toFixed(1)}`);
 
-  // 2.6 Hard date filter — drop any pair where EITHER market closes outside
-  // the date window. Sports pairs (shared team detected) use a tighter
-  // [MIN_DAYS_TO_CLOSE, MAX_DAYS_TO_CLOSE_SPORTS] window since sports markets
-  // resolve in hours/days and anything further out is too speculative.
-  // All other categories use [MIN_DAYS_TO_CLOSE, MAX_DAYS_TO_CLOSE].
+  // 2.6 Hard date filter — drop any pair where EITHER market closes
+  // outside its category-specific window. Sports get the tightest window
+  // (14d), crypto 30d, economic 60d, politics/everything else 365d. Pairs
+  // also have to clear a per-category fuzzy threshold check at this stage
+  // because the matcher uses a single low cutoff to keep all categories.
   const beforeDateFilter = allCandidates.length;
-  let sportsDroppedByDate = 0;
+  let droppedByDate = { sports: 0, crypto: 0, economic: 0, politics: 0 };
+  let droppedByCategoryThreshold = 0;
   const candidates = allCandidates.filter((p) => {
+    const cat = pairCategory(p);
+    // Per-category fuzzy threshold re-check. Sports/crypto join-pass
+    // pairs have explicit scores ≥ 0.95 so they always clear.
+    const fuzzyMin = fuzzyThresholdForCategory(cat);
+    if (p.score < fuzzyMin) {
+      droppedByCategoryThreshold++;
+      return false;
+    }
     const k = parseCloseTimeMs(p.kalshi.closeTime);
     const pl = parseCloseTimeMs(p.poly.closeTime);
     if (k === null || pl === null) return false;
     const kDays = daysFromNow(k);
     const pDays = daysFromNow(pl);
-    const isSports = pairSharedTeam(p) !== null;
-    const maxDays = isSports ? MAX_DAYS_TO_CLOSE_SPORTS : MAX_DAYS_TO_CLOSE;
+    const maxDays = maxDaysForCategory(cat);
     if (kDays < MIN_DAYS_TO_CLOSE || kDays > maxDays) {
-      if (isSports) sportsDroppedByDate++;
+      droppedByDate[cat]++;
       return false;
     }
     if (pDays < MIN_DAYS_TO_CLOSE || pDays > maxDays) {
-      if (isSports) sportsDroppedByDate++;
+      droppedByDate[cat]++;
       return false;
     }
     return true;
@@ -1809,9 +2282,14 @@ async function runScanCycle(
       before: beforeDateFilter,
       after: candidates.length,
       filteredOut: pairsFilteredByDate,
-      sportsDroppedByDate,
-      sportsMaxDays: MAX_DAYS_TO_CLOSE_SPORTS,
-      otherMaxDays: MAX_DAYS_TO_CLOSE,
+      droppedByDate,
+      droppedByCategoryThreshold,
+      maxDays: {
+        sports: MAX_DAYS_TO_CLOSE_SPORTS,
+        crypto: MAX_DAYS_TO_CLOSE_CRYPTO,
+        economic: MAX_DAYS_TO_CLOSE_ECONOMIC,
+        politics: MAX_DAYS_TO_CLOSE,
+      },
     }),
   );
 
@@ -1999,11 +2477,16 @@ async function runScanCycle(
   });
 
   // 7. Decorate spread results with date/annualized fields and sort by
-  //    annualized return (capital efficiency) — net spread is now secondary.
+  //    PRIORITY (annualized return × category multiplier). Faster-recycling
+  //    categories rank above equivalent-APY long-dated ones because the
+  //    same dollar can be redeployed sooner.
   interface ScoredSpread extends SpreadResult {
     closeMs: number | null;
     days: number;
     annReturn: number;
+    category: PairCategory;
+    minApy: number;
+    priority: number;
   }
   const scoredSpreads: ScoredSpread[] = spreadResults
     .filter((r) => r.kalshiBook && r.polyBook && Number.isFinite(r.bestNet))
@@ -2011,29 +2494,33 @@ async function runScanCycle(
       const closeMs = effectiveCloseMs(r.prep.pair);
       const days = closeMs !== null ? daysFromNow(closeMs) : 0;
       const annReturn = days > 0 ? (r.bestNet / days) * 365 : 0;
-      return { ...r, closeMs, days, annReturn };
+      const category = pairCategory(r.prep.pair);
+      const minApy = minApyForCategory(category);
+      const priority = annReturn * categoryMultiplier(category);
+      return { ...r, closeMs, days, annReturn, category, minApy, priority };
     });
-  scoredSpreads.sort((a, b) => b.annReturn - a.annReturn);
+  scoredSpreads.sort((a, b) => b.priority - a.priority);
   console.log(
-    `[scanner] ${scoredSpreads.length} pairs with usable orderbooks (sorted by annualized return)`,
+    `[scanner] ${scoredSpreads.length} pairs with usable orderbooks (sorted by priority)`,
   );
   if (scoredSpreads.length > 0) {
     const top = scoredSpreads[0];
     console.log(
-      `[scanner] best annualized: ${(top.annReturn * 100).toFixed(1)}% (${top.bestNet.toFixed(4)} net over ${top.days.toFixed(1)}d) — ${top.prep.pair.kalshi.title}`,
+      `[scanner] best by priority: ${top.category} ${(top.annReturn * 100).toFixed(1)}% APY × ${categoryMultiplier(top.category)} = ${(top.priority * 100).toFixed(1)} priority (${top.bestNet.toFixed(4)} net over ${top.days.toFixed(1)}d) — ${top.prep.pair.kalshi.title}`,
     );
   }
 
   const clearedSpread = scoredSpreads.filter((r) => r.bestNet >= MIN_NET_SPREAD);
-  const clearedBoth = clearedSpread.filter(
-    (r) => r.annReturn >= MIN_ANNUALIZED_RETURN,
-  );
+  // Per-category APY floor — sports get 50%, crypto 30%, economic 20%,
+  // politics 15%. The category was already attached to each scored spread
+  // above so we just compare against its own floor.
+  const clearedBoth = clearedSpread.filter((r) => r.annReturn >= r.minApy);
   const filteredByAnnReturn = clearedSpread.length - clearedBoth.length;
   console.log(
     `[filter-summary] cleared spread (>=${MIN_NET_SPREAD * 100}%): ${clearedSpread.length}`,
   );
   console.log(
-    `[filter-summary] cleared spread but filtered by annReturn (<${MIN_ANNUALIZED_RETURN * 100}% APY): ${filteredByAnnReturn}`,
+    `[filter-summary] cleared spread but filtered by per-category APY floor: ${filteredByAnnReturn}`,
   );
   console.log(
     `[filter-summary] cleared BOTH (truly actionable): ${clearedBoth.length}`,
@@ -2146,6 +2633,49 @@ async function runScanCycle(
   };
   console.log('[sports]', JSON.stringify(sportsStats));
 
+  // Category breakdown — pairs (post date filter), opportunities (with
+  // usable orderbook + cleared per-category APY floor), bestAPY in each
+  // bucket. Used by the frontend to give per-category status pills.
+  const categoryBreakdown: Record<
+    PairCategory,
+    { pairs: number; opportunities: number; bestAPY: number | null; bestPriority: number | null }
+  > = {
+    sports: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
+    crypto: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
+    economic: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
+    politics: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
+  };
+  for (const c of candidates) {
+    categoryBreakdown[pairCategory(c)].pairs++;
+  }
+  for (const sc of scoredSpreads) {
+    if (sc.annReturn < sc.minApy) continue;
+    if (sc.bestNet < MIN_NET_SPREAD) continue;
+    const bucket = categoryBreakdown[sc.category];
+    bucket.opportunities++;
+    if (bucket.bestAPY === null || sc.annReturn > bucket.bestAPY) {
+      bucket.bestAPY = Number(sc.annReturn.toFixed(4));
+    }
+    if (bucket.bestPriority === null || sc.priority > bucket.bestPriority) {
+      bucket.bestPriority = Number(sc.priority.toFixed(4));
+    }
+  }
+  console.log('[category-breakdown]', JSON.stringify(categoryBreakdown));
+
+  // Single best opportunity overall, by priority score.
+  const bestOverall = scoredSpreads[0]
+    ? {
+        category: scoredSpreads[0].category,
+        kalshi: scoredSpreads[0].prep.pair.kalshi.title,
+        poly: scoredSpreads[0].prep.pair.poly.title,
+        netSpread: Number(scoredSpreads[0].bestNet.toFixed(4)),
+        annualizedReturn: Number(scoredSpreads[0].annReturn.toFixed(4)),
+        priority: Number(scoredSpreads[0].priority.toFixed(4)),
+        days: Number(scoredSpreads[0].days.toFixed(2)),
+      }
+    : null;
+  if (bestOverall) console.log('[best-overall]', JSON.stringify(bestOverall));
+
   return {
     opportunities,
     kalshiCount: kalshiMarkets.length,
@@ -2163,6 +2693,8 @@ async function runScanCycle(
     pairSummaries,
     verdictDist,
     sportsStats,
+    categoryBreakdown,
+    bestOverall,
     errors,
   };
 }
@@ -2252,6 +2784,8 @@ serve(async (req) => {
       actionableCount: result.actionableCount,
       verdictDist: result.verdictDist,
       sportsStats: result.sportsStats,
+      categoryBreakdown: result.categoryBreakdown,
+      bestOverall: result.bestOverall,
       errors: result.errors,
     };
     if (diag) {
