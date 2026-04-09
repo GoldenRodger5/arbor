@@ -17,8 +17,26 @@ interface UnifiedMarket {
   platform: Platform;
   marketId: string;
   title: string;
+  // POLARITY-CORRECT TOKEN IDS — assigned ONLY after Claude verifies which
+  // Polymarket outcome corresponds to Kalshi YES. Until verification:
+  //   - For Kalshi: yesTokenId/noTokenId are not used (Kalshi uses ticker).
+  //   - For Polymarket: yesTokenId/noTokenId stay UNDEFINED at fetch time.
+  //     The raw outcome→token mapping lives in outcome0Label/outcome0TokenId
+  //     /outcome1Label/outcome1TokenId. Claude reads those and decides which
+  //     index = same direction as Kalshi YES; the resolver then assigns
+  //     yesTokenId = same-direction, noTokenId = hedge so the calculator's
+  //     orient-A walk (BUY Kalshi YES + BUY Poly NO=hedge) is a real arb.
   yesTokenId?: string;
   noTokenId?: string;
+  // Polymarket only: raw outcome → token mapping straight from the Gamma
+  // payload, BEFORE polarity verification. The label is the human-readable
+  // outcome name (e.g. "Athletics", "New York Yankees"); the token id is
+  // the CLOB token id at the same array index. Claude uses these labels
+  // to decide which index matches the Kalshi YES direction.
+  outcome0Label?: string;
+  outcome0TokenId?: string;
+  outcome1Label?: string;
+  outcome1TokenId?: string;
   closeTime?: string;
   yesAsk?: number;
   noAsk?: number;
@@ -34,12 +52,6 @@ interface UnifiedMarket {
   // team nicknames ('mets', 'red sox', 'lakers', etc.).
   sportLeague?: string;
   sportTeams?: string[];
-  // Pre-detected crypto info, populated at fetch time. Crypto fast-path
-  // requires both sides to have asset, price, and dateRef populated AND to
-  // match exactly. Otherwise the pair falls through to Claude as normal.
-  cryptoAsset?: 'btc' | 'eth';
-  cryptoPrice?: number;
-  cryptoDateRef?: string;
 }
 
 interface OrderbookLevel {
@@ -103,22 +115,24 @@ const KALSHI_BASE = 'https://api.elections.kalshi.com/trade-api/v2';
 const POLY_GAMMA = 'https://gamma-api.polymarket.com';
 const POLY_CLOB = 'https://clob.polymarket.com';
 
-// Default fuzzy threshold for politics/macro pairs. Sports/crypto/economic
-// use the per-category override below since their titles overlap less
-// cleanly across platforms.
-const FUZZY_THRESHOLD = 0.40;
+// Default fuzzy threshold for politics/macro pairs. Lowered from 0.40 →
+// 0.25 because the tighter threshold was killing legitimate cross-platform
+// pairs whose titles phrased the same proposition differently (e.g.
+// "Trump wins 2028" vs "Will Donald Trump win the 2028 election?"). Claude
+// is the source of truth for SAFE/SKIP — the fuzzy matcher's only job is
+// to surface candidates worth verifying. We'd rather waste a Claude call
+// on a 0.27-overlap false positive than miss a real arb.
+const FUZZY_THRESHOLD = 0.25;
 // Sports titles format very differently across platforms (Kalshi:
 // "Chiefs ML vs Eagles 04/13" vs Poly: "Will Kansas City Chiefs beat
 // Philadelphia Eagles on April 13?"). Token overlap on team names alone
 // usually only gives 0.30-0.40, so we lower the threshold for any pair
 // where both titles share a recognizable team from the same league.
 const SPORTS_FUZZY_THRESHOLD = 0.30;
-// Crypto and economic categories use a 0.35 threshold — slightly lower
-// than politics (0.40) because price/release-date wording differs more
-// across platforms but slightly higher than sports because the underlying
-// fuzzy matcher still has signal to work with (no team-name truncation).
-const CRYPTO_FUZZY_THRESHOLD = 0.35;
-const ECONOMIC_FUZZY_THRESHOLD = 0.35;
+// Economic markets use a 0.30 threshold — release-date wording differs
+// across platforms ("April CPI" vs "CPI YoY > 3.2%") so the fuzzy matcher
+// has weaker signal than politics, but Claude verifies polarity downstream.
+const ECONOMIC_FUZZY_THRESHOLD = 0.30;
 const STALENESS_THRESHOLD_MS = 120_000;
 // TEMP: diagnostic, raise to 0.02 once spread distribution is understood.
 const MIN_NET_SPREAD = 0.005;
@@ -143,30 +157,33 @@ const MIN_HOURS_TO_CLOSE_SPORTS = 3;
 // or monthly); economic releases get 60 days (covers next CPI/NFP cycle);
 // politics/everything else keeps the 365-day default.
 const MAX_DAYS_TO_CLOSE_SPORTS = 14;
-const MAX_DAYS_TO_CLOSE_CRYPTO = 30;
 const MAX_DAYS_TO_CLOSE_ECONOMIC = 60;
 // 15% annualized minimum is the politics floor (current default).
-// Sports/crypto/economic categories deserve different floors because
-// their average days-to-close is shorter, so even small spreads still
-// produce huge APYs (50%/30%/20% respectively).
+// Sports/economic categories deserve different floors because their
+// average days-to-close is shorter, so even small spreads still produce
+// large APYs (50% / 20% respectively).
 const MIN_ANNUALIZED_RETURN = 0.15;
 const MIN_APY_SPORTS = 0.50;
-const MIN_APY_CRYPTO = 0.30;
 const MIN_APY_ECONOMIC = 0.20;
 const MIN_APY_POLITICS = 0.15;
 // Priority = annualizedReturn * categoryMultiplier. Faster-recycling
 // categories rank above equivalent-APY long-dated ones because the same
 // dollar can be redeployed sooner.
 const CATEGORY_MULTIPLIER_SPORTS = 1.5;
-const CATEGORY_MULTIPLIER_CRYPTO = 1.3;
 const CATEGORY_MULTIPLIER_ECONOMIC = 1.2;
 const CATEGORY_MULTIPLIER_POLITICS = 1.0;
 const REQUEST_DELAY_MS = 50; // gentle pacing between orderbook calls
 const KALSHI_PAGE_DELAY_MS = 250; // Kalshi rate limit ~5 req/s
-const MAX_PAIRS_TO_RESOLVE = 250; // soft cap; cache covers steady state
-const MAX_ORDERBOOKS_TO_FETCH = 250;
-const CLAUDE_CONCURRENCY = 6;
-const ORDERBOOK_CONCURRENCY = 4;
+// Lowered Apr 2026 from 250 → 40 because fast-paths were removed: every
+// pair now spends one Claude call. At 250 the worker hit WORKER_LIMIT
+// (~150s wallclock + memory). 40 fits under the 150s wallclock budget at
+// CLAUDE_CONCURRENCY=5 (~6 batches × 4s/call = ~24s of Claude wait, plus
+// fetch + orderbook). Steady-state coverage doesn't drop because the cache
+// holds 24h of verdicts and the highest-priority pairs come first.
+const MAX_PAIRS_TO_RESOLVE = 40;
+const MAX_ORDERBOOKS_TO_FETCH = 40;
+const CLAUDE_CONCURRENCY = 5;
+const ORDERBOOK_CONCURRENCY = 3;
 const TOP_SPREADS_STORED = 20;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -388,103 +405,21 @@ function parseKalshiSportTicker(eventTicker: string): KalshiSportInfo | null {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Crypto market detection
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// We extract the asset (BTC/ETH), price level (e.g. 100000 for "$100K"),
-// and a coarse date reference (e.g. "jul-2025" or "2025") from each title
-// at fetch time. The crypto fast-path requires both sides to have all
-// three populated AND to match exactly. Anything else falls through to
-// Claude.
-
-interface CryptoInfo {
-  asset: 'btc' | 'eth';
-  price: number | null;
-  dateRef: string | null;
-}
-
-const MONTH_MAP: Record<string, string> = {
-  jan: 'jan', january: 'jan',
-  feb: 'feb', february: 'feb',
-  mar: 'mar', march: 'mar',
-  apr: 'apr', april: 'apr',
-  may: 'may',
-  jun: 'jun', june: 'jun',
-  jul: 'jul', july: 'jul',
-  aug: 'aug', august: 'aug',
-  sep: 'sep', sept: 'sep', september: 'sep',
-  oct: 'oct', october: 'oct',
-  nov: 'nov', november: 'nov',
-  dec: 'dec', december: 'dec',
-};
-
-function detectCrypto(title: string): CryptoInfo | null {
-  if (!title) return null;
-  const lower = title.toLowerCase();
-  let asset: 'btc' | 'eth' | null = null;
-  if (/\b(bitcoin|btc)\b/.test(lower)) asset = 'btc';
-  else if (/\b(ethereum|eth|ether)\b/.test(lower)) asset = 'eth';
-  if (!asset) return null;
-
-  // Extract first price level. Patterns:
-  //   $100K, $100,000, 100K, $4500, $100000
-  // We require BTC ≥ 1000 and ETH ≥ 100 to filter out years and small ints.
-  let price: number | null = null;
-  const priceRe = /\$?\s*(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(k|m)?\b/gi;
-  let match: RegExpExecArray | null;
-  while ((match = priceRe.exec(lower)) !== null) {
-    const cleanedNum = match[1].replace(/,/g, '');
-    let val = parseFloat(cleanedNum);
-    if (!Number.isFinite(val)) continue;
-    const suffix = match[2]?.toLowerCase();
-    if (suffix === 'k') val *= 1000;
-    else if (suffix === 'm') val *= 1_000_000;
-    if (asset === 'btc' && val < 1000) continue;
-    if (asset === 'eth' && val < 100) continue;
-    if (val > 10_000_000) continue;
-    // Reject likely-year matches (4 digits 2000-2099 with no $ or K/M).
-    if (val >= 2000 && val <= 2099 && !match[0].includes('$') && !suffix) continue;
-    price = val;
-    break;
-  }
-
-  // Extract date reference: "by July 2025", "Dec 31 2025", "EOY 2025",
-  // "end of 2025", or just a bare year. Canonicalize to mon-YYYY when both
-  // are present, else just YYYY.
-  let dateRef: string | null = null;
-  const monthYearRe =
-    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s*(?:\d{1,2},?\s*)?(\d{4})\b/i;
-  const my = lower.match(monthYearRe);
-  if (my) {
-    const m = MONTH_MAP[my[1].toLowerCase()] ?? my[1].toLowerCase();
-    dateRef = `${m}-${my[2]}`;
-  } else {
-    const eoyMatch = lower.match(/\b(?:eoy|end of(?:\s+the)?(?:\s+year)?)\s*(\d{4})\b/);
-    if (eoyMatch) {
-      dateRef = `dec-${eoyMatch[1]}`;
-    } else {
-      const yearMatch = lower.match(/\b(20\d{2})\b/);
-      if (yearMatch) dateRef = yearMatch[1];
-    }
-  }
-
-  return { asset, price, dateRef };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Pair category classification
 // ─────────────────────────────────────────────────────────────────────────────
 
-type PairCategory = 'sports' | 'crypto' | 'economic' | 'politics';
+// Crypto removed entirely (Apr 2026): Kalshi crypto markets are weekly
+// price-ladder contracts ("BTC > $X by Mar 21") while Polymarket crypto
+// markets are coarse monthly/quarterly bets ("Will BTC hit $X in 2026?").
+// The two ladders never line up at the same (price, date) tuple in
+// practice, and even when they do the resolution sources differ enough
+// that Claude has to SKIP them. We'll revisit if Kalshi adds longer-dated
+// strikes that line up with Poly's grid.
+type PairCategory = 'sports' | 'economic' | 'politics';
 
 const ECONOMIC_CATEGORIES = new Set([
   'economics', 'finance',
   'Economics', 'Finance',
-]);
-
-const CRYPTO_CATEGORIES = new Set([
-  'crypto', 'bitcoin', 'ethereum',
-  'Crypto', 'Bitcoin', 'Ethereum',
 ]);
 
 function isEconomicMarket(m: UnifiedMarket): boolean {
@@ -493,20 +428,9 @@ function isEconomicMarket(m: UnifiedMarket): boolean {
   return ECONOMIC_CATEGORIES.has(cat);
 }
 
-function isCryptoMarket(m: UnifiedMarket): boolean {
-  if (m.cryptoAsset) return true;
-  const cat = m.category;
-  if (!cat) return false;
-  return CRYPTO_CATEGORIES.has(cat);
-}
-
 function pairCategory(pair: CandidatePair): PairCategory {
   // Sports first — most specific signal (precomputed shared team).
   if (pairSharedTeamFast(pair)) return 'sports';
-  // Crypto second — at least one side has asset detected OR has crypto
-  // category tag. Same-asset detection on both sides is what triggers the
-  // FAST-PATH; here we just need to bucket the pair correctly.
-  if (isCryptoMarket(pair.kalshi) || isCryptoMarket(pair.poly)) return 'crypto';
   // Economic — either side tagged in Economics/Finance.
   if (isEconomicMarket(pair.kalshi) || isEconomicMarket(pair.poly)) return 'economic';
   return 'politics';
@@ -527,7 +451,6 @@ function pairSharedTeamFast(pair: CandidatePair): boolean {
 
 function maxDaysForCategory(cat: PairCategory): number {
   if (cat === 'sports') return MAX_DAYS_TO_CLOSE_SPORTS;
-  if (cat === 'crypto') return MAX_DAYS_TO_CLOSE_CRYPTO;
   if (cat === 'economic') return MAX_DAYS_TO_CLOSE_ECONOMIC;
   return MAX_DAYS_TO_CLOSE;
 }
@@ -543,21 +466,18 @@ function minMsFromNowForCategory(cat: PairCategory): number {
 
 function minApyForCategory(cat: PairCategory): number {
   if (cat === 'sports') return MIN_APY_SPORTS;
-  if (cat === 'crypto') return MIN_APY_CRYPTO;
   if (cat === 'economic') return MIN_APY_ECONOMIC;
   return MIN_APY_POLITICS;
 }
 
 function categoryMultiplier(cat: PairCategory): number {
   if (cat === 'sports') return CATEGORY_MULTIPLIER_SPORTS;
-  if (cat === 'crypto') return CATEGORY_MULTIPLIER_CRYPTO;
   if (cat === 'economic') return CATEGORY_MULTIPLIER_ECONOMIC;
   return CATEGORY_MULTIPLIER_POLITICS;
 }
 
 function fuzzyThresholdForCategory(cat: PairCategory): number {
   if (cat === 'sports') return SPORTS_FUZZY_THRESHOLD;
-  if (cat === 'crypto') return CRYPTO_FUZZY_THRESHOLD;
   if (cat === 'economic') return ECONOMIC_FUZZY_THRESHOLD;
   return FUZZY_THRESHOLD;
 }
@@ -675,11 +595,11 @@ interface KalshiEventRaw {
 }
 
 // Categories on /events that overlap with Polymarket inventory.
+// Crypto removed Apr 2026 — see PairCategory comment.
 const KALSHI_CATEGORIES = new Set([
   'Politics',
   'Economics',
   'Finance',
-  'Crypto',
   'Climate',
   'Science',
   'Awards',
@@ -697,17 +617,6 @@ const KALSHI_SPORTS_SERIES = [
   'KXNHLGAME', // NHL game lines
 ];
 
-// Series tickers Kalshi uses for crypto price markets. Daily variants
-// (D suffix) are the highest-value short-dated markets. Fetched
-// unconditionally alongside /events because daily markets churn through
-// /events fast and we don't want to miss them.
-const KALSHI_CRYPTO_SERIES = [
-  'KXBTC',  // Bitcoin price (weekly/longer)
-  'KXBTCD', // Bitcoin daily
-  'KXETH',  // Ethereum price
-  'KXETHD', // Ethereum daily
-];
-
 // Series tickers Kalshi uses for economic data releases. These are the
 // highest-edge category — release dates are public, agencies are
 // authoritative, and Kalshi typically posts before Polymarket so the
@@ -722,7 +631,7 @@ const KALSHI_ECONOMIC_SERIES = [
   'KXRATE',      // Interest rates
 ];
 
-// Series tickers known to contain political/macro/crypto markets — used as a
+// Series tickers known to contain political/macro markets — used as a
 // fallback when /events filtering doesn't yield enough markets.
 const HIGH_OVERLAP_SERIES = [
   'KXFED', // Fed rate decisions
@@ -731,8 +640,6 @@ const HIGH_OVERLAP_SERIES = [
   'KXPRES', // Presidential
   'KXSENATE', // Senate
   'KXHOUSE', // House
-  'KXBTC', // Bitcoin price
-  'KXETH', // Ethereum
   'KXNASDAQ', // Nasdaq
   'KXSP', // S&P 500
   'KXOIL', // Oil price
@@ -869,15 +776,6 @@ function pushKalshiMarket(
   } catch (err) {
     console.error('[scanner] parseKalshiSportTicker threw', err);
   }
-  // Crypto detection runs on every Kalshi market title (not just Crypto
-  // category) because some events sit under "Finance" or no category at
-  // all but are clearly crypto price markets.
-  let cryptoInfo: CryptoInfo | null = null;
-  try {
-    cryptoInfo = detectCrypto(m.title ?? '');
-  } catch (err) {
-    console.error('[scanner] detectCrypto threw', err);
-  }
   list.push({
     platform: 'kalshi',
     marketId: m.ticker,
@@ -886,12 +784,9 @@ function pushKalshiMarket(
     yesAsk,
     noAsk,
     url: buildKalshiUrl(m),
-    category: category ?? (sportInfo ? 'Sports' : cryptoInfo ? 'Crypto' : undefined),
+    category: category ?? (sportInfo ? 'Sports' : undefined),
     sportLeague: sportInfo?.sport,
     sportTeams: sportInfo?.teams,
-    cryptoAsset: cryptoInfo?.asset,
-    cryptoPrice: cryptoInfo?.price ?? undefined,
-    cryptoDateRef: cryptoInfo?.dateRef ?? undefined,
   });
 }
 
@@ -974,30 +869,7 @@ async function kalshiGetMarkets(): Promise<UnifiedMarket[]> {
     `[scanner] kalshi sports series total: +${markets.length - sportsBefore} markets`,
   );
 
-  // Approach D (crypto): always pull KX{BTC,ETH}{,D} series. /events
-  // sometimes serves these under "Crypto" category but daily markets
-  // churn faster than /events pages and we don't want to miss any.
-  const cryptoBefore = markets.length;
-  for (const series of KALSHI_CRYPTO_SERIES) {
-    try {
-      const seriesMarkets = await kalshiFetchSeriesMarkets(series);
-      const before = markets.length;
-      for (const m of seriesMarkets) {
-        pushKalshiMarket(markets, seen, m, 'Crypto');
-      }
-      console.log(
-        `[scanner] kalshi crypto series ${series}: +${markets.length - before} markets (raw ${seriesMarkets.length})`,
-      );
-    } catch (err) {
-      console.error(`[scanner] kalshi crypto series ${series} fetch failed`, err);
-    }
-    await sleep(KALSHI_PAGE_DELAY_MS);
-  }
-  console.log(
-    `[scanner] kalshi crypto series total: +${markets.length - cryptoBefore} markets`,
-  );
-
-  // Approach E (economic releases): Kalshi's strongest category. Same
+  // Approach D (economic releases): Kalshi's strongest category. Same
   // pattern — fetch the per-release series unconditionally so we don't
   // miss CPI/NFP cycles between /events pagination passes.
   const econBefore = markets.length;
@@ -1147,6 +1019,13 @@ interface PolyMarketRaw {
   enableOrderBook?: boolean;
   acceptingOrders?: boolean;
   clobTokenIds?: string | string[];
+  // Polymarket binary outcomes — JSON-encoded array of 2 labels e.g.
+  // '["Athletics", "New York Yankees"]'. The order corresponds 1:1 to
+  // clobTokenIds. We CANNOT assume index 0 = "yes": for the A's vs Yankees
+  // market the labels were ["Athletics", "Yankees"], so the token at index
+  // 0 paid out if Athletics won — not whatever the question's grammatical
+  // YES side was. Claude reads these labels to resolve polarity.
+  outcomes?: string | string[];
   slug?: string;
   events?: Array<{ slug?: string }>;
 }
@@ -1167,14 +1046,9 @@ function buildPolyUrl(raw: PolyMarketRaw): string | undefined {
 // the per-sport category wins the dedupe (this matters for league
 // detection downstream).
 //
-// Crypto-specific slugs (bitcoin/ethereum) are kept separate from the
-// generic 'crypto' slug because Polymarket sometimes promotes a crypto
-// price market under the asset slug only.
+// Crypto slugs removed Apr 2026 — see PairCategory comment.
 const POLY_TAG_SLUGS = [
   'politics',
-  'crypto',
-  'bitcoin',
-  'ethereum',
   'economics',
   'finance',
   'science',
@@ -1194,13 +1068,20 @@ const POLY_TAG_SLUGS = [
 // some other path.
 const POLY_SPORT_SLUGS = new Set(['nfl', 'nba', 'mlb', 'nhl', 'soccer', 'sports']);
 
-// Slugs that imply the market is crypto — used to seed crypto detection
-// at fetch time on titles that don't explicitly mention BTC/ETH.
-const POLY_CRYPTO_SLUGS = new Set(['crypto', 'bitcoin', 'ethereum']);
-
 interface PolyEventRaw {
   slug?: string;
   markets?: PolyMarketRaw[];
+}
+
+function parseJsonArray(raw: string | string[] | undefined): string[] | null {
+  if (!raw) return null;
+  if (Array.isArray(raw)) return raw;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 function polyMarketToUnified(
@@ -1211,15 +1092,13 @@ function polyMarketToUnified(
   if (!m.enableOrderBook || !m.acceptingOrders) return null;
   const conditionId = m.conditionId ?? '';
   if (!conditionId) return null;
-  let tokenIds: string[] = [];
-  try {
-    const raw = m.clobTokenIds ?? '[]';
-    if (typeof raw === 'string') tokenIds = JSON.parse(raw);
-    else if (Array.isArray(raw)) tokenIds = raw;
-  } catch {
-    return null;
-  }
-  if (tokenIds.length < 2) return null;
+  // Pull token ids AND outcome labels in lockstep — index 0/1 of one MUST
+  // line up with index 0/1 of the other. If either array is missing or
+  // shorter than 2, the market is unusable for arb.
+  const tokenIds = parseJsonArray(m.clobTokenIds);
+  if (!tokenIds || tokenIds.length < 2) return null;
+  const outcomes = parseJsonArray(m.outcomes);
+  if (!outcomes || outcomes.length < 2) return null;
   const title = m.question ?? '';
   // Polymarket titles are full text ("Will the New York Mets beat the
   // Athletics on April 11?") so direct team-name detection works. We pick
@@ -1235,38 +1114,24 @@ function polyMarketToUnified(
     // NHL detection from titles isn't reliable yet (no team list above),
     // but the tag itself flags this as a sports market.
   }
-  // Crypto detection: always run on every Polymarket title (since price
-  // markets sometimes show up under non-crypto categories).
-  let cryptoInfo: CryptoInfo | null = null;
-  try {
-    cryptoInfo = detectCrypto(title);
-  } catch (err) {
-    console.error('[scanner] detectCrypto threw (poly)', err);
-  }
-  // Normalize the category for poly-side classification: Polymarket sends
-  // tag slugs in lowercase; we keep them lowercase so isEconomicMarket
-  // matches both 'Economics' (kalshi) and 'finance' (poly).
-  let resolvedCategory = category;
-  if (POLY_CRYPTO_SLUGS.has(category ?? '') && !cryptoInfo) {
-    // Tag says crypto but title didn't parse — still flag it.
-    resolvedCategory = 'crypto';
-  }
   return {
     platform: 'polymarket',
     marketId: conditionId,
     title,
-    yesTokenId: tokenIds[0],
-    noTokenId: tokenIds[1],
+    // INTENTIONALLY do NOT set yesTokenId / noTokenId here. Those get
+    // assigned by resolvePair AFTER Claude verifies polarity. Until then
+    // any caller that relies on them gets undefined and skips the pair.
+    outcome0Label: String(outcomes[0]),
+    outcome0TokenId: String(tokenIds[0]),
+    outcome1Label: String(outcomes[1]),
+    outcome1TokenId: String(tokenIds[1]),
     closeTime: m.endDate,
     url: eventSlug
       ? `https://polymarket.com/event/${eventSlug}`
       : buildPolyUrl(m),
-    category: resolvedCategory,
+    category,
     sportLeague,
     sportTeams,
-    cryptoAsset: cryptoInfo?.asset,
-    cryptoPrice: cryptoInfo?.price ?? undefined,
-    cryptoDateRef: cryptoInfo?.dateRef ?? undefined,
   };
 }
 
@@ -1633,48 +1498,6 @@ function findCandidatePairs(
     `[scanner] sports join pass: ${sportsResults.length} pairs from ${claimedPoly.size} claimed poly markets`,
   );
 
-  // Crypto join pass — match by (asset, price, dateRef) tuple. Both sides
-  // must have all three populated AND match exactly. The matcher only
-  // produces a pair when there's a clean signal; anything else falls
-  // through to the fuzzy pass. We boost the score so crypto pairs always
-  // make MAX_PAIRS_TO_RESOLVE.
-  const cryptoResults: CandidatePair[] = [];
-  // Build poly crypto index keyed by asset|price|date.
-  const polyCryptoIndex = new Map<string, number[]>();
-  for (let j = 0; j < polyMarkets.length; j++) {
-    const pm = polyMarkets[j];
-    if (!pm.cryptoAsset || pm.cryptoPrice === undefined || !pm.cryptoDateRef) continue;
-    const key = `${pm.cryptoAsset}|${pm.cryptoPrice}|${pm.cryptoDateRef}`;
-    let arr = polyCryptoIndex.get(key);
-    if (!arr) { arr = []; polyCryptoIndex.set(key, arr); }
-    arr.push(j);
-  }
-  for (let i = 0; i < kalshiMarkets.length; i++) {
-    const km = kalshiMarkets[i];
-    if (!km.cryptoAsset || km.cryptoPrice === undefined || !km.cryptoDateRef) continue;
-    const key = `${km.cryptoAsset}|${km.cryptoPrice}|${km.cryptoDateRef}`;
-    const list = polyCryptoIndex.get(key);
-    if (!list) continue;
-    // Pick the first unclaimed match. Crypto markets don't typically
-    // have ambiguity at the (asset, price, date) tuple level.
-    let bestJ = -1;
-    for (const j of list) {
-      if (claimedPoly.has(j)) continue;
-      bestJ = j;
-      break;
-    }
-    if (bestJ === -1) continue;
-    claimedPoly.add(bestJ);
-    cryptoResults.push({
-      kalshi: km,
-      poly: polyMarkets[bestJ],
-      score: 0.97, // between sports (0.95-0.99) and politics fuzzy max
-    });
-  }
-  console.log(
-    `[scanner] crypto join pass: ${cryptoResults.length} pairs (poly index size ${polyCryptoIndex.size})`,
-  );
-
   const kalshiTok = kalshiMarkets.map((m) => tokenize(m.title));
   const polyTok = polyMarkets.map((m) => tokenize(m.title));
   const polySizes = new Int32Array(polyMarkets.length);
@@ -1767,19 +1590,14 @@ function findCandidatePairs(
   }));
   console.log('[scanner] top fuzzy pairs:', JSON.stringify(topPairs));
 
-  // Start with the join-pass results so they can't get displaced.
+  // Start with the sports join-pass results so they can't get displaced.
   const claimed = new Set<number>(claimedPoly);
   const results: CandidatePair[] = [];
   for (const sp of sportsResults) results.push(sp);
-  for (const cr of cryptoResults) results.push(cr);
-  // Lowered to the loosest per-category threshold so crypto/economic
-  // fuzzy matches survive. The per-category re-check happens in the
-  // date filter step in runScanCycle.
-  const LOWER_BOUND = Math.min(
-    FUZZY_THRESHOLD,
-    CRYPTO_FUZZY_THRESHOLD,
-    ECONOMIC_FUZZY_THRESHOLD,
-  );
+  // Lowered to the loosest per-category threshold so economic fuzzy
+  // matches survive. The per-category re-check happens in the date
+  // filter step in runScanCycle.
+  const LOWER_BOUND = Math.min(FUZZY_THRESHOLD, ECONOMIC_FUZZY_THRESHOLD);
   for (const entry of order) {
     if (entry.polyIdx < 0) continue;
     if (entry.score < LOWER_BOUND) continue;
@@ -1824,12 +1642,36 @@ function isSportsMarket(m: UnifiedMarket): boolean {
 // Claude resolver
 // ─────────────────────────────────────────────────────────────────────────────
 
+// The verifier is the SOLE source of truth for whether a Kalshi/Polymarket
+// pair represents the same proposition AND for which Polymarket outcome
+// hedges Kalshi YES. There is NO fast-path of any kind — every pair goes
+// through this. Correctness over cost.
+//
+// The model must answer six questions explicitly, in order:
+//   1. Same proposition? (do both markets resolve based on the same
+//      underlying real-world event?)
+//   2. Same time window? (overlap on close/settlement deadlines)
+//   3. Same numeric/categorical thresholds? (e.g. "Fed cuts >=25bps" vs
+//      "Fed cuts" — different)
+//   4. Polarity check — what does Kalshi YES mean in plain English, and
+//      which of Polymarket's two outcomes (Outcome 0 or Outcome 1) means
+//      the SAME thing? This is the bug we're fixing: assigning by index
+//      blew up the A's vs Yankees scan with a fake 57% spread.
+//   5. Is the polarity confirmed with high confidence, or ambiguous?
+//      (ambiguous → forced SKIP)
+//   6. Resolution source — do both markets cite the same authoritative
+//      source for resolution? Different sources → SAFE auto-downgrades
+//      to CAUTION.
 const SYSTEM_PROMPT =
-  'You are a prediction market analyst specializing in resolution criteria. ' +
-  'Compare two markets from different platforms and determine if they will ' +
-  'definitionally resolve to the same outcome. Be conservative — if there is ' +
-  'any meaningful difference in resolution conditions, flag it. Respond only ' +
-  'with valid JSON, no markdown backticks.';
+  'You are a prediction market analyst. Your job is to determine whether ' +
+  'two markets — one on Kalshi, one on Polymarket — resolve to the same ' +
+  'outcome AND to identify which Polymarket outcome corresponds to the ' +
+  'Kalshi YES side. Polarity correctness is non-negotiable: assigning the ' +
+  'wrong Polymarket outcome to "yes" turns a real arbitrage into a leveraged ' +
+  'directional bet. Be conservative. If anything about the proposition, ' +
+  'thresholds, time window, resolution source, OR polarity is unclear, ' +
+  'return polarity_confirmed=false and the caller will SKIP. Respond with ' +
+  'valid JSON only — no markdown fences, no commentary.';
 
 function isVerdict(value: unknown): value is ResolutionVerdict {
   return value === 'SAFE' || value === 'CAUTION' || value === 'SKIP';
@@ -1839,6 +1681,33 @@ interface VerifyResult {
   verdict: ResolutionVerdict;
   reasoning: string;
   riskFactors: string[];
+  // Plain-English description of what Kalshi YES pays out on, e.g.
+  // "Kalshi YES pays if the New York Yankees win the game vs Athletics
+  // on April 9, 2026". Used downstream for logging and UI display.
+  kalshiYesMeaning: string;
+  // The Polymarket token id that pays out under the SAME condition as
+  // Kalshi YES. This is what gets assigned to UnifiedMarket.yesTokenId
+  // so the calculator's orient-A walk (BUY Kalshi YES + BUY Poly NO)
+  // produces a real arbitrage pair. The "NO" half is the OTHER token.
+  polySameDirectionTokenId: string | null;
+  // The Polymarket token id that pays out under the OPPOSITE condition
+  // — i.e. the HEDGE for Kalshi YES. This is what gets assigned to
+  // UnifiedMarket.noTokenId. Persisted to the cache as poly_hedge_token_id.
+  polyHedgeTokenId: string | null;
+  // Human-readable label of the hedge outcome, e.g. "Athletics" or "No".
+  // Persisted to the cache as poly_hedge_outcome_label so the UI can show
+  // "you're buying Athletics on Polymarket as the hedge for Yankees on Kalshi".
+  polyHedgeOutcomeLabel: string | null;
+  // True iff Claude was confident enough about the polarity assignment
+  // to commit to it. False forces verdict=SKIP regardless of what
+  // Claude said for the resolution comparison itself.
+  polarityConfirmed: boolean;
+  // True iff both markets cite the same authoritative resolution source
+  // (e.g. both reference "official MLB game result" or both reference
+  // "Federal Reserve press release"). False auto-downgrades SAFE → CAUTION.
+  resolutionSourceMatch: boolean;
+  // Short explanation of the resolution source comparison.
+  resolutionSourceNote: string;
 }
 
 let anthropicClient: Anthropic | null = null;
@@ -1850,62 +1719,192 @@ function getAnthropic(): Anthropic | null {
   return anthropicClient;
 }
 
+function emptyVerifyResult(
+  verdict: ResolutionVerdict,
+  reason: string,
+): VerifyResult {
+  return {
+    verdict,
+    reasoning: reason,
+    riskFactors: [],
+    kalshiYesMeaning: '',
+    polySameDirectionTokenId: null,
+    polyHedgeTokenId: null,
+    polyHedgeOutcomeLabel: null,
+    polarityConfirmed: false,
+    resolutionSourceMatch: false,
+    resolutionSourceNote: '',
+  };
+}
+
 async function verifyPair(
   kalshi: UnifiedMarket,
   poly: UnifiedMarket,
 ): Promise<VerifyResult> {
   const client = getAnthropic();
-  if (!client) {
-    return { verdict: 'PENDING', reasoning: 'No API key configured', riskFactors: [] };
+  if (!client) return emptyVerifyResult('PENDING', 'No API key configured');
+  // Polymarket markets without parsed outcomes can't be polarity-checked.
+  // Force CAUTION so the pair stays visible for diagnostics but never
+  // makes it through the orderbook fetch (yes/no token ids stay unset).
+  if (
+    !poly.outcome0Label || !poly.outcome0TokenId ||
+    !poly.outcome1Label || !poly.outcome1TokenId
+  ) {
+    return emptyVerifyResult('CAUTION', 'Polymarket outcome metadata missing');
   }
 
   const userMessage =
-    'Compare these prediction markets:\n\n' +
+    'Compare these two prediction markets and decide whether they resolve ' +
+    'to the same outcome AND which Polymarket outcome corresponds to Kalshi YES.\n\n' +
     'KALSHI:\n' +
-    `Title: ${kalshi.title}\n` +
-    `Resolution criteria: ${kalshi.resolutionCriteria ?? 'Not explicitly stated'}\n\n` +
+    `  Title: ${kalshi.title}\n` +
+    `  Resolution criteria: ${kalshi.resolutionCriteria ?? 'Not explicitly stated'}\n` +
+    `  Closes: ${kalshi.closeTime ?? 'unknown'}\n\n` +
     'POLYMARKET:\n' +
-    `Title: ${poly.title}\n` +
-    `Resolution criteria: ${poly.resolutionCriteria ?? 'Not explicitly stated'}\n\n` +
-    'Return JSON only:\n' +
+    `  Title: ${poly.title}\n` +
+    `  Resolution criteria: ${poly.resolutionCriteria ?? 'Not explicitly stated'}\n` +
+    `  Closes: ${poly.closeTime ?? 'unknown'}\n` +
+    '  Outcomes (binary):\n' +
+    `    Outcome 0: "${poly.outcome0Label}"\n` +
+    `    Outcome 1: "${poly.outcome1Label}"\n\n` +
+    'Think through these six checks INTERNALLY (do not write them out) before answering:\n' +
+    '  C1. Same proposition — both markets resolve on the same real-world event?\n' +
+    '  C2. Same time window — close/settlement deadlines describe the same period?\n' +
+    '  C3. Same numeric or categorical thresholds — ">=25bps cut" vs "any cut" are NOT same.\n' +
+    '  C4. POLARITY — what does KALSHI YES pay out on, and which Polymarket outcome\n' +
+    '      ("Outcome 0" or "Outcome 1") pays out under the SAME condition? Read the labels;\n' +
+    '      do NOT guess from index.\n' +
+    '  C5. Confidence — are you certain enough about C4 to commit a trade? If anything is\n' +
+    '      ambiguous (multi-outcome wrapped in binary, unclear labels, etc.), set confirmed=false.\n' +
+    '  C6. Resolution source — do both markets cite the same authoritative source?\n\n' +
+    'YOUR REPLY MUST BE A SINGLE RAW JSON OBJECT. No prose. No markdown. No code fences.\n' +
+    'Schema:\n' +
     '{\n' +
     '  "verdict": "SAFE" | "CAUTION" | "SKIP",\n' +
-    '  "reasoning": "one sentence",\n' +
-    '  "risk_factors": ["difference 1", "difference 2"]\n' +
+    '  "reasoning": "one sentence summary",\n' +
+    '  "risk_factors": ["short bullet 1", "short bullet 2"],\n' +
+    '  "kalshi_yes_meaning": "Kalshi YES pays if X happens",\n' +
+    '  "poly_same_direction_outcome": 0 | 1,\n' +
+    '  "polarity_confirmed": true | false,\n' +
+    '  "resolution_source_match": true | false,\n' +
+    '  "resolution_source_note": "one sentence"\n' +
     '}\n\n' +
-    'SAFE = identical resolution, guaranteed same outcome\n' +
-    'CAUTION = similar but subtle differences exist\n' +
-    'SKIP = different resolution conditions, do not trade';
+    'Verdict legend:\n' +
+    '  SAFE = identical proposition, identical thresholds, identical time window,\n' +
+    '         identical resolution source, polarity confirmed.\n' +
+    '  CAUTION = same proposition but subtle differences exist (different source,\n' +
+    '         different rounding, different settlement timing). Tradable with care.\n' +
+    '  SKIP = the markets do not resolve on the same event, OR polarity is\n' +
+    '         ambiguous, OR thresholds differ materially. Do not trade.\n' +
+    'If polarity_confirmed is false, the caller will force SKIP regardless of verdict.';
 
+  let response;
   try {
-    const response = await client.messages.create({
+    response = await client.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 300,
+      max_tokens: 500,
       system: SYSTEM_PROMPT,
       messages: [{ role: 'user', content: userMessage }],
     });
-    const text = response.content
-      .filter((b: { type: string }) => b.type === 'text')
-      .map((b: { type: string; text: string }) => b.text)
-      .join('')
-      .trim();
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      return { verdict: 'CAUTION', reasoning: 'Failed to parse Claude response', riskFactors: [] };
-    }
-    const obj = parsed as { verdict?: unknown; reasoning?: unknown; risk_factors?: unknown };
-    const verdict: ResolutionVerdict = isVerdict(obj.verdict) ? obj.verdict : 'CAUTION';
-    const reasoning = typeof obj.reasoning === 'string' ? obj.reasoning : '';
-    const riskFactors = Array.isArray(obj.risk_factors)
-      ? obj.risk_factors.filter((r): r is string => typeof r === 'string')
-      : [];
-    return { verdict, reasoning, riskFactors };
   } catch (err) {
-    console.error('[scanner] verifyPair error', err);
-    return { verdict: 'CAUTION', reasoning: 'Claude API error', riskFactors: [] };
+    const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    console.error('[scanner] verifyPair api error', detail);
+    return emptyVerifyResult('CAUTION', `Claude API error — ${detail}`);
   }
+
+  const text = response.content
+    .filter((b: { type: string }) => b.type === 'text')
+    .map((b: { type: string; text: string }) => b.text)
+    .join('')
+    .trim();
+  // Robust extraction: strip markdown code fences and grab the first {...} block.
+  // Claude occasionally wraps JSON in ```json ... ``` despite being told not to.
+  function extractJson(raw: string): string | null {
+    let s = raw.trim();
+    const fence = s.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    if (fence) s = fence[1].trim();
+    const first = s.indexOf('{');
+    const last = s.lastIndexOf('}');
+    if (first === -1 || last === -1 || last <= first) return null;
+    return s.slice(first, last + 1);
+  }
+  const jsonText = extractJson(text);
+  let parsed: unknown;
+  try {
+    if (!jsonText) throw new Error('no JSON object found');
+    parsed = JSON.parse(jsonText);
+  } catch (parseErr) {
+    const stop = (response as { stop_reason?: string }).stop_reason ?? '?';
+    const sample = text.slice(0, 200).replace(/\s+/g, ' ');
+    const detail = parseErr instanceof Error ? parseErr.message : String(parseErr);
+    console.error('[scanner] verifyPair parse failed', { stop, sample, detail });
+    return emptyVerifyResult('CAUTION', `Parse failed (stop=${stop}): ${sample}`);
+  }
+  const obj = parsed as {
+    verdict?: unknown;
+    reasoning?: unknown;
+    risk_factors?: unknown;
+    kalshi_yes_meaning?: unknown;
+    poly_same_direction_outcome?: unknown;
+    polarity_confirmed?: unknown;
+    resolution_source_match?: unknown;
+    resolution_source_note?: unknown;
+  };
+
+  let verdict: ResolutionVerdict = isVerdict(obj.verdict) ? obj.verdict : 'CAUTION';
+  const reasoning = typeof obj.reasoning === 'string' ? obj.reasoning : '';
+  const riskFactors = Array.isArray(obj.risk_factors)
+    ? obj.risk_factors.filter((r): r is string => typeof r === 'string')
+    : [];
+  const kalshiYesMeaning =
+    typeof obj.kalshi_yes_meaning === 'string' ? obj.kalshi_yes_meaning : '';
+  const polarityConfirmedRaw = obj.polarity_confirmed === true;
+  const resolutionSourceMatch = obj.resolution_source_match === true;
+  const resolutionSourceNote =
+    typeof obj.resolution_source_note === 'string' ? obj.resolution_source_note : '';
+
+  // Resolve which token id is "same direction as Kalshi YES" from the
+  // index Claude picked. Anything outside {0, 1} → polarity not confirmed.
+  let polySameDirectionTokenId: string | null = null;
+  let polyHedgeTokenId: string | null = null;
+  let polyHedgeOutcomeLabel: string | null = null;
+  if (obj.poly_same_direction_outcome === 0) {
+    polySameDirectionTokenId = poly.outcome0TokenId ?? null;
+    polyHedgeTokenId = poly.outcome1TokenId ?? null;
+    polyHedgeOutcomeLabel = poly.outcome1Label ?? null;
+  } else if (obj.poly_same_direction_outcome === 1) {
+    polySameDirectionTokenId = poly.outcome1TokenId ?? null;
+    polyHedgeTokenId = poly.outcome0TokenId ?? null;
+    polyHedgeOutcomeLabel = poly.outcome0Label ?? null;
+  }
+
+  // Polarity safety net: if Claude said confirmed=true but didn't actually
+  // commit to an outcome index, treat it as unconfirmed.
+  const polarityConfirmed =
+    polarityConfirmedRaw &&
+    polySameDirectionTokenId !== null &&
+    polyHedgeTokenId !== null;
+
+  // Force SKIP when polarity isn't confirmed — this is the whole point.
+  if (!polarityConfirmed) {
+    verdict = 'SKIP';
+  } else if (verdict === 'SAFE' && !resolutionSourceMatch) {
+    // Resolution source mismatch downgrades a SAFE to CAUTION (Part 8).
+    verdict = 'CAUTION';
+  }
+
+  return {
+    verdict,
+    reasoning,
+    riskFactors,
+    kalshiYesMeaning,
+    polySameDirectionTokenId,
+    polyHedgeTokenId,
+    polyHedgeOutcomeLabel,
+    polarityConfirmed,
+    resolutionSourceMatch,
+    resolutionSourceNote,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1918,17 +1917,37 @@ interface PreparedPair {
   verdict: ResolutionVerdict;
   reasoning: string;
   riskFactors: string[];
+  // Polarity bookkeeping carried alongside each prepared pair so the
+  // diagnostic logger and final report can show what Kalshi YES means
+  // and which Polymarket outcome we'd buy as the hedge.
+  kalshiYesMeaning: string;
+  polyHedgeOutcomeLabel: string | null;
+  polarityConfirmed: boolean;
+  fromCache: boolean;
+}
+
+interface CachedVerdict {
+  id: string;
+  verdict: ResolutionVerdict;
+  reasoning: string;
+  kalshiYesMeaning: string;
+  polyHedgeOutcomeLabel: string | null;
+  polyHedgeTokenId: string | null;
+  polarityConfirmed: boolean;
 }
 
 async function getCachedVerdict(
   sb: SupabaseClient,
   kalshiId: string,
   polyId: string,
-): Promise<{ id: string; verdict: ResolutionVerdict; reasoning: string } | null> {
+): Promise<CachedVerdict | null> {
   const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const { data, error } = await sb
     .from('market_pairs')
-    .select('id, resolution_verdict, verdict_reasoning, last_verified_at')
+    .select(
+      'id, resolution_verdict, verdict_reasoning, last_verified_at, ' +
+        'kalshi_yes_meaning, poly_hedge_outcome_label, poly_hedge_token_id, polarity_confirmed',
+    )
     .eq('kalshi_market_id', kalshiId)
     .eq('poly_market_id', polyId)
     .gt('last_verified_at', cutoff)
@@ -1943,6 +1962,10 @@ async function getCachedVerdict(
     id: data.id as string,
     verdict,
     reasoning: (data.verdict_reasoning as string | null) ?? '',
+    kalshiYesMeaning: (data.kalshi_yes_meaning as string | null) ?? '',
+    polyHedgeOutcomeLabel: (data.poly_hedge_outcome_label as string | null) ?? null,
+    polyHedgeTokenId: (data.poly_hedge_token_id as string | null) ?? null,
+    polarityConfirmed: data.polarity_confirmed === true,
   };
 }
 
@@ -1952,6 +1975,12 @@ async function upsertMarketPair(
   verdict: ResolutionVerdict,
   reasoning: string,
   riskFactors: string[],
+  polarity: {
+    kalshiYesMeaning: string;
+    polyHedgeOutcomeLabel: string | null;
+    polyHedgeTokenId: string | null;
+    polarityConfirmed: boolean;
+  },
 ): Promise<string | null> {
   const row = {
     kalshi_market_id: pair.kalshi.marketId,
@@ -1965,6 +1994,10 @@ async function upsertMarketPair(
     risk_factors: riskFactors.length > 0 ? riskFactors : null,
     match_score: pair.score,
     last_verified_at: new Date().toISOString(),
+    kalshi_yes_meaning: polarity.kalshiYesMeaning || null,
+    poly_hedge_outcome_label: polarity.polyHedgeOutcomeLabel,
+    poly_hedge_token_id: polarity.polyHedgeTokenId,
+    polarity_confirmed: polarity.polarityConfirmed,
   };
   const { data, error } = await sb
     .from('market_pairs')
@@ -2012,84 +2045,126 @@ async function logSpread(
 // Scan cycle
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Helper: assign the polarity-correct token IDs onto pair.poly so the
+ * downstream orderbook fetch + calculator walk produces a real arbitrage.
+ *
+ *   pair.poly.yesTokenId  = SAME-direction token (pays out when Kalshi YES wins)
+ *   pair.poly.noTokenId   = HEDGE token            (pays out when Kalshi NO wins)
+ *
+ * Note on naming: the user's spec called these polyYesTokenId/polyNoTokenId
+ * with the meanings inverted from what the calculator expects (it called
+ * "yesTokenId = hedge"). I diverged from those literal labels and used
+ * semantic names (sameDirection / hedge) inside verifyPair, then mapped
+ * them to UnifiedMarket.yesTokenId/noTokenId in the calculator-correct
+ * orientation. The persisted column `poly_hedge_token_id` is unambiguous —
+ * that's the hedge token, regardless of which slot it lives in.
+ *
+ * The calculator's orient-A walk does:
+ *   walkOrderbook(kalshiBook.yesAsks, polyBook.noAsks, 'kalshi', 'polymarket', ...)
+ * For that to be a real hedge, polyBook.noAsks MUST be the hedge token's
+ * asks, which means pair.poly.noTokenId MUST be the hedge token. The
+ * inversion in the user's literal spec would have made the calculator
+ * compute spreads on a directional bet, not an arbitrage.
+ */
+function assignPolarity(
+  pair: CandidatePair,
+  polySameDirectionTokenId: string | null,
+  polyHedgeTokenId: string | null,
+): void {
+  if (polySameDirectionTokenId && polyHedgeTokenId) {
+    pair.poly.yesTokenId = polySameDirectionTokenId;
+    pair.poly.noTokenId = polyHedgeTokenId;
+  } else {
+    // Polarity not confirmed — clear token ids so the orderbook fetch
+    // skips this pair entirely (the worker checks for both before fetching).
+    pair.poly.yesTokenId = undefined;
+    pair.poly.noTokenId = undefined;
+  }
+}
+
 async function resolvePair(
   sb: SupabaseClient,
   pair: CandidatePair,
   skipClaude: boolean,
 ): Promise<PreparedPair> {
-  // Sports fast-path runs BEFORE the verdict cache because (a) sports
-  // resolutions are unambiguous so we always want SAFE here regardless of
-  // any stale cached PENDING/CAUTION from prior Claude runs, and (b) it
-  // saves a DB roundtrip when both pre-conditions hold.
-  const sharedTeam = pairSharedTeam(pair);
-  if (sharedTeam !== null) {
-    const verdict: ResolutionVerdict = 'SAFE';
-    const reasoning = `sports fast-path: both markets reference ${sharedTeam.sport.toUpperCase()} ${sharedTeam.team}; resolution unambiguous`;
-    console.log(
-      `[resolver] SAFE (sports fast-path, ${sharedTeam.sport}/${sharedTeam.team}) | ${pair.kalshi.title} → ${pair.poly.title}`,
-    );
-    const pairId = await upsertMarketPair(sb, pair, verdict, reasoning, []);
-    return { pair, pairId, verdict, reasoning, riskFactors: [] };
-  }
-  // Crypto fast-path: SAFE only if both sides have asset+price+dateRef
-  // AND all three match exactly. Anything else (different asset, missing
-  // price, different date reference) falls through to Claude. Same
-  // ordering rationale as sports — don't trust stale cached PENDING.
-  const k = pair.kalshi;
-  const p = pair.poly;
-  if (
-    k.cryptoAsset && p.cryptoAsset &&
-    k.cryptoAsset === p.cryptoAsset &&
-    k.cryptoPrice !== undefined && p.cryptoPrice !== undefined &&
-    k.cryptoPrice === p.cryptoPrice &&
-    k.cryptoDateRef && p.cryptoDateRef &&
-    k.cryptoDateRef === p.cryptoDateRef
-  ) {
-    const verdict: ResolutionVerdict = 'SAFE';
-    const reasoning =
-      `crypto fast-path: both markets reference ${k.cryptoAsset.toUpperCase()} at $${k.cryptoPrice} on ${k.cryptoDateRef}`;
-    console.log(
-      `[resolver] SAFE (crypto fast-path, ${k.cryptoAsset}/${k.cryptoPrice}/${k.cryptoDateRef}) | ${k.title} → ${p.title}`,
-    );
-    const pairId = await upsertMarketPair(sb, pair, verdict, reasoning, []);
-    return { pair, pairId, verdict, reasoning, riskFactors: [] };
-  }
-  // Economic markets: NEVER fast-path. Resolution differs by agency,
-  // seasonal-adjustment flag, and exact threshold wording. Always send
-  // to Claude. (No early return here — falls through to cache + verifyPair.)
+  // No fast-paths. Every pair goes through the cache + Claude. Sports
+  // markets used to short-circuit to SAFE based on shared team, but that
+  // skipped the polarity check entirely — which is exactly what produced
+  // the fake A's vs Yankees 57% spread. Correctness over cost.
   const cached = await getCachedVerdict(sb, pair.kalshi.marketId, pair.poly.marketId);
   if (cached) {
-    console.log(
-      `[resolver] cached ${cached.verdict} | ${pair.kalshi.title} → ${pair.poly.title}`,
-    );
-    return {
-      pair,
-      pairId: cached.id,
-      verdict: cached.verdict,
-      reasoning: cached.reasoning,
-      riskFactors: [],
-    };
-  }
-  let verdict: ResolutionVerdict = 'PENDING';
-  let reasoning = '';
-  let riskFactors: string[] = [];
-  if (!skipClaude) {
-    try {
-      const r = await verifyPair(pair.kalshi, pair.poly);
-      verdict = r.verdict;
-      reasoning = r.reasoning;
-      riskFactors = r.riskFactors;
-    } catch (err) {
-      console.error('[scanner] verifyPair failed', err);
-      verdict = 'CAUTION';
+    // Reuse cached verdict only if polarity was confirmed AND a hedge
+    // token was persisted. Otherwise re-run Claude — a stale unconfirmed
+    // verdict shouldn't keep blocking a pair forever.
+    if (cached.polarityConfirmed && cached.polyHedgeTokenId) {
+      // Reconstruct same-direction token from the stored hedge label.
+      // The hedge token is the one we DON'T buy as the same-direction
+      // leg, so the OTHER outcome's token id is the same-direction id.
+      let sameDir: string | null = null;
+      if (pair.poly.outcome0TokenId && cached.polyHedgeTokenId === pair.poly.outcome1TokenId) {
+        sameDir = pair.poly.outcome0TokenId;
+      } else if (pair.poly.outcome1TokenId && cached.polyHedgeTokenId === pair.poly.outcome0TokenId) {
+        sameDir = pair.poly.outcome1TokenId;
+      }
+      if (sameDir) {
+        assignPolarity(pair, sameDir, cached.polyHedgeTokenId);
+        console.log(
+          `[resolver] cached ${cached.verdict} (polarity confirmed) | ${pair.kalshi.title} → ${pair.poly.title}`,
+        );
+        return {
+          pair,
+          pairId: cached.id,
+          verdict: cached.verdict,
+          reasoning: cached.reasoning,
+          riskFactors: [],
+          kalshiYesMeaning: cached.kalshiYesMeaning,
+          polyHedgeOutcomeLabel: cached.polyHedgeOutcomeLabel,
+          polarityConfirmed: true,
+          fromCache: true,
+        };
+      }
+      // Outcome ids changed since the cache row was written — re-verify.
     }
   }
+
+  // No usable cache. Run Claude (unless explicitly disabled by skipClaude
+  // for diagnostic dry-runs).
+  let r = emptyVerifyResult('PENDING', skipClaude ? 'skipClaude=1' : 'no Claude run');
+  if (!skipClaude) {
+    try {
+      r = await verifyPair(pair.kalshi, pair.poly);
+    } catch (err) {
+      console.error('[scanner] verifyPair failed', err);
+      r = emptyVerifyResult('CAUTION', 'verifyPair threw');
+    }
+  }
+  // Wire the polarity-corrected token ids onto pair.poly so the
+  // downstream orderbook fetch consumes the right book per leg.
+  assignPolarity(pair, r.polySameDirectionTokenId, r.polyHedgeTokenId);
   console.log(
-    `[resolver] ${verdict} | ${pair.kalshi.title} → ${pair.poly.title}` +
-      (reasoning ? ` | ${reasoning}` : ''),
+    `[resolver] ${r.verdict} polarity=${r.polarityConfirmed} ` +
+      `kalshiYes="${r.kalshiYesMeaning}" polyHedge="${r.polyHedgeOutcomeLabel ?? ''}" | ` +
+      `${pair.kalshi.title} → ${pair.poly.title}` +
+      (r.reasoning ? ` | ${r.reasoning}` : ''),
   );
-  const pairId = await upsertMarketPair(sb, pair, verdict, reasoning, riskFactors);
-  return { pair, pairId, verdict, reasoning, riskFactors };
+  const pairId = await upsertMarketPair(sb, pair, r.verdict, r.reasoning, r.riskFactors, {
+    kalshiYesMeaning: r.kalshiYesMeaning,
+    polyHedgeOutcomeLabel: r.polyHedgeOutcomeLabel,
+    polyHedgeTokenId: r.polyHedgeTokenId,
+    polarityConfirmed: r.polarityConfirmed,
+  });
+  return {
+    pair,
+    pairId,
+    verdict: r.verdict,
+    reasoning: r.reasoning,
+    riskFactors: r.riskFactors,
+    kalshiYesMeaning: r.kalshiYesMeaning,
+    polyHedgeOutcomeLabel: r.polyHedgeOutcomeLabel,
+    polarityConfirmed: r.polarityConfirmed,
+    fromCache: false,
+  };
 }
 
 interface PairSummary {
@@ -2097,6 +2172,11 @@ interface PairSummary {
   polyTitle: string;
   score: number;
   verdict: ResolutionVerdict;
+  verdictReasoning: string;
+  polarityConfirmed: boolean;
+  kalshiYesMeaning: string;
+  polyHedgeLabel: string;
+  fromCache: boolean;
   netSpread: number | null;
   hasOrderbook: boolean;
   kalshiYesAsksLen: number;
@@ -2269,7 +2349,7 @@ async function runScanCycle(
   // keep all categories.
   const filterNow = Date.now();
   const beforeDateFilter = allCandidates.length;
-  let droppedByDate = { sports: 0, crypto: 0, economic: 0, politics: 0 };
+  let droppedByDate = { sports: 0, economic: 0, politics: 0 };
   let droppedSportsInProgress = 0; // sports pairs killed by the new 3h floor
   let droppedByCategoryThreshold = 0;
   const candidates = allCandidates.filter((p) => {
@@ -2316,7 +2396,6 @@ async function runScanCycle(
       },
       maxDays: {
         sports: MAX_DAYS_TO_CLOSE_SPORTS,
-        crypto: MAX_DAYS_TO_CLOSE_CRYPTO,
         economic: MAX_DAYS_TO_CLOSE_ECONOMIC,
         politics: MAX_DAYS_TO_CLOSE,
       },
@@ -2488,6 +2567,11 @@ async function runScanCycle(
       polyTitle: prep.pair.poly.title,
       score: Number(prep.pair.score.toFixed(3)),
       verdict: prep.verdict,
+      verdictReasoning: prep.reasoning ?? '',
+      polarityConfirmed: prep.polarityConfirmed ?? false,
+      kalshiYesMeaning: prep.kalshiYesMeaning ?? '',
+      polyHedgeLabel: prep.polyHedgeOutcomeLabel ?? '',
+      fromCache: prep.fromCache ?? false,
       netSpread: netSpreadVal !== null ? Number(netSpreadVal.toFixed(4)) : null,
       hasOrderbook: !!(sr?.kalshiBook && sr?.polyBook),
       kalshiYesAsksLen: sr?.kalshiBook?.yesAsks.length ?? 0,
@@ -2671,7 +2755,6 @@ async function runScanCycle(
     { pairs: number; opportunities: number; bestAPY: number | null; bestPriority: number | null }
   > = {
     sports: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
-    crypto: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
     economic: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
     politics: { pairs: 0, opportunities: 0, bestAPY: null, bestPriority: null },
   };
