@@ -131,6 +131,11 @@ const DIAGNOSTIC_WALK_THRESHOLD = -1.0;
 // out tie up capital for negligible annualized return.
 const MIN_DAYS_TO_CLOSE = 1;
 const MAX_DAYS_TO_CLOSE = 365;
+// Sports gets a per-hour minimum instead of a per-day minimum: a 3h cushion
+// is enough to filter "already in progress" and "about to start" games while
+// still allowing tonight's games scanned in the morning. 3 hours is the
+// floor to safely execute both legs (Kalshi auth, Poly tx, settlement).
+const MIN_HOURS_TO_CLOSE_SPORTS = 3;
 // Per-category date filter ceilings — the further out a market closes,
 // the more its annualized return decays and the more category-specific
 // resolution risk creeps in. Sports get the tightest window because games
@@ -169,6 +174,7 @@ const TOP_SPREADS_STORED = 20;
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MS_PER_DAY = 86_400_000;
+const MS_PER_HOUR = 3_600_000;
 
 function parseCloseTimeMs(s?: string | null): number | null {
   if (!s) return null;
@@ -524,6 +530,15 @@ function maxDaysForCategory(cat: PairCategory): number {
   if (cat === 'crypto') return MAX_DAYS_TO_CLOSE_CRYPTO;
   if (cat === 'economic') return MAX_DAYS_TO_CLOSE_ECONOMIC;
   return MAX_DAYS_TO_CLOSE;
+}
+
+// Earliest acceptable close time, expressed as ms-from-now. Sports uses an
+// hours-based floor (3h) so today's evening games still qualify in the
+// morning, but in-progress / about-to-start games are excluded entirely.
+// Other categories keep the 1-day (24h) global minimum.
+function minMsFromNowForCategory(cat: PairCategory): number {
+  if (cat === 'sports') return MIN_HOURS_TO_CLOSE_SPORTS * MS_PER_HOUR;
+  return MIN_DAYS_TO_CLOSE * MS_PER_DAY;
 }
 
 function minApyForCategory(cat: PairCategory): number {
@@ -2116,6 +2131,7 @@ async function runScanCycle(
   matchedCount: number;
   matchedCountPreDateFilter: number;
   pairsFilteredByDate: number;
+  droppedSportsInProgress: number;
   avgDaysToClose: number;
   dateBuckets: {
     expired: number;
@@ -2244,11 +2260,17 @@ async function runScanCycle(
 
   // 2.6 Hard date filter — drop any pair where EITHER market closes
   // outside its category-specific window. Sports get the tightest window
-  // (14d), crypto 30d, economic 60d, politics/everything else 365d. Pairs
-  // also have to clear a per-category fuzzy threshold check at this stage
-  // because the matcher uses a single low cutoff to keep all categories.
+  // (14d), crypto 30d, economic 60d, politics/everything else 365d. The
+  // per-category MINIMUM is the new piece: sports requires close >= now+3h
+  // (everything else: now+24h). This filters in-progress games, games
+  // already past their close, and games starting too soon to safely fill
+  // both legs. Pairs also have to clear a per-category fuzzy threshold
+  // check at this stage because the matcher uses a single low cutoff to
+  // keep all categories.
+  const filterNow = Date.now();
   const beforeDateFilter = allCandidates.length;
   let droppedByDate = { sports: 0, crypto: 0, economic: 0, politics: 0 };
+  let droppedSportsInProgress = 0; // sports pairs killed by the new 3h floor
   let droppedByCategoryThreshold = 0;
   const candidates = allCandidates.filter((p) => {
     const cat = pairCategory(p);
@@ -2262,14 +2284,17 @@ async function runScanCycle(
     const k = parseCloseTimeMs(p.kalshi.closeTime);
     const pl = parseCloseTimeMs(p.poly.closeTime);
     if (k === null || pl === null) return false;
-    const kDays = daysFromNow(k);
-    const pDays = daysFromNow(pl);
-    const maxDays = maxDaysForCategory(cat);
-    if (kDays < MIN_DAYS_TO_CLOSE || kDays > maxDays) {
+    const minMs = minMsFromNowForCategory(cat);
+    const earliestAllowed = filterNow + minMs;
+    if (k < earliestAllowed || pl < earliestAllowed) {
       droppedByDate[cat]++;
+      if (cat === 'sports') droppedSportsInProgress++;
       return false;
     }
-    if (pDays < MIN_DAYS_TO_CLOSE || pDays > maxDays) {
+    const maxDays = maxDaysForCategory(cat);
+    const kDays = daysFromNow(k, filterNow);
+    const pDays = daysFromNow(pl, filterNow);
+    if (kDays > maxDays || pDays > maxDays) {
       droppedByDate[cat]++;
       return false;
     }
@@ -2283,7 +2308,12 @@ async function runScanCycle(
       after: candidates.length,
       filteredOut: pairsFilteredByDate,
       droppedByDate,
+      droppedSportsInProgress,
       droppedByCategoryThreshold,
+      minClose: {
+        sports: `${MIN_HOURS_TO_CLOSE_SPORTS}h`,
+        other: `${MIN_DAYS_TO_CLOSE}d`,
+      },
       maxDays: {
         sports: MAX_DAYS_TO_CLOSE_SPORTS,
         crypto: MAX_DAYS_TO_CLOSE_CRYPTO,
@@ -2683,6 +2713,7 @@ async function runScanCycle(
     matchedCount: candidates.length,
     matchedCountPreDateFilter: beforeDateFilter,
     pairsFilteredByDate,
+    droppedSportsInProgress,
     avgDaysToClose: Number(avgDaysToClose.toFixed(2)),
     dateBuckets,
     clearedSpreadCount: clearedSpread.length,
@@ -2776,6 +2807,7 @@ serve(async (req) => {
       matchedCountPreDateFilter: result.matchedCountPreDateFilter,
       matchedCount: result.matchedCount,
       pairsFilteredByDate: result.pairsFilteredByDate,
+      droppedSportsInProgress: result.droppedSportsInProgress,
       avgDaysToClose: result.avgDaysToClose,
       dateBuckets: result.dateBuckets,
       opportunityCount: result.opportunities.length,
