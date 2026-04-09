@@ -94,6 +94,12 @@ function adaptOpportunity(opp: ArbitrageOpportunity, idx: number): Opportunity {
     effectiveCloseDate: opp.effectiveCloseDate,
     kalshiCloseDate: opp.kalshiCloseDate,
     polyCloseDate: opp.polyCloseDate,
+    polyUrl: opp.polyMarket.url,
+    kalshiUrl: opp.kalshiMarket.url,
+    verdictReasoning: opp.verdictReasoning,
+    riskFactors: opp.riskFactors,
+    kalshiYesMeaning: opp.kalshiYesMeaning,
+    polyHedgeOutcomeLabel: opp.polyHedgeOutcomeLabel,
   };
 }
 
@@ -386,11 +392,38 @@ export default function Opportunities() {
                         <DepthBar label="POLYMARKET DEPTH" depth={o.polyDepth} />
                         <DepthBar label="KALSHI DEPTH" depth={o.kalshiDepth} />
                       </div>
+                      {(o.kalshiYesMeaning || o.polyHedgeOutcomeLabel || o.verdictReasoning || (o.riskFactors && o.riskFactors.length > 0)) && (
+                        <div style={{ marginTop: 16, padding: 12, background: 'var(--bg-base)', borderRadius: 6, fontSize: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
+                          {o.kalshiYesMeaning && (
+                            <div>
+                              <div className="label" style={{ marginBottom: 3 }}>TRADE STRUCTURE</div>
+                              <div style={{ color: 'var(--text-primary)' }}>{o.kalshiYesMeaning}</div>
+                              {o.polyHedgeOutcomeLabel && (
+                                <div style={{ color: 'var(--text-secondary)', marginTop: 2 }}>Hedge: buy <span style={{ color: 'var(--accent)' }}>{o.polyHedgeOutcomeLabel}</span> on Polymarket</div>
+                              )}
+                            </div>
+                          )}
+                          {o.verdictReasoning && (
+                            <div>
+                              <div className="label" style={{ marginBottom: 3 }}>VERDICT REASONING</div>
+                              <div style={{ color: 'var(--text-secondary)' }}>{o.verdictReasoning}</div>
+                            </div>
+                          )}
+                          {o.riskFactors && o.riskFactors.length > 0 && (
+                            <div>
+                              <div className="label" style={{ marginBottom: 3 }}>RISK FACTORS</div>
+                              <ul style={{ margin: 0, paddingLeft: 16, color: 'var(--amber)', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                                {o.riskFactors.map((r, i) => <li key={i}>{r}</li>)}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      )}
                       <div style={{ display: 'flex', gap: 12, marginTop: 16 }}>
-                        <a href="#" style={{ fontSize: 12, color: 'var(--text-secondary)', border: '1px solid var(--border)', padding: '6px 12px', textDecoration: 'none' }}>
+                        <a href={o.polyUrl ?? '#'} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12, color: 'var(--text-secondary)', border: '1px solid var(--border)', padding: '6px 12px', textDecoration: 'none', opacity: o.polyUrl ? 1 : 0.4 }}>
                           VIEW ON POLYMARKET ↗
                         </a>
-                        <a href="#" style={{ fontSize: 12, color: 'var(--text-secondary)', border: '1px solid var(--border)', padding: '6px 12px', textDecoration: 'none' }}>
+                        <a href={o.kalshiUrl ?? '#'} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12, color: 'var(--text-secondary)', border: '1px solid var(--border)', padding: '6px 12px', textDecoration: 'none', opacity: o.kalshiUrl ? 1 : 0.4 }}>
                           VIEW ON KALSHI ↗
                         </a>
                       </div>

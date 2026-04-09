@@ -2508,14 +2508,20 @@ async function verifyPair(
     `    Outcome 1: "${poly.outcome1Label}"\n\n` +
     'Think through these six checks INTERNALLY (do not write them out) before answering:\n' +
     '  C1. Same proposition — both markets resolve on the same real-world event?\n' +
-    '  C2. Same time window — close/settlement deadlines describe the same period?\n' +
+    '  C2. Same time window — IMPORTANT: for UNIQUE one-time events (awards, political\n' +
+    '      deadlines, season championships, game-winner markets) a close-date gap of\n' +
+    '      up to 30 days is NORMAL and NOT a CAUTION factor — both platforms settle on\n' +
+    '      the same publicly announced result. Only flag close-date gaps for RECURRING\n' +
+    '      events (monthly CPI, weekly jobs) where the gap could mean a different period.\n' +
     '  C3. Same numeric or categorical thresholds — ">=25bps cut" vs "any cut" are NOT same.\n' +
     '  C4. POLARITY — what does KALSHI YES pay out on, and which Polymarket outcome\n' +
     '      ("Outcome 0" or "Outcome 1") pays out under the SAME condition? Read the labels;\n' +
     '      do NOT guess from index.\n' +
     '  C5. Confidence — are you certain enough about C4 to commit a trade? If anything is\n' +
     '      ambiguous (multi-outcome wrapped in binary, unclear labels, etc.), set confirmed=false.\n' +
-    '  C6. Resolution source — do both markets cite the same authoritative source?\n\n' +
+    '  C6. Resolution source — only matters for economic reports (CPI, jobs, FOMC).\n' +
+    '      For awards, sports, and political markets set resolution_source_match=true\n' +
+    '      since both platforms resolve on the same publicly announced result.\n\n' +
     'YOUR REPLY MUST BE A SINGLE RAW JSON OBJECT. No prose. No markdown. No code fences.\n' +
     'Schema:\n' +
     '{\n' +
@@ -2529,12 +2535,12 @@ async function verifyPair(
     '  "resolution_source_note": "one sentence"\n' +
     '}\n\n' +
     'Verdict legend:\n' +
-    '  SAFE = identical proposition, identical thresholds, identical time window,\n' +
-    '         identical resolution source, polarity confirmed.\n' +
-    '  CAUTION = same proposition but subtle differences exist (different source,\n' +
-    '         different rounding, different settlement timing). Tradable with care.\n' +
-    '  SKIP = the markets do not resolve on the same event, OR polarity is\n' +
-    '         ambiguous, OR thresholds differ materially. Do not trade.\n' +
+    '  SAFE = same proposition, same thresholds, polarity confirmed, no material\n' +
+    '         differences that would cause the markets to resolve differently.\n' +
+    '         Close-date gaps are NOT material for unique one-time events.\n' +
+    '  CAUTION = same proposition but a genuine risk exists — different threshold,\n' +
+    '         ambiguous scope, or for recurring markets a possible different period.\n' +
+    '  SKIP = different events, polarity ambiguous, or thresholds differ materially.\n' +
     'If polarity_confirmed is false, the caller will force SKIP regardless of verdict.';
 
   // Sports diagnostic: log exactly what Claude sees so we can debug why
@@ -2651,8 +2657,23 @@ async function verifyPair(
   if (!polarityConfirmed) {
     verdict = 'SKIP';
   } else if (verdict === 'SAFE' && !resolutionSourceMatch) {
-    // Resolution source mismatch downgrades a SAFE to CAUTION (Part 8).
-    verdict = 'CAUTION';
+    // Resolution source mismatch only downgrades SAFE→CAUTION for recurring
+    // economic report markets (CPI, jobs, FOMC) where the exact reporting
+    // body matters. For UNIQUE events — awards, political deadlines, season
+    // championships, game-winner markets — both platforms will resolve on
+    // the same publicly announced result regardless of which source they
+    // cite. Blanket-downgrading UNIQUE events to CAUTION because they don't
+    // explicitly name a resolution source in their metadata is too strict.
+    const isEconomicMarket =
+      kalshi.category === 'Economics' ||
+      /\b(cpi|pce|gdp|jobs|nfp|fomc|fed|inflation|unemployment|rate cut|rate hike)\b/i
+        .test(kalshi.title);
+    if (isEconomicMarket) {
+      verdict = 'CAUTION';
+    }
+    // For all other categories (sports, politics, awards, entertainment):
+    // keep SAFE — resolution source ambiguity is not a trading risk when
+    // the underlying event is unambiguous and unique.
   }
 
   return {
@@ -3664,6 +3685,8 @@ async function runScanCycle(
       verdict: r.prep.verdict,
       verdictReasoning: r.prep.reasoning,
       riskFactors: r.prep.riskFactors,
+      kalshiYesMeaning: r.prep.kalshiYesMeaning,
+      polyHedgeOutcomeLabel: r.prep.polyHedgeOutcomeLabel ?? undefined,
       levels: r.levels,
       bestNetSpread: r.bestNet,
       totalMaxProfit: Math.round(r.totalMax),

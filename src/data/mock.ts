@@ -43,6 +43,14 @@ export interface Opportunity {
   effectiveCloseDate?: string;
   kalshiCloseDate?: string;
   polyCloseDate?: string;
+  // Live URLs for direct platform links.
+  polyUrl?: string;
+  kalshiUrl?: string;
+  // Claude verification output — shown in expanded row.
+  verdictReasoning?: string;
+  riskFactors?: string[];
+  kalshiYesMeaning?: string;
+  polyHedgeOutcomeLabel?: string;
 }
 
 export const opportunities: Opportunity[] = [

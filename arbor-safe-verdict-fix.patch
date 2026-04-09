@@ -1,0 +1,201 @@
+From 8ee1f73da570903e3bfed3d55e5453620e9489ff Mon Sep 17 00:00:00 2001
+From: Isaac <isaac@arbor>
+Date: Thu, 9 Apr 2026 17:55:06 +0000
+Subject: [PATCH] Fix SAFE verdicts, wire external links, show verdict
+ reasoning in UI
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Remove blanket resolutionSourceMatch downgrade for non-economic markets
+  Awards, sports, political deadlines now keep SAFE verdict when resolution
+  source isn't explicitly stated — only economic reports (CPI/FOMC/jobs)
+  get downgraded to CAUTION for source mismatch
+- Update Claude prompt: C2 clarifies unique vs recurring event close-date gaps,
+  C6 now tells Claude to set resolution_source_match=true for awards/sports/politics
+- Wire Polymarket and Kalshi links to real URLs (polyMarket.url / kalshiMarket.url)
+- Add verdict reasoning panel to expanded opportunity row
+- Pass kalshiYesMeaning + polyHedgeOutcomeLabel to frontend
+- Update ArbitrageOpportunity type and Opportunity interface
+---
+ src/data/mock.ts                    |  8 ++++++
+ src/pages/Opportunities.tsx         | 37 +++++++++++++++++++++++--
+ src/types/index.ts                  |  3 ++
+ supabase/functions/scanner/index.ts | 43 ++++++++++++++++++++++-------
+ 4 files changed, 79 insertions(+), 12 deletions(-)
+
+diff --git a/src/data/mock.ts b/src/data/mock.ts
+index 5e00758..4733be1 100644
+--- a/src/data/mock.ts
++++ b/src/data/mock.ts
+@@ -43,6 +43,14 @@ export interface Opportunity {
+   effectiveCloseDate?: string;
+   kalshiCloseDate?: string;
+   polyCloseDate?: string;
++  // Live URLs for direct platform links.
++  polyUrl?: string;
++  kalshiUrl?: string;
++  // Claude verification output — shown in expanded row.
++  verdictReasoning?: string;
++  riskFactors?: string[];
++  kalshiYesMeaning?: string;
++  polyHedgeOutcomeLabel?: string;
+ }
+ 
+ export const opportunities: Opportunity[] = [
+diff --git a/src/pages/Opportunities.tsx b/src/pages/Opportunities.tsx
+index 7abb5c0..71fb590 100644
+--- a/src/pages/Opportunities.tsx
++++ b/src/pages/Opportunities.tsx
+@@ -94,6 +94,12 @@ function adaptOpportunity(opp: ArbitrageOpportunity, idx: number): Opportunity {
+     effectiveCloseDate: opp.effectiveCloseDate,
+     kalshiCloseDate: opp.kalshiCloseDate,
+     polyCloseDate: opp.polyCloseDate,
++    polyUrl: opp.polyMarket.url,
++    kalshiUrl: opp.kalshiMarket.url,
++    verdictReasoning: opp.verdictReasoning,
++    riskFactors: opp.riskFactors,
++    kalshiYesMeaning: opp.kalshiYesMeaning,
++    polyHedgeOutcomeLabel: opp.polyHedgeOutcomeLabel,
+   };
+ }
+ 
+@@ -386,11 +392,38 @@ export default function Opportunities() {
+                         <DepthBar label="POLYMARKET DEPTH" depth={o.polyDepth} />
+                         <DepthBar label="KALSHI DEPTH" depth={o.kalshiDepth} />
+                       </div>
++                      {(o.kalshiYesMeaning || o.polyHedgeOutcomeLabel || o.verdictReasoning || (o.riskFactors && o.riskFactors.length > 0)) && (
++                        <div style={{ marginTop: 16, padding: 12, background: 'var(--bg-base)', borderRadius: 6, fontSize: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
++                          {o.kalshiYesMeaning && (
++                            <div>
++                              <div className="label" style={{ marginBottom: 3 }}>TRADE STRUCTURE</div>
++                              <div style={{ color: 'var(--text-primary)' }}>{o.kalshiYesMeaning}</div>
++                              {o.polyHedgeOutcomeLabel && (
++                                <div style={{ color: 'var(--text-secondary)', marginTop: 2 }}>Hedge: buy <span style={{ color: 'var(--accent)' }}>{o.polyHedgeOutcomeLabel}</span> on Polymarket</div>
++                              )}
++                            </div>
++                          )}
++                          {o.verdictReasoning && (
++                            <div>
++                              <div className="label" style={{ marginBottom: 3 }}>VERDICT REASONING</div>
++                              <div style={{ color: 'var(--text-secondary)' }}>{o.verdictReasoning}</div>
++                            </div>
++                          )}
++                          {o.riskFactors && o.riskFactors.length > 0 && (
++                            <div>
++                              <div className="label" style={{ marginBottom: 3 }}>RISK FACTORS</div>
++                              <ul style={{ margin: 0, paddingLeft: 16, color: 'var(--amber)', display: 'flex', flexDirection: 'column', gap: 2 }}>
++                                {o.riskFactors.map((r, i) => <li key={i}>{r}</li>)}
++                              </ul>
++                            </div>
++                          )}
++                        </div>
++                      )}
+                       <div style={{ display: 'flex', gap: 12, marginTop: 16 }}>
+-                        <a href="#" style={{ fontSize: 12, color: 'var(--text-secondary)', border: '1px solid var(--border)', padding: '6px 12px', textDecoration: 'none' }}>
++                        <a href={o.polyUrl ?? '#'} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12, color: 'var(--text-secondary)', border: '1px solid var(--border)', padding: '6px 12px', textDecoration: 'none', opacity: o.polyUrl ? 1 : 0.4 }}>
+                           VIEW ON POLYMARKET ↗
+                         </a>
+-                        <a href="#" style={{ fontSize: 12, color: 'var(--text-secondary)', border: '1px solid var(--border)', padding: '6px 12px', textDecoration: 'none' }}>
++                        <a href={o.kalshiUrl ?? '#'} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12, color: 'var(--text-secondary)', border: '1px solid var(--border)', padding: '6px 12px', textDecoration: 'none', opacity: o.kalshiUrl ? 1 : 0.4 }}>
+                           VIEW ON KALSHI ↗
+                         </a>
+                       </div>
+diff --git a/src/types/index.ts b/src/types/index.ts
+index c7d8ff0..ca81966 100644
+--- a/src/types/index.ts
++++ b/src/types/index.ts
+@@ -48,6 +48,9 @@ export interface ArbitrageOpportunity {
+   verdict: ResolutionVerdict;
+   verdictReasoning?: string;
+   riskFactors?: string[];
++  // Claude verification output fields.
++  kalshiYesMeaning?: string;
++  polyHedgeOutcomeLabel?: string;
+   levels: ArbitrageLevel[];
+   bestNetSpread: number;
+   totalMaxProfit: number;
+diff --git a/supabase/functions/scanner/index.ts b/supabase/functions/scanner/index.ts
+index d8e5ed4..1169840 100644
+--- a/supabase/functions/scanner/index.ts
++++ b/supabase/functions/scanner/index.ts
+@@ -2508,14 +2508,20 @@ async function verifyPair(
+     `    Outcome 1: "${poly.outcome1Label}"\n\n` +
+     'Think through these six checks INTERNALLY (do not write them out) before answering:\n' +
+     '  C1. Same proposition — both markets resolve on the same real-world event?\n' +
+-    '  C2. Same time window — close/settlement deadlines describe the same period?\n' +
++    '  C2. Same time window — IMPORTANT: for UNIQUE one-time events (awards, political\n' +
++    '      deadlines, season championships, game-winner markets) a close-date gap of\n' +
++    '      up to 30 days is NORMAL and NOT a CAUTION factor — both platforms settle on\n' +
++    '      the same publicly announced result. Only flag close-date gaps for RECURRING\n' +
++    '      events (monthly CPI, weekly jobs) where the gap could mean a different period.\n' +
+     '  C3. Same numeric or categorical thresholds — ">=25bps cut" vs "any cut" are NOT same.\n' +
+     '  C4. POLARITY — what does KALSHI YES pay out on, and which Polymarket outcome\n' +
+     '      ("Outcome 0" or "Outcome 1") pays out under the SAME condition? Read the labels;\n' +
+     '      do NOT guess from index.\n' +
+     '  C5. Confidence — are you certain enough about C4 to commit a trade? If anything is\n' +
+     '      ambiguous (multi-outcome wrapped in binary, unclear labels, etc.), set confirmed=false.\n' +
+-    '  C6. Resolution source — do both markets cite the same authoritative source?\n\n' +
++    '  C6. Resolution source — only matters for economic reports (CPI, jobs, FOMC).\n' +
++    '      For awards, sports, and political markets set resolution_source_match=true\n' +
++    '      since both platforms resolve on the same publicly announced result.\n\n' +
+     'YOUR REPLY MUST BE A SINGLE RAW JSON OBJECT. No prose. No markdown. No code fences.\n' +
+     'Schema:\n' +
+     '{\n' +
+@@ -2529,12 +2535,12 @@ async function verifyPair(
+     '  "resolution_source_note": "one sentence"\n' +
+     '}\n\n' +
+     'Verdict legend:\n' +
+-    '  SAFE = identical proposition, identical thresholds, identical time window,\n' +
+-    '         identical resolution source, polarity confirmed.\n' +
+-    '  CAUTION = same proposition but subtle differences exist (different source,\n' +
+-    '         different rounding, different settlement timing). Tradable with care.\n' +
+-    '  SKIP = the markets do not resolve on the same event, OR polarity is\n' +
+-    '         ambiguous, OR thresholds differ materially. Do not trade.\n' +
++    '  SAFE = same proposition, same thresholds, polarity confirmed, no material\n' +
++    '         differences that would cause the markets to resolve differently.\n' +
++    '         Close-date gaps are NOT material for unique one-time events.\n' +
++    '  CAUTION = same proposition but a genuine risk exists — different threshold,\n' +
++    '         ambiguous scope, or for recurring markets a possible different period.\n' +
++    '  SKIP = different events, polarity ambiguous, or thresholds differ materially.\n' +
+     'If polarity_confirmed is false, the caller will force SKIP regardless of verdict.';
+ 
+   // Sports diagnostic: log exactly what Claude sees so we can debug why
+@@ -2651,8 +2657,23 @@ async function verifyPair(
+   if (!polarityConfirmed) {
+     verdict = 'SKIP';
+   } else if (verdict === 'SAFE' && !resolutionSourceMatch) {
+-    // Resolution source mismatch downgrades a SAFE to CAUTION (Part 8).
+-    verdict = 'CAUTION';
++    // Resolution source mismatch only downgrades SAFE→CAUTION for recurring
++    // economic report markets (CPI, jobs, FOMC) where the exact reporting
++    // body matters. For UNIQUE events — awards, political deadlines, season
++    // championships, game-winner markets — both platforms will resolve on
++    // the same publicly announced result regardless of which source they
++    // cite. Blanket-downgrading UNIQUE events to CAUTION because they don't
++    // explicitly name a resolution source in their metadata is too strict.
++    const isEconomicMarket =
++      kalshi.category === 'Economics' ||
++      /\b(cpi|pce|gdp|jobs|nfp|fomc|fed|inflation|unemployment|rate cut|rate hike)\b/i
++        .test(kalshi.title);
++    if (isEconomicMarket) {
++      verdict = 'CAUTION';
++    }
++    // For all other categories (sports, politics, awards, entertainment):
++    // keep SAFE — resolution source ambiguity is not a trading risk when
++    // the underlying event is unambiguous and unique.
+   }
+ 
+   return {
+@@ -3664,6 +3685,8 @@ async function runScanCycle(
+       verdict: r.prep.verdict,
+       verdictReasoning: r.prep.reasoning,
+       riskFactors: r.prep.riskFactors,
++      kalshiYesMeaning: r.prep.kalshiYesMeaning,
++      polyHedgeOutcomeLabel: r.prep.polyHedgeOutcomeLabel ?? undefined,
+       levels: r.levels,
+       bestNetSpread: r.bestNet,
+       totalMaxProfit: Math.round(r.totalMax),
+-- 
+2.43.0
+

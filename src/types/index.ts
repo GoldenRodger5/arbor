@@ -48,6 +48,9 @@ export interface ArbitrageOpportunity {
   verdict: ResolutionVerdict;
   verdictReasoning?: string;
   riskFactors?: string[];
+  // Claude verification output fields.
+  kalshiYesMeaning?: string;
+  polyHedgeOutcomeLabel?: string;
   levels: ArbitrageLevel[];
   bestNetSpread: number;
   totalMaxProfit: number;
