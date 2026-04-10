@@ -1475,6 +1475,13 @@ serve(async (req) => {
   const bodyDryRun = update.dryRun === true;
   const dryRun = urlDryRun || bodyDryRun;
 
+  console.log('[trade] dryRun check', {
+    GLOBAL_DRY_RUN,
+    bodyDryRun: update.dryRun,
+    paramDryRun: url.searchParams.get('dryRun'),
+    finalDryRun: dryRun,
+  });
+
   // Manual dry-run invocation: POST {"dryRun":true,"slug":"KXMLB..."}
   if (dryRun && update.slug) {
     const slug = update.slug as string;

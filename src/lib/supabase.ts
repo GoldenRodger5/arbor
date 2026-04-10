@@ -210,7 +210,7 @@ export async function getPositions(): Promise<Position[]> {
 export async function getAnalyticsSummary(): Promise<AnalyticsSummary> {
   const sb = safeSupabase();
   const defaults: AnalyticsSummary = {
-    totalCapital: 500, deployedCapital: 0, activeCapital: 400, realizedPnl: 0,
+    totalCapital: 0, deployedCapital: 0, activeCapital: 0, realizedPnl: 0,
     totalPositions: 0, openPositions: 0, settledPositions: 0, partialPositions: 0, failedPositions: 0,
     totalSpreadsDetected: 0, openSpreads: 0, closedSpreads: 0,
     avgSpreadDurationSeconds: null, medianSpreadDurationSeconds: null,
@@ -233,10 +233,10 @@ export async function getAnalyticsSummary(): Promise<AnalyticsSummary> {
     ]);
 
   // Capital
-  let totalCapital = 500, deployedCapital = 0, safetyReservePct = 0.2, realizedPnl = 0;
+  let totalCapital = 0, deployedCapital = 0, safetyReservePct = 0.2, realizedPnl = 0;
   if (capitalRes.status === 'fulfilled' && capitalRes.value.data) {
     const c = capitalRes.value.data as Record<string, number | null>;
-    totalCapital    = (c.total_capital    as number) ?? 500;
+    totalCapital    = (c.total_capital    as number) ?? 0;
     deployedCapital = (c.deployed_capital as number) ?? 0;
     safetyReservePct = (c.safety_reserve_pct as number) ?? 0.2;
     realizedPnl     = (c.realized_pnl     as number) ?? 0;
@@ -347,11 +347,11 @@ export async function getRecentSpreadEvents(limit = 20): Promise<SpreadEvent[]> 
 }
 
 const DEFAULT_CAPITAL: CapitalState = {
-  totalCapital: 500,
+  totalCapital: 0,
   deployedCapital: 0,
   safetyReservePct: 0.2,
   realizedPnl: 0,
-  activeCapital: 500,
+  activeCapital: 0,
 };
 
 function computeActiveCapital(
@@ -380,7 +380,7 @@ export async function getCapital(): Promise<CapitalState> {
   }
   if (!data) return DEFAULT_CAPITAL;
 
-  const totalCapital = (data.total_capital as number | null) ?? 500;
+  const totalCapital = (data.total_capital as number | null) ?? 0;
   const deployedCapital = (data.deployed_capital as number | null) ?? 0;
   const safetyReservePct = (data.safety_reserve_pct as number | null) ?? 0.2;
   const realizedPnl = (data.realized_pnl as number | null) ?? 0;

@@ -88,7 +88,7 @@ function CapitalSection({ s }: { s: AnalyticsSummary }) {
     <>
       <SectionHeader title="CAPITAL OVERVIEW" />
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10, marginBottom: 24 }}>
-        <StatCard label="TOTAL CAPITAL" value={`$${s.totalCapital.toFixed(0)}`} sub="Starting balance" />
+        <StatCard label="TOTAL CAPITAL" value={`$${s.totalCapital.toFixed(0)}`} sub="Live from capital_ledger" />
         <StatCard label="ACTIVE CAPITAL"
           value={`$${s.activeCapital.toFixed(0)}`}
           sub={`$${s.deployedCapital.toFixed(0)} deployed`}
@@ -372,7 +372,7 @@ function SpreadEventsFeed({ events }: { events: SpreadEvent[] }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const EMPTY_SUMMARY: AnalyticsSummary = {
-  totalCapital: 500, deployedCapital: 0, activeCapital: 400, realizedPnl: 0,
+  totalCapital: 0, deployedCapital: 0, activeCapital: 0, realizedPnl: 0,
   totalPositions: 0, openPositions: 0, settledPositions: 0, partialPositions: 0, failedPositions: 0,
   totalSpreadsDetected: 0, openSpreads: 0, closedSpreads: 0,
   avgSpreadDurationSeconds: null, medianSpreadDurationSeconds: null,
