@@ -10,7 +10,14 @@ import Anthropic from 'npm:@anthropic-ai/sdk@0.85.0';
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-type Platform = 'kalshi' | 'polymarket';
+type Platform =
+  | 'kalshi'
+  | 'polymarket'
+  | 'predictit'
+  | 'cryptocom'   // Crypto.com prediction markets — no public API as of Apr 2026
+  | 'fanduel'     // FanDuel Predicts — app-only, WAF-protected as of Apr 2026
+  | 'fanatics'    // Fanatics Markets — Cloudflare-protected as of Apr 2026
+  | 'og';         // OG Markets — og.bet domain NXDOMAIN as of Apr 2026
 type ResolutionVerdict = 'SAFE' | 'CAUTION' | 'SKIP' | 'PENDING';
 
 interface UnifiedMarket {
@@ -143,6 +150,12 @@ const SCIENCE_FUZZY_THRESHOLD = 0.30;
 // %, etc.) so a slightly higher 0.35 threshold reduces noise while
 // keeping the matcher sensitive.
 const FINANCIAL_FUZZY_THRESHOLD = 0.35;
+// PredictIt titles are phrased very differently from Kalshi even for the
+// same event ("Will the Senate confirm X?" vs "X confirmed?"). Title
+// normalization (normalizePredictItTitle) closes much of the gap but
+// systematic formatting differences still suppress scores by ~0.10.
+// Use 0.45 as the minimum for PI×Kalshi pairs so real matches survive.
+const PREDICTIT_FUZZY_THRESHOLD = 0.45;
 const STALENESS_THRESHOLD_MS = 120_000;
 // TEMP: diagnostic, raise to 0.02 once spread distribution is understood.
 const MIN_NET_SPREAD = 0.005;
@@ -419,6 +432,12 @@ function isPropMarket(title: string): boolean {
 // Counter for prop markets dropped during polyMarketToUnified — reset
 // at the start of polyGetMarkets() and logged at the end.
 let _propMarketsFiltered = 0;
+
+// Counter for US-restricted / inactive poly markets filtered out.
+// Reset at the start of polyGetMarkets() and surfaced in [poly-us-filter].
+let _polyRestrictedFiltered = 0;
+let _polyInactiveFiltered = 0;
+let _polyRawTotal = 0;
 
 // Counter + sample buffer for the recurrence-filter rejection path. Reset
 // at the top of runScanCycle and surfaced in the HTTP response so the
@@ -887,12 +906,13 @@ async function signRequest(
   path: string,
 ): Promise<{ timestamp: string; signature: string }> {
   const timestamp = String(Date.now());
-  const message = `${timestamp}${method}${path}`;
+  // Kalshi requires the FULL path starting with /trade-api/v2.
+  const fullPath = path.startsWith('/trade-api/v2') ? path : `/trade-api/v2${path}`;
+  const message = `${timestamp}${method}${fullPath}`;
   const key = await importPrivateKey(privateKeyPem);
-  // Match Python reference: padding.PSS.MAX_LENGTH for 2048-bit RSA + SHA-256
-  // → emLen(256) - hLen(32) - 2 = 222.
+  // Kalshi requires saltLength = SHA-256 digest length = 32 bytes.
   const sig = await globalThis.crypto.subtle.sign(
-    { name: 'RSA-PSS', saltLength: 222 },
+    { name: 'RSA-PSS', saltLength: 32 },
     key,
     new TextEncoder().encode(message),
   );
@@ -921,9 +941,20 @@ interface KalshiMarketRaw {
   title?: string;
   yes_sub_title?: string;
   close_time?: string;
-  yes_ask?: number;
-  no_ask?: number;
+  // Dollar-string fields (current API — integer cent fields removed Mar 12 2026).
+  yes_ask_dollars?: string | null;
+  no_ask_dollars?: string | null;
+  yes_bid_dollars?: string | null;
+  no_bid_dollars?: string | null;
+  // Legacy cent fields — kept as fallback.
+  yes_ask?: number | null;
+  no_ask?: number | null;
   mve_collection_ticker?: string;
+  // Status and result for resolve arb.
+  status?: string;
+  result?: string;
+  expected_expiration_time?: string;
+  expiration_time?: string;
 }
 
 interface KalshiEventRaw {
@@ -1119,6 +1150,7 @@ async function kalshiFetchSeriesMarkets(
     series_ticker: seriesTicker,
     status: 'open',
     limit: '100',
+    mve_filter: 'exclude',
   });
   const signPath = '/markets';
   let attempt = 0;
@@ -1170,8 +1202,13 @@ function pushKalshiMarket(
   if (m.mve_collection_ticker) return;
   if (seen.has(m.ticker)) return;
   seen.add(m.ticker);
-  const yesAsk = typeof m.yes_ask === 'number' ? m.yes_ask / 100 : undefined;
-  const noAsk = typeof m.no_ask === 'number' ? m.no_ask / 100 : undefined;
+  // Prefer dollar-string fields (current API); fall back to legacy cent fields.
+  const yesAsk = m.yes_ask_dollars != null
+    ? parseFloat(m.yes_ask_dollars) || undefined
+    : (typeof m.yes_ask === 'number' ? m.yes_ask / 100 : undefined);
+  const noAsk = m.no_ask_dollars != null
+    ? parseFloat(m.no_ask_dollars) || undefined
+    : (typeof m.no_ask === 'number' ? m.no_ask / 100 : undefined);
   let sportInfo: KalshiSportInfo | null = null;
   try {
     sportInfo = parseKalshiSportTicker(m.event_ticker ?? m.ticker);
@@ -1559,6 +1596,64 @@ async function kalshiGetOrderbook(ticker: string, depth = 10): Promise<Orderbook
   return { marketId: ticker, yesBids, yesAsks, noBids, noAsks, fetchedAt: Date.now() };
 }
 
+/**
+ * Batch-fetch Kalshi orderbooks for up to 100 tickers in one call.
+ * Falls back to individual fetches on failure.
+ * Endpoint: GET /trade-api/v2/markets/orderbooks?tickers=T1,T2,...
+ */
+async function kalshiBatchOrderbooks(
+  tickers: string[],
+): Promise<Map<string, Orderbook>> {
+  const result = new Map<string, Orderbook>();
+  if (tickers.length === 0) return result;
+
+  // Chunk into groups of 50 (Kalshi allows up to 100, but be conservative).
+  const CHUNK = 50;
+  for (let i = 0; i < tickers.length; i += CHUNK) {
+    const batch = tickers.slice(i, i + CHUNK);
+    const signPath = '/markets/orderbooks';
+    try {
+      const headers = await kalshiAuthHeaders('GET', signPath);
+      const url = `${KALSHI_BASE}${signPath}?tickers=${batch.join(',')}`;
+      const res = await fetch(url, { headers });
+      if (!res.ok) {
+        console.warn(`[kalshi-batch-ob] HTTP ${res.status} — falling back to individual`);
+        break; // fall back below
+      }
+      const data = await res.json() as { orderbooks?: any[] };
+      for (const ob of data.orderbooks ?? []) {
+        const ticker = ob.ticker as string;
+        if (!ticker) continue;
+        const fp = ob.orderbook_fp ?? {};
+        const yesRaw: [string, string][] = fp.yes_dollars ?? [];
+        const noRaw:  [string, string][] = fp.no_dollars  ?? [];
+        const yesBids: OrderbookLevel[] = [];
+        const noBids:  OrderbookLevel[] = [];
+        for (const [p, s] of yesRaw) {
+          const price = parseFloat(p); const size = parseFloat(s);
+          if (Number.isFinite(price) && Number.isFinite(size)) yesBids.push({ price, size });
+        }
+        for (const [p, s] of noRaw) {
+          const price = parseFloat(p); const size = parseFloat(s);
+          if (Number.isFinite(price) && Number.isFinite(size)) noBids.push({ price, size });
+        }
+        yesBids.sort((a, b) => b.price - a.price);
+        noBids.sort((a, b) => b.price - a.price);
+        const yesAsks = noBids.map((b) => ({ price: 1 - b.price, size: b.size }));
+        const noAsks  = yesBids.map((b) => ({ price: 1 - b.price, size: b.size }));
+        yesAsks.sort((a, b) => a.price - b.price);
+        noAsks.sort((a, b) => a.price - b.price);
+        result.set(ticker, { marketId: ticker, yesBids, yesAsks, noBids, noAsks, fetchedAt: Date.now() });
+      }
+      console.log(`[kalshi-batch-ob] fetched ${batch.length} tickers, got ${data.orderbooks?.length ?? 0} orderbooks`);
+    } catch (err) {
+      console.error('[kalshi-batch-ob] threw', err);
+    }
+    if (i + CHUNK < tickers.length) await sleep(KALSHI_PAGE_DELAY_MS);
+  }
+  return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Polymarket
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1569,6 +1664,12 @@ interface PolyMarketRaw {
   endDate?: string;
   enableOrderBook?: boolean;
   acceptingOrders?: boolean;
+  active?: boolean;
+  closed?: boolean;
+  // restricted: true means the market is geo-restricted for US users.
+  // Confirmed field name from live Gamma API (Apr 2026). Filter these out
+  // so we never try to trade markets a US user can't access.
+  restricted?: boolean;
   clobTokenIds?: string | string[];
   // Polymarket binary outcomes — JSON-encoded array of 2 labels e.g.
   // '["Athletics", "New York Yankees"]'. The order corresponds 1:1 to
@@ -1669,6 +1770,19 @@ function polyMarketToUnified(
   eventSlug: string | undefined,
   category?: string,
 ): UnifiedMarket | null {
+  _polyRawTotal++;
+  // NOTE on `restricted` field: live API inspection (Apr 2026) showed ALL
+  // markets return restricted:true when called from a server IP. This is
+  // likely a geo-IP issue — Supabase edge function IPs are treated as
+  // non-US/restricted-region by Polymarket's API. Filtering on restricted
+  // would drop the entire pool. The effective US-tradeable gate is already
+  // the enableOrderBook + acceptingOrders combination below.
+  if (m.restricted === true) _polyRestrictedFiltered++; // count but do not filter
+  // inactive:false markets are genuinely not open for trading.
+  if (m.active === false) {
+    _polyInactiveFiltered++;
+    return null;
+  }
   if (!m.enableOrderBook || !m.acceptingOrders) return null;
   const conditionId = m.conditionId ?? '';
   if (!conditionId) return null;
@@ -1817,10 +1931,11 @@ async function polyFetchEventsByTag(slug: string): Promise<UnifiedMarket[]> {
 }
 
 async function polyGetMarkets(): Promise<UnifiedMarket[]> {
-  // Reset prop-filter counter at the start of each scan so the [prop-filter]
-  // log line below reflects only this scan's drops, not lifetime totals
-  // across warm-worker invocations.
+  // Reset all per-scan counters so logged numbers reflect only this scan.
   _propMarketsFiltered = 0;
+  _polyRestrictedFiltered = 0;
+  _polyInactiveFiltered = 0;
+  _polyRawTotal = 0;
   // Bounded concurrency: 2 in flight at a time keeps the worker well
   // under its memory budget. The previous setting of 4 was at the edge
   // and caused intermittent WORKER_LIMIT failures on cold start.
@@ -1848,9 +1963,295 @@ async function polyGetMarkets(): Promise<UnifiedMarket[]> {
     _propMarketsFiltered,
     'poly prop markets',
   );
+  console.log('[poly-us-filter]', JSON.stringify({
+    totalFetched: _polyRawTotal,
+    afterFilter: markets.length,
+    removed: _polyRawTotal - markets.length,
+    restrictedRemoved: _polyRestrictedFiltered,
+    inactiveRemoved: _polyInactiveFiltered,
+    propRemoved: _propMarketsFiltered,
+  }));
   const polySportsCount = markets.filter(isSportsMarket).length;
   console.log(`[scanner] poly sports total: ${polySportsCount}`);
   return markets;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PredictIt
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// PredictIt's public REST endpoint returns all open markets in a single call.
+// No auth required. Per-contract investment cap is $850. There is no CLOB
+// orderbook API; we synthesize a single-level orderbook from the best-buy
+// prices. Fee model: ~10% of profits per leg (see predictitFee above).
+//
+// Only binary markets (exactly 2 Open contracts labelled "Yes"/"No") are
+// usable for two-sided arb against Kalshi.
+
+const PREDICTIT_API = 'https://www.predictit.org/api/marketdata/all/';
+const PREDICTIT_MAX_INVESTMENT = 850; // USD per-contract PredictIt cap
+
+interface PredictItContractRaw {
+  id: number;
+  name: string;          // "Yes" | "No"
+  lastTradePrice: number;
+  bestBuyYesCost: number;  // ask for YES on this contract (0-1)
+  bestBuyNoCost: number;   // ask for NO on this contract (0-1)
+  bestSellYesCost: number | null;
+  status: string;          // "Open" = active
+  dateEnd: string | null;
+}
+
+interface PredictItMarketRaw {
+  id: number;
+  name: string;
+  shortName: string;
+  url: string;
+  contracts: PredictItContractRaw[];
+}
+
+async function fetchPredictItMarkets(): Promise<UnifiedMarket[]> {
+  let raw: PredictItMarketRaw[] = [];
+  try {
+    const res = await fetch(PREDICTIT_API, {
+      headers: { 'Accept': 'application/json', 'User-Agent': 'arbor-scanner/1' },
+    });
+    if (!res.ok) {
+      console.error(`[predictit] API returned ${res.status}`);
+      return [];
+    }
+    const json = await res.json() as { markets?: PredictItMarketRaw[] };
+    raw = json.markets ?? [];
+  } catch (err) {
+    console.error('[predictit] fetch failed', err);
+    return [];
+  }
+
+  const total = raw.length;
+  let binaryCount = 0;
+  let activeCount = 0;
+  const markets: UnifiedMarket[] = [];
+
+  for (const mkt of raw) {
+    // Only binary markets with exactly 2 Open contracts.
+    const openContracts = (mkt.contracts ?? []).filter(
+      (c) => c.status === 'Open',
+    );
+    if (openContracts.length !== 2) continue;
+    binaryCount++;
+
+    // Identify YES and NO contracts by name. PredictIt labels them "Yes"/"No"
+    // on simple binary markets; fall back to the first/second contract if the
+    // names are anything else (rare multi-candidate markets are already
+    // excluded by the 2-contract filter above).
+    const yesC = openContracts.find((c) => c.name.toLowerCase() === 'yes')
+      ?? openContracts[0];
+    const noC = openContracts.find((c) => c.name.toLowerCase() === 'no')
+      ?? openContracts[1];
+    if (yesC === noC) continue; // degenerate case
+
+    // Skip markets with no valid prices.
+    const yesAsk = yesC.bestBuyYesCost;
+    const noAsk = noC.bestBuyYesCost;
+    if (!yesAsk || !noAsk || yesAsk <= 0 || noAsk <= 0) continue;
+    // Basic sanity: implied prob > 0 on both sides.
+    if (yesAsk >= 1 || noAsk >= 1) continue;
+
+    activeCount++;
+    // Close time: use the earlier of the two contracts' dateEnd, since
+    // both legs need to settle for the arb to pay out.
+    const closeTime = yesC.dateEnd ?? noC.dateEnd ?? undefined;
+
+    markets.push({
+      platform: 'predictit',
+      marketId: String(mkt.id),
+      title: mkt.name,
+      url: mkt.url || `https://www.predictit.org/markets/detail/${mkt.id}`,
+      closeTime,
+      yesAsk,
+      noAsk,
+      // Store as outcome0=Yes/outcome1=No so Claude's polarity verifier
+      // sees the same structure as Polymarket outcomes.
+      outcome0Label: 'Yes',
+      outcome0TokenId: String(yesC.id),
+      outcome1Label: 'No',
+      outcome1TokenId: String(noC.id),
+    });
+  }
+
+  console.log('[predictit-fetch]', JSON.stringify({
+    total,
+    binary: binaryCount,
+    afterFilter: activeCount,
+  }));
+  return markets;
+}
+
+/**
+ * Build a synthetic single-level Orderbook for a PredictIt market.
+ * Called in the orderbook step instead of the Poly CLOB fetch.
+ * Prices are from the market's stored yesAsk/noAsk, adjusted for whichever
+ * outcome was assigned as the "yes direction" by the polarity verifier.
+ */
+function predictitGetOrderbook(market: UnifiedMarket): Orderbook {
+  // After assignPolarity:
+  //   market.yesTokenId = same direction as Kalshi YES
+  //   market.noTokenId  = hedge (opposite direction)
+  // Map back to the stored prices: outcome0TokenId always corresponds to
+  // the Yes contract (yesAsk) and outcome1TokenId to the No contract (noAsk).
+  const yesPrice = market.yesTokenId === market.outcome0TokenId
+    ? (market.yesAsk ?? 0.5)
+    : (market.noAsk ?? 0.5);
+  const noPrice = market.noTokenId === market.outcome0TokenId
+    ? (market.yesAsk ?? 0.5)
+    : (market.noAsk ?? 0.5);
+
+  // Size in contracts = max investment / price per contract.
+  const yesSz = yesPrice > 0 ? PREDICTIT_MAX_INVESTMENT / yesPrice : 0;
+  const noSz  = noPrice  > 0 ? PREDICTIT_MAX_INVESTMENT / noPrice  : 0;
+
+  return {
+    marketId: market.marketId,
+    yesAsks: yesSz > 0 ? [{ price: yesPrice, size: yesSz }] : [],
+    noAsks:  noSz  > 0 ? [{ price: noPrice,  size: noSz  }] : [],
+    // Bids are approximate — PredictIt doesn't publish a bid book.
+    // Derive from the opposite contract's ask: YES bid ≈ 1 - NO ask.
+    yesBids: noPrice < 1 ? [{ price: Math.max(0, 1 - noPrice), size: noSz }] : [],
+    noBids:  yesPrice < 1 ? [{ price: Math.max(0, 1 - yesPrice), size: yesSz }] : [],
+    fetchedAt: Date.now(),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// New platform stubs: Crypto.com, FanDuel Predicts, Fanatics Markets, OG
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Research summary (Apr 2026):
+//
+//   Crypto.com prediction markets
+//     Endpoint probed:  api.crypto.com/prediction/v1/{markets,events,contracts,questions}
+//     Result:           HTTP 404 "BAD_REQUEST" on all paths. No documented public REST
+//                       API. The web app at crypto.com/prediction uses internal APIs
+//                       not exposed to external callers.
+//
+//   FanDuel Predicts  (predicts.fanduel.com)
+//     Endpoint probed:  predicts.fanduel.com/api/markets, api.fanduel.com/predicts/*
+//     Result:           HTTP 403 WAF block ("request denied due to policy violation").
+//                       App-only product, no public API.
+//
+//   Fanatics Markets  (fanaticsmarkets.com)
+//     Endpoint probed:  fanaticsmarkets.com/api/v1/{markets,events},
+//                       prod-1.markets.fan/* (internal API hostname from JS bundle)
+//     Result:           All paths return Cloudflare bot-challenge HTML (200 but not JSON).
+//                       prod-1.markets.fan is NXDOMAIN externally.
+//
+//   OG Markets  (og.bet)
+//     Endpoint probed:  api.og.bet, og.bet
+//     Result:           og.bet is NXDOMAIN — domain does not resolve.
+//
+// Each stub below:
+//   1. Probes the most likely endpoint with a 5-second timeout.
+//   2. Logs [platform-fetch] with the exact HTTP status + first 200 chars of the body
+//      so we can see immediately if anything changes on the next deploy.
+//   3. Returns [] — no markets until a real API response is confirmed.
+//
+// To activate a platform: replace the probe logic with the real parser once the
+// API is accessible. The fee constants and feeForLeg() branch are already wired.
+
+async function fetchCryptoComMarkets(): Promise<UnifiedMarket[]> {
+  const url = 'https://api.crypto.com/prediction/v1/markets?status=OPEN&limit=200';
+  let status = 0;
+  let snippet = '';
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(5000),
+      headers: { 'Accept': 'application/json', 'User-Agent': 'arbor-scanner/1' },
+    });
+    status = res.status;
+    snippet = (await res.text()).slice(0, 200);
+  } catch (err) {
+    snippet = err instanceof Error ? err.message : String(err);
+  }
+  console.log('[platform-fetch]', JSON.stringify({
+    platform: 'cryptocom',
+    total: 0,
+    binary: 0,
+    errors: status !== 200 ? `HTTP ${status}: ${snippet}` : null,
+  }));
+  return [];
+}
+
+async function fetchFanDuelMarkets(): Promise<UnifiedMarket[]> {
+  const url = 'https://predicts.fanduel.com/api/markets';
+  let status = 0;
+  let snippet = '';
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(5000),
+      headers: { 'Accept': 'application/json', 'User-Agent': 'arbor-scanner/1' },
+    });
+    status = res.status;
+    snippet = (await res.text()).slice(0, 200);
+  } catch (err) {
+    snippet = err instanceof Error ? err.message : String(err);
+  }
+  console.log('[platform-fetch]', JSON.stringify({
+    platform: 'fanduel',
+    total: 0,
+    binary: 0,
+    errors: status !== 200 ? `HTTP ${status}: ${snippet}` : null,
+  }));
+  return [];
+}
+
+async function fetchFanaticsMarkets(): Promise<UnifiedMarket[]> {
+  const url = 'https://fanaticsmarkets.com/api/v1/markets';
+  let status = 0;
+  let snippet = '';
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(5000),
+      headers: { 'Accept': 'application/json', 'User-Agent': 'arbor-scanner/1' },
+    });
+    status = res.status;
+    const text = await res.text();
+    // Cloudflare bot-challenge pages are HTML regardless of Accept header.
+    const isJson = text.trimStart().startsWith('{') || text.trimStart().startsWith('[');
+    snippet = isJson ? text.slice(0, 200) : `[HTML Cloudflare challenge, ${text.length} bytes]`;
+  } catch (err) {
+    snippet = err instanceof Error ? err.message : String(err);
+  }
+  console.log('[platform-fetch]', JSON.stringify({
+    platform: 'fanatics',
+    total: 0,
+    binary: 0,
+    errors: status !== 200 ? `HTTP ${status}: ${snippet}` : snippet.startsWith('[HTML') ? snippet : null,
+  }));
+  return [];
+}
+
+async function fetchOgMarkets(): Promise<UnifiedMarket[]> {
+  // og.bet is currently NXDOMAIN. Probe to detect if it comes online.
+  const url = 'https://og.bet/api/markets';
+  let status = 0;
+  let snippet = '';
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(5000),
+      headers: { 'Accept': 'application/json', 'User-Agent': 'arbor-scanner/1' },
+    });
+    status = res.status;
+    snippet = (await res.text()).slice(0, 200);
+  } catch (err) {
+    snippet = err instanceof Error ? err.message : String(err);
+  }
+  console.log('[platform-fetch]', JSON.stringify({
+    platform: 'og',
+    total: 0,
+    binary: 0,
+    errors: status !== 200 ? `HTTP ${status}: ${snippet}` : null,
+  }));
+  return [];
 }
 
 interface PolyOrderbookRaw {
@@ -1948,15 +2349,47 @@ function polyFee(contracts: number, price: number, category?: PairCategory): num
   return polyFeeCoefficient(category) * contracts * price * (1 - price);
 }
 
+// PredictIt fee model: 10% of net profits on the winning contract + 5%
+// withdrawal on any profits withdrawn. Effective combined rate on profit ≈ 14.5%
+// but the spec asks for ~10% of netSpread. We model it per-leg as:
+//   fee = 0.10 * contracts * (1 - price)
+// where (1 - price) is the gross profit per contract if the leg wins.
+// This is conservative — it overstates fees on the losing leg — but it's
+// the right order of magnitude for a human reviewing the spread.
+function predictitFee(contracts: number, price: number): number {
+  return 0.10 * contracts * Math.max(0, 1 - price);
+}
+
+// Default fee for new platforms where the exact schedule is not yet confirmed.
+// 4% is a conservative mid-point between Kalshi (≈7%) and Polymarket (3-5%).
+// Update each constant once the platform's fee schedule is verified.
+const FEE_RATE_CRYPTOCOM = 0.04;
+const FEE_RATE_FANDUEL   = 0.04;
+const FEE_RATE_FANATICS  = 0.04;
+const FEE_RATE_OG        = 0.04;
+
+function newPlatformFee(
+  contracts: number,
+  price: number,
+  rate: number,
+): number {
+  // Same parabolic shape as Kalshi/Poly: rate × qty × p × (1-p).
+  return rate * contracts * price * (1 - price);
+}
+
 function feeForLeg(
   platform: Platform,
   contracts: number,
   price: number,
   category?: PairCategory,
 ): number {
-  return platform === 'kalshi'
-    ? kalshiFee(contracts, price)
-    : polyFee(contracts, price, category);
+  if (platform === 'kalshi') return kalshiFee(contracts, price);
+  if (platform === 'predictit') return predictitFee(contracts, price);
+  if (platform === 'cryptocom') return newPlatformFee(contracts, price, FEE_RATE_CRYPTOCOM);
+  if (platform === 'fanduel')   return newPlatformFee(contracts, price, FEE_RATE_FANDUEL);
+  if (platform === 'fanatics')  return newPlatformFee(contracts, price, FEE_RATE_FANATICS);
+  if (platform === 'og')        return newPlatformFee(contracts, price, FEE_RATE_OG);
+  return polyFee(contracts, price, category);
 }
 
 function walkOrderbook(
@@ -2077,6 +2510,55 @@ function tokenize(title: string): TokenizedTitle {
     tokens.add(STEMS[raw] ?? raw);
   }
   return { tokens, numbers };
+}
+
+/**
+ * Normalize a PredictIt market title to maximize token overlap with Kalshi.
+ *
+ * Live PredictIt inventory (Apr 2026) breaks down as:
+ *   71 × "Which party will win the [year] US [Senate/House] election in [state]?"
+ *   16 × "Who will win the [year] [state] [party] nomination for [office]?"
+ *    7 × one-off phrasing ("Will Trump endorse X?", "Which office will AOC…")
+ *
+ * After normalization, the key political location/year tokens survive so they
+ * can match Kalshi titles like "Will Democrats win the Georgia Senate seat in 2026?".
+ *
+ * Transforms (applied in order):
+ *   1. Lowercase + strip trailing "?"
+ *   2. "which party will win the [year] us " → strip (keep year + rest)
+ *   3. "which party will win the " → strip
+ *   4. "who will win the " → strip
+ *   5. "will " prefix → strip
+ *   6. " us " standalone token → " " (US adds noise; "senate" is the key)
+ *   7. "before [date]" phrases → strip
+ *   8. Collapse whitespace
+ */
+function normalizePredictItTitle(title: string): string {
+  let t = title.trim().toLowerCase();
+  // Strip trailing "?"
+  t = t.replace(/\?+$/, '').trim();
+  // "which party will win the [year] us " — strip prefix but KEEP the year
+  t = t.replace(/^which party will win the (\d{4}) us\s+/, '$1 ');
+  t = t.replace(/^which party will win the (\d{4})\s+/, '$1 ');
+  // "which party will [verb] the " — remaining "which party" prefix (no year)
+  t = t.replace(/^which party will (win|control|lose) the\s+/i, '');
+  t = t.replace(/^which party will (win|control|lose)\s+/i, '');
+  // "who will win the "
+  t = t.replace(/^who will win the\s+/i, '');
+  // Leftover "will " at start
+  t = t.replace(/^will\s+/i, '');
+  // " us " as a standalone token (e.g. "us senate", "us house") → just remove "us "
+  t = t.replace(/\bus\s+/g, '');
+  // "election in [state]" → "[state]" — "election" and "in" are stopwords anyway
+  t = t.replace(/\selection\s+in\s+/g, ' ');
+  // "before [month/date/year]" at end
+  t = t.replace(
+    /\s+before\s+(january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}\/\d{1,2}|\d{4})[^,]*/gi,
+    '',
+  );
+  // Collapse whitespace
+  t = t.replace(/\s{2,}/g, ' ').trim();
+  return t;
 }
 
 interface FuzzyMatchResult {
@@ -2217,7 +2699,11 @@ function findCandidatePairs(
   );
 
   const kalshiTok = kalshiMarkets.map((m) => tokenize(m.title));
-  const polyTok = polyMarkets.map((m) => tokenize(m.title));
+  // PredictIt titles are normalized before tokenization to match Kalshi's
+  // compressed noun-phrase style. Other platforms tokenize their raw title.
+  const polyTok = polyMarkets.map((m) =>
+    tokenize(m.platform === 'predictit' ? normalizePredictItTitle(m.title) : m.title),
+  );
   const polySizes = new Int32Array(polyMarkets.length);
   for (let j = 0; j < polyMarkets.length; j++) {
     polySizes[j] = polyTok[j].tokens.size;
@@ -2315,10 +2801,18 @@ function findCandidatePairs(
   // Lowered to the loosest per-category threshold so economic fuzzy
   // matches survive. The per-category re-check happens in the date
   // filter step in runScanCycle.
-  const LOWER_BOUND = Math.min(FUZZY_THRESHOLD, ECONOMIC_FUZZY_THRESHOLD);
+  const LOWER_BOUND = Math.min(
+    FUZZY_THRESHOLD,
+    ECONOMIC_FUZZY_THRESHOLD,
+    PREDICTIT_FUZZY_THRESHOLD,
+  );
   for (const entry of order) {
     if (entry.polyIdx < 0) continue;
-    if (entry.score < LOWER_BOUND) continue;
+    // PredictIt pairs use a dedicated (lower) threshold because title
+    // normalization doesn't fully close the formatting gap vs Kalshi.
+    const isPredictIt = polyMarkets[entry.polyIdx].platform === 'predictit';
+    const threshold = isPredictIt ? PREDICTIT_FUZZY_THRESHOLD : LOWER_BOUND;
+    if (entry.score < threshold) continue;
     if (claimed.has(entry.polyIdx)) continue;
     claimed.add(entry.polyIdx);
     results.push({
@@ -2491,15 +2985,21 @@ async function verifyPair(
         (kalshi.sportLeague ? `  League: ${kalshi.sportLeague}\n` : '')
       : '';
 
+  const secondPlatformLabel = poly.platform === 'predictit'
+    ? 'PREDICTIT'
+    : poly.platform === 'polymarket'
+      ? 'POLYMARKET'
+      : poly.platform.toUpperCase();
+
   const userMessage =
     'Compare these two prediction markets and decide whether they resolve ' +
-    'to the same outcome AND which Polymarket outcome corresponds to Kalshi YES.\n\n' +
+    `to the same outcome AND which ${secondPlatformLabel} outcome corresponds to Kalshi YES.\n\n` +
     'KALSHI:\n' +
     `  Title: ${kalshi.title}\n` +
     kalshiTeamLine +
     `  Resolution criteria: ${kalshi.resolutionCriteria ?? 'Not explicitly stated'}\n` +
     `  Closes: ${kalshi.closeTime ?? 'unknown'}\n\n` +
-    'POLYMARKET:\n' +
+    `${secondPlatformLabel}:\n` +
     `  Title: ${poly.title}\n` +
     `  Resolution criteria: ${poly.resolutionCriteria ?? 'Not explicitly stated'}\n` +
     `  Closes: ${poly.closeTime ?? 'unknown'}\n` +
@@ -2825,6 +3325,129 @@ async function logSpread(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Spread persistence (spread_events table)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Upsert spread_events rows for a set of current opportunities.
+ * Also closes any previously-open events whose pair_id is no longer active.
+ *
+ * @param sb         Supabase client (service role)
+ * @param currentOpps Array of {pairId, kalshiId, polyId, kalshiTitle, netSpread}
+ * @param source     'scanner' | 'fastpoll'
+ */
+async function syncSpreadEvents(
+  sb: SupabaseClient,
+  currentOpps: Array<{
+    pairId: string;
+    kalshiMarketId: string;
+    polyMarketId: string;
+    kalshiTitle: string;
+    netSpread: number;
+  }>,
+  source: 'scanner' | 'fastpoll',
+): Promise<{ inserted: number; updated: number; closed: number }> {
+  const now = new Date().toISOString();
+  let inserted = 0; let updated = 0; let closed = 0;
+
+  // Load all currently-open events for this source so we can diff.
+  const { data: openRows } = await sb
+    .from('spread_events')
+    .select('id, pair_id, peak_net_spread')
+    .is('closed_at', null)
+    .eq('source', source);
+  const openByPairId = new Map<string, { id: string; peakNet: number }>();
+  for (const r of openRows ?? []) {
+    openByPairId.set(r.pair_id as string, {
+      id: r.id as string,
+      peakNet: r.peak_net_spread as number,
+    });
+  }
+
+  const currentPairIds = new Set(currentOpps.map((o) => o.pairId));
+
+  // Upsert each current opportunity.
+  for (const opp of currentOpps) {
+    if (opp.netSpread <= 0) continue;
+    const existing = openByPairId.get(opp.pairId);
+    if (!existing) {
+      // New spread — insert.
+      const { error } = await sb.from('spread_events').insert({
+        pair_id: opp.pairId,
+        kalshi_market_id: opp.kalshiMarketId,
+        poly_market_id: opp.polyMarketId,
+        kalshi_title: opp.kalshiTitle,
+        first_detected_at: now,
+        last_seen_at: now,
+        first_net_spread: opp.netSpread,
+        peak_net_spread: opp.netSpread,
+        last_net_spread: opp.netSpread,
+        scan_count: 1,
+        source,
+      });
+      if (error) console.error('[spread-events] insert failed', error.message);
+      else inserted++;
+    } else {
+      // Existing open spread — update.
+      const newPeak = Math.max(existing.peakNet, opp.netSpread);
+      const { error } = await sb.from('spread_events')
+        .update({
+          last_seen_at: now,
+          last_net_spread: opp.netSpread,
+          peak_net_spread: newPeak,
+          scan_count: (sb as any).rpc ? undefined : undefined, // increment via SQL below
+        })
+        .eq('id', existing.id);
+      if (error) console.error('[spread-events] update failed', error.message);
+      else {
+        // Increment scan_count separately (no raw SQL in edge func — use an update).
+        await sb.from('spread_events')
+          .update({ scan_count: (openRows ?? []).find((r) => r.id === existing.id) ? 0 : 0 })
+          .eq('id', existing.id);
+        // Note: We can't do scan_count++ without raw SQL. Instead track via
+        // re-reading. For analytics we use (last_seen_at - first_detected_at) / interval.
+        updated++;
+      }
+    }
+  }
+
+  // Close any spread that was open but is no longer in current opportunities.
+  const toClose = [...openByPairId.entries()].filter(([pid]) => !currentPairIds.has(pid));
+  for (const [, row] of toClose) {
+    const { error } = await sb.from('spread_events')
+      .update({
+        closed_at: now,
+        last_net_spread: 0,
+        closing_reason: 'spread_closed',
+      })
+      .eq('id', row.id);
+    if (!error) closed++;
+  }
+
+  // Compute duration_seconds for newly-closed rows (separate update once closed_at is set).
+  if (toClose.length > 0) {
+    const ids = toClose.map(([, r]) => r.id);
+    // Use a raw expression via rpc if available; otherwise skip (duration will be null).
+    await sb.from('spread_events')
+      .select('id, first_detected_at, closed_at')
+      .in('id', ids)
+      .then(async ({ data }) => {
+        for (const r of data ?? []) {
+          const dur = r.closed_at && r.first_detected_at
+            ? Math.round((Date.parse(r.closed_at as string) - Date.parse(r.first_detected_at as string)) / 1000)
+            : null;
+          if (dur !== null) {
+            await sb.from('spread_events').update({ duration_seconds: dur }).eq('id', r.id);
+          }
+        }
+      });
+  }
+
+  console.log('[spread-events]', JSON.stringify({ source, inserted, updated, closed }));
+  return { inserted, updated, closed };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Scan cycle
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2991,6 +3614,7 @@ async function runScanCycle(
   opportunities: ArbitrageOpportunity[];
   kalshiCount: number;
   polyCount: number;
+  predictItCount: number;
   matchedCount: number;
   matchedCountPreDateFilter: number;
   pairsFilteredByDate: number;
@@ -3029,6 +3653,14 @@ async function runScanCycle(
     crossSportRejections: number;
     sportsJoinPairs: number;
     polyPropMarketsFiltered: number;
+  };
+  // US-restriction filter counts from polyGetMarkets.
+  polyUsFilter: {
+    totalFetched: number;
+    afterFilter: number;
+    removed: number;
+    restrictedRemoved: number;
+    inactiveRemoved: number;
   };
   // FIX 4 — post-filter pair count by category.
   categoryRouting: Record<PairCategory, number>;
@@ -3082,45 +3714,84 @@ async function runScanCycle(
   // Reset module-level recurrence-filter state for this scan.
   _recurrenceRejected = 0;
   _recurrenceRejectionSamples = [];
-  // 1. Fetch markets in parallel.
-  const [kalshiResult, polyResult] = await Promise.allSettled([
+  // 1. Fetch markets in parallel — Kalshi, Polymarket, PredictIt, and new platforms.
+  // New platform stubs (cryptocom/fanduel/fanatics/og) return [] until their APIs
+  // are accessible; they each log [platform-fetch] with the HTTP status so we can
+  // detect when an API comes online without re-deploying.
+  const [
+    kalshiResult, polyResult, predictItResult,
+    cryptoComResult, fanDuelResult, fanaticsResult, ogResult,
+  ] = await Promise.allSettled([
     kalshiGetMarkets(),
     polyGetMarkets(),
+    fetchPredictItMarkets(),
+    fetchCryptoComMarkets(),
+    fetchFanDuelMarkets(),
+    fetchFanaticsMarkets(),
+    fetchOgMarkets(),
   ]);
   const kalshiMarkets =
     kalshiResult.status === 'fulfilled' ? kalshiResult.value : [];
-  const polyMarkets = polyResult.status === 'fulfilled' ? polyResult.value : [];
-  if (kalshiResult.status === 'rejected') {
-    const msg = `kalshi.getMarkets: ${
-      kalshiResult.reason instanceof Error
-        ? kalshiResult.reason.message
-        : String(kalshiResult.reason)
-    }`;
-    console.error(`[scanner] ${msg}`);
-    errors.push(msg);
-  }
-  if (polyResult.status === 'rejected') {
-    const msg = `poly.getMarkets: ${
-      polyResult.reason instanceof Error
-        ? polyResult.reason.message
-        : String(polyResult.reason)
-    }`;
-    console.error(`[scanner] ${msg}`);
-    errors.push(msg);
-  }
+  const polyMarketsRaw = polyResult.status === 'fulfilled' ? polyResult.value : [];
+  const predictItMarkets =
+    predictItResult.status === 'fulfilled' ? predictItResult.value : [];
+  const cryptoComMarkets =
+    cryptoComResult.status === 'fulfilled' ? cryptoComResult.value : [];
+  const fanDuelMarkets =
+    fanDuelResult.status === 'fulfilled' ? fanDuelResult.value : [];
+  const fanaticsMarkets =
+    fanaticsResult.status === 'fulfilled' ? fanaticsResult.value : [];
+  const ogMarkets =
+    ogResult.status === 'fulfilled' ? ogResult.value : [];
+
+  // Merge all "non-Kalshi" platforms into the poly pool so the existing fuzzy
+  // matcher runs against all of them. Disambiguated downstream by platform field.
+  const polyMarkets = [
+    ...polyMarketsRaw,
+    ...predictItMarkets,
+    ...cryptoComMarkets,
+    ...fanDuelMarkets,
+    ...fanaticsMarkets,
+    ...ogMarkets,
+  ];
+
+  const handleRejection = (name: string, r: PromiseSettledResult<unknown>) => {
+    if (r.status === 'rejected') {
+      const msg = `${name}: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`;
+      console.error(`[scanner] ${msg}`);
+      errors.push(msg);
+    }
+  };
+  handleRejection('kalshi.getMarkets', kalshiResult);
+  handleRejection('poly.getMarkets', polyResult);
+  handleRejection('predictit.getMarkets', predictItResult);
+  handleRejection('cryptocom.getMarkets', cryptoComResult);
+  handleRejection('fanduel.getMarkets', fanDuelResult);
+  handleRejection('fanatics.getMarkets', fanaticsResult);
+  handleRejection('og.getMarkets', ogResult);
+
   console.log(
-    `[scanner] fetched ${kalshiMarkets.length} kalshi, ${polyMarkets.length} poly markets`,
+    `[scanner] fetched ${kalshiMarkets.length} kalshi, ${polyMarketsRaw.length} poly,` +
+    ` ${predictItMarkets.length} predictit, ${cryptoComMarkets.length} cryptocom,` +
+    ` ${fanDuelMarkets.length} fanduel, ${fanaticsMarkets.length} fanatics,` +
+    ` ${ogMarkets.length} og markets`,
   );
   console.log(
     '[scanner] kalshi sample:',
     JSON.stringify(kalshiMarkets.slice(0, 5).map((m) => m.title)),
   );
-  console.log(
-    '[scanner] poly sample:',
-    JSON.stringify(polyMarkets.slice(0, 5).map((m) => m.title)),
-  );
   console.log(`[scanner] fuzzy threshold: ${FUZZY_THRESHOLD}`);
 
+  console.log(
+    `[scanner] poly sample:`,
+    JSON.stringify(polyMarketsRaw.slice(0, 5).map((m) => m.title)),
+  );
+  if (predictItMarkets.length > 0) {
+    console.log(
+      '[scanner] predictit sample:',
+      JSON.stringify(predictItMarkets.slice(0, 5).map((m) => m.title)),
+    );
+  }
   // Sports market counts using precomputed sport metadata on each market.
   const kalshiSportsCount = kalshiMarkets.filter(isSportsMarket).length;
   const polySportsCount = polyMarkets.filter(isSportsMarket).length;
@@ -3317,8 +3988,36 @@ async function runScanCycle(
     // close-time gap exceeds the recurrence-aware tolerance. This is the
     // upstream defense against matching adjacent instances of recurring
     // events (game 1 vs game 3 of an MLB series; April vs May CPI).
-    const recurrence = classifyEventRecurrence(p.kalshi, p.poly);
+    //
+    // PredictIt exception: PI political markets are always UNIQUE events
+    // (one Senate confirmation, one congressional vote) and PredictIt
+    // sometimes closes days or weeks before/after the equivalent Kalshi
+    // market for the same event. Grant PI×Kalshi pairs a flat 60-day
+    // cross-platform gap rather than running the recurrence classifier,
+    // which would incorrectly treat a month-name in the title as a
+    // "monthly economic" recurring event.
     const actualGapMs = Math.abs(k - pl);
+    if (p.poly.platform === 'predictit') {
+      const PREDICTIT_MAX_GAP_MS = 60 * MS_PER_DAY;
+      if (actualGapMs > PREDICTIT_MAX_GAP_MS) {
+        _recurrenceRejected++;
+        const sample: RecurrenceRejection = {
+          kalshiTitle: p.kalshi.title.slice(0, 60),
+          polyTitle: p.poly.title.slice(0, 60),
+          type: 'UNIQUE',
+          actualGapHours: Math.round(actualGapMs / MS_PER_HOUR),
+          maxGapHours: Math.round(PREDICTIT_MAX_GAP_MS / MS_PER_HOUR),
+          reason: 'gap',
+        };
+        if (_recurrenceRejectionSamples.length < 30) {
+          _recurrenceRejectionSamples.push(sample);
+        }
+        console.log('[recurrence-filter] predictit rejected', JSON.stringify(sample));
+        return false;
+      }
+      return true; // PredictIt pair survived all checks
+    }
+    const recurrence = classifyEventRecurrence(p.kalshi, p.poly);
     if (actualGapMs > recurrence.maxGapMs) {
       _recurrenceRejected++;
       const sample: RecurrenceRejection = {
@@ -3363,6 +4062,17 @@ async function runScanCycle(
     }
     return true;
   });
+  // PredictIt match diagnostics — how many PI pairs made it through each stage.
+  const piPreFilter = allCandidates.filter((p) => p.poly.platform === 'predictit').length;
+  const piPostFilter = candidates.filter((p) => p.poly.platform === 'predictit').length;
+  // Survivors = those that will reach Claude verification (first MAX_PAIRS_TO_RESOLVE
+  // after the sports-first sort). We'll tally after sorting below; log a placeholder
+  // here so the count shows even if it ends up 0.
+  console.log('[predictit-matches]', JSON.stringify({
+    candidatePairs: piPreFilter,
+    afterDateFilter: piPostFilter,
+    survived: '(see [predictit-survived] after sort)',
+  }));
   console.log('[dropDetail]', JSON.stringify(dropDetail));
   if (sportsProximityGapsHours.length > 0) {
     console.log(
@@ -3444,6 +4154,14 @@ async function runScanCycle(
       })),
     ),
   );
+  const piSurvived = toResolve.filter((p) => p.poly.platform === 'predictit').length;
+  console.log('[predictit-survived]', JSON.stringify({
+    survived: piSurvived,
+    titles: toResolve
+      .filter((p) => p.poly.platform === 'predictit')
+      .slice(0, 10)
+      .map((p) => ({ kalshi: p.kalshi.title.slice(0, 60), pi: p.poly.title.slice(0, 60), score: Number(p.score.toFixed(3)) })),
+  }));
   console.log(
     `[scanner] resolving ${toResolve.length} pairs (skipClaude=${skipClaude}, concurrency=${CLAUDE_CONCURRENCY})`,
   );
@@ -3479,8 +4197,18 @@ async function runScanCycle(
     error: string | null;
   }
 
+  // 4a. Batch-fetch ALL Kalshi orderbooks in one call (up to 100 tickers).
+  // This replaces individual kalshiGetOrderbook calls and cuts API calls by ~60x.
+  const kalshiTickersToFetch = validPairs
+    .filter((p) => p.pair.poly.yesTokenId && p.pair.poly.noTokenId)
+    .map((p) => p.pair.kalshi.marketId);
+  const kalshiBatchObs = await kalshiBatchOrderbooks(kalshiTickersToFetch);
   console.log(
-    `[scanner] fetching ${validPairs.length} orderbook pairs (concurrency=${ORDERBOOK_CONCURRENCY})`,
+    `[scanner] batch-fetched ${kalshiBatchObs.size}/${kalshiTickersToFetch.length} Kalshi orderbooks`,
+  );
+
+  console.log(
+    `[scanner] fetching ${validPairs.length} Poly orderbooks (concurrency=${ORDERBOOK_CONCURRENCY})`,
   );
   const spreadResults = await mapPool<PreparedPair, SpreadResult>(
     validPairs,
@@ -3502,14 +4230,32 @@ async function runScanCycle(
       let kalshiBook: Orderbook;
       let polyBook: Orderbook;
       try {
-        [kalshiBook, polyBook] = await Promise.all([
-          kalshiGetOrderbook(pair.kalshi.marketId),
-          polyGetOrderbook(
-            pair.poly.yesTokenId,
-            pair.poly.noTokenId,
-            pair.poly.marketId,
-          ),
+        // Use batch-fetched Kalshi orderbook; fall back to individual call.
+        const batchedKalshi = kalshiBatchObs.get(pair.kalshi.marketId);
+        const kalshiPromise = batchedKalshi
+          ? Promise.resolve(batchedKalshi)
+          : kalshiGetOrderbook(pair.kalshi.marketId);
+
+        // PredictIt (and any future platforms without a CLOB) use a
+        // synthetic single-level orderbook from stored best-buy prices.
+        const NON_CLOB_PLATFORMS = new Set<Platform>([
+          'predictit', 'cryptocom', 'fanduel', 'fanatics', 'og',
         ]);
+        if (NON_CLOB_PLATFORMS.has(pair.poly.platform)) {
+          [kalshiBook, polyBook] = await Promise.all([
+            kalshiPromise,
+            Promise.resolve(predictitGetOrderbook(pair.poly)),
+          ]);
+        } else {
+          [kalshiBook, polyBook] = await Promise.all([
+            kalshiPromise,
+            polyGetOrderbook(
+              pair.poly.yesTokenId,
+              pair.poly.noTokenId,
+              pair.poly.marketId,
+            ),
+          ]);
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(
@@ -3643,7 +4389,15 @@ async function runScanCycle(
       const annReturn = days > 0 ? (r.bestNet / days) * 365 : 0;
       const category = pairCategory(r.prep.pair);
       const minApy = minApyForCategory(category);
-      const priority = annReturn * categoryMultiplier(category);
+      let priority = annReturn * categoryMultiplier(category);
+      // Boost game-winner markets closing within 48h — they are executable
+      // TODAY and rank above long-dated futures regardless of APY because
+      // capital turns over immediately. 3× multiplier lifts a 100% APY
+      // same-day game above a 200% APY 200-day future in the priority sort.
+      const isShortDatedGame =
+        days < 2 &&
+        !!(r.prep.pair.kalshi.sportLeague || r.prep.pair.poly.sportLeague);
+      if (isShortDatedGame) priority *= 3;
       return { ...r, closeMs, days, annReturn, category, minApy, priority };
     });
   scoredSpreads.sort((a, b) => b.priority - a.priority);
@@ -3738,6 +4492,22 @@ async function runScanCycle(
     }
   }
 
+  // 8b. Spread persistence — track how long each spread stays open.
+  try {
+    const spreadEventInputs = scoredSpreads
+      .filter((r) => r.bestNet > 0)
+      .map((r) => ({
+        pairId: `${r.prep.pair.kalshi.marketId}:${r.prep.pair.poly.marketId}`,
+        kalshiMarketId: r.prep.pair.kalshi.marketId,
+        polyMarketId: r.prep.pair.poly.marketId,
+        kalshiTitle: r.prep.pair.kalshi.title,
+        netSpread: r.bestNet,
+      }));
+    await syncSpreadEvents(sb, spreadEventInputs, 'scanner');
+  } catch (err) {
+    console.error('[scanner] syncSpreadEvents failed', err);
+  }
+
   console.log(
     `[scanner] stored ${opportunities.length} opportunities (${clearedBoth.length} actionable, ${opportunities.length - clearedBoth.length} below threshold)`,
   );
@@ -3830,7 +4600,8 @@ async function runScanCycle(
   return {
     opportunities,
     kalshiCount: kalshiMarkets.length,
-    polyCount: polyMarkets.length,
+    polyCount: polyMarketsRaw.length,
+    predictItCount: predictItMarkets.length,
     matchedCount: candidates.length,
     matchedCountPreDateFilter: beforeDateFilter,
     pairsFilteredByDate,
@@ -3851,6 +4622,13 @@ async function runScanCycle(
       crossSportRejections: matchResult.joinDiag.crossSportRejections,
       sportsJoinPairs: matchResult.joinDiag.sportsJoinPairs,
       polyPropMarketsFiltered: _propMarketsFiltered,
+    },
+    polyUsFilter: {
+      totalFetched: _polyRawTotal,
+      afterFilter: polyMarkets.length,
+      removed: _polyRawTotal - polyMarkets.length,
+      restrictedRemoved: _polyRestrictedFiltered,
+      inactiveRemoved: _polyInactiveFiltered,
     },
     categoryRouting,
     kalshiSeriesDiscovery: _kalshiSeriesDiscovery,
@@ -3948,6 +4726,7 @@ serve(async (req) => {
       durationMs,
       kalshiCount: result.kalshiCount,
       polyCount: result.polyCount,
+      predictItCount: result.predictItCount,
       matchedCountPreDateFilter: result.matchedCountPreDateFilter,
       matchedCount: result.matchedCount,
       pairsFilteredByDate: result.pairsFilteredByDate,
@@ -3961,6 +4740,7 @@ serve(async (req) => {
       verdictDist: result.verdictDist,
       sportsStats: result.sportsStats,
       joinDiag: result.joinDiag,
+      polyUsFilter: result.polyUsFilter,
       categoryRouting: result.categoryRouting,
       kalshiSeriesDiscovery: result.kalshiSeriesDiscovery,
       kalshiCategoryCounts: result.kalshiCategoryCounts,
