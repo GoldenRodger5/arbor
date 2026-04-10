@@ -1622,11 +1622,18 @@ async function kalshiBatchOrderbooks(
         break; // fall back below
       }
       const data = await res.json() as { orderbooks?: any[] };
-      const returnedTickers = (data.orderbooks ?? []).map((ob: any) => ob.ticker as string).filter(Boolean);
-      console.log(`[kalshi-batch-ob] requested=${JSON.stringify(batch)} returned=${JSON.stringify(returnedTickers)} missing=${JSON.stringify(batch.filter(t => !returnedTickers.includes(t)))}`);
+      // Kalshi batch API may return a single orderbook object whose `ticker`
+      // field is a comma-joined string of all requested tickers (when they
+      // share an event). Split and store under each individual ticker so
+      // downstream lookups by single marketId succeed.
+      const rawTickers: string[] = [];
       for (const ob of data.orderbooks ?? []) {
-        const ticker = ob.ticker as string;
-        if (!ticker) continue;
+        const rawTicker = ob.ticker as string;
+        if (!rawTicker) continue;
+        const tickerKeys = rawTicker.includes(',')
+          ? rawTicker.split(',').map((t) => t.trim()).filter(Boolean)
+          : [rawTicker];
+        rawTickers.push(...tickerKeys);
         const fp = ob.orderbook_fp ?? {};
         const yesRaw: [string, string][] = fp.yes_dollars ?? [];
         const noRaw:  [string, string][] = fp.no_dollars  ?? [];
@@ -1646,8 +1653,12 @@ async function kalshiBatchOrderbooks(
         const noAsks  = yesBids.map((b) => ({ price: 1 - b.price, size: b.size }));
         yesAsks.sort((a, b) => a.price - b.price);
         noAsks.sort((a, b) => a.price - b.price);
-        result.set(ticker, { marketId: ticker, yesBids, yesAsks, noBids, noAsks, fetchedAt: Date.now() });
+        // Store under every individual ticker key.
+        for (const t of tickerKeys) {
+          result.set(t, { marketId: t, yesBids, yesAsks, noBids, noAsks, fetchedAt: Date.now() });
+        }
       }
+      console.log(`[kalshi-batch-ob] requested=${JSON.stringify(batch)} returned=${JSON.stringify(rawTickers)} missing=${JSON.stringify(batch.filter(t => !rawTickers.includes(t)))}`);
     } catch (err) {
       console.error('[kalshi-batch-ob] threw', err);
     }
@@ -2407,29 +2418,40 @@ function parseLevels(
   return out;
 }
 
+// Module-level flag so we only log the full response sample once per scan.
+let _polyObLogged = false;
+
 async function polyFetchBook(tokenId: string): Promise<PolyOrderbookRaw> {
-  const url = `${POLY_CLOB}/book?token_id=${encodeURIComponent(tokenId)}`;
+  // Polymarket US markets live on a separate exchange — their token IDs don't
+  // exist on the global CLOB (clob.polymarket.com). Use the US gateway instead.
+  const url = `https://gateway.polymarket.us/v1/book?token_id=${encodeURIComponent(tokenId)}`;
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'arbor-scanner/1', 'Accept': 'application/json' },
+    });
     const data = response.ok
       ? await response.json() as PolyOrderbookRaw
       : {};
-    console.log('[poly-ob-debug]', JSON.stringify({
-      tokenId: tokenId.slice(0, 20),
-      url,
-      status: response.status,
-      responseKeys: Object.keys(data),
-      rawSample: JSON.stringify(data).slice(0, 300),
-    }));
+    if (!_polyObLogged) {
+      _polyObLogged = true;
+      console.log('[poly-us-ob-response]', JSON.stringify({
+        tokenId,
+        status: response.status,
+        keys: Object.keys(data),
+        sample: JSON.stringify(data).slice(0, 400),
+      }));
+    }
     if (!response.ok) return {};
     return data;
   } catch (err) {
-    console.log('[poly-ob-debug]', JSON.stringify({
-      tokenId: tokenId.slice(0, 20),
-      url,
-      status: 'threw',
-      error: String(err),
-    }));
+    if (!_polyObLogged) {
+      _polyObLogged = true;
+      console.log('[poly-us-ob-response]', JSON.stringify({
+        tokenId,
+        status: 'threw',
+        error: String(err),
+      }));
+    }
     return {};
   }
 }
@@ -3858,6 +3880,7 @@ async function runScanCycle(
   // Reset module-level recurrence-filter state for this scan.
   _recurrenceRejected = 0;
   _recurrenceRejectionSamples = [];
+  _polyObLogged = false;
   // 1. Fetch markets in parallel — Kalshi, Polymarket, PredictIt, and new platforms.
   // New platform stubs (cryptocom/fanduel/fanatics/og) return [] until their APIs
   // are accessible; they each log [platform-fetch] with the HTTP status so we can
