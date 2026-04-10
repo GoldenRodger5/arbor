@@ -718,14 +718,14 @@ async function executePolymarketOrder(
       intent,
       price,
       size: Math.round(size),
-      response: data,
+      responseBody: data,
     }));
     if (!res.ok) return null;
 
     const order = data.order ?? data;
     return {
       orderId: order.id ?? order.orderId ?? order.order_id ?? String(Date.now()),
-      filled:  parseFloat(String(order.filledQuantity ?? order.filled ?? order.sizeMatched ?? size)),
+      filled:  parseFloat(String(order.filledQuantity ?? order.filled ?? order.sizeMatched ?? 0)),
       avgPrice: parseFloat(String(order.avgPrice ?? order.avg_price ?? price)),
     };
   } catch (err) {

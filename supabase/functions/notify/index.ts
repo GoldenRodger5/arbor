@@ -566,6 +566,25 @@ serve(async (req) => {
       try {
         const pairId = `${o.kalshiMarket.marketId ?? ''}:${o.polyMarket.marketId ?? ''}`;
 
+        // Skip if there is already an open/partial/pending_fill position for
+        // the same game. Strip the -NYM/-ATH outcome suffix so both sides of
+        // the same game match the same base ticker.
+        if (sb) {
+          const kTicker = o.kalshiMarket?.marketId ?? '';
+          const baseTicker = kTicker.replace(/-[A-Z]{2,4}$/, '');
+          const { data: existingPos } = await sb
+            .from('positions')
+            .select('id')
+            .ilike('kalshi_market_id', `${baseTicker}%`)
+            .in('status', ['open', 'partial', 'pending_fill'])
+            .maybeSingle();
+          if (existingPos) {
+            console.log('[notify] skip dupe — open position exists', baseTicker);
+            deduped++;
+            continue;
+          }
+        }
+
         // Dedup check against spread_events.
         if (sb) {
           const { data: event } = await sb
@@ -667,7 +686,21 @@ serve(async (req) => {
           break;
         }
 
-        // Step 3: was_executed dedup check — prevents re-execution across scans.
+        // Step 3a: open position dedup — skip if same game already has a position.
+        const kTicker = o.kalshiMarket?.marketId ?? '';
+        const baseTicker = kTicker.replace(/-[A-Z]{2,4}$/, '');
+        const { data: existingGamePos } = await sb
+          .from('positions')
+          .select('id')
+          .ilike('kalshi_market_id', `${baseTicker}%`)
+          .in('status', ['open', 'partial', 'pending_fill'])
+          .maybeSingle();
+        if (existingGamePos) {
+          console.log('[auto-execute] skip dupe — open position exists', baseTicker);
+          continue;
+        }
+
+        // Step 3b: was_executed dedup check — prevents re-execution across scans.
         const oppId = slugifyId(o.kalshiMarket?.marketId || o.id || '');
         const { data: existing } = await sb
           .from('spread_events')
