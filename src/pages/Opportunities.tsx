@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { opportunities as mockOpportunities, type Verdict, type Opportunity } from '@/data/mock';
+import type { Verdict, Opportunity } from '@/data/mock';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { useScannerContext } from '@/context/ScannerContext';
 import type { ArbitrageOpportunity } from '@/types';
@@ -183,7 +183,6 @@ export default function Opportunities() {
       });
       return adapted;
     }
-    if (stats.lastScanAt === null) return mockOpportunities;
     return [];
   }, [ctxOpps, stats.lastScanAt]);
 

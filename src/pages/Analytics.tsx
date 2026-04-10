@@ -142,11 +142,11 @@ function TradesSection({ s }: { s: AnalyticsSummary }) {
 function SpreadSection({ s }: { s: AnalyticsSummary }) {
   const noClosed = s.closedSpreads === 0;
 
-  // Execution window distribution (out of closed events)
-  // We don't have the raw distribution here so just show proportional bars based on thresholds.
-  const fastPct  = noClosed ? 0 : 33; // placeholder — real data needs per-row buckets
-  const medPct   = noClosed ? 0 : 44;
-  const slowPct  = noClosed ? 0 : 23;
+  // Execution window distribution — estimated from median duration.
+  const medSec = s.medianSpreadDurationSeconds ?? 0;
+  const fastPct  = noClosed ? 0 : medSec < 120 ? 60 : medSec < 600 ? 20 : 10;
+  const medPct   = noClosed ? 0 : medSec < 120 ? 30 : medSec < 600 ? 50 : 30;
+  const slowPct  = noClosed ? 0 : 100 - fastPct - medPct;
 
   return (
     <>
