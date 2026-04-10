@@ -173,7 +173,7 @@ const MAX_DAYS_TO_CLOSE = 365;
 // is enough to filter "already in progress" and "about to start" games while
 // still allowing tonight's games scanned in the morning. 3 hours is the
 // floor to safely execute both legs (Kalshi auth, Poly tx, settlement).
-const MIN_HOURS_TO_CLOSE_SPORTS = 3;
+const MIN_HOURS_TO_CLOSE_SPORTS = 1;
 // Per-category date filter ceilings — the further out a market closes,
 // the more its annualized return decays and the more category-specific
 // resolution risk creeps in. Sports used to be capped at 14d to focus on
