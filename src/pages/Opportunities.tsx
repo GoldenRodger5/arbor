@@ -1,8 +1,7 @@
 import { useMemo, useState } from 'react';
-import type { Verdict, Opportunity } from '@/data/mock';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { useScannerContext } from '@/context/ScannerContext';
-import type { ArbitrageOpportunity } from '@/types';
+import type { ArbitrageOpportunity, Verdict, OpportunityRow as Opportunity } from '@/types';
 
 type Filter = 'ALL' | 'SAFE' | 'CAUTION';
 
@@ -169,10 +168,7 @@ export default function Opportunities() {
     triggering,
   } = useScannerContext();
 
-  // Use live opportunities when available; otherwise fall back to mock data
-  // until the first real scan_results row exists. Live opportunities are
-  // sorted by annualized return (capital efficiency) descending — raw spread
-  // is now a secondary metric.
+  // Live opportunities sorted by annualized return (capital efficiency) descending.
   const opportunities = useMemo<Opportunity[]>(() => {
     if (ctxOpps.length > 0) {
       const adapted = ctxOpps.map(adaptOpportunity);

@@ -52,7 +52,7 @@ const SUPABASE_BASE = Deno.env.get('SUPABASE_URL') ?? '';
 
 // Hard limits (safety rails — non-negotiable)
 const MIN_POSITION_USD     = 20;    // not worth executing below this
-const MAX_POSITION_SAFE    = 200;   // SAFE verdict cap
+const MAX_POSITION_SAFE    = 80;    // Must not exceed total capital ($198)
 const MAX_POSITION_CAUTION = 100;   // CAUTION verdict cap
 const MAX_CAPITAL_FRACTION = 0.40;  // never exceed 40% of active capital
 const QUARTER_KELLY        = 0.25;  // fraction of full Kelly to use
@@ -931,11 +931,10 @@ async function handleBuy(
 
   // Show "executing" state while orders are in flight.
   await editMessage(chatId, messageId,
-    `⚙️ <b>Executing${dryLabel}...</b>\n\n${htmlEscape(kTitle)}\n\n` +
-    `KALSHI — Buy ${kalshiSide.toUpperCase()} @ $${kalshiRawPrice.toFixed(4)} × ${qty}\n` +
-    `POLYMARKET — Buy hedge @ $${polyRawPrice.toFixed(4)} × ${qty}\n\n` +
-    `💰 Total: $${totalDeployed.toFixed(2)}\n` +
-    `<i>Quarter Kelly on $${activeCapital.toFixed(2)} active capital — limit: ${sizing.limitingFactor}</i>`);
+    `⚙️ <b>Executing${dryLabel}...</b>\n\n` +
+    `<b>${htmlEscape(kTitle.slice(0,60))}</b>\n\n` +
+    `Kalshi  →  ${kalshiSide.toUpperCase()} @ $${kalshiRawPrice.toFixed(2)}  ×  ${qty} contracts\n` +
+    `Polymarket  →  hedge @ $${polyRawPrice.toFixed(2)}  ×  ${qty} contracts`);
 
   console.log('[execution]', JSON.stringify({
     opportunity: slug,
@@ -977,47 +976,69 @@ async function handleBuy(
   }
   await sb.from('positions').update(update).eq('id', positionId);
 
-  const closeDate = opp.effectiveCloseDate
-    ? new Date(opp.effectiveCloseDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+  const settleDate = opp.effectiveCloseDate
+    ? new Date(opp.effectiveCloseDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
     : `${opp.daysToClose.toFixed(0)}d`;
+  const kTitleShort = kTitle.length > 60 ? kTitle.slice(0, 59) + '…' : kTitle;
 
   let tgMsg: string;
   if (bothOk) {
     const actualDeployed = (kalshiResult!.avgPrice * kalshiResult!.filled) +
                            (polyResult!.avgPrice * polyResult!.filled);
+
+    // Track deployed capital so the system knows how much is in open positions.
+    try {
+      const { data: ledger } = await sb
+        .from('capital_ledger')
+        .select('id, deployed_capital')
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (ledger) {
+        const newDeployed = ((ledger.deployed_capital as number) ?? 0) + actualDeployed;
+        await sb.from('capital_ledger')
+          .update({ deployed_capital: newDeployed, updated_at: new Date().toISOString() })
+          .eq('id', (ledger as any).id);
+        console.log('[capital-deployed]', JSON.stringify({
+          added: Number(actualDeployed.toFixed(2)),
+          newDeployed: Number(newDeployed.toFixed(2)),
+        }));
+      }
+    } catch (err) {
+      console.error('[capital-deployed] update failed', err);
+    }
+
     tgMsg =
       `✅ <b>EXECUTED${dryLabel}</b>\n\n` +
-      `${htmlEscape(kTitle)}\n\n` +
-      `KALSHI: ${kalshiResult!.filled} contracts @ $${kalshiResult!.avgPrice.toFixed(4)}\n` +
-      `POLYMARKET: ${polyResult!.filled} contracts @ $${polyResult!.avgPrice.toFixed(4)}\n\n` +
-      `💰 Total deployed: <b>$${actualDeployed.toFixed(2)}</b>\n` +
-      `📈 Max profit: <b>$${expectedProfit}</b>\n` +
-      `📅 Closes: ${closeDate}\n\n` +
-      `Position ID: <code>${positionId}</code>`;
+      `<b>${htmlEscape(kTitleShort)}</b>\n\n` +
+      `<code>Kalshi     ${kalshiSide.toUpperCase().padEnd(6)}$${kalshiResult!.avgPrice.toFixed(2)}  ×  ${kalshiResult!.filled}</code>\n` +
+      `<code>Polymarket hedge  $${polyResult!.avgPrice.toFixed(2)}  ×  ${polyResult!.filled}</code>\n\n` +
+      `Deployed  <b>$${actualDeployed.toFixed(2)}</b>\n` +
+      `Profit    <b>+$${expectedProfit}</b>  when settled ${settleDate}\n\n` +
+      `<code>${positionId}</code>`;
   } else if (noneOk) {
     tgMsg =
-      `❌ <b>Execution failed on both legs${dryLabel}</b>\n\n` +
-      `${htmlEscape(kTitle)}\n\nNo position opened. Position ID: <code>${positionId}</code>`;
+      `❌ <b>Execution failed — no position opened${dryLabel}</b>\n\n` +
+      `<b>${htmlEscape(kTitleShort)}</b>\n\n` +
+      `Both legs returned errors. No capital deployed.\n` +
+      `Check platform status and try again if spread persists.\n\n` +
+      `<code>${positionId}</code>`;
   } else {
-    // Partial fill — one leg succeeded, one failed. This is dangerous.
-    const filledPlatform   = kalshiOk ? 'KALSHI'      : 'POLYMARKET';
-    const failedPlatform   = kalshiOk ? 'POLYMARKET'  : 'KALSHI';
-    const filledDetail     = kalshiOk
-      ? `${kalshiResult!.filled} contracts @ $${kalshiResult!.avgPrice.toFixed(4)}`
-      : `${polyResult!.filled} contracts @ $${polyResult!.avgPrice.toFixed(4)}`;
+    const filledPlatform   = kalshiOk ? 'Kalshi'      : 'Polymarket';
+    const failedPlatform   = kalshiOk ? 'Polymarket'  : 'Kalshi';
     const failedMarket     = kalshiOk ? pTitle : kTitle;
     const failedSide       = kalshiOk ? (kalshiSide === 'yes' ? 'NO' : 'YES') : kalshiSide.toUpperCase();
     const failedPrice      = kalshiOk ? polyRawPrice : kalshiRawPrice;
     tgMsg =
-      `⚠️ <b>PARTIAL FILL — ACTION REQUIRED${dryLabel}</b>\n\n` +
-      `${filledPlatform} leg filled: ${filledDetail}\n` +
-      `${failedPlatform} leg FAILED.\n\n` +
-      `You have an <b>open unhedged position</b>.\n\n` +
-      `Manually execute the ${failedPlatform} leg:\n` +
-      `<code>${htmlEscape(failedMarket)}</code>\n` +
-      `Buy ${failedSide} @ $${failedPrice.toFixed(4)}\n\n` +
-      `Or close the ${filledPlatform} position immediately.\n\n` +
-      `Position ID: <code>${positionId}</code>`;
+      `⚠️ <b>PARTIAL FILL — ACT NOW${dryLabel}</b>\n\n` +
+      `${filledPlatform} leg filled ✅\n` +
+      `${failedPlatform} leg failed ❌\n\n` +
+      `You have an open unhedged position.\n\n` +
+      `Manually execute on ${failedPlatform}:\n` +
+      `<code>${htmlEscape(failedMarket.slice(0,60))}</code>\n` +
+      `Buy ${failedSide} @ $${failedPrice.toFixed(2)}\n\n` +
+      `Or immediately close your ${filledPlatform} position.\n\n` +
+      `<code>${positionId}</code>`;
   }
   await editMessage(chatId, messageId, tgMsg);
 }
@@ -1145,18 +1166,21 @@ async function handleResolutionBuy(
 
   let tgMsg: string;
   if (result) {
+    const resDeployed = (result.avgPrice * result.filled);
+    const resProfit   = ((1 - result.avgPrice) * 0.99 * result.filled);
     tgMsg =
-      `🏁 <b>RESOLUTION ARB EXECUTED${dryLabel}</b>\n\n` +
-      `${htmlEscape(title)}\n\n` +
-      `Bought ${result.filled} contracts @ $${result.avgPrice.toFixed(4)}\n` +
-      `Expected payout: <b>$${result.filled}.00</b> per contract\n` +
-      `Expected profit: <b>+$${netProfit}</b>\n\n` +
-      `Position ID: <code>${positionId}</code>\n` +
-      `Settles automatically within 2 hours.`;
+      `🏁 <b>RESOLUTION EXECUTED${dryLabel}</b>\n\n` +
+      `<b>${htmlEscape(title.slice(0,60))}</b>\n\n` +
+      `<code>BUY ${side.toUpperCase().padEnd(4)} kalshi  $${result.avgPrice.toFixed(2)}  ×  ${result.filled}</code>\n\n` +
+      `Deployed <b>$${resDeployed.toFixed(2)}</b>  →  profit <b>+$${resProfit.toFixed(2)}</b>\n` +
+      `Settles within 2 hours\n\n` +
+      `<code>${positionId}</code>`;
   } else {
     tgMsg =
-      `❌ <b>Resolution arb execution failed${dryLabel}</b>\n\n` +
-      `${htmlEscape(title)}\n\nOrder not placed. Position ID: <code>${positionId}</code>`;
+      `❌ <b>Execution failed — no position opened${dryLabel}</b>\n\n` +
+      `<b>${htmlEscape(title.slice(0,60))}</b>\n\n` +
+      `Order not placed. Check platform status.\n\n` +
+      `<code>${positionId}</code>`;
   }
   await editMessage(chatId, messageId, tgMsg);
 }

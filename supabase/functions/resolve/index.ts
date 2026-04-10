@@ -407,38 +407,37 @@ async function sendTelegram(payload: Record<string, unknown>): Promise<void> {
   }
 }
 
+function trunc(s: string, n = 60): string {
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
 async function alertOpportunity(opp: ResolutionOpportunity, dryRun: boolean): Promise<void> {
-  const netPctStr = (opp.netPct * 100).toFixed(1);
-  const qty       = Math.max(1, Math.floor(MAX_RESOLUTION_USD / opp.winningAsk));
-  const deployed  = (opp.winningAsk * qty).toFixed(2);
-  const profit    = (opp.netProfit * qty).toFixed(2);
-  const sportLine = opp.sport && opp.teams.length >= 2
-    ? `<b>${htmlEscape(opp.teams[0])} vs ${htmlEscape(opp.teams[1])}</b> — ${opp.sport} — GAME FINAL\n`
-    : '';
-  const espnLine = opp.espnVerified
-    ? `✅ ESPN confirmed: <b>${htmlEscape(opp.espnWinner ?? '')}</b> won\n`
-    : `⚠️ ESPN verification pending — manual confirm advised\n`;
+  const qty      = Math.max(1, Math.floor(MAX_RESOLUTION_USD / opp.winningAsk));
+  const deployed = (opp.winningAsk * qty);
+  const profit   = (opp.netProfit * qty);
+  const espnTag  = opp.espnVerified ? 'ESPN confirmed ✅' : 'Pending verification ⚠️';
   const dryLabel = dryRun ? ' [DRY RUN]' : '';
   const oppId    = slugify(opp.ticker);
+  const sportTag = opp.sport ?? 'MARKET';
+
+  const teamLine = opp.teams.length >= 2
+    ? `<b>${htmlEscape(opp.teams[0])} vs ${htmlEscape(opp.teams[1])}</b>\n`
+    : '';
 
   const text =
-    `🏁 <b>RESOLUTION ARB${dryLabel}</b> — ${opp.sport ?? 'MARKET'}\n\n` +
-    sportLine +
-    `${htmlEscape(opp.title)}\n\n` +
-    `${espnLine}\n` +
-    `Kalshi result: <b>${opp.result.toUpperCase()}</b> — ${htmlEscape(opp.winningSide.toUpperCase())} side wins\n` +
-    `Current ${opp.winningSide.toUpperCase()} ask: <b>$${opp.winningAsk.toFixed(4)}</b> (should be $1.00)\n\n` +
-    `Buy ${opp.winningSide.toUpperCase()}: <code>kalshi @ $${opp.winningAsk.toFixed(4)} × ${qty} contracts = $${deployed}</code>\n` +
-    `Guaranteed payout: <b>$${qty}.00</b>\n` +
-    `Net profit: <b>$${profit} (+${netPctStr}%)</b>\n` +
-    `Settles: typically within 2 hours`;
+    `🏁 <b>RESOLUTION ARB${dryLabel} · ${sportTag}</b>\n\n` +
+    teamLine +
+    `${espnTag}\n\n` +
+    `<b>${htmlEscape(opp.espnWinner ?? opp.teams[0] ?? '')} won</b> · winning side mispriced at <b>$${opp.winningAsk.toFixed(2)}</b>\n\n` +
+    `<code>BUY ${opp.winningSide.toUpperCase().padEnd(4)} kalshi  $${opp.winningAsk.toFixed(2)}  ×  ${qty}</code>\n\n` +
+    `Deploy <b>$${deployed.toFixed(2)}</b>  →  profit <b>+$${profit.toFixed(2)}</b>\n` +
+    `Settles within 2 hours`;
 
   const row1 = [
-    { text: `✅ Execute $${deployed}`, callback_data: `res_buy_${oppId}` },
-    { text: '❌ Skip',                  callback_data: `res_skip_${oppId}` },
+    { text: `✅ Execute $${deployed.toFixed(2)}`, callback_data: `res_buy_${oppId}` },
+    { text: '❌ Skip', callback_data: `res_skip_${oppId}` },
   ];
-  const row2 = [{ text: '📈 View on Kalshi ↗', url: opp.kalshiUrl }];
-
+  const row2 = [{ text: 'Kalshi ↗', url: opp.kalshiUrl }];
   await sendTelegram({ text, reply_markup: { inline_keyboard: [row1, row2] } });
 }
 
@@ -656,24 +655,22 @@ async function checkLiveGameSpreads(
         console.log(`[resolve-live] ${ticker}: ${winningSide} ask=$${winningAsk.toFixed(4)} (leading ${game.leadingTeam} by ${game.scoreDiff}, ${game.winProbLabel})`);
 
         if (winningAsk > 0 && winningAsk < 0.90) {
-          // Winning side still < 90¢ during a high-certainty game = arb opportunity.
-          const profit = ((1 - winningAsk) * 0.99).toFixed(2);
-          const text =
-            `⚡ <b>LIVE GAME ARB — ${game.sport} IN PROGRESS</b>\n\n` +
-            `<b>${htmlEscape(game.homeTeam)} ${game.homeScore} — ${htmlEscape(game.awayTeam)} ${game.awayScore}</b>\n` +
-            `${game.period}${game.clock ? ' | ' + game.clock : ''}\n\n` +
-            `${htmlEscape(game.leadingTeam)} leading by ${game.scoreDiff} — ${game.winProbLabel} likely winner\n\n` +
-            `${winningSide} ask on Kalshi: <b>$${winningAsk.toFixed(4)}</b> (should be ~$0.90+)\n` +
-            `Profit if winner: <b>+$${profit}/contract</b>\n\n` +
-            `⚡ Window: prices diverging — act fast`;
+          const profit = ((1 - winningAsk) * 0.99);
+          const oppId  = slugify(ticker);
 
-          const oppId = slugify(ticker);
+          const text =
+            `⚡ <b>LIVE ARB · ${game.sport}</b>\n\n` +
+            `<b>${htmlEscape(game.homeTeam)} ${game.homeScore} – ${htmlEscape(game.awayTeam)} ${game.awayScore}</b>\n` +
+            `${game.period}${game.clock ? ' · ' + game.clock : ''} · ${game.winProbLabel} probable winner\n\n` +
+            `Platform prices diverging — window closing fast\n\n` +
+            `<code>BUY ${winningSide.padEnd(4)} kalshi  $${winningAsk.toFixed(2)}</code>\n\n` +
+            `Profit <b>+$${profit.toFixed(2)}/contract</b>`;
+
           await sendTelegram({
             text,
-            reply_markup: { inline_keyboard: [[
-              { text: `✅ Execute NOW`, callback_data: `buy_${oppId}` },
-              { text: '❌ Skip', callback_data: `skip_${oppId}` },
-            ]]},
+            reply_markup: { inline_keyboard: [
+              [{ text: `✅ Execute NOW`, callback_data: `buy_${oppId}` }, { text: '❌ Skip', callback_data: `skip_${oppId}` }],
+            ]},
           });
           liveAlerts++;
         }
@@ -827,29 +824,24 @@ async function checkPositionSettlements(
           }).eq('id', ledger.id);
         }
 
-        // Telegram notification.
-        const kTitle = pos.kalshi_title as string ?? '';
+        const kTitle = trunc(htmlEscape(pos.kalshi_title as string ?? ''));
         if (realizedPnl >= 0) {
           await sendTelegram({
             text:
-              `✅ <b>POSITION SETTLED — PROFIT</b>\n\n` +
-              `${htmlEscape(kTitle)}\n\n` +
-              `Kalshi: ${kSide.toUpperCase()} @ $${(kFillPrice??0).toFixed(4)} × ${kQty}\n` +
-              `Polymarket: hedge @ $${(pFillPrice??0).toFixed(4)} × ${kQty}\n\n` +
-              `Total deployed: <b>$${totalCost.toFixed(2)}</b>\n` +
-              `Payout received: <b>$${totalPayout.toFixed(2)}</b>\n` +
-              `💰 Profit: <b>+$${realizedPnl.toFixed(2)} (+${pnlPct.toFixed(1)}%)</b>\n\n` +
-              `Capital freed: $${totalCost.toFixed(2)}`,
+              `✅ <b>SETTLED · +$${realizedPnl.toFixed(2)}</b>\n\n` +
+              `<b>${kTitle}</b>\n\n` +
+              `Deployed  $${totalCost.toFixed(2)}\n` +
+              `Payout    $${totalPayout.toFixed(2)}\n` +
+              `Profit    <b>+$${realizedPnl.toFixed(2)} (+${pnlPct.toFixed(1)}%)</b>`,
           });
         } else {
           await sendTelegram({
             text:
-              `⚠️ <b>POSITION SETTLED — UNEXPECTED LOSS</b>\n\n` +
-              `${htmlEscape(kTitle)}\n\n` +
-              `Total deployed: $${totalCost.toFixed(2)}\n` +
-              `Payout: $${totalPayout.toFixed(2)}\n` +
-              `❌ Loss: <b>-$${Math.abs(realizedPnl).toFixed(2)}</b>\n\n` +
-              `This should not happen in arb — check execution logs.`,
+              `⚠️ <b>SETTLED · -$${Math.abs(realizedPnl).toFixed(2)}</b>\n\n` +
+              `<b>${kTitle}</b>\n\n` +
+              `Deployed  $${totalCost.toFixed(2)}\n` +
+              `Payout    $${totalPayout.toFixed(2)}\n` +
+              `❌ Loss <b>-$${Math.abs(realizedPnl).toFixed(2)}</b> — check execution logs`,
           });
         }
 
@@ -871,12 +863,10 @@ async function checkPositionSettlements(
       const hours = Math.round(age / 3_600_000);
       await sendTelegram({
         text:
-          `⏰ <b>PENDING POSITION REMINDER</b>\n\n` +
-          `${htmlEscape(p.kalshi_title as string ?? '')}\n` +
-          `Logged ${hours} hours ago as pending.\n\n` +
-          `Have you executed both legs manually?\n` +
-          `If yes, reply <code>/done_${p.id}</code>\n` +
-          `If no longer valid, reply <code>/cancel_${p.id}</code>`,
+          `⏰ <b>PENDING · ${hours}h old</b>\n\n` +
+          `<b>${trunc(htmlEscape(p.kalshi_title as string ?? ''))}</b>\n\n` +
+          `Executed both legs? → <code>/done_${p.id}</code>\n` +
+          `No longer valid? → <code>/cancel_${p.id}</code>`,
       });
       pendingReminders++;
     }
@@ -960,17 +950,15 @@ serve(async (req) => {
     }
   }
 
-  // Alert manual-review non-verified sports opps separately.
   for (const opp of manualReview) {
-    const text =
-      `⚠️ <b>RESOLUTION ARB — MANUAL VERIFY REQUIRED</b>\n\n` +
-      `${htmlEscape(opp.title)}\n\n` +
-      `Kalshi says: <b>${opp.result.toUpperCase()}</b> wins\n` +
-      `ESPN: could not verify outcome\n` +
-      `${opp.winningSide.toUpperCase()} ask: <b>$${opp.winningAsk.toFixed(4)}</b>\n\n` +
-      `Verify manually at: <a href="${opp.kalshiUrl}">${opp.kalshiUrl}</a>\n` +
-      `If correct, execute: buy ${opp.winningSide} @ ${opp.winningAsk.toFixed(4)}`;
-    await sendTelegram({ text });
+    await sendTelegram({
+      text:
+        `⚠️ <b>RESOLUTION ARB · VERIFY MANUALLY</b>\n\n` +
+        `<b>${trunc(htmlEscape(opp.title))}</b>\n\n` +
+        `Kalshi says <b>${opp.result.toUpperCase()}</b> wins · ${opp.winningSide.toUpperCase()} @ <b>$${opp.winningAsk.toFixed(2)}</b>\n` +
+        `ESPN could not confirm\n\n` +
+        `Verify at ${opp.kalshiUrl}`,
+    });
     alertsFired++;
   }
 

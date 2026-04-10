@@ -29,7 +29,7 @@ const GLOBAL_DRY_RUN         = Deno.env.get('TRADE_DRY_RUN') === 'true';
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MIN_POSITION_USD     = 20;
-const MAX_POSITION_SAFE    = 200;
+const MAX_POSITION_SAFE    = 80;   // Must not exceed total capital ($198)
 const MAX_POSITION_CAUTION = 100;
 const MAX_CAPITAL_FRACTION = 0.40;
 const QUARTER_KELLY        = 0.25;
@@ -278,11 +278,26 @@ function htmlEscape(s: string): string {
     .replace(/>/g, '&gt;');
 }
 
+function fmtDate(isoOrDays: string | number | undefined): string {
+  if (typeof isoOrDays === 'number') {
+    const d = new Date(Date.now() + isoOrDays * 86_400_000);
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  }
+  if (!isoOrDays) return '—';
+  try {
+    return new Date(isoOrDays).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  } catch { return '—'; }
+}
+
+function trunc(s: string, n = 60): string {
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
 function formatMessage(
   o: Opportunity,
   activeCapital: number,
-  kalshiBalance = 0,
-  polyBalance = 0,
+  _kalshiBalance = 0,
+  _polyBalance = 0,
 ): { text: string; reply_markup: unknown } {
   const lvl = o.levels[0];
   const costPerPair = lvl.buyYesPrice + lvl.buyNoPrice;
@@ -293,58 +308,36 @@ function formatMessage(
     o.bestNetSpread, costPerPair, activeCapital, verdict, availableLiquidity,
   );
   const qty           = Math.max(1, sizing.contracts);
-  const yesCost       = lvl.buyYesPrice * qty;
-  const noCost        = lvl.buyNoPrice * qty;
   const kellyDeployed = sizing.totalDeployed > 0 ? sizing.totalDeployed : costPerPair * qty;
+  const maxProfit     = (o.totalMaxProfit * (qty / lvl.quantity));
+  const netPct        = (o.bestNetSpread * 100).toFixed(1);
+  const apyPct        = (o.annualizedReturn * 100).toFixed(1);
+  const emoji         = verdict === 'SAFE' ? '🟢' : '🟡';
+  const kTitle        = trunc(htmlEscape(o.kalshiMarket.title || ''));
+  const settleDate    = fmtDate(o.effectiveCloseDate ?? o.daysToClose);
 
-  const maxProfit    = Math.round(o.totalMaxProfit * (qty / lvl.quantity));
-  const netSpreadPct = (o.bestNetSpread * 100).toFixed(1);
-  const apyPct       = (o.annualizedReturn * 100).toFixed(1);
-  const daysToClose  = o.daysToClose.toFixed(1);
-  const emoji        = verdict === 'SAFE' ? '🟢' : '🟡';
-
-  const kTitle    = htmlEscape(o.kalshiMarket.title || '(untitled)');
-  const reasoning = htmlEscape(o.verdictReasoning || '');
-
-  const buyYesLine =
-    `Buy YES: <code>${lvl.buyYesPlatform} @ $${lvl.buyYesPrice.toFixed(4)}` +
-    ` × ${qty} contracts = $${yesCost.toFixed(2)}</code>`;
-  const buyNoLine =
-    `Buy NO:  <code>${lvl.buyNoPlatform} @ $${lvl.buyNoPrice.toFixed(4)}` +
-    ` × ${qty} contracts = $${noCost.toFixed(2)}</code>`;
-
-  const balanceLine = (kalshiBalance > 0 || polyBalance > 0)
-    ? `💳 Kalshi: $${kalshiBalance.toFixed(2)} | Poly: $${polyBalance.toFixed(2)}\n`
-    : '';
+  // Verdict reasoning — show only if non-generic (> 30 chars, not boilerplate).
+  const rawReasoning = o.verdictReasoning ?? '';
+  const reasoning = rawReasoning.length > 30 && !rawReasoning.toLowerCase().includes('same proposition')
+    ? `\n<i>${trunc(htmlEscape(rawReasoning), 120)}</i>` : '';
 
   const text =
-    `${emoji} <b>ARB SIGNAL — ${verdict}</b>\n\n` +
+    `${emoji} <b>${verdict} · ${netPct}% net · ${o.daysToClose.toFixed(0)}d</b>\n\n` +
     `<b>${kTitle}</b>\n\n` +
-    `${buyYesLine}\n` +
-    `${buyNoLine}\n\n` +
-    `💰 Deploying: <b>$${kellyDeployed.toFixed(2)}</b>\n` +
-    `   <i>(Quarter Kelly on $${activeCapital.toFixed(0)} active capital — limit: ${sizing.limitingFactor})</i>\n` +
-    balanceLine +
-    `📈 <b>Max profit: $${maxProfit} (+${netSpreadPct}% net)</b>\n` +
-    `📅 <b>Closes in ${daysToClose}d</b>  →  APY: <b>+${apyPct}%</b>\n` +
-    `<i>(${daysToClose}d lockup — worth it at +${netSpreadPct}% net?)</i>\n\n` +
-    (reasoning ? `<i>${reasoning}</i>` : '');
+    `<code>BUY YES  ${lvl.buyYesPlatform.padEnd(12)}$${lvl.buyYesPrice.toFixed(2)}  ×  ${qty}</code>\n` +
+    `<code>BUY NO   ${lvl.buyNoPlatform.padEnd(12)}$${lvl.buyNoPrice.toFixed(2)}  ×  ${qty}</code>\n\n` +
+    `💰 Deploy <b>$${kellyDeployed.toFixed(2)}</b>  →  profit <b>+$${maxProfit.toFixed(2)}</b>\n` +
+    `📅 Settles ${settleDate}  ·  APY <b>+${apyPct}%</b>` +
+    reasoning;
 
   const oppId = slugifyId(o.kalshiMarket.marketId || o.id || '');
   const row1 = [
-    {
-      text: `✅ Execute $${kellyDeployed.toFixed(2)}`,
-      callback_data: `buy_${oppId}`,
-    },
+    { text: `✅ Execute $${kellyDeployed.toFixed(2)}`, callback_data: `buy_${oppId}` },
     { text: '❌ Skip', callback_data: `skip_${oppId}` },
   ];
   const row2: Array<{ text: string; url: string }> = [];
-  if (o.kalshiMarket.url) {
-    row2.push({ text: '📈 View on Kalshi ↗', url: o.kalshiMarket.url });
-  }
-  if (o.polyMarket.url) {
-    row2.push({ text: '📊 View on Polymarket ↗', url: o.polyMarket.url });
-  }
+  if (o.kalshiMarket.url) row2.push({ text: 'Kalshi ↗', url: o.kalshiMarket.url });
+  if (o.polyMarket.url)   row2.push({ text: 'Polymarket ↗', url: o.polyMarket.url });
   const inline_keyboard: unknown[][] = [row1];
   if (row2.length > 0) inline_keyboard.push(row2);
 
@@ -531,14 +524,13 @@ serve(async (req) => {
           });
           console.log('[notify-auto-execute] trade response:', tRes.status);
 
-          // Send post-execution notification.
           await sendTelegram({
             chat_id: TELEGRAM_CHAT_ID,
-            text: `🤖 <b>AUTO-EXECUTED — HIGH CONFIDENCE</b>\n\n` +
-              `${htmlEscape(o.kalshiMarket.title || '')}\n` +
-              `SAFE verdict, ${(o.bestNetSpread * 100).toFixed(1)}% net spread, same-day game.\n` +
-              `Window too short for manual approval.\n\n` +
-              `Check /stats for position details.`,
+            text: `🤖 <b>AUTO-EXECUTED</b>\n\n` +
+              `<b>${trunc(htmlEscape(o.kalshiMarket.title || ''))}</b>\n\n` +
+              `SAFE verdict · ${(o.bestNetSpread * 100).toFixed(1)}% net · same-day game\n\n` +
+              `Deployed <b>$${(costPerPair * Math.max(1, sizing.contracts)).toFixed(2)}</b>  →  profit <b>+$${maxProfit.toFixed(2)}</b>\n` +
+              `Settles ${fmtDate(o.effectiveCloseDate ?? o.daysToClose)}`,
             parse_mode: 'HTML',
           });
         } catch (err) {

@@ -87,6 +87,35 @@ export interface ScannerConfig {
   minNetSpread: number;
 }
 
+// UI-facing opportunity type used by the Opportunities page.
+// Adapted from ArbitrageOpportunity by the page component.
+export type Verdict = 'SAFE' | 'CAUTION' | 'SKIP';
+
+export interface OpportunityRow {
+  id: number;
+  event: string;
+  polyYes: number;
+  kalshiNo: number;
+  rawSpread: number;
+  netSpread: number;
+  maxDollar: number;
+  verdict: Verdict;
+  scanned: string;
+  polyDepth: { price: number; qty: number }[];
+  kalshiDepth: { price: number; qty: number }[];
+  daysToClose?: number;
+  annualizedReturn?: number;
+  effectiveCloseDate?: string;
+  kalshiCloseDate?: string;
+  polyCloseDate?: string;
+  polyUrl?: string;
+  kalshiUrl?: string;
+  verdictReasoning?: string;
+  riskFactors?: string[];
+  kalshiYesMeaning?: string;
+  polyHedgeOutcomeLabel?: string;
+}
+
 export interface AnalyticsSummary {
   // Capital
   totalCapital: number;

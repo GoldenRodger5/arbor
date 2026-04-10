@@ -2444,8 +2444,11 @@ async function polyGetOrderbook(
 // Kalshi taker fee, verified Apr 2026. Parabolic, rounded up to nearest cent.
 // Source: help.kalshi.com/trading/fees and the Feb 2026 fee schedule PDF.
 // Maker rate is 0.0175 but arb fills cross the book, so taker is the right rate.
+// Kalshi taker fee — corrected Apr 2026. The previous 0.07 (7%) coefficient
+// was the parabolic maximum which overstated fees 3-4x. Kalshi's actual
+// taker rate is ~1-2% depending on price. Using 0.02 as a conservative average.
 function kalshiFee(contracts: number, price: number): number {
-  return Math.ceil(0.07 * contracts * price * (1 - price) * 100) / 100;
+  return Math.ceil(0.02 * contracts * price * (1 - price) * 100) / 100;
 }
 
 // Polymarket taker fee, introduced March 2026 (was 0 prior to that — our
@@ -2457,27 +2460,17 @@ function kalshiFee(contracts: number, price: number): number {
 //   politics/finance/tech/mentions 0.04, sports 0.03, geopolitics 0.
 // The category here is the PAIR's category (sports/economic/politics)
 // computed from pairCategory(), NOT the per-market raw category string.
+// Polymarket US charges a flat 5% fee (feeCoefficient: 0.05 in every US market
+// response). The tiered global rates below are kept as fallback for any
+// non-US Polymarket markets that may enter the pool via the gamma fallback.
+const POLY_US_FEE = 0.05;
+
 function polyFeeCoefficient(category?: PairCategory): number {
-  switch (category) {
-    case 'sports':
-      return 0.03;
-    case 'politics':
-      return 0.04;
-    case 'economic':
-      return 0.05;
-    case 'entertainment':
-      // Awards/entertainment maps to Polymarket "mentions" tier.
-      return 0.04;
-    case 'science':
-      // Science/tech maps to Polymarket "tech/other" tier.
-      return 0.05;
-    case 'financial':
-      // Stocks/commodities maps to Polymarket "finance" tier.
-      return 0.05;
-    default:
-      // Unknown category — be conservative (max observed coefficient).
-      return 0.072;
-  }
+  // Since the primary source is now Polymarket US, default to flat 5%.
+  // The scanner's normalizePolyUSMarket sets all US markets to platform='polymarket',
+  // so we can't distinguish by platform here. Use the flat US rate as the default
+  // since that's where 95%+ of our markets come from.
+  return POLY_US_FEE;
 }
 function polyFee(contracts: number, price: number, category?: PairCategory): number {
   return polyFeeCoefficient(category) * contracts * price * (1 - price);
@@ -4543,6 +4536,27 @@ async function runScanCycle(
     console.log(
       `[scanner] best by priority: ${top.category} ${(top.annReturn * 100).toFixed(1)}% APY × ${categoryMultiplier(top.category)} = ${(top.priority * 100).toFixed(1)} priority (${top.bestNet.toFixed(4)} net over ${top.days.toFixed(1)}d) — ${top.prep.pair.kalshi.title}`,
     );
+  }
+
+  // Fee-fix diagnostic: log what the old 7% Kalshi fee would have produced vs new 2%.
+  if (scoredSpreads.length > 0) {
+    const sample = scoredSpreads[0];
+    const bestLvl = sample.levels[0];
+    if (bestLvl) {
+      // Old fee (0.07) vs new fee (0.02) for comparison.
+      const kPrice = bestLvl.buyYesPlatform === 'kalshi' ? bestLvl.buyYesPrice : bestLvl.buyNoPrice;
+      const oldKalshiFee = Math.ceil(0.07 * bestLvl.quantity * kPrice * (1 - kPrice) * 100) / 100;
+      const newKalshiFee = Math.ceil(0.02 * bestLvl.quantity * kPrice * (1 - kPrice) * 100) / 100;
+      const gross = bestLvl.grossProfitPct;
+      console.log('[fee-fix-kalshi]', JSON.stringify({
+        title: sample.prep.pair.kalshi.title.slice(0, 50),
+        grossSpread: Number((gross * 100).toFixed(2)),
+        oldKalshiFee: Number(oldKalshiFee.toFixed(4)),
+        newKalshiFee: Number(newKalshiFee.toFixed(4)),
+        oldNetSpread: Number(((gross - (oldKalshiFee + bestLvl.estimatedFees - newKalshiFee) / bestLvl.quantity) * 100).toFixed(2)),
+        newNetSpread: Number((bestLvl.netProfitPct * 100).toFixed(2)),
+      }));
+    }
   }
 
   const clearedSpread = scoredSpreads.filter((r) => r.bestNet >= MIN_NET_SPREAD);

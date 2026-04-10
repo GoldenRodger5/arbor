@@ -31,11 +31,11 @@ const defaultConfig: ScannerConfig = {
 };
 
 const defaultCapital: CapitalState = {
-  totalCapital: 500,
+  totalCapital: 0,
   deployedCapital: 0,
   safetyReservePct: 0.2,
   realizedPnl: 0,
-  activeCapital: 500,
+  activeCapital: 0,
 };
 
 interface ScannerContextValue {
