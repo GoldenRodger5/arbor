@@ -1598,9 +1598,9 @@ async function kalshiGetOrderbook(ticker: string, depth = 10): Promise<Orderbook
 }
 
 /**
- * Batch-fetch Kalshi orderbooks for up to 100 tickers in one call.
- * Falls back to individual fetches on failure.
- * Endpoint: GET /trade-api/v2/markets/orderbooks?tickers=T1,T2,...
+ * Fetch Kalshi orderbooks for a list of tickers in parallel.
+ * The batch endpoint (?tickers=T1,T2,...) merges same-event tickers into one
+ * response with empty data, so we fetch individually and parallelize instead.
  */
 async function kalshiBatchOrderbooks(
   tickers: string[],
@@ -1608,73 +1608,26 @@ async function kalshiBatchOrderbooks(
   const result = new Map<string, Orderbook>();
   if (tickers.length === 0) return result;
 
-  // Chunk into groups of 50 (Kalshi allows up to 100, but be conservative).
-  const CHUNK = 50;
-  for (let i = 0; i < tickers.length; i += CHUNK) {
-    const batch = tickers.slice(i, i + CHUNK);
-    const signPath = '/markets/orderbooks';
-    try {
-      const headers = await kalshiAuthHeaders('GET', signPath);
-      const url = `${KALSHI_BASE}${signPath}?tickers=${batch.join(',')}`;
-      const res = await fetch(url, { headers });
-      if (!res.ok) {
-        console.warn(`[kalshi-batch-ob] HTTP ${res.status} — falling back to individual`);
-        break; // fall back below
-      }
-      const data = await res.json() as { orderbooks?: any[] };
-      // Log the raw structure of the first orderbook so we can verify field names.
-      if ((data.orderbooks ?? []).length > 0) {
-        const firstOb = data.orderbooks![0];
-        console.log('[kalshi-ob-raw]', JSON.stringify({
-          ticker: firstOb.ticker,
-          keys: Object.keys(firstOb),
-          yesSide: firstOb.yes ?? firstOb.YES,
-          noSide: firstOb.no ?? firstOb.NO,
-          sample: JSON.stringify(firstOb).slice(0, 400),
-        }));
-      }
-      // Kalshi batch API may return a single orderbook object whose `ticker`
-      // field is a comma-joined string of all requested tickers (when they
-      // share an event). Split and store under each individual ticker so
-      // downstream lookups by single marketId succeed.
-      const rawTickers: string[] = [];
-      for (const ob of data.orderbooks ?? []) {
-        const rawTicker = ob.ticker as string;
-        if (!rawTicker) continue;
-        const tickerKeys = rawTicker.includes(',')
-          ? rawTicker.split(',').map((t) => t.trim()).filter(Boolean)
-          : [rawTicker];
-        rawTickers.push(...tickerKeys);
-        const fp = ob.orderbook_fp ?? {};
-        const yesRaw: [string, string][] = fp.yes_dollars ?? [];
-        const noRaw:  [string, string][] = fp.no_dollars  ?? [];
-        const yesBids: OrderbookLevel[] = [];
-        const noBids:  OrderbookLevel[] = [];
-        for (const [p, s] of yesRaw) {
-          const price = parseFloat(p); const size = parseFloat(s);
-          if (Number.isFinite(price) && Number.isFinite(size)) yesBids.push({ price, size });
-        }
-        for (const [p, s] of noRaw) {
-          const price = parseFloat(p); const size = parseFloat(s);
-          if (Number.isFinite(price) && Number.isFinite(size)) noBids.push({ price, size });
-        }
-        yesBids.sort((a, b) => b.price - a.price);
-        noBids.sort((a, b) => b.price - a.price);
-        const yesAsks = noBids.map((b) => ({ price: 1 - b.price, size: b.size }));
-        const noAsks  = yesBids.map((b) => ({ price: 1 - b.price, size: b.size }));
-        yesAsks.sort((a, b) => a.price - b.price);
-        noAsks.sort((a, b) => a.price - b.price);
-        // Store under every individual ticker key.
-        for (const t of tickerKeys) {
-          result.set(t, { marketId: t, yesBids, yesAsks, noBids, noAsks, fetchedAt: Date.now() });
-        }
-      }
-      console.log(`[kalshi-batch-ob] requested=${JSON.stringify(batch)} returned=${JSON.stringify(rawTickers)} missing=${JSON.stringify(batch.filter(t => !rawTickers.includes(t)))}`);
-    } catch (err) {
-      console.error('[kalshi-batch-ob] threw', err);
+  const settled = await Promise.allSettled(
+    tickers.map(async (ticker) => {
+      const ob = await kalshiGetOrderbook(ticker);
+      return { ticker, ob };
+    }),
+  );
+
+  let fetched = 0;
+  const missing: string[] = [];
+  for (const s of settled) {
+    if (s.status === 'fulfilled') {
+      result.set(s.value.ticker, s.value.ob);
+      fetched++;
+    } else {
+      // extract ticker from rejection — find which one failed
+      const idx = settled.indexOf(s);
+      if (idx >= 0) missing.push(tickers[idx]);
     }
-    if (i + CHUNK < tickers.length) await sleep(KALSHI_PAGE_DELAY_MS);
   }
+  console.log(`[kalshi-batch-ob] fetched=${fetched}/${tickers.length} missing=${JSON.stringify(missing)}`);
   return result;
 }
 
@@ -2429,40 +2382,15 @@ function parseLevels(
   return out;
 }
 
-// Module-level flag so we only log the full response sample once per scan.
-let _polyObLogged = false;
-
 async function polyFetchBook(tokenId: string): Promise<PolyOrderbookRaw> {
-  // Global Polymarket CLOB — only reached for non-US markets whose yesAsk/noAsk
-  // are not embedded. US markets are handled by the synthetic path in the caller.
+  // Global Polymarket CLOB — only reached for non-US global markets.
+  // US markets use the synthetic orderbook path (embedded prices from market listing).
   const url = `${POLY_CLOB}/book?token_id=${encodeURIComponent(tokenId)}`;
   try {
-    const response = await fetch(url, {
-      headers: { 'User-Agent': 'arbor-scanner/1', 'Accept': 'application/json' },
-    });
-    const text = await response.text();
-    const data = response.ok ? JSON.parse(text) as PolyOrderbookRaw : {};
-    if (!_polyObLogged) {
-      _polyObLogged = true;
-      console.log('[poly-us-ob-attempt]', JSON.stringify({
-        tokenId,
-        urlTried: url,
-        status: response.status,
-        body: text.slice(0, 200),
-      }));
-    }
+    const response = await fetch(url);
     if (!response.ok) return {};
-    return data;
-  } catch (err) {
-    if (!_polyObLogged) {
-      _polyObLogged = true;
-      console.log('[poly-us-ob-attempt]', JSON.stringify({
-        tokenId,
-        urlTried: url,
-        status: 'threw',
-        error: String(err),
-      }));
-    }
+    return (await response.json()) as PolyOrderbookRaw;
+  } catch {
     return {};
   }
 }
@@ -3891,7 +3819,6 @@ async function runScanCycle(
   // Reset module-level recurrence-filter state for this scan.
   _recurrenceRejected = 0;
   _recurrenceRejectionSamples = [];
-  _polyObLogged = false;
   // 1. Fetch markets in parallel — Kalshi, Polymarket, PredictIt, and new platforms.
   // New platform stubs (cryptocom/fanduel/fanatics/og) return [] until their APIs
   // are accessible; they each log [platform-fetch] with the HTTP status so we can
@@ -4400,20 +4327,12 @@ async function runScanCycle(
           ? Promise.resolve(batchedKalshi)
           : kalshiGetOrderbook(pair.kalshi.marketId);
 
-        // Polymarket US markets already have yesAsk/noAsk embedded from the
+        // Polymarket US markets have yesAsk/noAsk already embedded from the
         // market listing (side0.price / side1.price in normalizePolyUSMarket).
-        // Their "token IDs" are internal side IDs (small integers) not CLOB
-        // token IDs, so the global CLOB fetch will always 404. Use the same
-        // synthetic single-level orderbook pattern as PredictIt.
+        // Their "token IDs" are internal side IDs (small integers), not CLOB
+        // token IDs, so a CLOB fetch would 404. Use the synthetic orderbook
+        // path (same pattern as PredictIt) when prices are available.
         const polyUsHasPrices = pair.poly.yesAsk != null && pair.poly.noAsk != null;
-        console.log('[poly-us-market-price]', JSON.stringify({
-          marketId: pair.poly.marketId,
-          yesAsk: pair.poly.yesAsk,
-          noAsk: pair.poly.noAsk,
-          yesTokenId: pair.poly.yesTokenId,
-          noTokenId: pair.poly.noTokenId,
-          usingSynthetic: polyUsHasPrices,
-        }));
 
         // PredictIt, Poly US (embedded prices), and other non-CLOB platforms
         // use a synthetic single-level orderbook from stored best-buy prices.
