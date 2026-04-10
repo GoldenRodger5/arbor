@@ -930,24 +930,20 @@ async function checkPositionSettlements(
     }
   }
 
-  // Step 6: check stale pending positions (>24h old).
+  // Step 6: auto-cancel stale pending positions (>1h old).
   const { data: pendingPositions } = await sb
     .from('positions')
     .select('id, kalshi_title, opened_at')
     .eq('status', 'pending');
 
-  const DAY_MS = 24 * 60 * 60 * 1000;
+  const HOUR_MS = 60 * 60 * 1000;
   for (const p of pendingPositions ?? []) {
     const age = Date.now() - Date.parse(p.opened_at as string ?? '');
-    if (age > DAY_MS) {
-      const hours = Math.round(age / 3_600_000);
-      await sendTelegram({
-        text:
-          `⏰ <b>PENDING · ${hours}h old</b>\n\n` +
-          `<b>${trunc(htmlEscape(p.kalshi_title as string ?? ''))}</b>\n\n` +
-          `Executed both legs? → <code>/done_${p.id}</code>\n` +
-          `No longer valid? → <code>/cancel_${p.id}</code>`,
-      });
+    if (age > HOUR_MS) {
+      await sb.from('positions')
+        .update({ status: 'cancelled' })
+        .eq('id', p.id);
+      console.log('[resolve] auto-cancelled stale pending', p.id);
       pendingReminders++;
     }
   }

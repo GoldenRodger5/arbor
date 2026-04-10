@@ -736,34 +736,32 @@ async function executePolymarketOrder(
 
 /**
  * Sell back a Polymarket position to unwind a leg.
- * Inverts the original intent: hedge (BUY_SHORT) → sell back via BUY_LONG.
- * Uses IOC (immediate-or-cancel) market order for instant execution.
+ * Inverts the original intent: hedge (BUY_SHORT) → exit via BUY_LONG.
+ * Uses IOC market order for instant execution.
  */
 async function sellBackPolymarketPosition(
   tokenId: string,
-  filledQty: number,
-  avgPrice: number,
-  polyUrl: string | undefined,
+  quantity: number,
   wasHedge: boolean,
+  price: number,
   dryRun: boolean,
-): Promise<{ recovered: number; success: boolean }> {
-  if (filledQty <= 0) return { recovered: 0, success: true };
-  const sellIntent = wasHedge ? 'ORDER_INTENT_BUY_LONG' : 'ORDER_INTENT_BUY_SHORT';
-  const slug = polyUrl ? extractPolyUSSlug(polyUrl) : null;
+): Promise<boolean> {
+  if (quantity <= 0) return true;
+  const exitIntent = wasHedge ? 'ORDER_INTENT_BUY_LONG' : 'ORDER_INTENT_BUY_SHORT';
   const orderBody = {
-    marketSlug: slug ?? tokenId,
-    intent: sellIntent,
+    marketSlug: tokenId,
+    intent: exitIntent,
     type: 'ORDER_TYPE_MARKET',
-    quantity: Math.round(filledQty),
+    quantity: Math.round(quantity),
     tif: 'TIME_IN_FORCE_IMMEDIATE_OR_CANCEL',
   };
   if (dryRun) {
-    console.log('[poly-sell-back-dry]', JSON.stringify({ tokenId, filledQty, sellIntent }));
-    return { recovered: avgPrice * filledQty, success: true };
+    console.log('[poly-sell-back-dry]', JSON.stringify({ tokenId, quantity, exitIntent, price }));
+    return true;
   }
   if (!POLY_US_KEY_ID || !POLY_US_SECRET_KEY) {
     console.error('[poly-sell-back] credentials not set');
-    return { recovered: 0, success: false };
+    return false;
   }
   try {
     const path = '/v1/orders';
@@ -772,15 +770,11 @@ async function sellBackPolymarketPosition(
       method: 'POST', headers, body: JSON.stringify(orderBody),
     });
     const data = await res.json().catch(() => ({})) as any;
-    console.log('[poly-sell-back]', JSON.stringify({ status: res.status, responseBody: data }));
-    if (!res.ok) return { recovered: 0, success: false };
-    const order = data.order ?? data;
-    const soldQty   = parseFloat(String(order.filledQuantity ?? order.filled ?? order.sizeMatched ?? 0));
-    const soldPrice = parseFloat(String(order.avgPrice ?? order.avg_price ?? avgPrice));
-    return { recovered: soldQty * soldPrice, success: soldQty > 0 };
+    console.log('[poly-sell-back]', JSON.stringify({ status: res.status, quantity, exitIntent, responseBody: data }));
+    return res.ok;
   } catch (err) {
     console.error('[poly-sell-back] threw', err);
-    return { recovered: 0, success: false };
+    return false;
   }
 }
 
@@ -1218,142 +1212,66 @@ async function handleBuy(
   const kTitleShort = kTitle.length > 60 ? kTitle.slice(0, 59) + '…' : kTitle;
 
   // ── SEQUENTIAL EXECUTION ─────────────────────────────────────────────────
-  // Execute Polymarket leg FIRST. If it fails or ghosts, abort with no Kalshi
-  // exposure. If Kalshi then fails, immediately unwind the Polymarket position.
+  // Polymarket first. If it fails or comes back 0-filled (IOC = no liquidity),
+  // abort with zero Kalshi exposure. If Kalshi then fails, sell back Poly immediately.
 
-  // STEP 1: Execute Polymarket leg
+  // STEP 1: Polymarket first
   const polyResult = await executePolymarketOrder(
-    polyTokenId, livePolyPrice, qty, POLY_FUNDER_ADDRESS, dryRun, opp.polyMarket.url, true,
+    polyTokenId, livePolyPrice, qty,
+    POLY_FUNDER_ADDRESS, dryRun,
+    opp.polyMarket.url,
+    kalshiSide === 'yes' ? true : false,
   );
   const polyFilled = polyResult?.filled ?? 0;
 
-  // STEP 2: Validate Polymarket fill
-  if (polyResult === null) {
-    // API rejected outright — nothing deployed
-    await sb.from('positions').update({
-      status: 'failed', executed_at: new Date().toISOString(),
-    }).eq('id', positionId);
+  // STEP 2: Validate Polymarket
+  if (!polyResult || polyFilled === 0) {
+    await sb.from('positions')
+      .update({ status: 'failed', executed_at: new Date().toISOString() })
+      .eq('id', positionId);
     await editMessage(chatId, messageId,
-      `❌ <b>AUTO-EXECUTE FAILED${dryLabel}</b>\n\n` +
+      `❌ <b>FAILED — Polymarket rejected${dryLabel}</b>\n\n` +
       `${htmlEscape(kTitleShort)}\n\n` +
-      `Polymarket leg rejected. Nothing deployed.\n` +
-      `No position opened.\n\n` +
-      `Position: <code>${positionId}</code>`);
-    return;
-  }
-
-  if (polyFilled === 0) {
-    // Order accepted but zero filled — GTC ghost, cancel and abort
-    await sellBackPolymarketPosition(polyTokenId, 0, polyRawPrice, opp.polyMarket.url, true, dryRun);
-    await sb.from('positions').update({
-      status: 'failed', executed_at: new Date().toISOString(),
-      poly_order_id: polyResult.orderId,
-    }).eq('id', positionId);
-    await editMessage(chatId, messageId,
-      `⚠️ <b>AUTO-EXECUTE SKIPPED${dryLabel}</b>\n\n` +
-      `${htmlEscape(kTitleShort)}\n\n` +
-      `Polymarket order resting on book (GTC).\n` +
-      `Cancelling — no Kalshi leg fired.\n\n` +
-      `Position: <code>${positionId}</code>`);
+      `Polymarket order returned null or 0 filled.\n` +
+      `Nothing deployed. No risk.`);
     return;
   }
 
   if (polyFilled < qty * 0.9) {
-    // Less than 90% filled — sell back and abort
-    const sellBack = await sellBackPolymarketPosition(
-      polyTokenId, polyFilled, polyResult.avgPrice, opp.polyMarket.url, true, dryRun,
-    );
-    await sb.from('positions').update({
-      status: 'failed', executed_at: new Date().toISOString(),
-      poly_order_id: polyResult.orderId, poly_fill_price: polyResult.avgPrice,
-      poly_fill_quantity: polyFilled,
-    }).eq('id', positionId);
+    await sellBackPolymarketPosition(polyTokenId, polyFilled, kalshiSide === 'yes', livePolyPrice, dryRun);
+    await sb.from('positions')
+      .update({ status: 'failed', executed_at: new Date().toISOString() })
+      .eq('id', positionId);
     await editMessage(chatId, messageId,
-      `⚠️ <b>AUTO-EXECUTE PARTIAL${dryLabel}</b>\n\n` +
-      `${htmlEscape(kTitleShort)}\n\n` +
-      `Polymarket only filled ${polyFilled}/${qty}.\n` +
-      `Selling back Polymarket position.\n` +
-      `No Kalshi leg fired.\n\n` +
-      `Recovered: ~$${sellBack.recovered.toFixed(2)}\n\n` +
-      `Position: <code>${positionId}</code>`);
+      `⚠️ <b>ABORTED — Partial Poly fill${dryLabel}</b>\n\n` +
+      `Only ${polyFilled}/${qty} filled.\n` +
+      `Position sold back. Nothing at risk.`);
     return;
   }
 
-  // STEP 3: Execute Kalshi leg
-  const kalshiResult = await executeKalshiOrder(kTicker, kalshiSide, qty, kalshiPriceInCents, dryRun);
+  // STEP 3: Kalshi second
+  const kalshiResult = await executeKalshiOrder(
+    kTicker, kalshiSide, polyFilled, kalshiPriceInCents, dryRun,
+  );
   const kalshiFilled = kalshiResult?.filled ?? 0;
 
-  // STEP 4: Validate Kalshi fill — unwind Poly immediately if Kalshi fails
-  if (kalshiResult === null || kalshiFilled === 0) {
-    const sellBack = await sellBackPolymarketPosition(
-      polyTokenId, polyFilled, polyResult.avgPrice, opp.polyMarket.url, true, dryRun,
-    );
-    await sb.from('positions').update({
-      status: 'failed', executed_at: new Date().toISOString(),
-      poly_order_id: polyResult.orderId, poly_fill_price: polyResult.avgPrice,
-      poly_fill_quantity: polyFilled,
-    }).eq('id', positionId);
-    const feeLoss = polyResult.avgPrice * polyFilled * 0.05;
+  // STEP 4: If Kalshi failed — sell back Poly
+  if (!kalshiResult || kalshiFilled === 0) {
+    await sellBackPolymarketPosition(polyTokenId, polyFilled, kalshiSide === 'yes', livePolyPrice, dryRun);
+    await sb.from('positions')
+      .update({ status: 'failed', executed_at: new Date().toISOString() })
+      .eq('id', positionId);
     await editMessage(chatId, messageId,
-      `🚨 <b>UNWIND — Kalshi Failed${dryLabel}</b>\n\n` +
+      `🚨 <b>UNWOUND — Kalshi failed${dryLabel}</b>\n\n` +
       `${htmlEscape(kTitleShort)}\n\n` +
-      `Polymarket leg was open and has been sold back.\n\n` +
-      `Kalshi: FAILED\n` +
-      `Polymarket ${polyFilled} contracts SOLD BACK\n` +
-      `Net P&L: ~-$${feeLoss.toFixed(2)} (fees)\n\n` +
-      `Position: <code>${positionId}</code>`);
+      `Polymarket ${polyFilled} contracts sold back.\n` +
+      `Recovered: ~$${(polyFilled * livePolyPrice).toFixed(2)}\n` +
+      `Net loss: ~fees only`);
     return;
   }
 
-  // STEP 4b: Quantity mismatch — auto-unwind excess Poly if Poly > Kalshi
-  if (Math.abs(kalshiFilled - polyFilled) > 1) {
-    const excessPoly = polyFilled - kalshiFilled;
-    if (excessPoly > 0) {
-      const sellBack = await sellBackPolymarketPosition(
-        polyTokenId, excessPoly, polyResult.avgPrice, opp.polyMarket.url, true, dryRun,
-      );
-      await sb.from('positions').update({
-        status: 'partial', executed_at: new Date().toISOString(),
-        kalshi_order_id: kalshiResult.orderId, kalshi_fill_price: kalshiResult.avgPrice,
-        kalshi_fill_quantity: kalshiFilled,
-        poly_order_id: polyResult.orderId, poly_fill_price: polyResult.avgPrice,
-        poly_fill_quantity: polyFilled,
-      }).eq('id', positionId);
-      await editMessage(chatId, messageId,
-        `⚠️ <b>MISMATCH — EXCESS POLY SOLD BACK${dryLabel}</b>\n\n` +
-        `${htmlEscape(kTitleShort)}\n\n` +
-        `Kalshi filled: ${kalshiFilled}\n` +
-        `Polymarket filled: ${polyFilled}\n` +
-        `Sold back ${excessPoly} excess Poly contracts.\n` +
-        `Recovered: ~$${sellBack.recovered.toFixed(2)}\n\n` +
-        `Hedged position: ${kalshiFilled} contracts each.\n` +
-        `Position: <code>${positionId}</code>`);
-    } else {
-      // Kalshi > Poly — can't easily sell Kalshi, alert for manual action
-      const excessKalshi = kalshiFilled - polyFilled;
-      await sb.from('positions').update({
-        status: 'partial', executed_at: new Date().toISOString(),
-        kalshi_order_id: kalshiResult.orderId, kalshi_fill_price: kalshiResult.avgPrice,
-        kalshi_fill_quantity: kalshiFilled,
-        poly_order_id: polyResult.orderId, poly_fill_price: polyResult.avgPrice,
-        poly_fill_quantity: polyFilled,
-      }).eq('id', positionId);
-      await editMessage(chatId, messageId,
-        `⚠️ <b>QUANTITY MISMATCH — ACTION REQUIRED${dryLabel}</b>\n\n` +
-        `${htmlEscape(kTitleShort)}\n\n` +
-        `Kalshi filled: ${kalshiFilled}\n` +
-        `Polymarket filled: ${polyFilled}\n` +
-        `${excessKalshi} unhedged Kalshi contracts.\n\n` +
-        `Manually sell ${excessKalshi} on Kalshi or buy more on Polymarket.\n\n` +
-        `Position: <code>${positionId}</code>`);
-    }
-    return;
-  }
-
-  // STEP 5: Both legs confirmed — update position and send confirmation
-  const actualDeployed =
-    (kalshiResult.avgPrice * kalshiFilled) +
-    (polyResult.avgPrice   * polyFilled);
+  // STEP 5: Both filled — success
+  const actualDeployed = (liveKalshiPrice * kalshiFilled) + (livePolyPrice * polyFilled);
 
   try {
     const { data: ledger } = await sb
@@ -1377,22 +1295,26 @@ async function handleBuy(
   }
 
   await sb.from('positions').update({
-    status: 'open', executed_at: new Date().toISOString(),
-    kalshi_order_id: kalshiResult.orderId, kalshi_fill_price: kalshiResult.avgPrice,
+    status: 'open',
+    executed_at: new Date().toISOString(),
+    kalshi_order_id: kalshiResult.orderId,
+    kalshi_fill_price: kalshiResult.avgPrice,
     kalshi_fill_quantity: kalshiFilled,
-    poly_order_id: polyResult.orderId, poly_fill_price: polyResult.avgPrice,
+    poly_order_id: polyResult.orderId,
+    poly_fill_price: polyResult.avgPrice,
     poly_fill_quantity: polyFilled,
   }).eq('id', positionId);
 
   await editMessage(chatId, messageId,
     `✅ <b>EXECUTED${dryLabel}</b>\n\n` +
     `${htmlEscape(kTitleShort)}\n\n` +
-    `KALSHI: ${kalshiFilled} contracts @ $${kalshiResult.avgPrice.toFixed(4)}\n` +
-    `POLYMARKET: ${polyFilled} contracts @ $${polyResult.avgPrice.toFixed(4)}\n\n` +
-    `💰 Deployed: <b>$${actualDeployed.toFixed(2)}</b>\n` +
-    `📈 Max profit: <b>$${expectedProfit}</b>\n` +
-    `📅 Closes: ${settleDate}\n\n` +
-    `Position: <code>${positionId}</code>`);
+    `KALSHI ${kalshiSide.toUpperCase()}: ` +
+    `${kalshiFilled} @ $${kalshiResult.avgPrice.toFixed(4)}\n` +
+    `POLYMARKET hedge: ` +
+    `${polyFilled} @ $${polyResult.avgPrice.toFixed(4)}\n\n` +
+    `💰 Deployed: $${actualDeployed.toFixed(2)}\n` +
+    `📈 Max profit: $${expectedProfit}\n` +
+    `📅 Closes: ${settleDate}`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
