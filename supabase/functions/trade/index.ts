@@ -52,10 +52,10 @@ const SUPABASE_BASE = Deno.env.get('SUPABASE_URL') ?? '';
 
 // Hard limits (safety rails — non-negotiable)
 const MIN_POSITION_USD     = 20;    // not worth executing below this
-const MAX_POSITION_SAFE    = 80;    // Must not exceed total capital ($198)
-const MAX_POSITION_CAUTION = 100;   // CAUTION verdict cap
-const MAX_CAPITAL_FRACTION = 0.40;  // never exceed 40% of active capital
-const QUARTER_KELLY        = 0.25;  // fraction of full Kelly to use
+const MAX_POSITION_SAFE    = 500;   // SAFE verdict cap (not binding at current capital)
+const MAX_POSITION_CAUTION = 200;   // CAUTION verdict cap
+const MAX_CAPITAL_FRACTION = 0.90;  // 90% of active capital per trade
+const HALF_KELLY           = 0.50;  // fraction of full Kelly to use
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Live balance fetching
@@ -290,7 +290,7 @@ interface SizingResult {
   contracts: number;
   totalDeployed: number;
   kellyFraction: number;
-  quarterKelly: number;
+  halfKelly: number;
   rawPosition: number;
   limitingFactor: LimitingFactor;
 }
@@ -304,7 +304,7 @@ function calculatePositionSize(
 ): SizingResult {
   // Safety rule 2: zero spread → zero size.
   if (netSpread <= 0 || totalCostPerContract <= 0) {
-    return { contracts: 0, totalDeployed: 0, kellyFraction: 0, quarterKelly: 0, rawPosition: 0, limitingFactor: 'kelly' };
+    return { contracts: 0, totalDeployed: 0, kellyFraction: 0, halfKelly: 0, rawPosition: 0, limitingFactor: 'kelly' };
   }
 
   // Kelly formula for prediction market arb:
@@ -315,8 +315,8 @@ function calculatePositionSize(
   const rawKelly = odds > 0 ? netSpread / odds : 0;
   // Safety rule 3: cap kelly at 1.0.
   const kellyFraction = Math.min(rawKelly, 1.0);
-  const quarterKelly  = QUARTER_KELLY * kellyFraction;
-  const rawPosition   = quarterKelly * activeCapital;
+  const halfKelly  = HALF_KELLY * kellyFraction;
+  const rawPosition   = halfKelly * activeCapital;
 
   // Verdict cap.
   const verdictCap = verdict.toUpperCase() === 'SAFE' ? MAX_POSITION_SAFE : MAX_POSITION_CAUTION;
@@ -348,7 +348,7 @@ function calculatePositionSize(
       if (minDeployed <= Math.min(availableLiquidity, verdictCap, capitalCap)) {
         return {
           contracts: minContracts, totalDeployed: minDeployed,
-          kellyFraction, quarterKelly, rawPosition, limitingFactor: 'minimum',
+          kellyFraction, halfKelly, rawPosition, limitingFactor: 'minimum',
         };
       }
     }
@@ -356,17 +356,18 @@ function calculatePositionSize(
 
   const result: SizingResult = {
     contracts, totalDeployed: contracts * totalCostPerContract,
-    kellyFraction, quarterKelly, rawPosition, limitingFactor,
+    kellyFraction, halfKelly, rawPosition, limitingFactor,
   };
 
-  console.log('[kelly-sizing]', JSON.stringify({
+  console.log('[kelly-sizing-v2]', JSON.stringify({
+    fraction: 'half-kelly',
     netSpread, odds: Number(odds.toFixed(4)),
     kellyFraction: Number(kellyFraction.toFixed(4)),
-    quarterKelly:  Number(quarterKelly.toFixed(4)),
+    halfKelly: Number(halfKelly.toFixed(4)),
     activeCapital: Number(activeCapital.toFixed(2)),
-    rawPosition:   Number(rawPosition.toFixed(2)),
-    finalPosition: Number(result.totalDeployed.toFixed(2)),
-    contracts:     result.contracts,
+    halfKellyRaw: Number(rawPosition.toFixed(2)),
+    finalUSD: Number(result.totalDeployed.toFixed(2)),
+    contracts: result.contracts,
     limitingFactor: result.limitingFactor,
     verdict,
   }));
@@ -834,7 +835,7 @@ async function handleBuy(
   const realTotal = (kalshiBalance + polyBalance) > 0
     ? kalshiBalance + polyBalance
     : capital.totalCapital;
-  const activeCapital = realTotal * (1 - capital.safetyReservePct);
+  const activeCapital = realTotal * 0.90;
 
   // Safety rule 1: refuse if active capital is below minimum.
   if (activeCapital < MIN_POSITION_USD) {
@@ -847,12 +848,6 @@ async function handleBuy(
   }
 
   const costPerPair = kalshiRawPrice + polyRawPrice;
-
-  // Per-leg cost for balance check.
-  const kalshiLegCost = kalshiSide === 'yes'
-    ? lvl.buyYesPrice * Math.floor(MAX_POSITION_CAUTION / costPerPair)
-    : lvl.buyNoPrice  * Math.floor(MAX_POSITION_CAUTION / costPerPair);
-  const polyLegCost = (costPerPair * Math.floor(MAX_POSITION_CAUTION / costPerPair)) - kalshiLegCost;
   const availableLiquidity = (lvl.totalCost ?? costPerPair) * lvl.quantity;
   const sizing = calculatePositionSize(
     opp.bestNetSpread,
@@ -1363,7 +1358,7 @@ serve(async (req) => {
     const realTotal = (kalshiBalance + polyBalance) > 0
       ? kalshiBalance + polyBalance
       : capital.totalCapital;
-    const activeCapital = realTotal * (1 - capital.safetyReservePct);
+    const activeCapital = realTotal * 0.90;
     const availableLiquidity = (lvl.totalCost ?? costPerPair) * lvl.quantity;
     const sizing = calculatePositionSize(
       opp.bestNetSpread, costPerPair, activeCapital,
@@ -1380,7 +1375,7 @@ serve(async (req) => {
       kelly: {
         netSpread: opp.bestNetSpread,
         kellyFraction: Number(sizing.kellyFraction.toFixed(4)),
-        quarterKelly:  Number(sizing.quarterKelly.toFixed(4)),
+        halfKelly:  Number(sizing.halfKelly.toFixed(4)),
         activeCapital: Number(activeCapital.toFixed(2)),
         rawPosition:   Number(sizing.rawPosition.toFixed(2)),
         contracts:     qty,
@@ -1418,7 +1413,7 @@ serve(async (req) => {
         `<b>KELLY CALC</b>\n` +
         `<code>netSpread:    ${(opp.bestNetSpread * 100).toFixed(2)}%\n` +
         `kellyFraction: ${(sizing.kellyFraction * 100).toFixed(1)}%\n` +
-        `quarterKelly:  ${(sizing.quarterKelly * 100).toFixed(1)}%\n` +
+        `halfKelly:  ${(sizing.halfKelly * 100).toFixed(1)}%\n` +
         `activeCapital: $${activeCapital.toFixed(2)}\n` +
         `rawPosition:   $${sizing.rawPosition.toFixed(2)}\n` +
         `finalDeployed: $${(costPerPair * qty).toFixed(2)}\n` +

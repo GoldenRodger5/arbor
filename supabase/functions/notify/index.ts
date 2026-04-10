@@ -29,16 +29,16 @@ const GLOBAL_DRY_RUN         = Deno.env.get('TRADE_DRY_RUN') === 'true';
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MIN_POSITION_USD     = 20;
-const MAX_POSITION_SAFE    = 80;   // Must not exceed total capital ($198)
-const MAX_POSITION_CAUTION = 100;
-const MAX_CAPITAL_FRACTION = 0.40;
-const QUARTER_KELLY        = 0.25;
+const MAX_POSITION_SAFE    = 500;  // Not binding at current capital
+const MAX_POSITION_CAUTION = 200;
+const MAX_CAPITAL_FRACTION = 0.90;
+const HALF_KELLY           = 0.50;
 
 interface SizingResult {
   contracts: number;
   totalDeployed: number;
   kellyFraction: number;
-  quarterKelly: number;
+  halfKelly: number;
   rawPosition: number;
   limitingFactor: string;
 }
@@ -51,13 +51,13 @@ function calculatePositionSize(
   availableLiquidity: number,
 ): SizingResult {
   if (netSpread <= 0 || totalCostPerContract <= 0) {
-    return { contracts: 0, totalDeployed: 0, kellyFraction: 0, quarterKelly: 0, rawPosition: 0, limitingFactor: 'kelly' };
+    return { contracts: 0, totalDeployed: 0, kellyFraction: 0, halfKelly: 0, rawPosition: 0, limitingFactor: 'kelly' };
   }
   const odds = (1 / totalCostPerContract) - 1;
   const rawKelly = odds > 0 ? netSpread / odds : 0;
   const kellyFraction = Math.min(rawKelly, 1.0);
-  const quarterKelly  = QUARTER_KELLY * kellyFraction;
-  const rawPosition   = quarterKelly * activeCapital;
+  const halfKelly  = HALF_KELLY * kellyFraction;
+  const rawPosition   = halfKelly * activeCapital;
   const verdictCap    = verdict.toUpperCase() === 'SAFE' ? MAX_POSITION_SAFE : MAX_POSITION_CAUTION;
   const capitalCap    = MAX_CAPITAL_FRACTION * activeCapital;
   let finalUSD        = rawPosition;
@@ -71,10 +71,10 @@ function calculatePositionSize(
     const minContracts = Math.ceil(MIN_POSITION_USD / totalCostPerContract);
     const minDeployed  = minContracts * totalCostPerContract;
     if (minDeployed <= Math.min(availableLiquidity, verdictCap, capitalCap)) {
-      return { contracts: minContracts, totalDeployed: minDeployed, kellyFraction, quarterKelly, rawPosition, limitingFactor: 'minimum' };
+      return { contracts: minContracts, totalDeployed: minDeployed, kellyFraction, halfKelly, rawPosition, limitingFactor: 'minimum' };
     }
   }
-  return { contracts, totalDeployed, kellyFraction, quarterKelly, rawPosition, limitingFactor };
+  return { contracts, totalDeployed, kellyFraction, halfKelly, rawPosition, limitingFactor };
 }
 
 // Real balance fetchers (self-contained copies — notify has no imports from trade)
@@ -213,7 +213,7 @@ async function fetchActiveCapital(): Promise<{ activeCapital: number; kalshiBala
   console.log('[notify-balances]', JSON.stringify({ kalshiBalance, polyBalance }));
   if (kalshiBalance > 0 || polyBalance > 0) {
     const total  = kalshiBalance + polyBalance;
-    const active = total * 0.8; // 80% safety-adjusted
+    const active = total * 0.90;
     return { activeCapital: active, kalshiBalance, polyBalance };
   }
   // Fallback: read capital_ledger.
