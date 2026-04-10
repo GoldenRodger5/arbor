@@ -1622,6 +1622,17 @@ async function kalshiBatchOrderbooks(
         break; // fall back below
       }
       const data = await res.json() as { orderbooks?: any[] };
+      // Log the raw structure of the first orderbook so we can verify field names.
+      if ((data.orderbooks ?? []).length > 0) {
+        const firstOb = data.orderbooks![0];
+        console.log('[kalshi-ob-raw]', JSON.stringify({
+          ticker: firstOb.ticker,
+          keys: Object.keys(firstOb),
+          yesSide: firstOb.yes ?? firstOb.YES,
+          noSide: firstOb.no ?? firstOb.NO,
+          sample: JSON.stringify(firstOb).slice(0, 400),
+        }));
+      }
       // Kalshi batch API may return a single orderbook object whose `ticker`
       // field is a comma-joined string of all requested tickers (when they
       // share an event). Split and store under each individual ticker so
@@ -2422,23 +2433,22 @@ function parseLevels(
 let _polyObLogged = false;
 
 async function polyFetchBook(tokenId: string): Promise<PolyOrderbookRaw> {
-  // Polymarket US markets live on a separate exchange — their token IDs don't
-  // exist on the global CLOB (clob.polymarket.com). Use the US gateway instead.
-  const url = `https://gateway.polymarket.us/v1/book?token_id=${encodeURIComponent(tokenId)}`;
+  // Global Polymarket CLOB — only reached for non-US markets whose yesAsk/noAsk
+  // are not embedded. US markets are handled by the synthetic path in the caller.
+  const url = `${POLY_CLOB}/book?token_id=${encodeURIComponent(tokenId)}`;
   try {
     const response = await fetch(url, {
       headers: { 'User-Agent': 'arbor-scanner/1', 'Accept': 'application/json' },
     });
-    const data = response.ok
-      ? await response.json() as PolyOrderbookRaw
-      : {};
+    const text = await response.text();
+    const data = response.ok ? JSON.parse(text) as PolyOrderbookRaw : {};
     if (!_polyObLogged) {
       _polyObLogged = true;
-      console.log('[poly-us-ob-response]', JSON.stringify({
+      console.log('[poly-us-ob-attempt]', JSON.stringify({
         tokenId,
+        urlTried: url,
         status: response.status,
-        keys: Object.keys(data),
-        sample: JSON.stringify(data).slice(0, 400),
+        body: text.slice(0, 200),
       }));
     }
     if (!response.ok) return {};
@@ -2446,8 +2456,9 @@ async function polyFetchBook(tokenId: string): Promise<PolyOrderbookRaw> {
   } catch (err) {
     if (!_polyObLogged) {
       _polyObLogged = true;
-      console.log('[poly-us-ob-response]', JSON.stringify({
+      console.log('[poly-us-ob-attempt]', JSON.stringify({
         tokenId,
+        urlTried: url,
         status: 'threw',
         error: String(err),
       }));
@@ -4389,12 +4400,27 @@ async function runScanCycle(
           ? Promise.resolve(batchedKalshi)
           : kalshiGetOrderbook(pair.kalshi.marketId);
 
-        // PredictIt (and any future platforms without a CLOB) use a
-        // synthetic single-level orderbook from stored best-buy prices.
+        // Polymarket US markets already have yesAsk/noAsk embedded from the
+        // market listing (side0.price / side1.price in normalizePolyUSMarket).
+        // Their "token IDs" are internal side IDs (small integers) not CLOB
+        // token IDs, so the global CLOB fetch will always 404. Use the same
+        // synthetic single-level orderbook pattern as PredictIt.
+        const polyUsHasPrices = pair.poly.yesAsk != null && pair.poly.noAsk != null;
+        console.log('[poly-us-market-price]', JSON.stringify({
+          marketId: pair.poly.marketId,
+          yesAsk: pair.poly.yesAsk,
+          noAsk: pair.poly.noAsk,
+          yesTokenId: pair.poly.yesTokenId,
+          noTokenId: pair.poly.noTokenId,
+          usingSynthetic: polyUsHasPrices,
+        }));
+
+        // PredictIt, Poly US (embedded prices), and other non-CLOB platforms
+        // use a synthetic single-level orderbook from stored best-buy prices.
         const NON_CLOB_PLATFORMS = new Set<Platform>([
           'predictit', 'cryptocom', 'fanduel', 'fanatics', 'og',
         ]);
-        if (NON_CLOB_PLATFORMS.has(pair.poly.platform)) {
+        if (NON_CLOB_PLATFORMS.has(pair.poly.platform) || polyUsHasPrices) {
           [kalshiBook, polyBook] = await Promise.all([
             kalshiPromise,
             Promise.resolve(predictitGetOrderbook(pair.poly)),
