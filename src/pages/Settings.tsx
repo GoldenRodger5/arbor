@@ -176,10 +176,20 @@ export default function Settings() {
 
       {/* Capital */}
       <div className="label" style={{ marginBottom: 16 }}>CAPITAL</div>
-      <TextInput label="Starting Capital" placeholder="$198" type="number" mono />
-      <TextInput label="Safety Reserve %" placeholder="20" type="number" mono />
+      <div style={{ marginBottom: 12 }}>
+        <div className="label" style={{ marginBottom: 6 }}>Total Capital (live from Kalshi + Polymarket)</div>
+        <div className="font-mono" style={{ fontSize: 18, fontWeight: 600, color: 'var(--text-primary)', padding: '10px 0' }}>
+          ${ctxCapital.totalCapital.toFixed(2)}
+        </div>
+      </div>
+      <div style={{ marginBottom: 12 }}>
+        <div className="label" style={{ marginBottom: 6 }}>Safety Reserve</div>
+        <div className="font-mono" style={{ fontSize: 13, color: 'var(--text-secondary)', padding: '10px 0' }}>
+          {Math.round(ctxCapital.safetyReservePct * 100)}% (${(ctxCapital.totalCapital * ctxCapital.safetyReservePct).toFixed(2)} reserved)
+        </div>
+      </div>
       <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 4 }}>
-        Active Capital: <span className="font-mono">${activeCapital}</span>
+        Active Capital: <span className="font-mono" style={{ color: 'var(--text-primary)', fontWeight: 600 }}>${ctxCapital.activeCapital.toFixed(2)}</span>
       </div>
 
       <div style={{ height: 32 }} />
