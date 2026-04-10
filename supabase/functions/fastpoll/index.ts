@@ -349,59 +349,114 @@ function parseJsonArray(raw: string | string[] | undefined): string[] | null {
 
 async function fetchPolyGameMarkets(): Promise<PolyGameMarket[]> {
   const now = Date.now();
-  const endMax = new Date(now + WINDOW_MS).toISOString();
-  const endMin = new Date(now).toISOString();
-
   const markets: PolyGameMarket[] = [];
   let totalFetched = 0;
   let binaryCount = 0;
+  let source = 'polymarket-us';
 
+  // Primary: Polymarket US gateway (these are the markets you can trade).
   try {
-    // Fetch via /events with sports tag
-    const params = new URLSearchParams({
-      active: 'true', closed: 'false', tag_slug: 'sports', limit: '100',
-      end_date_min: endMin, end_date_max: endMax,
+    const url = `https://gateway.polymarket.us/v1/markets?limit=200&active=true&closed=false`;
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'arbor-fastpoll/1', 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(10000),
     });
-    const res = await fetch(`${POLY_GAMMA}/events?${params}`);
-    if (!res.ok) { console.warn('[fastpoll-polymarket] events fetch failed', res.status); }
-    else {
-      const events = await res.json() as Array<{ slug?: string; markets?: any[] }>;
-      for (const ev of events ?? []) {
-        for (const m of ev.markets ?? []) {
-          totalFetched++;
-          if (!m.enableOrderBook || !m.acceptingOrders) continue;
-          if (m.active === false) continue;
-          const tokenIds = parseJsonArray(m.clobTokenIds);
-          const outcomes = parseJsonArray(m.outcomes);
-          if (!tokenIds || tokenIds.length < 2 || !outcomes || outcomes.length < 2) continue;
-          binaryCount++;
-          const title: string = m.question ?? '';
-          const teams = extractTeamsFromTitle(title);
-          if (teams.length < 1) continue; // skip non-team sports markets
-          const closeTime: string = m.endDate ?? '';
-          const closeMs = Date.parse(closeTime);
-          if (!Number.isFinite(closeMs) || closeMs <= now || closeMs > now + WINDOW_MS) continue;
-          const eventSlug = ev.slug ?? m.slug ?? '';
-          markets.push({
-            conditionId: m.conditionId ?? '',
-            title,
-            closeTime,
-            outcome0Label: String(outcomes[0]),
-            outcome0TokenId: String(tokenIds[0]),
-            outcome1Label: String(outcomes[1]),
-            outcome1TokenId: String(tokenIds[1]),
-            teams,
-            eventSlug,
-            polyUrl: eventSlug ? `https://polymarket.com/event/${eventSlug}` : '',
-          });
-        }
+    if (res.ok) {
+      const data = await res.json() as { markets?: any[] };
+      for (const m of data.markets ?? []) {
+        totalFetched++;
+        if (m.closed || !m.active) continue;
+        // Only moneyline (game-winner) markets for fastpoll.
+        if (m.marketType !== 'moneyline') continue;
+        const outcomes = parseJsonArray(m.outcomes);
+        if (!outcomes || outcomes.length < 2) continue;
+        const sides = m.marketSides ?? [];
+        if (sides.length < 2) continue;
+        binaryCount++;
+
+        // Extract team names from embedded team objects.
+        const team0 = sides[0]?.team;
+        const team1 = sides[1]?.team;
+        const teamNames: string[] = [];
+        if (team0?.alias) teamNames.push(team0.alias.toLowerCase());
+        else if (team0?.name) teamNames.push(team0.name.toLowerCase());
+        if (team1?.alias) teamNames.push(team1.alias.toLowerCase());
+        else if (team1?.name) teamNames.push(team1.name.toLowerCase());
+        // Also try fuzzy detection from title.
+        const titleTeams = extractTeamsFromTitle(m.question ?? '');
+        for (const t of titleTeams) { if (!teamNames.includes(t)) teamNames.push(t); }
+        if (teamNames.length < 1) continue;
+
+        const closeTime: string = m.endDate ?? '';
+        const closeMs = Date.parse(closeTime);
+        if (!Number.isFinite(closeMs) || closeMs <= now || closeMs > now + WINDOW_MS) continue;
+
+        const slug = m.slug ?? '';
+        markets.push({
+          conditionId: slug || String(m.id),
+          title: m.question ?? '',
+          closeTime,
+          outcome0Label: sides[0].description ?? String(outcomes[0]),
+          outcome0TokenId: String(sides[0].id ?? '0'),
+          outcome1Label: sides[1].description ?? String(outcomes[1]),
+          outcome1TokenId: String(sides[1].id ?? '1'),
+          teams: teamNames,
+          eventSlug: slug,
+          polyUrl: slug ? `https://polymarket.us/market/${slug}` : '',
+        });
       }
+    } else {
+      console.warn('[fastpoll-polymarket] US API HTTP', res.status);
+      source = 'polymarket-global-fallback';
     }
   } catch (err) {
-    console.error('[fastpoll-polymarket] threw', err);
+    console.error('[fastpoll-polymarket] US API threw', err);
+    source = 'polymarket-global-fallback';
   }
 
-  console.log('[fastpoll-polymarket]', JSON.stringify({ fetched: totalFetched, binary: binaryCount, withTeams: markets.length }));
+  // Fallback to global gamma API if US returned nothing.
+  if (markets.length === 0 && source.includes('fallback')) {
+    try {
+      const endMax = new Date(now + WINDOW_MS).toISOString();
+      const endMin = new Date(now).toISOString();
+      const params = new URLSearchParams({
+        active: 'true', closed: 'false', tag_slug: 'sports', limit: '100',
+        end_date_min: endMin, end_date_max: endMax,
+      });
+      const res = await fetch(`${POLY_GAMMA}/events?${params}`);
+      if (res.ok) {
+        const events = await res.json() as Array<{ slug?: string; markets?: any[] }>;
+        for (const ev of events ?? []) {
+          for (const m of ev.markets ?? []) {
+            totalFetched++;
+            if (!m.enableOrderBook || !m.acceptingOrders || m.active === false) continue;
+            const tokenIds = parseJsonArray(m.clobTokenIds);
+            const outcomes = parseJsonArray(m.outcomes);
+            if (!tokenIds || tokenIds.length < 2 || !outcomes || outcomes.length < 2) continue;
+            binaryCount++;
+            const title: string = m.question ?? '';
+            const teams = extractTeamsFromTitle(title);
+            if (teams.length < 1) continue;
+            const closeTime: string = m.endDate ?? '';
+            const closeMs = Date.parse(closeTime);
+            if (!Number.isFinite(closeMs) || closeMs <= now || closeMs > now + WINDOW_MS) continue;
+            const eventSlug = ev.slug ?? m.slug ?? '';
+            markets.push({
+              conditionId: m.conditionId ?? '', title, closeTime,
+              outcome0Label: String(outcomes[0]), outcome0TokenId: String(tokenIds[0]),
+              outcome1Label: String(outcomes[1]), outcome1TokenId: String(tokenIds[1]),
+              teams, eventSlug,
+              polyUrl: eventSlug ? `https://polymarket.com/event/${eventSlug}` : '',
+            });
+          }
+        }
+      }
+    } catch (err) {
+      console.error('[fastpoll-polymarket] gamma fallback threw', err);
+    }
+  }
+
+  console.log('[fastpoll-polymarket]', JSON.stringify({ source, fetched: totalFetched, binary: binaryCount, withTeams: markets.length }));
   return markets;
 }
 

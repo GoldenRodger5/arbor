@@ -1930,45 +1930,179 @@ async function polyFetchEventsByTag(slug: string): Promise<UnifiedMarket[]> {
   return out;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Polymarket US fetcher (primary) + global gamma fallback
+// ─────────────────────────────────────────────────────────────────────────────
+
+const POLY_US_GATEWAY = 'https://gateway.polymarket.us';
+
+/**
+ * Normalize a Polymarket US market (from gateway.polymarket.us/v1/markets)
+ * to the UnifiedMarket format used by the scanner.
+ *
+ * US API structure (confirmed Apr 2026):
+ *   id, slug, question, endDate, category, marketType,
+ *   outcomes: ["Label0","Label1"], outcomePrices: ["0.55","0.45"],
+ *   marketSides: [{ id, description, price, long, team: { name, abbreviation, league } }]
+ */
+function normalizePolyUSMarket(m: any): UnifiedMarket | null {
+  if (!m || m.closed || !m.active) return null;
+
+  // Require exactly 2 outcomes (binary market).
+  const outcomes = parseJsonArray(m.outcomes);
+  if (!outcomes || outcomes.length < 2) return null;
+
+  const title = m.question ?? '';
+  if (isPropMarket(title)) { _propMarketsFiltered++; return null; }
+
+  // Use marketSides for outcome labels + side IDs (these are the tradeable legs).
+  const sides = m.marketSides ?? [];
+  if (sides.length < 2) return null;
+
+  // Side 0 = long (YES-equivalent), Side 1 = short (NO-equivalent).
+  const side0 = sides[0];
+  const side1 = sides[1];
+
+  // Use slug as the marketId (the US API's unique identifier for trading).
+  const marketId = m.slug ?? String(m.id);
+
+  // Extract team info from embedded team objects.
+  let sportLeague: string | undefined;
+  let sportTeams: string[] | undefined;
+  const team0 = side0?.team;
+  const team1 = side1?.team;
+  if (team0?.league) {
+    sportLeague = team0.league;
+    sportTeams = [
+      (team0.alias ?? team0.name ?? '').toLowerCase(),
+      (team1?.alias ?? team1?.name ?? '').toLowerCase(),
+    ].filter(Boolean);
+  }
+
+  // Build URL to polymarket.us
+  const url = m.slug ? `https://polymarket.us/market/${m.slug}` : undefined;
+
+  // Use gameStartTime as closeTime when available — it's the actual game time.
+  // endDate is the settlement deadline (often 2 weeks later) which breaks
+  // the recurrence filter's close-time gap check against Kalshi's game time.
+  const closeTime = m.gameStartTime ?? m.endDate;
+
+  return {
+    platform: 'polymarket',
+    marketId,
+    title,
+    outcome0Label: side0.description ?? String(outcomes[0]),
+    outcome0TokenId: String(side0.id ?? '0'),
+    outcome1Label: side1.description ?? String(outcomes[1]),
+    outcome1TokenId: String(side1.id ?? '1'),
+    closeTime,
+    yesAsk: side0.price != null ? parseFloat(String(side0.price)) : undefined,
+    noAsk:  side1.price != null ? parseFloat(String(side1.price)) : undefined,
+    url,
+    category: m.category ?? undefined,
+    sportLeague,
+    sportTeams,
+  };
+}
+
+/**
+ * Fetch ALL active binary markets from the Polymarket US API.
+ * Paginates in 200-market chunks. Returns normalized UnifiedMarkets.
+ */
+async function fetchPolyUSMarkets(): Promise<UnifiedMarket[]> {
+  const markets: UnifiedMarket[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+  const LIMIT = 200;
+  const MAX_PAGES = 10; // safety cap: 2000 markets max
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    try {
+      const url = `${POLY_US_GATEWAY}/v1/markets?limit=${LIMIT}&offset=${offset}&active=true&closed=false`;
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'arbor-scanner/1', 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) {
+        console.warn(`[poly-us] HTTP ${res.status} at offset=${offset}`);
+        break;
+      }
+      const data = await res.json() as { markets?: any[] };
+      const batch = data.markets ?? [];
+      if (batch.length === 0) break;
+
+      for (const raw of batch) {
+        _polyRawTotal++;
+        const u = normalizePolyUSMarket(raw);
+        if (!u) continue;
+        if (seen.has(u.marketId)) continue;
+        seen.add(u.marketId);
+        markets.push(u);
+      }
+
+      offset += LIMIT;
+      if (batch.length < LIMIT) break;
+      await sleep(REQUEST_DELAY_MS);
+    } catch (err) {
+      console.error(`[poly-us] page ${page} threw`, err);
+      break;
+    }
+  }
+
+  return markets;
+}
+
 async function polyGetMarkets(): Promise<UnifiedMarket[]> {
-  // Reset all per-scan counters so logged numbers reflect only this scan.
+  // Reset all per-scan counters.
   _propMarketsFiltered = 0;
   _polyRestrictedFiltered = 0;
   _polyInactiveFiltered = 0;
   _polyRawTotal = 0;
-  // Bounded concurrency: 2 in flight at a time keeps the worker well
-  // under its memory budget. The previous setting of 4 was at the edge
-  // and caused intermittent WORKER_LIMIT failures on cold start.
-  const tagResults = await mapPool(POLY_TAG_SLUGS, 2, (slug) =>
-    polyFetchEventsByTag(slug).catch((err) => {
-      console.error(`[scanner] poly tag ${slug} failed`, err);
-      return [] as UnifiedMarket[];
-    }),
-  );
-  const seen = new Set<string>();
-  const markets: UnifiedMarket[] = [];
-  for (let i = 0; i < tagResults.length; i++) {
-    const before = markets.length;
-    for (const m of tagResults[i]) {
-      if (seen.has(m.marketId)) continue;
-      seen.add(m.marketId);
-      markets.push(m);
+
+  // Try Polymarket US first (these are the markets you can actually trade).
+  let markets: UnifiedMarket[] = [];
+  let source = 'polymarket-us';
+
+  try {
+    markets = await fetchPolyUSMarkets();
+    if (markets.length > 0) {
+      console.log('[poly-source]', JSON.stringify({
+        source: 'polymarket-us',
+        marketsFound: markets.length,
+        binaryMarkets: markets.length,
+      }));
     }
-    console.log(
-      `[scanner] poly tag ${POLY_TAG_SLUGS[i]}: +${markets.length - before} markets (raw ${tagResults[i].length})`,
-    );
+  } catch (err) {
+    console.error('[poly-us] fetchPolyUSMarkets threw', err);
   }
-  console.log(
-    '[prop-filter] skipped',
-    _propMarketsFiltered,
-    'poly prop markets',
-  );
+
+  // Fallback to global gamma API if US API returned < 50 markets.
+  if (markets.length < 50) {
+    source = markets.length > 0 ? 'polymarket-us+global-fallback' : 'polymarket-global-fallback';
+    console.log(`[poly-source] US returned ${markets.length} — falling back to global gamma API`);
+
+    const seen = new Set(markets.map(m => m.title.toLowerCase()));
+    const tagResults = await mapPool(POLY_TAG_SLUGS, 2, (slug) =>
+      polyFetchEventsByTag(slug).catch((err) => {
+        console.error(`[scanner] poly tag ${slug} failed`, err);
+        return [] as UnifiedMarket[];
+      }),
+    );
+    for (let i = 0; i < tagResults.length; i++) {
+      for (const m of tagResults[i]) {
+        // Dedupe by title (US and global may share the same market with different IDs).
+        const key = m.title.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        markets.push(m);
+      }
+    }
+    console.log('[poly-source]', JSON.stringify({ source, marketsFound: markets.length }));
+  }
+
   console.log('[poly-us-filter]', JSON.stringify({
     totalFetched: _polyRawTotal,
     afterFilter: markets.length,
-    removed: _polyRawTotal - markets.length,
-    restrictedRemoved: _polyRestrictedFiltered,
-    inactiveRemoved: _polyInactiveFiltered,
     propRemoved: _propMarketsFiltered,
   }));
   const polySportsCount = markets.filter(isSportsMarket).length;

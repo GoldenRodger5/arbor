@@ -480,6 +480,416 @@ async function executeResolutionOrder(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Live game arb: ESPN score-based spread detection
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface LiveGame {
+  sport: string;         // MLB, NBA, NHL, NFL
+  homeTeam: string;
+  awayTeam: string;
+  homeScore: number;
+  awayScore: number;
+  period: string;        // "7th", "4th", "3rd", "4th"
+  clock: string;         // "5:42", "Final", etc.
+  gameState: string;     // 'pre' | 'in' | 'post'
+  gameId: string;
+  highCertainty: boolean;
+  leadingTeam: string;
+  scoreDiff: number;
+  winProbLabel: string;  // e.g. "~90%"
+}
+
+async function fetchLiveGames(): Promise<LiveGame[]> {
+  const games: LiveGame[] = [];
+  const sportConfigs = [
+    { sport: 'MLB', path: 'baseball/mlb' },
+    { sport: 'NBA', path: 'basketball/nba' },
+    { sport: 'NHL', path: 'hockey/nhl' },
+    { sport: 'NFL', path: 'football/nfl' },
+  ];
+
+  const results = await Promise.allSettled(
+    sportConfigs.map(async ({ sport, path }) => {
+      const url = `http://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard`;
+      const res = await fetch(url, { headers: { 'User-Agent': 'arbor-resolve/1' }, signal: AbortSignal.timeout(8000) });
+      if (!res.ok) return [];
+      const data = await res.json() as { events?: any[] };
+      const out: LiveGame[] = [];
+      for (const ev of data.events ?? []) {
+        const comp = ev.competitions?.[0];
+        if (!comp) continue;
+        const state: string = comp.status?.type?.state ?? '';
+        if (state !== 'in') continue; // only live games
+        const comps = comp.competitors ?? [];
+        if (comps.length < 2) continue;
+        const home = comps.find((c: any) => c.homeAway === 'home');
+        const away = comps.find((c: any) => c.homeAway === 'away');
+        if (!home || !away) continue;
+        const homeScore = parseInt(home.score ?? '0', 10);
+        const awayScore = parseInt(away.score ?? '0', 10);
+        const diff = Math.abs(homeScore - awayScore);
+        const leading = homeScore >= awayScore
+          ? (home.team?.displayName ?? '')
+          : (away.team?.displayName ?? '');
+        const period = comp.status?.period?.toString() ?? '';
+        const clock  = comp.status?.displayClock ?? '';
+        const clockMin = parseFloat(clock.split(':')[0] ?? '99');
+
+        // High-certainty check per sport.
+        let highCertainty = false;
+        let winProb = '~50%';
+        if (sport === 'MLB' && diff >= 4 && parseInt(period) >= 7) {
+          highCertainty = true; winProb = '~92%';
+        } else if (sport === 'NBA' && diff >= 15 && parseInt(period) >= 4 && clockMin < 5) {
+          highCertainty = true; winProb = '~95%';
+        } else if (sport === 'NHL' && diff >= 2 && parseInt(period) >= 3) {
+          highCertainty = true; winProb = '~90%';
+        } else if (sport === 'NFL' && diff >= 14 && parseInt(period) >= 4 && clockMin < 5) {
+          highCertainty = true; winProb = '~95%';
+        } else if (diff >= 3) {
+          winProb = '~75%';
+        }
+
+        out.push({
+          sport, gameId: ev.id ?? '',
+          homeTeam: home.team?.displayName ?? '',
+          awayTeam: away.team?.displayName ?? '',
+          homeScore, awayScore, period, clock,
+          gameState: state,
+          highCertainty,
+          leadingTeam: leading,
+          scoreDiff: diff,
+          winProbLabel: winProb,
+        });
+      }
+      return out;
+    }),
+  );
+
+  for (const r of results) {
+    if (r.status === 'fulfilled') games.push(...r.value);
+  }
+  return games;
+}
+
+async function checkLiveGameSpreads(
+  sb: ReturnType<typeof createClient> | null,
+  dryRun: boolean,
+): Promise<{ liveGames: number; highCertainty: number; liveAlerts: number }> {
+  const liveGames = await fetchLiveGames();
+  const highCertaintyGames = liveGames.filter(g => g.highCertainty);
+
+  console.log('[resolve-live]', JSON.stringify({
+    totalLive: liveGames.length,
+    highCertainty: highCertaintyGames.length,
+    games: liveGames.map(g => ({
+      sport: g.sport,
+      matchup: `${g.homeTeam} ${g.homeScore}-${g.awayScore} ${g.awayTeam}`,
+      period: g.period, clock: g.clock,
+      highCertainty: g.highCertainty,
+      winProb: g.winProbLabel,
+    })),
+  }));
+
+  if (!sb) return { liveGames: liveGames.length, highCertainty: highCertaintyGames.length, liveAlerts: 0 };
+
+  let liveAlerts = 0;
+
+  for (const game of liveGames) {
+    // Update score tracking in known_game_markets.
+    const scoreStr = `${game.homeScore}-${game.awayScore}`;
+    const now = new Date().toISOString();
+
+    // Find matching markets by team name (case-insensitive).
+    const homeSearch = game.homeTeam.toLowerCase().split(' ').pop() ?? '';
+    const awaySearch = game.awayTeam.toLowerCase().split(' ').pop() ?? '';
+
+    const { data: matchingMarkets } = await sb
+      .from('known_game_markets')
+      .select('*')
+      .or(`home_team.ilike.%${homeSearch}%,away_team.ilike.%${homeSearch}%,home_team.ilike.%${awaySearch}%,away_team.ilike.%${awaySearch}%`)
+      .gt('close_time', now)
+      .limit(10);
+
+    // Update score + espn_game_id for any matching markets.
+    for (const m of matchingMarkets ?? []) {
+      const prevScore = m.last_score;
+      await sb.from('known_game_markets')
+        .update({ last_score: scoreStr, last_score_checked_at: now, espn_game_id: game.gameId })
+        .eq('id', m.id);
+
+      // Detect score change.
+      if (prevScore && prevScore !== scoreStr) {
+        console.log(`[resolve-live] score change: ${m.title} ${prevScore} → ${scoreStr}`);
+      }
+    }
+
+    // For HIGH_CERTAINTY games, check Kalshi prices for arb.
+    if (game.highCertainty && matchingMarkets && matchingMarkets.length > 0) {
+      // Find Kalshi market in matches.
+      const kalshiMarket = matchingMarkets.find((m: any) => m.platform === 'kalshi');
+      if (!kalshiMarket) continue;
+
+      // Fetch current Kalshi price for the winning side.
+      try {
+        const signPath = '/markets/orderbooks';
+        const headers = await kalshiAuthHeaders('GET', signPath);
+        const ticker = kalshiMarket.market_id;
+        const res = await fetch(`${KALSHI_BASE}${signPath}?tickers=${ticker}`, { headers });
+        if (!res.ok) continue;
+        const data = await res.json() as { orderbooks?: any[] };
+        const ob = data.orderbooks?.[0];
+        if (!ob?.orderbook_fp) continue;
+
+        const yesRaw = ob.orderbook_fp.yes_dollars ?? [];
+        const noRaw  = ob.orderbook_fp.no_dollars ?? [];
+        const topYesBid = yesRaw.length > 0 ? parseFloat(yesRaw[0][0]) : 0;
+        const topNoBid  = noRaw.length > 0  ? parseFloat(noRaw[0][0])  : 0;
+        const yesAsk = topNoBid > 0 ? 1 - topNoBid : 0;
+        const noAsk  = topYesBid > 0 ? 1 - topYesBid : 0;
+
+        // Determine which side is winning.
+        // Kalshi YES is typically the first team in the ticker (home-ish).
+        const winningAsk = game.homeScore > game.awayScore ? yesAsk : noAsk;
+        const winningSide = game.homeScore > game.awayScore ? 'YES' : 'NO';
+
+        console.log(`[resolve-live] ${ticker}: ${winningSide} ask=$${winningAsk.toFixed(4)} (leading ${game.leadingTeam} by ${game.scoreDiff}, ${game.winProbLabel})`);
+
+        if (winningAsk > 0 && winningAsk < 0.90) {
+          // Winning side still < 90¢ during a high-certainty game = arb opportunity.
+          const profit = ((1 - winningAsk) * 0.99).toFixed(2);
+          const text =
+            `⚡ <b>LIVE GAME ARB — ${game.sport} IN PROGRESS</b>\n\n` +
+            `<b>${htmlEscape(game.homeTeam)} ${game.homeScore} — ${htmlEscape(game.awayTeam)} ${game.awayScore}</b>\n` +
+            `${game.period}${game.clock ? ' | ' + game.clock : ''}\n\n` +
+            `${htmlEscape(game.leadingTeam)} leading by ${game.scoreDiff} — ${game.winProbLabel} likely winner\n\n` +
+            `${winningSide} ask on Kalshi: <b>$${winningAsk.toFixed(4)}</b> (should be ~$0.90+)\n` +
+            `Profit if winner: <b>+$${profit}/contract</b>\n\n` +
+            `⚡ Window: prices diverging — act fast`;
+
+          const oppId = slugify(ticker);
+          await sendTelegram({
+            text,
+            reply_markup: { inline_keyboard: [[
+              { text: `✅ Execute NOW`, callback_data: `buy_${oppId}` },
+              { text: '❌ Skip', callback_data: `skip_${oppId}` },
+            ]]},
+          });
+          liveAlerts++;
+        }
+      } catch (err) {
+        console.error('[resolve-live] price check threw', err);
+      }
+    }
+  }
+
+  return { liveGames: liveGames.length, highCertainty: highCertaintyGames.length, liveAlerts };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Position settlement tracker
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface SettlementResult {
+  checked: number;
+  settled: number;
+  pendingReminders: number;
+}
+
+async function checkPositionSettlements(
+  sb: ReturnType<typeof createClient>,
+): Promise<SettlementResult> {
+  let checked = 0; let settled = 0; let pendingReminders = 0;
+
+  // Step 1: get all open positions.
+  const { data: openPositions } = await sb
+    .from('positions')
+    .select('*')
+    .eq('status', 'open');
+
+  if (!openPositions || openPositions.length === 0) {
+    console.log('[settle] no open positions');
+  } else {
+    console.log(`[settle] checking ${openPositions.length} open positions`);
+
+    for (const pos of openPositions) {
+      checked++;
+      const kalshiTicker = pos.kalshi_market_id as string | null;
+      const polyId       = pos.poly_market_id as string | null;
+      const kFillPrice   = pos.kalshi_fill_price as number | null;
+      const pFillPrice   = pos.poly_fill_price as number | null;
+      const kQty         = pos.kalshi_fill_quantity as number | null;
+      const kSide        = (pos.intended_kalshi_side as string | null) ?? 'yes';
+
+      let kalshiResult: string | null = null;
+      let polyResult:   string | null = null;
+
+      // Step 2: check Kalshi settlement.
+      if (kalshiTicker) {
+        try {
+          const signPath = `/markets/${kalshiTicker}`;
+          const headers  = await kalshiAuthHeaders('GET', signPath);
+          const res      = await fetch(`${KALSHI_BASE}${signPath}`, { headers });
+          if (res.ok) {
+            const data = await res.json() as { market?: any };
+            const mkt  = data.market ?? data;
+            const st   = mkt.status as string ?? '';
+            const result = mkt.result as string ?? '';
+            if ((st === 'determined' || st === 'finalized' || st === 'settled') && (result === 'yes' || result === 'no')) {
+              kalshiResult = result;
+              console.log(`[settle] Kalshi ${kalshiTicker}: ${st} result=${result}`);
+            }
+          }
+        } catch (err) {
+          console.error(`[settle] Kalshi check threw for ${kalshiTicker}`, err);
+        }
+      }
+
+      // Step 3: check Polymarket US settlement.
+      if (polyId) {
+        try {
+          const url = `${POLY_US_GATEWAY}/v1/markets?slug=${encodeURIComponent(polyId)}&limit=1`;
+          const res = await fetch(url, {
+            headers: { 'User-Agent': 'arbor-resolve/1', 'Accept': 'application/json' },
+            signal: AbortSignal.timeout(8000),
+          });
+          if (res.ok) {
+            const data = await res.json() as { markets?: any[] };
+            const mkt = data.markets?.[0];
+            if (mkt) {
+              const closed = mkt.closed === true;
+              const prices = (mkt.outcomePrices ?? []) as string[];
+              // If one outcome is "1" and another is "0", market is settled.
+              if (closed && prices.includes('1') && prices.includes('0')) {
+                const outcomes = (mkt.outcomes ?? []) as string[];
+                const winnerIdx = prices.indexOf('1');
+                polyResult = outcomes[winnerIdx] ?? `outcome${winnerIdx}`;
+                console.log(`[settle] Poly ${polyId}: closed, winner=${polyResult}`);
+              }
+            }
+          }
+        } catch (err) {
+          console.error(`[settle] Poly check threw for ${polyId}`, err);
+        }
+      }
+
+      // Step 4: if both resolved (or single-leg resolution arb), settle the position.
+      const tradeType = pos.trade_type as string ?? 'arb';
+      const bothResolved = tradeType === 'resolution'
+        ? (kalshiResult !== null) // resolution arb = single Kalshi leg
+        : (kalshiResult !== null || polyResult !== null); // arb = at least one platform confirmed
+
+      if (bothResolved && kFillPrice !== null && kQty !== null) {
+        // Calculate P&L.
+        const kalshiCost  = (kFillPrice ?? 0) * (kQty ?? 0);
+        const polyCost    = (pFillPrice ?? 0) * (kQty ?? 0); // same qty on both legs
+        const totalCost   = kalshiCost + polyCost;
+
+        // Determine which leg won.
+        let totalPayout: number;
+        if (tradeType === 'resolution') {
+          // Resolution arb: winning side always pays $1.00.
+          totalPayout = (kQty ?? 0) * 1.00;
+        } else {
+          // Two-leg arb: one leg always pays $1.00 per contract.
+          // The winning leg is the one where the market result matches the side you bought.
+          const kalshiWon = kalshiResult === kSide;
+          totalPayout = (kQty ?? 0) * 1.00; // arb guarantees one leg wins
+          // In arb, the total deployed was split across two legs, payout is always qty × $1.
+        }
+
+        const realizedPnl = totalPayout - totalCost;
+        const pnlPct      = totalCost > 0 ? (realizedPnl / totalCost) * 100 : 0;
+
+        console.log(`[settle] settling ${pos.id}: cost=$${totalCost.toFixed(2)} payout=$${totalPayout.toFixed(2)} pnl=$${realizedPnl.toFixed(2)} (${pnlPct.toFixed(1)}%)`);
+
+        // Update position.
+        await sb.from('positions').update({
+          status: 'settled',
+          realized_pnl: realizedPnl,
+          settled_at: new Date().toISOString(),
+          settlement_kalshi_result: kalshiResult,
+          settlement_poly_result: polyResult,
+        }).eq('id', pos.id);
+
+        // Update capital_ledger.
+        const { data: ledger } = await sb
+          .from('capital_ledger')
+          .select('id, deployed_capital, realized_pnl')
+          .order('updated_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (ledger) {
+          await sb.from('capital_ledger').update({
+            deployed_capital: Math.max(0, ((ledger.deployed_capital as number) ?? 0) - totalCost),
+            realized_pnl: ((ledger.realized_pnl as number) ?? 0) + realizedPnl,
+            updated_at: new Date().toISOString(),
+          }).eq('id', ledger.id);
+        }
+
+        // Telegram notification.
+        const kTitle = pos.kalshi_title as string ?? '';
+        if (realizedPnl >= 0) {
+          await sendTelegram({
+            text:
+              `✅ <b>POSITION SETTLED — PROFIT</b>\n\n` +
+              `${htmlEscape(kTitle)}\n\n` +
+              `Kalshi: ${kSide.toUpperCase()} @ $${(kFillPrice??0).toFixed(4)} × ${kQty}\n` +
+              `Polymarket: hedge @ $${(pFillPrice??0).toFixed(4)} × ${kQty}\n\n` +
+              `Total deployed: <b>$${totalCost.toFixed(2)}</b>\n` +
+              `Payout received: <b>$${totalPayout.toFixed(2)}</b>\n` +
+              `💰 Profit: <b>+$${realizedPnl.toFixed(2)} (+${pnlPct.toFixed(1)}%)</b>\n\n` +
+              `Capital freed: $${totalCost.toFixed(2)}`,
+          });
+        } else {
+          await sendTelegram({
+            text:
+              `⚠️ <b>POSITION SETTLED — UNEXPECTED LOSS</b>\n\n` +
+              `${htmlEscape(kTitle)}\n\n` +
+              `Total deployed: $${totalCost.toFixed(2)}\n` +
+              `Payout: $${totalPayout.toFixed(2)}\n` +
+              `❌ Loss: <b>-$${Math.abs(realizedPnl).toFixed(2)}</b>\n\n` +
+              `This should not happen in arb — check execution logs.`,
+          });
+        }
+
+        settled++;
+      }
+    }
+  }
+
+  // Step 6: check stale pending positions (>24h old).
+  const { data: pendingPositions } = await sb
+    .from('positions')
+    .select('id, kalshi_title, opened_at')
+    .eq('status', 'pending');
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  for (const p of pendingPositions ?? []) {
+    const age = Date.now() - Date.parse(p.opened_at as string ?? '');
+    if (age > DAY_MS) {
+      const hours = Math.round(age / 3_600_000);
+      await sendTelegram({
+        text:
+          `⏰ <b>PENDING POSITION REMINDER</b>\n\n` +
+          `${htmlEscape(p.kalshi_title as string ?? '')}\n` +
+          `Logged ${hours} hours ago as pending.\n\n` +
+          `Have you executed both legs manually?\n` +
+          `If yes, reply <code>/done_${p.id}</code>\n` +
+          `If no longer valid, reply <code>/cancel_${p.id}</code>`,
+      });
+      pendingReminders++;
+    }
+  }
+
+  console.log('[settle-done]', JSON.stringify({ checked, settled, pendingReminders }));
+  return { checked, settled, pendingReminders };
+}
+
+// Poly US gateway URL (reuse from scanner context if available, otherwise hardcode).
+const POLY_US_GATEWAY = 'https://gateway.polymarket.us';
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main handler
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -564,8 +974,27 @@ serve(async (req) => {
     alertsFired++;
   }
 
+  // Step 6: Live game spread detection via ESPN.
+  const liveResult = await checkLiveGameSpreads(sb, dryRun);
+
+  // Step 7: Position settlement tracking.
+  let settleResult = { checked: 0, settled: 0, pendingReminders: 0 };
+  if (sb) {
+    try {
+      settleResult = await checkPositionSettlements(sb);
+    } catch (err) {
+      console.error('[resolve] checkPositionSettlements threw', err);
+    }
+  }
+  alertsFired += liveResult.liveAlerts;
+
   const durationMs = Date.now() - startMs;
-  console.log('[resolve-done]', JSON.stringify({ durationMs, markets: markets.length, opportunities: opps.length, alertsFired, dryRun }));
+  console.log('[resolve-done]', JSON.stringify({
+    durationMs, markets: markets.length, opportunities: opps.length, alertsFired, dryRun,
+    liveGames: liveResult.liveGames, highCertainty: liveResult.highCertainty, liveAlerts: liveResult.liveAlerts,
+    positionsChecked: settleResult.checked, positionsSettled: settleResult.settled,
+    pendingReminders: settleResult.pendingReminders,
+  }));
 
   return new Response(JSON.stringify({
     ok: true, durationMs,
@@ -575,6 +1004,12 @@ serve(async (req) => {
     manualReview: manualReview.length,
     alertsFired,
     dryRun,
+    liveGames: liveResult.liveGames,
+    highCertainty: liveResult.highCertainty,
+    liveAlerts: liveResult.liveAlerts,
+    positionsChecked: settleResult.checked,
+    positionsSettled: settleResult.settled,
+    pendingReminders: settleResult.pendingReminders,
     details: opps.map(o => ({
       ticker:       o.ticker,
       result:       o.result,

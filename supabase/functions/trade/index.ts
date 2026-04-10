@@ -1274,7 +1274,21 @@ async function handleMessage(
       `✅ Position <code>${uuid}</code> marked as OPEN.\nSettlement will be tracked automatically.`);
     return;
   }
-  await sendMessage(chatId, 'Use the buttons in the alert message to execute or skip trades.\n\n/stats — spread analytics\n/done_{uuid} — mark position as filled');
+
+  const cancelMatch = text.match(/^\/cancel_([0-9a-fA-F-]{36})/);
+  if (cancelMatch) {
+    const uuid = cancelMatch[1];
+    const { error } = await sb.from('positions').update({ status: 'cancelled' }).eq('id', uuid);
+    if (error) {
+      await sendMessage(chatId, `⚠️ Cancel failed: <code>${htmlEscape(error.message)}</code>`);
+      return;
+    }
+    await sendMessage(chatId, `🚫 Position <code>${uuid}</code> cancelled.`);
+    return;
+  }
+
+  await sendMessage(chatId,
+    'Commands:\n/stats — spread analytics\n/done_{uuid} — mark position as filled\n/cancel_{uuid} — cancel pending position');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
