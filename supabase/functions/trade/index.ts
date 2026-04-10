@@ -601,7 +601,7 @@ async function executeKalshiOrder(
     side,
     count,
     yes_price: side === 'yes' ? priceInCents : 100 - priceInCents,
-    time_in_force: 'good_til_cancelled',
+    time_in_force: 'fill_or_kill',
   };
   if (dryRun) {
     console.log('[kalshi-order-dry-run]', JSON.stringify({
@@ -677,7 +677,7 @@ async function executePolymarketOrder(
     type: 'ORDER_TYPE_LIMIT',
     price: { value: price.toFixed(2), currency: 'USD' },
     quantity: Math.round(size),
-    tif: 'TIME_IN_FORCE_GOOD_TILL_CANCEL',
+    tif: 'TIME_IN_FORCE_IMMEDIATE_OR_CANCEL',
   };
 
   if (dryRun) {
@@ -888,6 +888,123 @@ async function findOpportunityBySlug(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Live price refresh — validate spread hasn't closed since scan
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MIN_NET_SPREAD = 0.005; // 0.5% — below this not worth executing
+
+/**
+ * Re-fetch live Kalshi best ask for the given side from the orderbook.
+ * Returns the refreshed price in dollars, or null on failure.
+ */
+async function fetchLiveKalshiAsk(ticker: string, side: 'yes' | 'no'): Promise<number | null> {
+  try {
+    const signPath = `/markets/${ticker}/orderbook`;
+    const headers = await kalshiAuthHeaders('GET', signPath);
+    const res = await fetch(`${KALSHI_BASE}${signPath}?depth=1`, { headers });
+    if (!res.ok) return null;
+    const data = await res.json() as any;
+    const fp = data.orderbook_fp ?? data.orderbook;
+    if (!fp) return null;
+    // Best ask for YES = 1 - best NO bid; best ask for NO = 1 - best YES bid.
+    // Kalshi returns bids; asks are derived from opposite side.
+    if (side === 'yes') {
+      const noBids: [string | number, string | number][] = fp.no_dollars ?? fp.no ?? [];
+      if (noBids.length === 0) return null;
+      const topNoBid = parseFloat(String(noBids[0][0]));
+      return Number.isFinite(topNoBid) ? 1 - topNoBid : null;
+    } else {
+      const yesBids: [string | number, string | number][] = fp.yes_dollars ?? fp.yes ?? [];
+      if (yesBids.length === 0) return null;
+      const topYesBid = parseFloat(String(yesBids[0][0]));
+      return Number.isFinite(topYesBid) ? 1 - topYesBid : null;
+    }
+  } catch { return null; }
+}
+
+/**
+ * Re-fetch live Polymarket US price for a market side via gateway API.
+ * Returns the refreshed price (0-1), or null on failure.
+ */
+async function fetchLivePolyAsk(slug: string, isHedge: boolean): Promise<number | null> {
+  try {
+    const url = `https://gateway.polymarket.us/v1/markets?slug=${encodeURIComponent(slug)}&limit=1`;
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'arbor-trade/1', 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json() as any;
+    const mkt = (data.markets ?? data)?.[0] ?? data;
+    const sides = mkt?.marketSides ?? [];
+    if (sides.length < 2) return null;
+    // Side 0 = long (YES/not-hedge), side 1 = short (NO/hedge)
+    const side = isHedge ? sides[1] : sides[0];
+    const price = parseFloat(String(side?.price ?? ''));
+    return Number.isFinite(price) ? price : null;
+  } catch { return null; }
+}
+
+/**
+ * Refresh prices for both legs. Returns refreshed prices and net spread,
+ * or null if prices could not be fetched.
+ * Aborts execution if net spread dropped below MIN_NET_SPREAD.
+ */
+async function refreshOpportunityPrices(
+  kTicker: string,
+  kalshiSide: 'yes' | 'no',
+  polySlug: string | null,
+  originalKalshiPrice: number,
+  originalPolyPrice: number,
+  originalNetSpread: number,
+  kalshiFeeRate = 0.02,
+  polyFeeRate = 0.05,
+): Promise<{
+  kalshiPrice: number;
+  polyPrice: number;
+  netSpread: number;
+  stale: boolean;
+  aborted: boolean;
+  reason: string;
+}> {
+  const [liveKalshi, livePoly] = await Promise.all([
+    fetchLiveKalshiAsk(kTicker, kalshiSide),
+    polySlug ? fetchLivePolyAsk(polySlug, true) : Promise.resolve(null),
+  ]);
+
+  const kalshiPrice = liveKalshi ?? originalKalshiPrice;
+  const polyPrice   = livePoly   ?? originalPolyPrice;
+  const refreshed   = liveKalshi !== null || livePoly !== null;
+  const costPerPair = kalshiPrice + polyPrice;
+  const grossSpread = 1 - costPerPair;
+
+  // Estimate net spread after fees (parabolic, approximate).
+  const kalshiFee = kalshiFeeRate * kalshiPrice * (1 - kalshiPrice);
+  const polyFee   = polyFeeRate   * polyPrice   * (1 - polyPrice);
+  const netSpread = grossSpread - kalshiFee - polyFee;
+
+  const stale = Math.abs(kalshiPrice - originalKalshiPrice) > 0.02 ||
+                Math.abs(polyPrice   - originalPolyPrice)   > 0.02;
+
+  console.log('[price-refresh]', JSON.stringify({
+    kalshiAsk: kalshiPrice.toFixed(4),
+    polyAsk: polyPrice.toFixed(4),
+    originalSpread: (originalNetSpread * 100).toFixed(2) + '%',
+    currentSpread: (netSpread * 100).toFixed(2) + '%',
+    liveKalshiFetched: liveKalshi !== null,
+    livePolyFetched: livePoly !== null,
+    stale,
+    action: netSpread < MIN_NET_SPREAD ? 'abort' : 'proceed',
+  }));
+
+  if (netSpread < MIN_NET_SPREAD) {
+    return { kalshiPrice, polyPrice, netSpread, stale, aborted: true,
+      reason: `Spread closed (was ${(originalNetSpread * 100).toFixed(1)}%, now ${(netSpread * 100).toFixed(1)}%)` };
+  }
+  return { kalshiPrice, polyPrice, netSpread, stale, aborted: false, reason: '' };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main handler: execute both legs
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1025,8 +1142,29 @@ async function handleBuy(
     }
   }
 
-  const kalshiPriceInCents = Math.round(kalshiRawPrice * 100);
-  const totalDeployed = qty * costPerPair;
+  // Re-fetch live prices to validate spread hasn't closed since scan.
+  const polySlug = opp.polyMarket.url ? extractPolyUSSlug(opp.polyMarket.url) : null;
+  const priceRefresh = await refreshOpportunityPrices(
+    kTicker, kalshiSide, polySlug,
+    kalshiRawPrice, polyRawPrice, opp.bestNetSpread,
+  );
+
+  if (priceRefresh.aborted) {
+    await answerCallback(callbackId, 'Spread closed');
+    await editMessage(chatId, messageId,
+      `⚠️ <b>STALE PRICE — Spread closed</b>\n\n` +
+      `${htmlEscape(kTitle.slice(0, 60))}\n\n` +
+      `${priceRefresh.reason}\n\n` +
+      `Trade cancelled.`);
+    return;
+  }
+
+  // Use refreshed prices for actual orders (falls back to scan prices if live fetch failed).
+  const liveKalshiPrice = priceRefresh.kalshiPrice;
+  const livePolyPrice   = priceRefresh.polyPrice;
+  const kalshiPriceInCents = Math.round(liveKalshiPrice * 100);
+  const liveCostPerPair = liveKalshiPrice + livePolyPrice;
+  const totalDeployed = qty * liveCostPerPair;
   const expectedProfit = Math.round(opp.totalMaxProfit * (qty / lvl.quantity));
 
   const dryLabel = dryRun ? ' [DRY RUN]' : '';
@@ -1060,15 +1198,15 @@ async function handleBuy(
   await editMessage(chatId, messageId,
     `⚙️ <b>Executing${dryLabel}...</b>\n\n` +
     `<b>${htmlEscape(kTitle.slice(0,60))}</b>\n\n` +
-    `Kalshi  →  ${kalshiSide.toUpperCase()} @ $${kalshiRawPrice.toFixed(2)}  ×  ${qty} contracts\n` +
-    `Polymarket  →  hedge @ $${polyRawPrice.toFixed(2)}  ×  ${qty} contracts`);
+    `Kalshi  →  ${kalshiSide.toUpperCase()} @ $${liveKalshiPrice.toFixed(2)}  ×  ${qty} contracts\n` +
+    `Polymarket  →  hedge @ $${livePolyPrice.toFixed(2)}  ×  ${qty} contracts`);
 
   console.log('[execution]', JSON.stringify({
     opportunity: slug,
     positionId,
     dryRun,
     kalshi: { ticker: kTicker, side: kalshiSide, count: qty, priceInCents: kalshiPriceInCents },
-    poly: { tokenId: polyTokenId, price: polyRawPrice, size: qty },
+    poly: { tokenId: polyTokenId, price: livePolyPrice, size: qty },
     totalDeployed: totalDeployed.toFixed(2),
     expectedProfit,
     balances: { kalshiBalance, polyBalance },
@@ -1085,7 +1223,7 @@ async function handleBuy(
 
   // STEP 1: Execute Polymarket leg
   const polyResult = await executePolymarketOrder(
-    polyTokenId, polyRawPrice, qty, POLY_FUNDER_ADDRESS, dryRun, opp.polyMarket.url, true,
+    polyTokenId, livePolyPrice, qty, POLY_FUNDER_ADDRESS, dryRun, opp.polyMarket.url, true,
   );
   const polyFilled = polyResult?.filled ?? 0;
 
