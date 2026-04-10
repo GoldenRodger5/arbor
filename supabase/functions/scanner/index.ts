@@ -4146,6 +4146,26 @@ async function runScanCycle(
       return true; // PredictIt pair survived all checks
     }
     const recurrence = classifyEventRecurrence(p.kalshi, p.poly);
+
+    // Diagnostic: log close-time details for sports-game pairs near the
+    // rejection boundary so we can see the real gap source before fixing.
+    if (recurrence.subtype === 'sports-game' && actualGapMs > 30 * MS_PER_HOUR) {
+      const gameDate = parseKalshiGameDate(p.kalshi.marketId);
+      const polyCloseMs = parseCloseTimeMs(p.poly.closeTime);
+      console.log('[sports-gap-debug]', JSON.stringify({
+        kalshiTitle: p.kalshi.title.slice(0, 50),
+        polyTitle: p.poly.title.slice(0, 50),
+        kalshiCloseTime: p.kalshi.closeTime,
+        polyCloseTime: p.poly.closeTime,
+        kalshiMarketId: p.kalshi.marketId,
+        actualGapHours: Math.round(actualGapMs / MS_PER_HOUR),
+        gameDate: gameDate?.toISOString() ?? null,
+        tickerGapHours: (gameDate && polyCloseMs !== null)
+          ? Math.round(Math.abs(polyCloseMs - gameDate.getTime()) / MS_PER_HOUR)
+          : null,
+      }));
+    }
+
     if (actualGapMs > recurrence.maxGapMs) {
       _recurrenceRejected++;
       const sample: RecurrenceRejection = {
