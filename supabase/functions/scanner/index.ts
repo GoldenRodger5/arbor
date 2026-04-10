@@ -1947,6 +1947,21 @@ const POLY_US_GATEWAY = 'https://gateway.polymarket.us';
  *   marketSides: [{ id, description, price, long, team: { name, abbreviation, league } }]
  */
 function normalizePolyUSMarket(m: any): UnifiedMarket | null {
+  if (_polyRawTotal === 1) {
+    console.log('[poly-us-raw-fields]',
+      JSON.stringify(Object.keys(m)));
+    console.log('[poly-us-raw-sample]',
+      JSON.stringify({
+        gameStartTime: m.gameStartTime,
+        endDate: m.endDate,
+        commenceTime: m.commenceTime,
+        startTime: m.startTime,
+        eventDate: m.eventDate,
+        closeTime: m.closeTime,
+        settleDate: m.settleDate,
+      })
+    );
+  }
   if (!m || m.closed || !m.active) return null;
 
   // Require exactly 2 outcomes (binary market).
