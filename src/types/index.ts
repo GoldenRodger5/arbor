@@ -87,6 +87,59 @@ export interface ScannerConfig {
   minNetSpread: number;
 }
 
+export interface AnalyticsSummary {
+  // Capital
+  totalCapital: number;
+  deployedCapital: number;
+  activeCapital: number;
+  realizedPnl: number;
+  // Trades
+  totalPositions: number;
+  openPositions: number;
+  settledPositions: number;
+  partialPositions: number;
+  failedPositions: number;
+  // Spreads
+  totalSpreadsDetected: number;
+  openSpreads: number;
+  closedSpreads: number;
+  avgSpreadDurationSeconds: number | null;
+  medianSpreadDurationSeconds: number | null;
+  fastestCloseSeconds: number | null;
+  slowestCloseSeconds: number | null;
+  avgPeakSpread: number;
+  avgFirstSpread: number;
+  spreadDecayRate: number | null;
+  // Alerts
+  totalAlerted: number;
+  totalExecuted: number;
+  alertRate: number;
+  executionRate: number;
+  // Scanner health
+  lastScanAt: string | null;
+  lastFastpollAt: string | null;
+}
+
+export interface SpreadEvent {
+  id: string;
+  pairId: string;
+  kalshiMarketId: string;
+  polyMarketId: string;
+  kalshiTitle: string;
+  firstDetectedAt: string;
+  lastSeenAt: string;
+  firstNetSpread: number;
+  peakNetSpread: number;
+  lastNetSpread: number;
+  scanCount: number;
+  closedAt: string | null;
+  durationSeconds: number | null;
+  wasAlerted: boolean;
+  wasExecuted: boolean;
+  closingReason: string | null;
+  source: 'scanner' | 'fastpoll';
+}
+
 export interface Position {
   id: string;
   kalshiTitle: string;
