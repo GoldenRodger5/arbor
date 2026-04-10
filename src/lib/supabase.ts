@@ -139,6 +139,70 @@ export async function logSpread(
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Positions
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface Position {
+  id: string;
+  kalshiTitle: string;
+  polyTitle: string;
+  kalshiMarketId: string | null;
+  polyMarketId: string | null;
+  status: 'pending' | 'open' | 'partial' | 'settled' | 'cancelled' | 'failed';
+  intendedKalshiSide: string | null;
+  intendedPolySide: string | null;
+  kalshiFillPrice: number | null;
+  polyFillPrice: number | null;
+  kalshiFillQuantity: number | null;
+  polyFillQuantity: number | null;
+  kalshiOrderId: string | null;
+  polyOrderId: string | null;
+  executedAt: string | null;
+  createdAt: string;
+  opportunityId: string | null;
+}
+
+export async function getPositions(): Promise<Position[]> {
+  const sb = safeSupabase();
+  if (!sb) return [];
+
+  const { data, error } = await sb
+    .from('positions')
+    .select(
+      'id, kalshi_title, poly_title, kalshi_market_id, poly_market_id, ' +
+      'status, intended_kalshi_side, intended_poly_side, ' +
+      'kalshi_fill_price, poly_fill_price, kalshi_fill_quantity, poly_fill_quantity, ' +
+      'kalshi_order_id, poly_order_id, executed_at, opened_at, opportunity_id',
+    )
+    .order('opened_at', { ascending: false });
+
+  if (error) {
+    console.error('[supabase] getPositions failed', error);
+    return [];
+  }
+
+  return (data ?? []).map((r) => ({
+    id: r.id as string,
+    kalshiTitle: (r.kalshi_title as string | null) ?? '',
+    polyTitle: (r.poly_title as string | null) ?? '',
+    kalshiMarketId: (r.kalshi_market_id as string | null) ?? null,
+    polyMarketId: (r.poly_market_id as string | null) ?? null,
+    status: (r.status as Position['status']) ?? 'pending',
+    intendedKalshiSide: (r.intended_kalshi_side as string | null) ?? null,
+    intendedPolySide: (r.intended_poly_side as string | null) ?? null,
+    kalshiFillPrice: (r.kalshi_fill_price as number | null) ?? null,
+    polyFillPrice: (r.poly_fill_price as number | null) ?? null,
+    kalshiFillQuantity: (r.kalshi_fill_quantity as number | null) ?? null,
+    polyFillQuantity: (r.poly_fill_quantity as number | null) ?? null,
+    kalshiOrderId: (r.kalshi_order_id as string | null) ?? null,
+    polyOrderId: (r.poly_order_id as string | null) ?? null,
+    executedAt: (r.executed_at as string | null) ?? null,
+    createdAt: (r.opened_at as string) ?? new Date().toISOString(),
+    opportunityId: (r.opportunity_id as string | null) ?? null,
+  }));
+}
+
 const DEFAULT_CAPITAL: CapitalState = {
   totalCapital: 500,
   deployedCapital: 0,

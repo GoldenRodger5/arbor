@@ -86,3 +86,23 @@ export interface ScannerConfig {
   intervalSeconds: number;
   minNetSpread: number;
 }
+
+export interface Position {
+  id: string;
+  kalshiTitle: string;
+  polyTitle: string;
+  kalshiMarketId: string | null;
+  polyMarketId: string | null;
+  status: 'pending' | 'open' | 'partial' | 'settled' | 'cancelled' | 'failed';
+  intendedKalshiSide: string | null;
+  intendedPolySide: string | null;
+  kalshiFillPrice: number | null;
+  polyFillPrice: number | null;
+  kalshiFillQuantity: number | null;
+  polyFillQuantity: number | null;
+  kalshiOrderId: string | null;
+  polyOrderId: string | null;
+  executedAt: string | null;
+  createdAt: string;
+  opportunityId: string | null;
+}
