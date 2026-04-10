@@ -1622,6 +1622,8 @@ async function kalshiBatchOrderbooks(
         break; // fall back below
       }
       const data = await res.json() as { orderbooks?: any[] };
+      const returnedTickers = (data.orderbooks ?? []).map((ob: any) => ob.ticker as string).filter(Boolean);
+      console.log(`[kalshi-batch-ob] requested=${JSON.stringify(batch)} returned=${JSON.stringify(returnedTickers)} missing=${JSON.stringify(batch.filter(t => !returnedTickers.includes(t)))}`);
       for (const ob of data.orderbooks ?? []) {
         const ticker = ob.ticker as string;
         if (!ticker) continue;
@@ -1646,7 +1648,6 @@ async function kalshiBatchOrderbooks(
         noAsks.sort((a, b) => a.price - b.price);
         result.set(ticker, { marketId: ticker, yesBids, yesAsks, noBids, noAsks, fetchedAt: Date.now() });
       }
-      console.log(`[kalshi-batch-ob] fetched ${batch.length} tickers, got ${data.orderbooks?.length ?? 0} orderbooks`);
     } catch (err) {
       console.error('[kalshi-batch-ob] threw', err);
     }
@@ -2407,13 +2408,28 @@ function parseLevels(
 }
 
 async function polyFetchBook(tokenId: string): Promise<PolyOrderbookRaw> {
+  const url = `${POLY_CLOB}/book?token_id=${encodeURIComponent(tokenId)}`;
   try {
-    const response = await fetch(
-      `${POLY_CLOB}/book?token_id=${encodeURIComponent(tokenId)}`,
-    );
+    const response = await fetch(url);
+    const data = response.ok
+      ? await response.json() as PolyOrderbookRaw
+      : {};
+    console.log('[poly-ob-debug]', JSON.stringify({
+      tokenId: tokenId.slice(0, 20),
+      url,
+      status: response.status,
+      responseKeys: Object.keys(data),
+      rawSample: JSON.stringify(data).slice(0, 300),
+    }));
     if (!response.ok) return {};
-    return (await response.json()) as PolyOrderbookRaw;
-  } catch {
+    return data;
+  } catch (err) {
+    console.log('[poly-ob-debug]', JSON.stringify({
+      tokenId: tokenId.slice(0, 20),
+      url,
+      status: 'threw',
+      error: String(err),
+    }));
     return {};
   }
 }
