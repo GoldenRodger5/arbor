@@ -564,6 +564,14 @@ serve(async (req) => {
     let deduped = 0;
     for (const o of toSend) {
       try {
+        // Skip manual alert if auto-execute will handle it.
+        const willAutoEx =
+          (o.verdict || '').toUpperCase() === 'SAFE' &&
+          o.bestNetSpread >= AUTO_EXECUTE_SPREAD &&
+          typeof o.daysToClose === 'number' &&
+          o.daysToClose <= AUTO_EXECUTE_MAX_DAYS;
+        if (willAutoEx) { deduped++; continue; }
+
         const pairId = `${o.kalshiMarket.marketId ?? ''}:${o.polyMarket.marketId ?? ''}`;
 
         // Skip if there is already an open/partial/pending_fill position for
@@ -702,13 +710,15 @@ serve(async (req) => {
 
         // Step 3b: was_executed dedup check — prevents re-execution across scans.
         const oppId = slugifyId(o.kalshiMarket?.marketId || o.id || '');
+        const fullPairId = `${o.kalshiMarket?.marketId ?? ''}:${o.polyMarket?.marketId ?? ''}`;
         const { data: existing } = await sb
           .from('spread_events')
           .select('was_executed')
-          .eq('pair_id', oppId)
+          .eq('pair_id', fullPairId)
+          .is('closed_at', null)
           .maybeSingle();
         if (existing?.was_executed) {
-          console.log('[auto-execute] already executed, skipping', oppId);
+          console.log('[auto-execute] already executed, skipping', fullPairId);
           continue;
         }
 
@@ -719,11 +729,11 @@ serve(async (req) => {
         const sizing = calculateAutoExecuteSize(liveRawTotal, costPerPair, availableLiquidity);
 
         if (sizing.contracts === 0) {
-          console.log('[auto-execute] 0 contracts from sizing, skipping', oppId);
+          console.log('[auto-execute] 0 contracts from sizing, skipping', fullPairId);
           continue;
         }
 
-        console.log('[auto-execute] firing', oppId, {
+        console.log('[auto-execute] firing', fullPairId, {
           liveRawTotal,
           contracts: sizing.contracts,
           deployedUSD: sizing.deployedUSD,
