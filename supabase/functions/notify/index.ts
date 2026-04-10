@@ -17,8 +17,12 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.39.0';
 const TELEGRAM_BOT_TOKEN = Deno.env.get('TELEGRAM_BOT_TOKEN') ?? '';
 const TELEGRAM_CHAT_ID   = Deno.env.get('TELEGRAM_CHAT_ID') ?? '';
 
-const MAX_ALERTS_PER_SCAN = 3;
-const MIN_NET_SPREAD = 0.03;
+const MAX_ALERTS_PER_SCAN    = 3;
+const MIN_NET_SPREAD         = 0.03;
+const MAX_DAYS_LOCKUP        = 2;    // Only alert on markets closing within 2 days
+const AUTO_EXECUTE_SPREAD    = 0.05; // 5% net → auto-execute
+const AUTO_EXECUTE_MAX_DAYS  = 1;    // same-day only
+const GLOBAL_DRY_RUN         = Deno.env.get('TRADE_DRY_RUN') === 'true';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Kelly position sizing (mirrored from trade/index.ts)
@@ -381,6 +385,9 @@ serve(async (req) => {
       if (o.bestNetSpread <= MIN_NET_SPREAD) return false;
       const v = (o.verdict || '').toUpperCase();
       if (v !== 'SAFE' && v !== 'CAUTION') return false;
+      // Only alert on short-dated markets — Cy Young, MLS Cup, etc. silenced.
+      if (typeof o.daysToClose !== 'number') return false;
+      if (o.daysToClose > MAX_DAYS_LOCKUP) return false;
       return true;
     });
 
@@ -418,10 +425,51 @@ serve(async (req) => {
       );
     }
 
+    // Smart dedup: check spread_events before sending each alert.
+    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
+    const serviceKey  = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+    const sb = (supabaseUrl && serviceKey) ? createClient(supabaseUrl, serviceKey) : null;
+
+    const REFIRE_HOURS = 6;
+    const SKIP_COOLDOWN_HOURS = 24;
+    const IMPROVEMENT_FACTOR  = 1.5; // re-alert if spread improved 50%+
+
     const toSend = filtered.slice(0, MAX_ALERTS_PER_SCAN);
     let sent = 0;
+    let deduped = 0;
     for (const o of toSend) {
       try {
+        const pairId = `${o.kalshiMarket.marketId ?? ''}:${o.polyMarket.marketId ?? ''}`;
+
+        // Dedup check against spread_events.
+        if (sb) {
+          const { data: event } = await sb
+            .from('spread_events')
+            .select('alerted_at, was_alerted, was_executed, peak_net_spread, skipped_at')
+            .eq('pair_id', pairId)
+            .is('closed_at', null)
+            .limit(1)
+            .maybeSingle();
+
+          if (event) {
+            const e = event as any;
+            // Rule 1: already executed → skip permanently.
+            if (e.was_executed) { deduped++; continue; }
+            // Rule 3: skipped recently → 24h cooldown.
+            if (e.skipped_at && (Date.now() - Date.parse(e.skipped_at)) < SKIP_COOLDOWN_HOURS * 3_600_000) {
+              deduped++; continue;
+            }
+            // Rule 2: recently alerted at similar spread.
+            if (e.alerted_at && (Date.now() - Date.parse(e.alerted_at)) < REFIRE_HOURS * 3_600_000) {
+              const peakSpread = e.peak_net_spread as number ?? 0;
+              if (o.bestNetSpread < peakSpread * IMPROVEMENT_FACTOR) {
+                deduped++; continue;
+              }
+            }
+            // Rule 4: never alerted → fall through to send.
+          }
+        }
+
         const { text, reply_markup } = formatMessage(o, activeCapital, kalshiBalance, polyBalance);
         await sendTelegram({
           chat_id: TELEGRAM_CHAT_ID,
@@ -431,8 +479,81 @@ serve(async (req) => {
           reply_markup,
         });
         sent++;
+
+        // Update spread_events after sending alert.
+        if (sb) {
+          await sb.from('spread_events')
+            .update({
+              was_alerted: true,
+              alerted_at: new Date().toISOString(),
+              last_net_spread: o.bestNetSpread,
+              peak_net_spread: Math.max((event as any)?.peak_net_spread ?? 0, o.bestNetSpread),
+            })
+            .eq('pair_id', pairId)
+            .is('closed_at', null)
+            .catch(() => {});
+        }
       } catch (err) {
         console.error('[notify] failed to send alert', err);
+      }
+    }
+    if (deduped > 0) console.log(`[notify] deduped ${deduped} alerts`);
+
+    // Auto-execute: for high-confidence same-day opportunities, call the
+    // trade function directly without waiting for a button tap.
+    // Respects TRADE_DRY_RUN guard.
+    if (sb && !GLOBAL_DRY_RUN) {
+      for (const o of filtered) {
+        const v = (o.verdict || '').toUpperCase();
+        if (v !== 'SAFE') continue;
+        if (o.bestNetSpread < AUTO_EXECUTE_SPREAD) continue;
+        if (typeof o.daysToClose !== 'number' || o.daysToClose > AUTO_EXECUTE_MAX_DAYS) continue;
+
+        const tradeUrl = (supabaseUrl || '').replace(/\/$/, '') + '/functions/v1/trade';
+        const oppId = slugifyId(o.kalshiMarket.marketId || o.id || '');
+        console.log('[notify-auto-execute] triggering for', oppId, 'spread=', (o.bestNetSpread * 100).toFixed(1) + '%');
+
+        try {
+          // Simulate a callback_query buy tap by calling handleBuy via the trade endpoint.
+          const tRes = await fetch(tradeUrl, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${serviceKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              callback_query: {
+                id: 'auto-exec-' + Date.now(),
+                data: `buy_${oppId}`,
+                message: { chat: { id: parseInt(TELEGRAM_CHAT_ID, 10) || 0 }, message_id: 0 },
+              },
+            }),
+          });
+          console.log('[notify-auto-execute] trade response:', tRes.status);
+
+          // Send post-execution notification.
+          await sendTelegram({
+            chat_id: TELEGRAM_CHAT_ID,
+            text: `🤖 <b>AUTO-EXECUTED — HIGH CONFIDENCE</b>\n\n` +
+              `${htmlEscape(o.kalshiMarket.title || '')}\n` +
+              `SAFE verdict, ${(o.bestNetSpread * 100).toFixed(1)}% net spread, same-day game.\n` +
+              `Window too short for manual approval.\n\n` +
+              `Check /stats for position details.`,
+            parse_mode: 'HTML',
+          });
+        } catch (err) {
+          console.error('[notify-auto-execute] threw', err);
+        }
+      }
+    } else if (GLOBAL_DRY_RUN) {
+      // In dry-run, just log which opps would have been auto-executed.
+      const autoQualified = filtered.filter(
+        (o) => (o.verdict || '').toUpperCase() === 'SAFE' &&
+               o.bestNetSpread >= AUTO_EXECUTE_SPREAD &&
+               typeof o.daysToClose === 'number' && o.daysToClose <= AUTO_EXECUTE_MAX_DAYS,
+      );
+      if (autoQualified.length > 0) {
+        console.log('[notify-auto-execute-dry]', autoQualified.length, 'opps would auto-execute if TRADE_DRY_RUN was off');
       }
     }
 

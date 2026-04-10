@@ -1166,6 +1166,7 @@ async function handleResolutionBuy(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function handleSkip(
+  sb: ReturnType<typeof createClient>,
   slug: string,
   chatId: number,
   messageId: number,
@@ -1181,6 +1182,14 @@ async function handleSkip(
     }
   }
   await editMessage(chatId, messageId, `⏭ <b>Skipped</b>\n${htmlEscape(label)}`);
+
+  // Record skip in spread_events for 24h dedup cooldown.
+  // The slug is the kalshi market ID slugified; try to match spread_events pair_id.
+  await sb.from('spread_events')
+    .update({ skipped_at: new Date().toISOString() })
+    .like('pair_id', `%${slug}%`)
+    .is('closed_at', null)
+    .catch(() => {});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1398,11 +1407,11 @@ serve(async (req) => {
       if (data.startsWith('res_buy_')) {
         await handleResolutionBuy(sb, data.slice(8), chatId, messageId, cq.id, dryRun);
       } else if (data.startsWith('res_skip_')) {
-        await handleSkip(data.slice(9), chatId, messageId, cq.id, originalText);
+        await handleSkip(sb, data.slice(9), chatId, messageId, cq.id, originalText);
       } else if (data.startsWith('buy_')) {
         await handleBuy(sb, data.slice(4), chatId, messageId, cq.id, dryRun);
       } else if (data.startsWith('skip_')) {
-        await handleSkip(data.slice(5), chatId, messageId, cq.id, originalText);
+        await handleSkip(sb, data.slice(5), chatId, messageId, cq.id, originalText);
       } else {
         await answerCallback(cq.id, 'Unknown action');
       }
