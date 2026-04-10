@@ -56,6 +56,7 @@ const MAX_POSITION_SAFE    = 500;   // SAFE verdict cap (not binding at current 
 const MAX_POSITION_CAUTION = 200;   // CAUTION verdict cap
 const MAX_CAPITAL_FRACTION = 0.90;  // 90% of active capital per trade
 const HALF_KELLY           = 0.50;  // fraction of full Kelly to use
+const SAFETY_RESERVE_PCT   = 0.10;  // reserve fraction kept untouched
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Live balance fetching
@@ -269,7 +270,7 @@ async function fetchActiveCapital(
   if (error || !data) return defaults;
   const total    = (data.total_capital    as number) ?? 500;
   const deployed = (data.deployed_capital as number) ?? 0;
-  const reserve  = (data.safety_reserve_pct as number) ?? 0.2;
+  const reserve  = (data.safety_reserve_pct as number) ?? SAFETY_RESERVE_PCT;
   const pnl      = (data.realized_pnl     as number) ?? 0;
   return {
     totalCapital: total,
@@ -373,6 +374,57 @@ function calculatePositionSize(
   }));
 
   return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auto-execute dynamic sizing (used when autoExecute:true flag is set)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function getTargetPositions(totalCapital: number): number {
+  if (totalCapital < 500)   return 2;
+  if (totalCapital < 2000)  return 3;
+  if (totalCapital < 10000) return 4;
+  if (totalCapital < 50000) return 5;
+  return 6;
+}
+
+function calculateAutoExecuteSize(
+  liveRawTotal: number,
+  costPerPair: number,
+  availableLiquidity: number,
+): { contracts: number; deployedUSD: number; limitingFactor: string; reserve: number } {
+  // Dynamic reserve: 5% of capital, $15 min, $100 max.
+  const reserve = Math.min(100, Math.max(15, liveRawTotal * 0.05));
+  const targets = getTargetPositions(liveRawTotal);
+  const perTradeTarget = liveRawTotal / targets;
+  const maxAllowed = Math.max(0, liveRawTotal - reserve);
+  const finalUSD = Math.min(perTradeTarget, maxAllowed, availableLiquidity);
+
+  const MIN_TRADE_USD = 20;
+  if (finalUSD < MIN_TRADE_USD) {
+    return { contracts: 0, deployedUSD: 0, limitingFactor: 'below_minimum', reserve };
+  }
+
+  const contracts = Math.floor(finalUSD / costPerPair);
+  const deployedUSD = contracts * costPerPair;
+  const limitingFactor =
+    finalUSD === availableLiquidity ? 'liquidity' :
+    finalUSD === maxAllowed        ? 'reserve'    : 'target';
+
+  console.log('[auto-execute-sizing]', JSON.stringify({
+    liveRawTotal,
+    reserve,
+    targets,
+    perTradeTarget: perTradeTarget.toFixed(2),
+    maxAllowed: maxAllowed.toFixed(2),
+    availableLiquidity: availableLiquidity.toFixed(2),
+    finalUSD: finalUSD.toFixed(2),
+    contracts,
+    deployedUSD: deployedUSD.toFixed(2),
+    limitingFactor,
+  }));
+
+  return { contracts, deployedUSD, limitingFactor, reserve };
 }
 
 const TG_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
@@ -583,7 +635,7 @@ async function executeKalshiOrder(
     const order = data.order ?? data;
     return {
       orderId: order.order_id ?? order.id ?? String(Date.now()),
-      filled: order.quantity_filled ?? order.filled ?? count,
+      filled: order.quantity_filled ?? order.filled ?? 0,
       avgPrice: (order.avg_price ?? priceInCents) / 100,
     };
   } catch (err) {
@@ -796,6 +848,8 @@ async function handleBuy(
   messageId: number,
   callbackId: string,
   dryRun: boolean,
+  autoExecute = false,
+  passedRawTotal?: number,
 ): Promise<void> {
   const opp = await findOpportunityBySlug(sb, slug);
   if (!opp) {
@@ -832,10 +886,10 @@ async function handleBuy(
   const { kalshiBalance, polyBalance } = await fetchRealBalancesAndSync(sb, dryRun);
   // Use real balances if available; fall back to capital_ledger otherwise.
   const capital = await fetchActiveCapital(sb);
-  const realTotal = (kalshiBalance + polyBalance) > 0
+  const realRawTotal = (kalshiBalance + polyBalance) > 0
     ? kalshiBalance + polyBalance
-    : capital.totalCapital;
-  const activeCapital = realTotal * 0.90;
+    : passedRawTotal ?? capital.totalCapital;
+  const activeCapital = realRawTotal * (1 - SAFETY_RESERVE_PCT);
 
   // Safety rule 1: refuse if active capital is below minimum.
   if (activeCapital < MIN_POSITION_USD) {
@@ -849,52 +903,80 @@ async function handleBuy(
 
   const costPerPair = kalshiRawPrice + polyRawPrice;
   const availableLiquidity = (lvl.totalCost ?? costPerPair) * lvl.quantity;
-  const sizing = calculatePositionSize(
-    opp.bestNetSpread,
-    costPerPair,
-    activeCapital,
-    opp.verdict ?? 'CAUTION',
-    availableLiquidity,
-  );
 
-  let qty = sizing.contracts;
-  if (qty > 0) {
-    // Check actual per-leg costs at the Kelly-sized quantity.
-    const kCost = kalshiRawPrice * qty;
-    const pCost = polyRawPrice   * qty;
-    if (kalshiBalance > 0 && kalshiBalance < kCost) {
-      await answerCallback(callbackId, 'Insufficient Kalshi balance');
-      await editMessage(chatId, messageId,
-        `⚠️ <b>Insufficient Kalshi balance</b>\n\n` +
-        `Required: <b>$${kCost.toFixed(2)}</b>\n` +
-        `Available: <b>$${kalshiBalance.toFixed(2)}</b>\n\n` +
-        `Top up at <a href="https://kalshi.com">kalshi.com</a> before trading.`);
-      await sb.from('positions').update({ status: 'cancelled' }).eq('id', 'pending');
+  let qty: number;
+  let sizingKellyFraction = 0;
+  let sizingLimitingFactor = 'kelly';
+
+  if (autoExecute) {
+    const autoSizing = calculateAutoExecuteSize(realRawTotal, costPerPair, availableLiquidity);
+    qty = autoSizing.contracts;
+    sizingLimitingFactor = autoSizing.limitingFactor;
+    console.log('[trade-auto-execute-sizing]', JSON.stringify({
+      realRawTotal,
+      contracts: autoSizing.contracts,
+      deployedUSD: autoSizing.deployedUSD,
+      limitingFactor: autoSizing.limitingFactor,
+      reserve: autoSizing.reserve,
+    }));
+    if (qty < 1) {
+      await answerCallback(callbackId, 'Insufficient capital for auto-execute');
+      await sendMessage(chatId,
+        `⚠️ <b>Auto-execute skipped</b>\n\n` +
+        `Capital too low for minimum trade.\n` +
+        `Raw total: $${realRawTotal.toFixed(2)}\n` +
+        `Reserve: $${autoSizing.reserve.toFixed(2)}\n` +
+        `Available: $${(realRawTotal - autoSizing.reserve).toFixed(2)}`);
       return;
     }
-    if (polyBalance > 0 && polyBalance < pCost) {
-      await answerCallback(callbackId, 'Insufficient Polymarket balance');
+  } else {
+    const sizing = calculatePositionSize(
+      opp.bestNetSpread,
+      costPerPair,
+      activeCapital,
+      opp.verdict ?? 'CAUTION',
+      availableLiquidity,
+    );
+    qty = sizing.contracts;
+    sizingKellyFraction = sizing.kellyFraction;
+    sizingLimitingFactor = sizing.limitingFactor;
+    if (qty > 0) {
+      const kCost = kalshiRawPrice * qty;
+      const pCost = polyRawPrice   * qty;
+      if (kalshiBalance > 0 && kalshiBalance < kCost) {
+        await answerCallback(callbackId, 'Insufficient Kalshi balance');
+        await editMessage(chatId, messageId,
+          `⚠️ <b>Insufficient Kalshi balance</b>\n\n` +
+          `Required: <b>$${kCost.toFixed(2)}</b>\n` +
+          `Available: <b>$${kalshiBalance.toFixed(2)}</b>\n\n` +
+          `Top up at <a href="https://kalshi.com">kalshi.com</a> before trading.`);
+        await sb.from('positions').update({ status: 'cancelled' }).eq('id', 'pending');
+        return;
+      }
+      if (polyBalance > 0 && polyBalance < pCost) {
+        await answerCallback(callbackId, 'Insufficient Polymarket balance');
+        await editMessage(chatId, messageId,
+          `⚠️ <b>Insufficient Polymarket balance</b>\n\n` +
+          `Required: <b>$${pCost.toFixed(2)}</b>\n` +
+          `Available: <b>$${polyBalance.toFixed(2)}</b>\n\n` +
+          `Top up at <a href="https://polymarket.com">polymarket.com</a> before trading.`);
+        return;
+      }
+    }
+    if (qty < 1) {
+      await answerCallback(callbackId, 'Position too small');
       await editMessage(chatId, messageId,
-        `⚠️ <b>Insufficient Polymarket balance</b>\n\n` +
-        `Required: <b>$${pCost.toFixed(2)}</b>\n` +
-        `Available: <b>$${polyBalance.toFixed(2)}</b>\n\n` +
-        `Top up at <a href="https://polymarket.com">polymarket.com</a> before trading.`);
+        `⚠️ <b>Kelly sizing resulted in 0 contracts</b>\n\n` +
+        `Active capital: $${activeCapital.toFixed(2)}\n` +
+        `Net spread: ${(opp.bestNetSpread * 100).toFixed(1)}%\n` +
+        `Kelly fraction: ${(sizing.kellyFraction * 100).toFixed(1)}%\n` +
+        `Limiting factor: ${sizing.limitingFactor}`);
       return;
     }
-  }
-  if (qty < 1) {
-    await answerCallback(callbackId, 'Position too small');
-    await editMessage(chatId, messageId,
-      `⚠️ <b>Kelly sizing resulted in 0 contracts</b>\n\n` +
-      `Active capital: $${activeCapital.toFixed(2)}\n` +
-      `Net spread: ${(opp.bestNetSpread * 100).toFixed(1)}%\n` +
-      `Kelly fraction: ${(sizing.kellyFraction * 100).toFixed(1)}%\n` +
-      `Limiting factor: ${sizing.limitingFactor}`);
-    return;
   }
 
   const kalshiPriceInCents = Math.round(kalshiRawPrice * 100);
-  const totalDeployed = sizing.totalDeployed;
+  const totalDeployed = qty * costPerPair;
   const expectedProfit = Math.round(opp.totalMaxProfit * (qty / lvl.quantity));
 
   const dryLabel = dryRun ? ' [DRY RUN]' : '';
@@ -910,8 +992,8 @@ async function handleBuy(
     intended_kalshi_side: kalshiSide,
     intended_poly_side: kalshiSide === 'yes' ? 'no' : 'yes',
     opportunity_id: slug,
-    kelly_fraction: sizing.kellyFraction,
-    limiting_factor: sizing.limitingFactor,
+    kelly_fraction: sizingKellyFraction,
+    limiting_factor: sizingLimitingFactor,
     active_capital_at_execution: activeCapital,
   };
   const { data: posRow, error: insertErr } = await sb
@@ -948,13 +1030,31 @@ async function handleBuy(
     executePolymarketOrder(polyTokenId, polyRawPrice, qty, POLY_FUNDER_ADDRESS, dryRun, opp.polyMarket.url, true),
   ]);
 
+  // ── EDGE CASE HANDLING ────────────────────────────────────────────────────
+
   const kalshiOk = kalshiResult !== null;
-  const polyOk   = polyResult !== null;
+  const polyOk   = polyResult   !== null;
   const bothOk   = kalshiOk && polyOk;
   const noneOk   = !kalshiOk && !polyOk;
 
-  // Determine final status and build update.
-  const finalStatus = bothOk ? 'open' : noneOk ? 'failed' : 'partial';
+  const kalshiFilled = kalshiResult?.filled ?? 0;
+  const polyFilled   = polyResult?.filled   ?? 0;
+
+  // EDGE CASE A: Both legs filled but quantities don't match (tolerance of 1).
+  const quantityMismatch = bothOk && Math.abs(kalshiFilled - polyFilled) > 1;
+
+  // EDGE CASE B: Order accepted but zero filled — GTC resting on book.
+  const kalshiGhost = kalshiOk && kalshiFilled === 0;
+  const polyGhost   = polyOk   && polyFilled   === 0;
+  const hasGhost    = kalshiGhost || polyGhost;
+
+  let finalStatus: string;
+  if (noneOk)                finalStatus = 'failed';
+  else if (quantityMismatch) finalStatus = 'partial';
+  else if (hasGhost)         finalStatus = 'pending_fill';
+  else if (!bothOk)          finalStatus = 'partial';
+  else                       finalStatus = 'open';
+
   const update: Record<string, unknown> = {
     status: finalStatus,
     executed_at: new Date().toISOString(),
@@ -962,12 +1062,12 @@ async function handleBuy(
   if (kalshiResult) {
     update.kalshi_order_id      = kalshiResult.orderId;
     update.kalshi_fill_price    = kalshiResult.avgPrice;
-    update.kalshi_fill_quantity = kalshiResult.filled;
+    update.kalshi_fill_quantity = kalshiFilled;
   }
   if (polyResult) {
     update.poly_order_id      = polyResult.orderId;
     update.poly_fill_price    = polyResult.avgPrice;
-    update.poly_fill_quantity = polyResult.filled;
+    update.poly_fill_quantity = polyFilled;
   }
   await sb.from('positions').update(update).eq('id', positionId);
 
@@ -977,9 +1077,11 @@ async function handleBuy(
   const kTitleShort = kTitle.length > 60 ? kTitle.slice(0, 59) + '…' : kTitle;
 
   let tgMsg: string;
-  if (bothOk) {
-    const actualDeployed = (kalshiResult!.avgPrice * kalshiResult!.filled) +
-                           (polyResult!.avgPrice * polyResult!.filled);
+
+  if (finalStatus === 'open') {
+    const actualDeployed =
+      (kalshiResult!.avgPrice * kalshiFilled) +
+      (polyResult!.avgPrice   * polyFilled);
 
     // Track deployed capital so the system knows how much is in open positions.
     try {
@@ -1005,36 +1107,77 @@ async function handleBuy(
 
     tgMsg =
       `✅ <b>EXECUTED${dryLabel}</b>\n\n` +
-      `<b>${htmlEscape(kTitleShort)}</b>\n\n` +
-      `<code>Kalshi     ${kalshiSide.toUpperCase().padEnd(6)}$${kalshiResult!.avgPrice.toFixed(2)}  ×  ${kalshiResult!.filled}</code>\n` +
-      `<code>Polymarket hedge  $${polyResult!.avgPrice.toFixed(2)}  ×  ${polyResult!.filled}</code>\n\n` +
-      `Deployed  <b>$${actualDeployed.toFixed(2)}</b>\n` +
-      `Profit    <b>+$${expectedProfit}</b>  when settled ${settleDate}\n\n` +
-      `<code>${positionId}</code>`;
-  } else if (noneOk) {
+      `${htmlEscape(kTitleShort)}\n\n` +
+      `KALSHI: ${kalshiFilled} contracts @ $${kalshiResult!.avgPrice.toFixed(4)}\n` +
+      `POLYMARKET: ${polyFilled} contracts @ $${polyResult!.avgPrice.toFixed(4)}\n\n` +
+      `💰 Deployed: <b>$${actualDeployed.toFixed(2)}</b>\n` +
+      `📈 Max profit: <b>$${expectedProfit}</b>\n` +
+      `📅 Closes: ${settleDate}\n\n` +
+      `Position: <code>${positionId}</code>`;
+
+  } else if (quantityMismatch) {
+    const overPlatform  = kalshiFilled > polyFilled ? 'KALSHI' : 'POLYMARKET';
+    const underPlatform = kalshiFilled > polyFilled ? 'POLYMARKET' : 'KALSHI';
+    const excessQty     = Math.abs(kalshiFilled - polyFilled);
     tgMsg =
-      `❌ <b>Execution failed — no position opened${dryLabel}</b>\n\n` +
-      `<b>${htmlEscape(kTitleShort)}</b>\n\n` +
-      `Both legs returned errors. No capital deployed.\n` +
-      `Check platform status and try again if spread persists.\n\n` +
-      `<code>${positionId}</code>`;
+      `⚠️ <b>QUANTITY MISMATCH — ACTION REQUIRED${dryLabel}</b>\n\n` +
+      `${htmlEscape(kTitleShort)}\n\n` +
+      `KALSHI filled: ${kalshiFilled} contracts\n` +
+      `POLYMARKET filled: ${polyFilled} contracts\n` +
+      `Excess: ${excessQty} unhedged contracts on ${overPlatform}\n\n` +
+      `<b>You are NOT fully hedged.</b>\n\n` +
+      `To fix: sell ${excessQty} contracts on ${overPlatform}\n` +
+      `Or: buy ${excessQty} more contracts on ${underPlatform}\n\n` +
+      `Position: <code>${positionId}</code>`;
+
+  } else if (hasGhost) {
+    const ghostPlatform = kalshiGhost ? 'KALSHI' : 'POLYMARKET';
+    tgMsg =
+      `🟡 <b>ORDER RESTING — NOT YET FILLED${dryLabel}</b>\n\n` +
+      `${htmlEscape(kTitleShort)}\n\n` +
+      `${ghostPlatform} order placed but 0 contracts filled.\n` +
+      `Order is resting as GTC (good til cancelled).\n\n` +
+      `<b>You may not be hedged yet.</b>\n` +
+      `Monitor ${ghostPlatform} and cancel manually if\n` +
+      `price moves away or game starts.\n\n` +
+      `Position: <code>${positionId}</code>`;
+
+  } else if (!bothOk && !noneOk) {
+    // Classic partial — one leg filled, one failed.
+    const filledPlatform = kalshiOk ? 'KALSHI' : 'POLYMARKET';
+    const failedPlatform = kalshiOk ? 'POLYMARKET' : 'KALSHI';
+    const filledQty      = kalshiOk ? kalshiFilled : polyFilled;
+    const filledPrice    = kalshiOk ? kalshiResult!.avgPrice : polyResult!.avgPrice;
+    const failedSide     = kalshiOk
+      ? (kalshiSide === 'yes' ? 'NO' : 'YES')
+      : kalshiSide.toUpperCase();
+    const failedPrice    = kalshiOk ? polyRawPrice : kalshiRawPrice;
+    const failedTitle    = kalshiOk ? pTitle : kTitle;
+    tgMsg =
+      `🚨 <b>PARTIAL FILL — ACT NOW${dryLabel}</b>\n\n` +
+      `${filledPlatform} leg filled:\n` +
+      `${filledQty} contracts @ $${filledPrice.toFixed(4)}\n\n` +
+      `${failedPlatform} leg FAILED.\n\n` +
+      `<b>You have an open unhedged position.</b>\n\n` +
+      `Option A — Complete the hedge:\n` +
+      `Buy ${failedSide} on ${failedPlatform}\n` +
+      `Market: <code>${htmlEscape(failedTitle.slice(0, 60))}</code>\n` +
+      `Target price: $${failedPrice.toFixed(4)}\n\n` +
+      `Option B — Close immediately:\n` +
+      `Sell ${filledQty} contracts on ${filledPlatform}\n\n` +
+      `Position: <code>${positionId}</code>`;
+
   } else {
-    const filledPlatform   = kalshiOk ? 'Kalshi'      : 'Polymarket';
-    const failedPlatform   = kalshiOk ? 'Polymarket'  : 'Kalshi';
-    const failedMarket     = kalshiOk ? pTitle : kTitle;
-    const failedSide       = kalshiOk ? (kalshiSide === 'yes' ? 'NO' : 'YES') : kalshiSide.toUpperCase();
-    const failedPrice      = kalshiOk ? polyRawPrice : kalshiRawPrice;
+    // noneOk — both legs failed.
     tgMsg =
-      `⚠️ <b>PARTIAL FILL — ACT NOW${dryLabel}</b>\n\n` +
-      `${filledPlatform} leg filled ✅\n` +
-      `${failedPlatform} leg failed ❌\n\n` +
-      `You have an open unhedged position.\n\n` +
-      `Manually execute on ${failedPlatform}:\n` +
-      `<code>${htmlEscape(failedMarket.slice(0,60))}</code>\n` +
-      `Buy ${failedSide} @ $${failedPrice.toFixed(2)}\n\n` +
-      `Or immediately close your ${filledPlatform} position.\n\n` +
-      `<code>${positionId}</code>`;
+      `❌ <b>EXECUTION FAILED${dryLabel}</b>\n\n` +
+      `${htmlEscape(kTitleShort)}\n\n` +
+      `Both legs failed. No position opened.\n` +
+      `Possible causes: market closed, auth error,\n` +
+      `insufficient balance, or API timeout.\n\n` +
+      `Position: <code>${positionId}</code>`;
   }
+
   await editMessage(chatId, messageId, tgMsg);
 }
 
@@ -1358,7 +1501,7 @@ serve(async (req) => {
     const realTotal = (kalshiBalance + polyBalance) > 0
       ? kalshiBalance + polyBalance
       : capital.totalCapital;
-    const activeCapital = realTotal * 0.90;
+    const activeCapital = realTotal * (1 - SAFETY_RESERVE_PCT);
     const availableLiquidity = (lvl.totalCost ?? costPerPair) * lvl.quantity;
     const sizing = calculatePositionSize(
       opp.bestNetSpread, costPerPair, activeCapital,
@@ -1442,7 +1585,9 @@ serve(async (req) => {
       } else if (data.startsWith('res_skip_')) {
         await handleSkip(sb, data.slice(9), chatId, messageId, cq.id, originalText);
       } else if (data.startsWith('buy_')) {
-        await handleBuy(sb, data.slice(4), chatId, messageId, cq.id, dryRun);
+        const isAutoExecute = update.autoExecute === true;
+        const passedRawTotal = typeof update.liveRawTotal === 'number' ? update.liveRawTotal : undefined;
+        await handleBuy(sb, data.slice(4), chatId, messageId, cq.id, dryRun, isAutoExecute, passedRawTotal);
       } else if (data.startsWith('skip_')) {
         await handleSkip(sb, data.slice(5), chatId, messageId, cq.id, originalText);
       } else {

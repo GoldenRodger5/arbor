@@ -698,18 +698,98 @@ async function checkPositionSettlements(
 ): Promise<SettlementResult> {
   let checked = 0; let settled = 0; let pendingReminders = 0;
 
-  // Step 1: get all open positions.
+  // Step 1: get all open + pending_fill positions.
   const { data: openPositions } = await sb
     .from('positions')
     .select('*')
-    .eq('status', 'open');
+    .in('status', ['open', 'pending_fill']);
 
   if (!openPositions || openPositions.length === 0) {
-    console.log('[settle] no open positions');
+    console.log('[settle] no open/pending_fill positions');
   } else {
-    console.log(`[settle] checking ${openPositions.length} open positions`);
+    console.log(`[settle] checking ${openPositions.length} open/pending_fill positions`);
 
     for (const pos of openPositions) {
+      // ── pending_fill: check whether the resting Kalshi order has resolved ──
+      if ((pos.status as string) === 'pending_fill') {
+        const orderId = pos.kalshi_order_id as string | null;
+        if (!orderId) {
+          console.log(`[settle] pending_fill ${pos.id} has no kalshi_order_id, skipping`);
+          continue;
+        }
+        try {
+          const signPath = `/portfolio/orders/${orderId}`;
+          const headers  = await kalshiAuthHeaders('GET', signPath);
+          const res      = await fetch(`${KALSHI_TRADING_BASE}${signPath}`, { headers });
+          if (!res.ok) {
+            console.warn(`[settle] Kalshi order check HTTP ${res.status} for order ${orderId}`);
+            continue;
+          }
+          const data        = await res.json() as any;
+          const ord         = data.order ?? data;
+          const orderStatus = (ord.status as string ?? '').toLowerCase();
+          const qtyFilled   = (ord.quantity_filled ?? ord.filled ?? 0) as number;
+
+          console.log(`[settle] pending_fill order ${orderId}: status=${orderStatus} filled=${qtyFilled}`);
+
+          if (orderStatus === 'resting') {
+            // Still on the book — come back next cycle.
+            console.log(`[settle] ${pos.id} still resting, skipping`);
+            continue;
+
+          } else if (orderStatus === 'filled') {
+            // Fully filled — promote to open with the real fill quantity.
+            await sb.from('positions').update({
+              status: 'open',
+              kalshi_fill_quantity: qtyFilled,
+            }).eq('id', pos.id);
+            console.log(`[settle] ${pos.id} promoted open, filled=${qtyFilled}`);
+            // Fall through: let the normal settlement check below run on this position.
+
+          } else if (orderStatus === 'cancelled' || orderStatus === 'expired') {
+            // Order died unfilled — mark failed, free any tracked capital, notify.
+            const kFillPrice = (pos.kalshi_fill_price as number) ?? 0;
+            const freedAmt   = kFillPrice * qtyFilled; // 0 for a fully-unfilled resting order
+
+            const { data: ledger } = await sb
+              .from('capital_ledger')
+              .select('id, deployed_capital')
+              .order('updated_at', { ascending: false })
+              .limit(1)
+              .maybeSingle();
+            if (ledger && freedAmt > 0) {
+              await sb.from('capital_ledger').update({
+                deployed_capital: Math.max(0, ((ledger.deployed_capital as number) ?? 0) - freedAmt),
+                updated_at: new Date().toISOString(),
+              }).eq('id', (ledger as any).id);
+            }
+
+            await sb.from('positions').update({ status: 'failed' }).eq('id', pos.id);
+
+            const kTitle = trunc(htmlEscape((pos.kalshi_title as string) ?? ''));
+            await sendTelegram({
+              text:
+                `⚠️ <b>GTC ORDER EXPIRED UNFILLED</b>\n\n` +
+                `${kTitle}\n` +
+                `Order never filled — no capital was deployed.\n` +
+                `Position closed with no loss.\n\n` +
+                `Position: <code>${pos.id}</code>`,
+            });
+            console.log(`[settle] ${pos.id} order ${orderStatus}, marked failed, freed $${freedAmt.toFixed(2)}`);
+            continue;
+
+          } else {
+            // Unknown order status — log and skip.
+            console.log(`[settle] ${pos.id} unknown order status: ${orderStatus}, skipping`);
+            continue;
+          }
+        } catch (err) {
+          console.error(`[settle] Kalshi order check threw for ${orderId}`, err);
+          continue;
+        }
+      }
+      // ── end pending_fill check ─────────────────────────────────────────────
+
       checked++;
       const kalshiTicker = pos.kalshi_market_id as string | null;
       const polyId       = pos.poly_market_id as string | null;

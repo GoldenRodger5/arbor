@@ -20,7 +20,7 @@ const TELEGRAM_CHAT_ID   = Deno.env.get('TELEGRAM_CHAT_ID') ?? '';
 const MAX_ALERTS_PER_SCAN    = 3;
 const MIN_NET_SPREAD         = 0.03;
 const MAX_DAYS_LOCKUP        = 2;    // Only alert on markets closing within 2 days
-const AUTO_EXECUTE_SPREAD    = 0.05; // 5% net → auto-execute
+const AUTO_EXECUTE_SPREAD    = 0.07; // 7% net → auto-execute
 const AUTO_EXECUTE_MAX_DAYS  = 1;    // same-day only
 const GLOBAL_DRY_RUN         = Deno.env.get('TRADE_DRY_RUN') === 'true';
 
@@ -33,6 +33,7 @@ const MAX_POSITION_SAFE    = 500;  // Not binding at current capital
 const MAX_POSITION_CAUTION = 200;
 const MAX_CAPITAL_FRACTION = 0.90;
 const HALF_KELLY           = 0.50;
+const SAFETY_RESERVE_PCT   = 0.10;  // reserve fraction kept untouched
 
 interface SizingResult {
   contracts: number;
@@ -75,6 +76,54 @@ function calculatePositionSize(
     }
   }
   return { contracts, totalDeployed, kellyFraction, halfKelly, rawPosition, limitingFactor };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auto-execute dynamic sizing (mirrored from trade/index.ts)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function getTargetPositions(totalCapital: number): number {
+  if (totalCapital < 500)   return 2;
+  if (totalCapital < 2000)  return 3;
+  if (totalCapital < 10000) return 4;
+  if (totalCapital < 50000) return 5;
+  return 6;
+}
+
+function calculateAutoExecuteSize(
+  liveRawTotal: number,
+  costPerPair: number,
+  availableLiquidity: number,
+): { contracts: number; deployedUSD: number; limitingFactor: string; reserve: number } {
+  const reserve = Math.min(100, Math.max(15, liveRawTotal * 0.05));
+  const targets = getTargetPositions(liveRawTotal);
+  const perTradeTarget = liveRawTotal / targets;
+  const maxAllowed = Math.max(0, liveRawTotal - reserve);
+  const finalUSD = Math.min(perTradeTarget, maxAllowed, availableLiquidity);
+
+  const MIN_TRADE_USD = 20;
+  if (finalUSD < MIN_TRADE_USD) {
+    return { contracts: 0, deployedUSD: 0, limitingFactor: 'below_minimum', reserve };
+  }
+
+  const contracts = Math.floor(finalUSD / costPerPair);
+  const deployedUSD = contracts * costPerPair;
+  const limitingFactor =
+    finalUSD === availableLiquidity ? 'liquidity' :
+    finalUSD === maxAllowed        ? 'reserve'    : 'target';
+
+  console.log('[auto-execute-sizing]', JSON.stringify({
+    liveRawTotal, reserve, targets,
+    perTradeTarget: perTradeTarget.toFixed(2),
+    maxAllowed: maxAllowed.toFixed(2),
+    availableLiquidity: availableLiquidity.toFixed(2),
+    finalUSD: finalUSD.toFixed(2),
+    contracts,
+    deployedUSD: deployedUSD.toFixed(2),
+    limitingFactor,
+  }));
+
+  return { contracts, deployedUSD, limitingFactor, reserve };
 }
 
 // Real balance fetchers (self-contained copies — notify has no imports from trade)
@@ -213,7 +262,7 @@ async function fetchActiveCapital(): Promise<{ activeCapital: number; kalshiBala
   console.log('[notify-balances]', JSON.stringify({ kalshiBalance, polyBalance }));
   if (kalshiBalance > 0 || polyBalance > 0) {
     const total  = kalshiBalance + polyBalance;
-    const active = total * 0.90;
+    const active = total * (1 - SAFETY_RESERVE_PCT);
     return { activeCapital: active, kalshiBalance, polyBalance };
   }
   // Fallback: read capital_ledger.
@@ -228,7 +277,7 @@ async function fetchActiveCapital(): Promise<{ activeCapital: number; kalshiBala
     .limit(1)
     .maybeSingle();
   if (!data) return { activeCapital: 400, kalshiBalance: 0, polyBalance: 0 };
-  const active = ((data.total_capital as number) ?? 500) * (1 - ((data.safety_reserve_pct as number) ?? 0.2))
+  const active = ((data.total_capital as number) ?? 500) * (1 - ((data.safety_reserve_pct as number) ?? SAFETY_RESERVE_PCT))
                - ((data.deployed_capital as number) ?? 0)
                + ((data.realized_pnl as number) ?? 0);
   return { activeCapital: active, kalshiBalance: 0, polyBalance: 0 };
@@ -296,8 +345,8 @@ function trunc(s: string, n = 60): string {
 function formatMessage(
   o: Opportunity,
   activeCapital: number,
-  _kalshiBalance = 0,
-  _polyBalance = 0,
+  kalshiBalance = 0,
+  polyBalance = 0,
 ): { text: string; reply_markup: unknown } {
   const lvl = o.levels[0];
   const costPerPair = lvl.buyYesPrice + lvl.buyNoPrice;
@@ -321,6 +370,17 @@ function formatMessage(
   const reasoning = rawReasoning.length > 30 && !rawReasoning.toLowerCase().includes('same proposition')
     ? `\n<i>${trunc(htmlEscape(rawReasoning), 120)}</i>` : '';
 
+  // Sizing context line — auto vs manual.
+  const willAutoExecute =
+    verdict === 'SAFE' &&
+    o.bestNetSpread >= AUTO_EXECUTE_SPREAD &&
+    typeof o.daysToClose === 'number' &&
+    o.daysToClose <= AUTO_EXECUTE_MAX_DAYS;
+  const targets = getTargetPositions(kalshiBalance + polyBalance);
+  const sizingLine = willAutoExecute
+    ? `\n🤖 Auto-executes · ${targets} position target · $${(kalshiBalance + polyBalance).toFixed(0)} capital`
+    : `\nHalf Kelly · $${activeCapital.toFixed(0)} active capital`;
+
   const text =
     `${emoji} <b>${verdict} · ${netPct}% net · ${o.daysToClose.toFixed(0)}d</b>\n\n` +
     `<b>${kTitle}</b>\n\n` +
@@ -328,7 +388,8 @@ function formatMessage(
     `<code>BUY NO   ${lvl.buyNoPlatform.padEnd(12)}$${lvl.buyNoPrice.toFixed(2)}  ×  ${qty}</code>\n\n` +
     `💰 Deploy <b>$${kellyDeployed.toFixed(2)}</b>  →  profit <b>+$${maxProfit.toFixed(2)}</b>\n` +
     `📅 Settles ${settleDate}  ·  APY <b>+${apyPct}%</b>` +
-    reasoning;
+    reasoning +
+    sizingLine;
 
   const oppId = slugifyId(o.kalshiMarket.marketId || o.id || '');
   const row1 = [
@@ -423,6 +484,55 @@ serve(async (req) => {
     const serviceKey  = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
     const sb = (supabaseUrl && serviceKey) ? createClient(supabaseUrl, serviceKey) : null;
 
+    // Better-opportunity-than-open-position detection.
+    // Alert if a new opportunity has a spread ≥2% better than an existing open position
+    // in the same sport (matched by first 5 chars of ticker prefix).
+    if (sb) {
+      const { data: openPos } = await sb
+        .from('positions')
+        .select('kalshi_title, kalshi_ticker, net_spread_pct, status')
+        .eq('status', 'open');
+
+      for (const o of filtered) {
+        const willAutoExecute =
+          (o.verdict || '').toUpperCase() === 'SAFE' &&
+          o.bestNetSpread >= AUTO_EXECUTE_SPREAD &&
+          typeof o.daysToClose === 'number' &&
+          o.daysToClose <= AUTO_EXECUTE_MAX_DAYS;
+        if (willAutoExecute) continue; // already auto-executing, skip double alert
+
+        const newTicker = o.kalshiMarket?.marketId ?? '';
+        const newPrefix = newTicker.substring(0, 5).toUpperCase();
+
+        const betterThan = (openPos ?? []).find((p: any) => {
+          const existPrefix = (p.kalshi_ticker ?? '').substring(0, 5).toUpperCase();
+          const existSpread = parseFloat(p.net_spread_pct ?? '0');
+          return existPrefix === newPrefix && o.bestNetSpread - existSpread >= 0.02;
+        });
+
+        if (betterThan) {
+          const existSpread = parseFloat((betterThan as any).net_spread_pct ?? '0');
+          const diff = ((o.bestNetSpread - existSpread) * 100).toFixed(1);
+          const [kb2, pb2] = await Promise.all([
+            getKalshiBalanceForNotify(),
+            getPolyBalanceForNotify(),
+          ]);
+          await sendTelegram({
+            chat_id: TELEGRAM_CHAT_ID,
+            text:
+              `⚡ <b>BETTER OPPORTUNITY DETECTED</b>\n\n` +
+              `<b>${htmlEscape(o.kalshiMarket?.title ?? '')}</b>\n` +
+              `New spread: <b>${(o.bestNetSpread * 100).toFixed(1)}%</b> net\n\n` +
+              `Open position: <b>${htmlEscape((betterThan as any).kalshi_title ?? '')}</b>\n` +
+              `That spread: <b>${(existSpread * 100).toFixed(1)}%</b> net\n\n` +
+              `Difference: <b>+${diff}% better</b>\n` +
+              `Available capital: <b>$${(kb2 + pb2).toFixed(0)}</b>`,
+            parse_mode: 'HTML',
+          });
+        }
+      }
+    }
+
     const REFIRE_HOURS = 6;
     const SKIP_COOLDOWN_HOURS = 24;
     const IMPROVEMENT_FACTOR  = 1.5; // re-alert if spread improved 50%+
@@ -492,22 +602,82 @@ serve(async (req) => {
     }
     if (deduped > 0) console.log(`[notify] deduped ${deduped} alerts`);
 
-    // Auto-execute: for high-confidence same-day opportunities, call the
-    // trade function directly without waiting for a button tap.
-    // Respects TRADE_DRY_RUN guard.
+    // Auto-execute: sequential loop with live balance re-fetch between trades.
+    // Only runs when TRADE_DRY_RUN is unset (live mode).
     if (sb && !GLOBAL_DRY_RUN) {
-      for (const o of filtered) {
+      const autoQualified = filtered.filter(o => {
         const v = (o.verdict || '').toUpperCase();
-        if (v !== 'SAFE') continue;
-        if (o.bestNetSpread < AUTO_EXECUTE_SPREAD) continue;
-        if (typeof o.daysToClose !== 'number' || o.daysToClose > AUTO_EXECUTE_MAX_DAYS) continue;
+        return v === 'SAFE' &&
+          o.bestNetSpread >= AUTO_EXECUTE_SPREAD &&
+          typeof o.daysToClose === 'number' &&
+          o.daysToClose <= AUTO_EXECUTE_MAX_DAYS;
+      });
 
+      console.log(`[auto-execute] ${autoQualified.length} qualifying opportunities`);
+
+      for (const o of autoQualified) {
+        // Step 1: Re-fetch live balances fresh before each trade.
+        const [kb, pb] = await Promise.all([
+          getKalshiBalanceForNotify(),
+          getPolyBalanceForNotify(),
+        ]);
+        const liveRawTotal = kb + pb;
+        const dynamicReserve = Math.min(100, Math.max(15, liveRawTotal * 0.05));
+
+        console.log('[auto-execute] live balances', {
+          kalshi: kb, poly: pb, total: liveRawTotal, reserve: dynamicReserve,
+        });
+
+        // Step 2: Reserve floor check — stop if not enough to trade.
+        if (liveRawTotal - dynamicReserve < 20) {
+          console.log('[auto-execute] at floor, stopping');
+          await sendTelegram({
+            chat_id: TELEGRAM_CHAT_ID,
+            text:
+              `⚠️ <b>Auto-execute stopped</b>\n\n` +
+              `Capital at reserve floor.\n` +
+              `Total: $${liveRawTotal.toFixed(2)}\n` +
+              `Reserve: $${dynamicReserve.toFixed(2)}\n` +
+              `Available: $${(liveRawTotal - dynamicReserve).toFixed(2)}\n\n` +
+              `Waiting for open positions to settle.`,
+            parse_mode: 'HTML',
+          });
+          break;
+        }
+
+        // Step 3: was_executed dedup check — prevents re-execution across scans.
+        const oppId = slugifyId(o.kalshiMarket?.marketId || o.id || '');
+        const { data: existing } = await sb
+          .from('spread_events')
+          .select('was_executed')
+          .eq('pair_id', oppId)
+          .maybeSingle();
+        if (existing?.was_executed) {
+          console.log('[auto-execute] already executed, skipping', oppId);
+          continue;
+        }
+
+        // Step 4: Preview sizing before firing.
+        const costPerPair = o.bestLevel?.totalCost ?? 0.96;
+        const availableLiquidity =
+          (o.bestLevel?.totalCost ?? 0.96) * (o.bestLevel?.quantity ?? 0);
+        const sizing = calculateAutoExecuteSize(liveRawTotal, costPerPair, availableLiquidity);
+
+        if (sizing.contracts === 0) {
+          console.log('[auto-execute] 0 contracts from sizing, skipping', oppId);
+          continue;
+        }
+
+        console.log('[auto-execute] firing', oppId, {
+          liveRawTotal,
+          contracts: sizing.contracts,
+          deployedUSD: sizing.deployedUSD,
+          limitingFactor: sizing.limitingFactor,
+        });
+
+        // Step 5: Fire the trade with autoExecute flag.
         const tradeUrl = (supabaseUrl || '').replace(/\/$/, '') + '/functions/v1/trade';
-        const oppId = slugifyId(o.kalshiMarket.marketId || o.id || '');
-        console.log('[notify-auto-execute] triggering for', oppId, 'spread=', (o.bestNetSpread * 100).toFixed(1) + '%');
-
         try {
-          // Simulate a callback_query buy tap by calling handleBuy via the trade endpoint.
           const tRes = await fetch(tradeUrl, {
             method: 'POST',
             headers: {
@@ -515,6 +685,8 @@ serve(async (req) => {
               'Content-Type': 'application/json',
             },
             body: JSON.stringify({
+              autoExecute: true,
+              liveRawTotal,
               callback_query: {
                 id: 'auto-exec-' + Date.now(),
                 data: `buy_${oppId}`,
@@ -522,23 +694,15 @@ serve(async (req) => {
               },
             }),
           });
-          console.log('[notify-auto-execute] trade response:', tRes.status);
-
-          await sendTelegram({
-            chat_id: TELEGRAM_CHAT_ID,
-            text: `🤖 <b>AUTO-EXECUTED</b>\n\n` +
-              `<b>${trunc(htmlEscape(o.kalshiMarket.title || ''))}</b>\n\n` +
-              `SAFE verdict · ${(o.bestNetSpread * 100).toFixed(1)}% net · same-day game\n\n` +
-              `Deployed <b>$${(costPerPair * Math.max(1, sizing.contracts)).toFixed(2)}</b>  →  profit <b>+$${maxProfit.toFixed(2)}</b>\n` +
-              `Settles ${fmtDate(o.effectiveCloseDate ?? o.daysToClose)}`,
-            parse_mode: 'HTML',
-          });
+          console.log('[auto-execute] trade response status:', tRes.status);
         } catch (err) {
-          console.error('[notify-auto-execute] threw', err);
+          console.error('[auto-execute] fetch threw:', err);
         }
+
+        // Step 6: 3 second pause for balance to settle before next trade.
+        await new Promise(r => setTimeout(r, 3000));
       }
     } else if (GLOBAL_DRY_RUN) {
-      // In dry-run, just log which opps would have been auto-executed.
       const autoQualified = filtered.filter(
         (o) => (o.verdict || '').toUpperCase() === 'SAFE' &&
                o.bestNetSpread >= AUTO_EXECUTE_SPREAD &&
