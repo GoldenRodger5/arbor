@@ -594,6 +594,7 @@ serve(async (req) => {
         }
 
         // Dedup check against spread_events.
+        let spreadEvent: any = null;
         if (sb) {
           const { data: event } = await sb
             .from('spread_events')
@@ -602,6 +603,14 @@ serve(async (req) => {
             .is('closed_at', null)
             .limit(1)
             .maybeSingle();
+          spreadEvent = event;
+
+          console.log('[notify-dedup-check]', {
+            pairId,
+            eventFound: !!event,
+            wasAlerted: event?.was_alerted,
+            alertedAt: event?.alerted_at,
+          });
 
           if (event) {
             const e = event as any;
@@ -632,17 +641,19 @@ serve(async (req) => {
         });
         sent++;
 
-        // Update spread_events after sending alert.
+        // Upsert spread_events after sending alert.
+        // Use upsert (not update) so the row is created if it doesn't exist yet.
+        // Without this, a brand-new spread never gets alerted_at written and
+        // fires every scan.
         if (sb) {
           await sb.from('spread_events')
-            .update({
+            .upsert({
+              pair_id: pairId,
               was_alerted: true,
               alerted_at: new Date().toISOString(),
               last_net_spread: o.bestNetSpread,
-              peak_net_spread: Math.max((event as any)?.peak_net_spread ?? 0, o.bestNetSpread),
-            })
-            .eq('pair_id', pairId)
-            .is('closed_at', null)
+              peak_net_spread: Math.max((spreadEvent as any)?.peak_net_spread ?? 0, o.bestNetSpread),
+            }, { onConflict: 'pair_id', ignoreDuplicates: false })
             .catch(() => {});
         }
       } catch (err) {
