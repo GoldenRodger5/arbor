@@ -1947,21 +1947,6 @@ const POLY_US_GATEWAY = 'https://gateway.polymarket.us';
  *   marketSides: [{ id, description, price, long, team: { name, abbreviation, league } }]
  */
 function normalizePolyUSMarket(m: any): UnifiedMarket | null {
-  if (_polyRawTotal === 1) {
-    console.log('[poly-us-raw-fields]',
-      JSON.stringify(Object.keys(m)));
-    console.log('[poly-us-raw-sample]',
-      JSON.stringify({
-        gameStartTime: m.gameStartTime,
-        endDate: m.endDate,
-        commenceTime: m.commenceTime,
-        startTime: m.startTime,
-        eventDate: m.eventDate,
-        closeTime: m.closeTime,
-        settleDate: m.settleDate,
-      })
-    );
-  }
   if (!m || m.closed || !m.active) return null;
 
   // Require exactly 2 outcomes (binary market).
@@ -4139,9 +4124,9 @@ async function runScanCycle(
     // cross-platform gap rather than running the recurrence classifier,
     // which would incorrectly treat a month-name in the title as a
     // "monthly economic" recurring event.
-    const actualGapMs = Math.abs(k - pl);
     if (p.poly.platform === 'predictit') {
       const PREDICTIT_MAX_GAP_MS = 60 * MS_PER_DAY;
+      const actualGapMs = Math.abs(k - pl);
       if (actualGapMs > PREDICTIT_MAX_GAP_MS) {
         _recurrenceRejected++;
         const sample: RecurrenceRejection = {
@@ -4162,24 +4147,16 @@ async function runScanCycle(
     }
     const recurrence = classifyEventRecurrence(p.kalshi, p.poly);
 
-    // Diagnostic: log close-time details for sports-game pairs near the
-    // rejection boundary so we can see the real gap source before fixing.
-    if (recurrence.subtype === 'sports-game' && actualGapMs > 30 * MS_PER_HOUR) {
-      const gameDate = parseKalshiGameDate(p.kalshi.marketId);
-      const polyCloseMs = parseCloseTimeMs(p.poly.closeTime);
-      console.log('[sports-gap-debug]', JSON.stringify({
-        kalshiTitle: p.kalshi.title.slice(0, 50),
-        polyTitle: p.poly.title.slice(0, 50),
-        kalshiCloseTime: p.kalshi.closeTime,
-        polyCloseTime: p.poly.closeTime,
-        kalshiMarketId: p.kalshi.marketId,
-        actualGapHours: Math.round(actualGapMs / MS_PER_HOUR),
-        gameDate: gameDate?.toISOString() ?? null,
-        tickerGapHours: (gameDate && polyCloseMs !== null)
-          ? Math.round(Math.abs(polyCloseMs - gameDate.getTime()) / MS_PER_HOUR)
-          : null,
-      }));
+    // For sports-game pairs, use the ticker game date as the Kalshi anchor
+    // instead of closeTime. Kalshi's closeTime includes a ~3-day settlement
+    // buffer that inflates the apparent gap against Polymarket's game-time
+    // close. The ticker date is the true game start and is the correct anchor.
+    let kAnchor = k;
+    if (recurrence.subtype === 'sports-game') {
+      const tickerDate = parseKalshiGameDate(p.kalshi.marketId);
+      if (tickerDate) kAnchor = tickerDate.getTime();
     }
+    const actualGapMs = Math.abs(kAnchor - pl);
 
     if (actualGapMs > recurrence.maxGapMs) {
       _recurrenceRejected++;
@@ -4196,32 +4173,6 @@ async function runScanCycle(
       }
       console.log('[recurrence-filter] rejected', JSON.stringify(sample));
       return false;
-    }
-    // Belt-and-suspenders: for sports game-winners, parse the Kalshi
-    // ticker date directly and verify the Polymarket close time is within
-    // 36h of the actual game start. Catches edge cases where Kalshi/Poly
-    // close times happen to be aligned but the actual events differ.
-    if (recurrence.subtype === 'sports-game') {
-      const gameDate = parseKalshiGameDate(p.kalshi.marketId);
-      if (gameDate) {
-        const tickerGapMs = Math.abs(pl - gameDate.getTime());
-        if (tickerGapMs > 36 * MS_PER_HOUR) {
-          _recurrenceRejected++;
-          const sample: RecurrenceRejection = {
-            kalshiTitle: p.kalshi.title.slice(0, 60),
-            polyTitle: p.poly.title.slice(0, 60),
-            type: 'sports-game',
-            actualGapHours: Math.round(tickerGapMs / MS_PER_HOUR),
-            maxGapHours: 36,
-            reason: 'ticker-cross-check',
-          };
-          if (_recurrenceRejectionSamples.length < 30) {
-            _recurrenceRejectionSamples.push(sample);
-          }
-          console.log('[recurrence-filter] rejected', JSON.stringify(sample));
-          return false;
-        }
-      }
     }
     return true;
   });
