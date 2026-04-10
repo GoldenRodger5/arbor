@@ -19,7 +19,15 @@ const TELEGRAM_CHAT_ID   = Deno.env.get('TELEGRAM_CHAT_ID') ?? '';
 
 const MAX_ALERTS_PER_SCAN    = 3;
 const MIN_NET_SPREAD         = 0.03;
-const MAX_DAYS_LOCKUP        = 2;    // Only alert on markets closing within 2 days
+function getMaxLockupDays(category: string): number {
+  const cat = (category || '').toLowerCase();
+  if (cat.includes('sport') || cat.includes('game')) return 2;
+  if (cat.includes('crypto'))    return 7;
+  if (cat.includes('finance'))   return 14;
+  if (cat.includes('economic'))  return 30;
+  if (cat.includes('politic'))   return 90;
+  return 14; // default for anything else
+}
 const AUTO_EXECUTE_SPREAD    = 0.07; // 7% net → auto-execute
 const AUTO_EXECUTE_MAX_DAYS  = 1;    // same-day only
 const GLOBAL_DRY_RUN         = Deno.env.get('TRADE_DRY_RUN') === 'true';
@@ -441,7 +449,8 @@ serve(async (req) => {
       if (v !== 'SAFE' && v !== 'CAUTION') return false;
       // Only alert on short-dated markets — Cy Young, MLS Cup, etc. silenced.
       if (typeof o.daysToClose !== 'number') return false;
-      if (o.daysToClose > MAX_DAYS_LOCKUP) return false;
+      const maxLockup = getMaxLockupDays(o.category ?? '');
+      if (o.daysToClose > maxLockup) return false;
       return true;
     });
 
