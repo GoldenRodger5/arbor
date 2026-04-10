@@ -176,7 +176,7 @@ export default function Settings() {
 
       {/* Capital */}
       <div className="label" style={{ marginBottom: 16 }}>CAPITAL</div>
-      <TextInput label="Starting Capital" placeholder="$500" type="number" mono />
+      <TextInput label="Starting Capital" placeholder="$198" type="number" mono />
       <TextInput label="Safety Reserve %" placeholder="20" type="number" mono />
       <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 4 }}>
         Active Capital: <span className="font-mono">${activeCapital}</span>

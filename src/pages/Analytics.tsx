@@ -265,8 +265,8 @@ function HealthSection({ s }: { s: AnalyticsSummary }) {
           ))}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
-          <Dot color="var(--amber)" />
-          <span style={{ fontSize: 12, color: 'var(--amber)' }}>DRY RUN MODE — TRADE_DRY_RUN=true — No real orders will execute</span>
+          <Dot color="var(--green)" />
+          <span style={{ fontSize: 12, color: 'var(--green)' }}>LIVE TRADING — orders will execute on Kalshi + Polymarket US</span>
         </div>
       </div>
     </>
