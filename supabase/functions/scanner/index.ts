@@ -106,6 +106,7 @@ interface ArbitrageOpportunity {
   effectiveCloseDate: string;
   kalshiCloseDate: string;
   polyCloseDate: string;
+  category: string;
 }
 
 interface CandidatePair {
@@ -4600,6 +4601,7 @@ async function runScanCycle(
       polyCloseDate: pCloseMs !== null ? new Date(pCloseMs).toISOString() : '',
       belowThreshold:
         r.bestNet < MIN_NET_SPREAD || r.annReturn < MIN_ANNUALIZED_RETURN,
+      category: pairCategory(r.prep.pair),
     };
     return opp;
   });

@@ -19,14 +19,25 @@ const TELEGRAM_CHAT_ID   = Deno.env.get('TELEGRAM_CHAT_ID') ?? '';
 
 const MAX_ALERTS_PER_SCAN    = 3;
 const MIN_NET_SPREAD         = 0.03;
-function getMaxLockupDays(category: string): number {
-  const cat = (category || '').toLowerCase();
-  if (cat.includes('sport') || cat.includes('game')) return 2;
-  if (cat.includes('crypto'))    return 7;
-  if (cat.includes('finance'))   return 14;
-  if (cat.includes('economic'))  return 30;
-  if (cat.includes('politic'))   return 90;
-  return 14; // default for anything else
+function getMaxLockupDays(o: Opportunity): number {
+  // Prefer explicit category if populated (from scanner's pairCategory())
+  const cat = (o.category ?? o.kalshiMarket?.category ?? '').toLowerCase();
+  if (cat === 'sports'   || cat.includes('sport') || cat.includes('game')) return 2;
+  if (cat === 'financial'|| cat.includes('financ'))                        return 14;
+  if (cat === 'economic' || cat.includes('econom'))                        return 30;
+  if (cat === 'politics' || cat.includes('politic'))                       return 90;
+  if (cat.includes('crypto'))                                              return 7;
+
+  // Fallback: derive from Kalshi ticker prefix when category is absent.
+  // Prefixes sourced from KALSHI_FINANCIAL_SERIES / HIGH_OVERLAP_SERIES in scanner.
+  const ticker = (o.kalshiMarket?.marketId ?? '').toUpperCase();
+  if (/^KXMLB|^KXNBA|^KXNFL|^KXNHL/.test(ticker))                               return 2;
+  if (/^KXBTC|^KXETH|^KXCRYP/.test(ticker))                                      return 7;
+  if (/^KXSP|^KXNASDAQ|^KXDOW|^KXGOLD|^KXOIL|^KXUSD|^KXVIX/.test(ticker))      return 14;
+  if (/^KXFED|^KXINFL|^KXGDP|^KXUNEMPLOY/.test(ticker))                         return 30;
+  if (/^KXPRES|^KXSENATE|^KXHOUSE/.test(ticker))                                 return 90;
+
+  return 14; // safe default for unrecognized
 }
 const AUTO_EXECUTE_SPREAD    = 0.07; // 7% net → auto-execute
 const AUTO_EXECUTE_MAX_DAYS  = 1;    // same-day only
@@ -305,6 +316,7 @@ interface Market {
   marketId?: string;
   title?: string;
   url?: string;
+  category?: string;
 }
 
 interface Opportunity {
@@ -319,6 +331,7 @@ interface Opportunity {
   annualizedReturn: number;
   daysToClose: number;
   belowThreshold?: boolean;
+  category?: string;
 }
 
 function slugifyId(marketId: string): string {
@@ -449,7 +462,7 @@ serve(async (req) => {
       if (v !== 'SAFE' && v !== 'CAUTION') return false;
       // Only alert on short-dated markets — Cy Young, MLS Cup, etc. silenced.
       if (typeof o.daysToClose !== 'number') return false;
-      const maxLockup = getMaxLockupDays(o.category ?? '');
+      const maxLockup = getMaxLockupDays(o);
       if (o.daysToClose > maxLockup) return false;
       return true;
     });
