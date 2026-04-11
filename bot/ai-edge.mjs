@@ -448,7 +448,7 @@ async function executeTrade(market, assessment) {
     const filled = order.quantity_filled ?? order.fill_count_fp ?? 0;
 
     await tg(
-      `🧠 <b>AI EDGE TRADE</b>\n\n` +
+      `🧠 <b>AI EDGE TRADE — KALSHI</b>\n\n` +
       `<b>${market.title}</b>\n\n` +
       `BUY ${side.toUpperCase()} @ $${price.toFixed(2)} × ${qty}\n` +
       `Deployed: <b>$${deployed.toFixed(2)}</b>\n` +
@@ -632,7 +632,7 @@ async function checkLiveScoreEdges() {
           const deployed = qty * price;
           const profit = qty * edge;
           await tg(
-            `⚡ <b>LIVE SCORE EDGE</b>\n\n` +
+            `⚡ <b>LIVE SCORE EDGE — KALSHI</b>\n\n` +
             `<b>${market.title}</b>\n` +
             `Ticker: <code>${decision.ticker}</code>\n` +
             `Score: ${awayScore}-${homeScore} (${gameDetail})\n\n` +
@@ -693,26 +693,26 @@ async function claudeBroadScan() {
     } catch { /* skip */ }
   }
 
-  // Non-sports — search by event categories
-  for (const cat of ['Economics', 'Politics', 'Crypto']) {
+  // Non-sports — fetch by Kalshi event categories
+  const categoryMap = [
+    { kalshiCat: 'Economics', label: 'Economics' },
+    { kalshiCat: 'Politics', label: 'Politics' },
+    { kalshiCat: 'Crypto', label: 'Crypto' },
+    { kalshiCat: 'Finance', label: 'Finance' },
+  ];
+  for (const { kalshiCat, label } of categoryMap) {
     try {
-      const data = await kalshiGet(`/markets?status=open&limit=20`);
+      const data = await kalshiGet(`/markets?status=open&limit=20&event_category=${kalshiCat}`);
       for (const m of data.markets ?? []) {
         if (!m.yes_ask_dollars || !m.no_ask_dollars) continue;
-        const title = (m.title ?? '').toLowerCase();
-        const category = m.category ?? '';
-        if (category.toLowerCase().includes(cat.toLowerCase()) ||
-            (cat === 'Crypto' && (title.includes('bitcoin') || title.includes('btc') || title.includes('ethereum'))) ||
-            (cat === 'Economics' && (title.includes('cpi') || title.includes('fed') || title.includes('gdp')))) {
-          allMarkets.push({
-            ticker: m.ticker,
-            title: m.title,
-            category: cat,
-            yesAsk: m.yes_ask_dollars,
-            noAsk: m.no_ask_dollars,
-            closeTime: m.close_time ?? '',
-          });
-        }
+        allMarkets.push({
+          ticker: m.ticker,
+          title: m.title,
+          category: label,
+          yesAsk: m.yes_ask_dollars,
+          noAsk: m.no_ask_dollars,
+          closeTime: m.close_time ?? '',
+        });
       }
     } catch { /* skip */ }
   }
@@ -783,7 +783,7 @@ async function claudeBroadScan() {
           `STRICT RULES — violating ANY means return {"trade":false}:\n` +
           `1. Your probability MUST differ from market price by at least 10 percentage points\n` +
           `2. YES price + NO price on Kalshi always sums to ~$1.00-1.03. This is NOT mispricing — it's the bid-ask spread. Do NOT trade based on YES+NO sum.\n` +
-          `3. ONLY trade games with tickers containing "${todayShort}" (today's date). Reject all other dates.\n` +
+          `3. For SPORTS game-winner tickers (KXMLBGAME/KXNBAGAME/KXNHLGAME): ONLY trade if ticker contains "${todayShort}" (today's date). Non-sports tickers (crypto/economics/politics) don't have dates — trade those anytime.\n` +
           `4. Max bet: $${Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25).toFixed(2)} (25% of $${kalshiBalance.toFixed(2)} cash)\n` +
           `5. If cash < $3, return {"trade":false}\n` +
           `6. You need a REAL reason the market is wrong — not just "asymmetric pricing" or "bid-ask spread"\n` +
@@ -814,9 +814,10 @@ async function claudeBroadScan() {
     const market = tradeable.find(m => m.ticker === decision.ticker);
     if (!market) { console.log(`[broad-scan] BLOCKED: invalid ticker ${decision.ticker}`); return; }
 
-    // Block if ticker date isn't today
-    if (!decision.ticker.includes(todayShort)) {
-      console.log(`[broad-scan] BLOCKED: ticker ${decision.ticker} is not today (${todayShort})`);
+    // Block sports game-winner tickers that aren't today
+    const isSportsGame = /^KX(MLB|NBA|NFL|NHL)GAME-/i.test(decision.ticker);
+    if (isSportsGame && !decision.ticker.includes(todayShort)) {
+      console.log(`[broad-scan] BLOCKED: sports ticker ${decision.ticker} is not today (${todayShort})`);
       return;
     }
 
@@ -868,9 +869,10 @@ async function claudeBroadScan() {
     if (result.ok) {
       stats.tradesPlaced++;
       await tg(
-        `🧠 <b>CLAUDE TRADE</b>\n\n` +
+        `🧠 <b>CLAUDE TRADE — KALSHI</b>\n\n` +
         `<b>${market.title}</b>\n` +
-        `Category: ${market.category}\n\n` +
+        `Category: ${market.category}\n` +
+        `Ticker: <code>${decision.ticker}</code>\n\n` +
         `BUY ${decision.side.toUpperCase()} @ $${price.toFixed(2)} × ${qty}\n` +
         `Deployed: <b>$${(qty * price).toFixed(2)}</b>\n` +
         `Edge: <b>${(edge*100).toFixed(0)}%</b> (Claude ${((decision.probability ?? 0)*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}%)\n\n` +
@@ -889,6 +891,14 @@ async function claudeBroadScan() {
 async function pollCycle() {
   // Refresh full portfolio (balance + positions)
   await refreshPortfolio();
+
+  // Prune old seen news IDs (keep last 500)
+  if (seenNewsIds.size > 500) {
+    const arr = [...seenNewsIds];
+    arr.splice(0, arr.length - 200);
+    seenNewsIds.clear();
+    for (const id of arr) seenNewsIds.add(id);
+  }
 
   // Step 1: Fetch news
   const newsItems = await fetchESPNNews();
@@ -982,8 +992,8 @@ async function main() {
 
   await tg(
     `🧠 <b>AI Edge Bot Started</b>\n\n` +
-    `Markets: Sports + Crypto + Economics + Politics\n` +
-    `Platforms: Kalshi + Polymarket\n` +
+    `Markets: Sports + Crypto + Economics + Politics + Finance\n` +
+    `Platform: Kalshi (Polymarket balance tracked, trading coming soon)\n` +
     `Min edge: ${MIN_EDGE_PCT}%\n` +
     `Max trade: $${MAX_TRADE_CAP} (25% of cash)\n` +
     `Poll: every ${POLL_INTERVAL_MS / 1000}s | Broad scan: every 5min\n\n` +
