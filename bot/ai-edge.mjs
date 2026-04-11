@@ -98,7 +98,10 @@ let polyBalance = 0;
 async function refreshPolyBalance() {
   if (!POLY_US_KEY_ID || !POLY_US_SECRET) return;
   try {
-    const { sign } = await import('@noble/ed25519');
+    const ed = await import('@noble/ed25519');
+    const { sha512 } = await import('@noble/hashes/sha512');
+    ed.etc.sha512Sync = (...m) => sha512(ed.etc.concatBytes(...m));
+    const sign = ed.signAsync ?? ed.sign;
     const privBytes = Uint8Array.from(atob(POLY_US_SECRET), c => c.charCodeAt(0)).slice(0, 32);
     const timestamp = String(Date.now());
     const path = '/v1/account/balances';
