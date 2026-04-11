@@ -86,6 +86,36 @@ async function kalshiPost(path, body) {
 // Telegram
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Polymarket US Auth (Ed25519)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const POLY_US_KEY_ID = process.env.POLY_US_KEY_ID ?? '';
+const POLY_US_SECRET = process.env.POLY_US_SECRET_KEY ?? '';
+const POLY_US_API = 'https://api.polymarket.us';
+let polyBalance = 0;
+
+async function refreshPolyBalance() {
+  if (!POLY_US_KEY_ID || !POLY_US_SECRET) return;
+  try {
+    // Use the Supabase trade function to check poly balance (Ed25519 auth is complex in Node)
+    const supaUrl = process.env.SUPABASE_URL;
+    const sKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (supaUrl && sKey) {
+      // Trigger a balance check via the trade function's test endpoint
+      const res = await fetch(`${supaUrl}/rest/v1/capital_ledger?select=total_capital&order=updated_at.desc&limit=1`, {
+        headers: { 'apikey': sKey, 'Authorization': `Bearer ${sKey}` },
+      });
+      if (res.ok) {
+        const rows = await res.json();
+        // Total includes both platforms — subtract Kalshi to get Poly estimate
+        const total = rows[0]?.total_capital ?? 0;
+        polyBalance = Math.max(0, total - kalshiBalance - kalshiPositionValue);
+      }
+    }
+  } catch { /* keep old */ }
+}
+
 async function tg(text) {
   if (!TG_TOKEN || !TG_CHAT) return;
   await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
@@ -123,13 +153,18 @@ async function refreshPortfolio() {
     })).filter(p => p.yes > 0 || p.no > 0);
   } catch { openPositions = []; }
 
-  console.log(`[portfolio] Cash: $${kalshiBalance.toFixed(2)} | Positions: $${kalshiPositionValue.toFixed(2)} | Open: ${openPositions.length}`);
+  // Also refresh Poly balance
+  await refreshPolyBalance();
+
+  console.log(`[portfolio] Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions | Poly: ~$${polyBalance.toFixed(2)} | Open: ${openPositions.length}`);
 }
 
 function getPortfolioSummary() {
-  return `Cash: $${kalshiBalance.toFixed(2)}, Positions: $${kalshiPositionValue.toFixed(2)}, ` +
-    `Total: $${(kalshiBalance + kalshiPositionValue).toFixed(2)}, ` +
-    `Open positions: ${openPositions.length}` +
+  const total = kalshiBalance + kalshiPositionValue + polyBalance;
+  return `KALSHI — Cash: $${kalshiBalance.toFixed(2)}, Positions: $${kalshiPositionValue.toFixed(2)}\n` +
+    `POLYMARKET — Balance: ~$${polyBalance.toFixed(2)}\n` +
+    `TOTAL: $${total.toFixed(2)}\n` +
+    `Open Kalshi positions: ${openPositions.length}` +
     (openPositions.length > 0 ? '\n' + openPositions.map(p =>
       `  ${p.ticker}: ${p.yes > 0 ? 'YES×' + p.yes : ''} ${p.no > 0 ? 'NO×' + p.no : ''}`
     ).join('\n') : '');
@@ -585,6 +620,178 @@ async function checkLiveScoreEdges() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Claude Broad Market Scan — finds edges across ALL market types
+// ─────────────────────────────────────────────────────────────────────────────
+
+let lastBroadScan = 0;
+const BROAD_SCAN_INTERVAL = 5 * 60 * 1000; // every 5 min (uses more Claude tokens)
+
+async function claudeBroadScan() {
+  if (Date.now() - lastBroadScan < BROAD_SCAN_INTERVAL) return;
+  lastBroadScan = Date.now();
+  if (kalshiBalance < 5) return; // not enough to trade
+
+  console.log('[broad-scan] Running Claude broad market scan...');
+
+  // Fetch markets across categories — sports, crypto, politics, economics
+  const categories = [
+    { name: 'Sports', series: ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME'] },
+    { name: 'Crypto', keywords: ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto'] },
+    { name: 'Economics', keywords: ['cpi', 'fed', 'gdp', 'jobs', 'inflation', 'rate'] },
+  ];
+
+  const allMarkets = [];
+
+  // Sports — get a sample of active game-winner markets
+  for (const s of categories[0].series) {
+    try {
+      const data = await kalshiGet(`/markets?series_ticker=${s}&status=open&limit=10`);
+      for (const m of data.markets ?? []) {
+        if (!m.yes_ask_dollars || !m.no_ask_dollars) continue;
+        allMarkets.push({
+          ticker: m.ticker,
+          title: m.title,
+          category: 'Sports',
+          yesAsk: m.yes_ask_dollars,
+          noAsk: m.no_ask_dollars,
+          closeTime: m.close_time ?? '',
+        });
+      }
+    } catch { /* skip */ }
+  }
+
+  // Non-sports — search by event categories
+  for (const cat of ['Economics', 'Politics', 'Crypto']) {
+    try {
+      const data = await kalshiGet(`/markets?status=open&limit=20`);
+      for (const m of data.markets ?? []) {
+        if (!m.yes_ask_dollars || !m.no_ask_dollars) continue;
+        const title = (m.title ?? '').toLowerCase();
+        const category = m.category ?? '';
+        if (category.toLowerCase().includes(cat.toLowerCase()) ||
+            (cat === 'Crypto' && (title.includes('bitcoin') || title.includes('btc') || title.includes('ethereum'))) ||
+            (cat === 'Economics' && (title.includes('cpi') || title.includes('fed') || title.includes('gdp')))) {
+          allMarkets.push({
+            ticker: m.ticker,
+            title: m.title,
+            category: cat,
+            yesAsk: m.yes_ask_dollars,
+            noAsk: m.no_ask_dollars,
+            closeTime: m.close_time ?? '',
+          });
+        }
+      }
+    } catch { /* skip */ }
+  }
+
+  if (allMarkets.length === 0) return;
+
+  // Build compact market list for Claude
+  const marketSummary = allMarkets.slice(0, 30).map(m =>
+    `[${m.category}] ${m.ticker}: "${m.title}" YES=$${m.yesAsk} NO=$${m.noAsk}`
+  ).join('\n');
+
+  // Fetch recent headlines for context
+  let recentNews = '';
+  try {
+    const newsRes = await fetch('http://site.api.espn.com/apis/site/v2/sports/baseball/mlb/news?limit=3',
+      { headers: { 'User-Agent': 'arbor/1' }, signal: AbortSignal.timeout(3000) });
+    if (newsRes.ok) {
+      const nd = await newsRes.json();
+      recentNews = (nd.articles ?? []).slice(0, 3).map(a => a.headline).join('; ');
+    }
+  } catch { /* skip */ }
+
+  // Ask Claude to analyze all markets and find the best trade
+  stats.claudeCalls++;
+  try {
+    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 400,
+        messages: [{ role: 'user', content:
+          `You are an autonomous prediction market trader. Your job is to find the single best trade right now.\n\n` +
+          `MY PORTFOLIO:\n${getPortfolioSummary()}\n\n` +
+          `TODAY: ${new Date().toISOString().slice(0, 10)} (ticker dates: 26APR11 = April 11)\n\n` +
+          `RECENT NEWS: ${recentNews || 'None'}\n\n` +
+          `AVAILABLE MARKETS:\n${marketSummary}\n\n` +
+          `RULES:\n` +
+          `- Only trade if you see a CLEAR mispricing (market price significantly wrong)\n` +
+          `- Don't trade if cash < $5\n` +
+          `- Max bet: 25% of cash balance\n` +
+          `- Don't add to positions I already hold\n` +
+          `- Prefer markets closing soon (capital recycles faster)\n` +
+          `- Sports: only trade TODAY's games (match ticker date to today)\n` +
+          `- Consider fees: Kalshi taker = 0.07 × P × (1-P)\n\n` +
+          `Respond JSON ONLY:\n` +
+          `{"trade": true/false, "ticker": "exact ticker", "side": "yes"/"no", ` +
+          `"betAmount": dollars, "probability": 0.XX, "reasoning": "why this is mispriced"}\n\n` +
+          `If no good trades exist right now, return {"trade": false, "reasoning": "why"}`
+        }],
+      }),
+    });
+
+    if (!claudeRes.ok) { console.error('[broad-scan] Claude HTTP', claudeRes.status); return; }
+    const cData = await claudeRes.json();
+    const cText = cData.content?.[0]?.text ?? '';
+    const jsonMatch = cText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return;
+
+    let decision;
+    try { decision = JSON.parse(jsonMatch[0]); } catch { return; }
+
+    if (!decision.trade) {
+      console.log(`[broad-scan] No trade: ${decision.reasoning}`);
+      return;
+    }
+
+    // Validate ticker exists
+    const market = allMarkets.find(m => m.ticker === decision.ticker);
+    if (!market) { console.log(`[broad-scan] Invalid ticker: ${decision.ticker}`); return; }
+
+    // Check cooldown
+    if (Date.now() - (tradeCooldowns.get(decision.ticker) ?? 0) < COOLDOWN_MS) return;
+
+    const price = decision.side === 'yes' ? parseFloat(market.yesAsk) : parseFloat(market.noAsk);
+    const safeBet = Math.min(decision.betAmount ?? 0, kalshiBalance * 0.25, MAX_TRADE_CAP);
+    if (safeBet < 1 || price <= 0) return;
+
+    const qty = Math.max(1, Math.floor(safeBet / price));
+    const priceInCents = Math.round(price * 100);
+
+    console.log(`[broad-scan] TRADE: ${market.title} ${decision.side} @${priceInCents}¢ × ${qty}`);
+    console.log(`  Reason: ${decision.reasoning}`);
+
+    tradeCooldowns.set(decision.ticker, Date.now());
+    const result = await kalshiPost('/portfolio/orders', {
+      ticker: decision.ticker, action: 'buy', side: decision.side, count: qty,
+      yes_price: decision.side === 'yes' ? priceInCents : 100 - priceInCents,
+    });
+
+    if (result.ok) {
+      stats.tradesPlaced++;
+      await tg(
+        `🧠 <b>CLAUDE TRADE</b>\n\n` +
+        `<b>${market.title}</b>\n` +
+        `Category: ${market.category}\n\n` +
+        `BUY ${decision.side.toUpperCase()} @ $${price.toFixed(2)} × ${qty}\n` +
+        `Deployed: <b>$${(qty * price).toFixed(2)}</b>\n` +
+        `Claude prob: ${((decision.probability ?? 0) * 100).toFixed(0)}% vs market ${(price * 100).toFixed(0)}%\n\n` +
+        `🧠 <i>${decision.reasoning}</i>`
+      );
+    }
+  } catch (e) {
+    console.error('[broad-scan] error:', e.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main Loop
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -602,6 +809,9 @@ async function pollCycle() {
 
   // Step 1b: Check live scores for high-certainty winners
   await checkLiveScoreEdges();
+
+  // Step 1c: Broad market scan — let Claude find edges across ALL Kalshi markets
+  await claudeBroadScan();
 
   // Step 2-4: For each news item, find markets and assess edge
   for (const news of newsItems) {
@@ -681,10 +891,13 @@ async function main() {
 
   await tg(
     `🧠 <b>AI Edge Bot Started</b>\n\n` +
+    `Markets: Sports + Crypto + Economics + Politics\n` +
+    `Platforms: Kalshi + Polymarket\n` +
     `Min edge: ${MIN_EDGE_PCT}%\n` +
-    `Max trade: $${MAX_TRADE_CAP}\n` +
-    `Poll: every ${POLL_INTERVAL_MS / 1000}s\n` +
-    `Balance: $${kalshiBalance.toFixed(2)}\n` +
+    `Max trade: $${MAX_TRADE_CAP} (25% of cash)\n` +
+    `Poll: every ${POLL_INTERVAL_MS / 1000}s | Broad scan: every 5min\n\n` +
+    `💰 Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions\n` +
+    `💰 Polymarket: ~$${polyBalance.toFixed(2)}\n` +
     `Model: claude-haiku-4-5`
   );
 
