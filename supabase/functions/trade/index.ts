@@ -711,6 +711,7 @@ async function executePolymarketOrder(
     const path    = '/v1/orders';
     const headers = await polyUsAuthHeaders('POST', path);
     const bodyStr = JSON.stringify(orderBody);
+    console.log('[poly-order-body]', bodyStr);
 
     const res = await fetch(`${POLY_US_API}${path}`, {
       method: 'POST',
