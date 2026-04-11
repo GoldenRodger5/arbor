@@ -169,11 +169,10 @@ async function refreshPortfolio() {
   // Fetch open positions
   try {
     const data = await kalshiGet('/portfolio/positions');
-    openPositions = (data.market_positions ?? data.positions ?? []).map(p => ({
-      ticker: p.ticker ?? p.market_ticker ?? '',
-      yes: p.yes_contracts ?? p.yes ?? 0,
-      no: p.no_contracts ?? p.no ?? 0,
-    })).filter(p => p.yes > 0 || p.no > 0);
+    openPositions = (data.event_positions ?? data.market_positions ?? data.positions ?? []).map(p => ({
+      ticker: p.event_ticker ?? p.ticker ?? p.market_ticker ?? '',
+      cost: parseFloat(p.total_cost_dollars ?? '0'),
+    })).filter(p => p.cost > 0);
   } catch { openPositions = []; }
 
   // Also refresh Poly balance
@@ -189,7 +188,7 @@ function getPortfolioSummary() {
     `TOTAL: $${total.toFixed(2)}\n` +
     `Open Kalshi positions: ${openPositions.length}` +
     (openPositions.length > 0 ? '\n' + openPositions.map(p =>
-      `  ${p.ticker}: ${p.yes > 0 ? 'YES×' + p.yes : ''} ${p.no > 0 ? 'NO×' + p.no : ''}`
+      `  ${p.ticker}: $${p.cost.toFixed(2)}`
     ).join('\n') : '');
 }
 
