@@ -141,6 +141,60 @@ async function refreshPolyBalance() {
   }
 }
 
+async function polymarketPost(slug, intent, price, quantity) {
+  if (!POLY_US_KEY_ID || !POLY_US_SECRET) {
+    console.error('[poly-order] credentials not set');
+    return { ok: false, status: 0, data: {} };
+  }
+  try {
+    const ed = await import('@noble/ed25519');
+    try {
+      const { createHash } = await import('crypto');
+      ed.etc.sha512Sync = (...m) => {
+        const h = createHash('sha512');
+        for (const msg of m) h.update(msg);
+        return new Uint8Array(h.digest());
+      };
+    } catch { /* already set */ }
+    const sign = ed.signAsync ?? ed.sign;
+    const privBytes = Uint8Array.from(atob(POLY_US_SECRET), c => c.charCodeAt(0)).slice(0, 32);
+
+    const ts = String(Date.now());
+    const path = '/v1/orders';
+    const body = {
+      marketSlug: slug,
+      intent,
+      type: 'ORDER_TYPE_LIMIT',
+      price: { value: price.toFixed(2), currency: 'USD' },
+      quantity: Math.round(quantity),
+      tif: 'TIME_IN_FORCE_IMMEDIATE_OR_CANCEL',
+    };
+    const bodyStr = JSON.stringify(body);
+    const message = `${ts}POST${path}`;
+    const sigBytes = await sign(new TextEncoder().encode(message), privBytes);
+    const signature = btoa(String.fromCharCode(...sigBytes));
+
+    const res = await fetch(`${POLY_US_API}${path}`, {
+      method: 'POST',
+      headers: {
+        'X-PM-Access-Key': POLY_US_KEY_ID,
+        'X-PM-Timestamp': ts,
+        'X-PM-Signature': signature,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'User-Agent': 'arbor-ai/1',
+      },
+      body: bodyStr,
+    });
+    const data = await res.json().catch(() => ({}));
+    console.log('[poly-order]', JSON.stringify({ status: res.status, slug, intent, price, quantity, response: data }));
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    console.error('[poly-order] error:', e.message);
+    return { ok: false, status: 0, data: {} };
+  }
+}
+
 async function tg(text) {
   if (!TG_TOKEN || !TG_CHAT) return;
   await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
@@ -884,6 +938,110 @@ async function claudeBroadScan() {
   } catch (e) {
     console.error('[broad-scan] error:', e.message);
   }
+
+  // === POLYMARKET SCAN ===
+  if (polyBalance < 3) return; // not enough Poly cash
+  try {
+    const polyMarkets = [];
+    const polyRes = await fetch('https://gateway.polymarket.us/v1/markets?limit=200&offset=200&active=true&closed=false', {
+      headers: { 'User-Agent': 'arbor-ai/1', 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (polyRes.ok) {
+      const pd = await polyRes.json();
+      for (const m of pd.markets ?? []) {
+        if (m.closed || !m.active) continue;
+        if (m.marketType !== 'moneyline') continue;
+        const sides = m.marketSides ?? [];
+        if (sides.length < 2) continue;
+        const s0 = parseFloat(String(sides[0]?.price ?? '0'));
+        const s1 = parseFloat(String(sides[1]?.price ?? '0'));
+        if (s0 < 0.05 || s1 < 0.05) continue; // skip resolved/extreme
+        polyMarkets.push({
+          slug: m.slug ?? '',
+          title: m.question ?? '',
+          side0: `${sides[0]?.team?.name ?? sides[0]?.description ?? 'Side0'} @ $${s0.toFixed(2)}`,
+          side1: `${sides[1]?.team?.name ?? sides[1]?.description ?? 'Side1'} @ $${s1.toFixed(2)}`,
+          s0Price: s0,
+          s1Price: s1,
+        });
+      }
+    }
+    if (polyMarkets.length === 0) return;
+
+    const polyList = polyMarkets.slice(0, 15).map(m =>
+      `"${m.title}" — ${m.side0} | ${m.side1} [slug: ${m.slug}]`
+    ).join('\n');
+
+    stats.claudeCalls++;
+    const polyClaudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 300,
+        messages: [{ role: 'user', content:
+          `You are a sports bettor. Find ONE trade on Polymarket US with a real edge.\n\n` +
+          `POLYMARKET CASH: $${polyBalance.toFixed(2)}\n\n` +
+          `MARKETS:\n${polyList}\n\n` +
+          `RULES:\n` +
+          `- Need 10%+ edge (your probability vs market price)\n` +
+          `- Max bet: $${Math.min(50, polyBalance * 0.25).toFixed(2)}\n` +
+          `- Need a REAL reason — not just "price seems off"\n` +
+          `- side0 = ORDER_INTENT_BUY_LONG, side1 = ORDER_INTENT_BUY_SHORT\n\n` +
+          `JSON ONLY:\n` +
+          `{"trade":false,"reasoning":"why"}\n` +
+          `OR {"trade":true,"slug":"exact slug","side":"side0"/"side1","betAmount":N,"probability":0.XX,"reasoning":"why mispriced"}`
+        }],
+      }),
+    });
+    if (!polyClaudeRes.ok) return;
+    const pcData = await polyClaudeRes.json();
+    const pcText = pcData.content?.[0]?.text ?? '';
+    const pcMatch = pcText.match(/\{[\s\S]*\}/);
+    if (!pcMatch) return;
+    let polyDecision;
+    try { polyDecision = JSON.parse(pcMatch[0]); } catch { return; }
+
+    if (!polyDecision.trade) {
+      console.log(`[poly-scan] No trade: ${polyDecision.reasoning}`);
+      return;
+    }
+
+    const polyMkt = polyMarkets.find(m => m.slug === polyDecision.slug);
+    if (!polyMkt) { console.log(`[poly-scan] Invalid slug: ${polyDecision.slug}`); return; }
+
+    const polyPrice = polyDecision.side === 'side0' ? polyMkt.s0Price : polyMkt.s1Price;
+    const polyEdge = Math.abs((polyDecision.probability ?? 0) - polyPrice);
+    if (polyEdge < 0.10) { console.log(`[poly-scan] Edge too small: ${(polyEdge*100).toFixed(1)}%`); return; }
+
+    const polyIntent = polyDecision.side === 'side0' ? 'ORDER_INTENT_BUY_LONG' : 'ORDER_INTENT_BUY_SHORT';
+    const polyBet = Math.min(polyDecision.betAmount ?? 0, polyBalance * 0.25, 50);
+    if (polyBet < 1) return;
+    const polyQty = Math.max(1, Math.floor(polyBet / (polyPrice + 0.02))); // +2¢ buffer
+
+    console.log(`[poly-scan] TRADE: ${polyMkt.title} ${polyDecision.side} @${(polyPrice*100).toFixed(0)}¢ × ${polyQty}`);
+    const polyResult = await polymarketPost(polyMkt.slug, polyIntent, polyPrice + 0.02, polyQty);
+
+    if (polyResult.ok) {
+      stats.tradesPlaced++;
+      await tg(
+        `🧠 <b>CLAUDE TRADE — POLYMARKET</b>\n\n` +
+        `<b>${polyMkt.title}</b>\n` +
+        `Slug: <code>${polyMkt.slug}</code>\n\n` +
+        `BUY ${polyDecision.side === 'side0' ? 'LONG' : 'SHORT'} @ $${polyPrice.toFixed(2)} × ${polyQty}\n` +
+        `Deployed: <b>$${(polyQty * polyPrice).toFixed(2)}</b>\n` +
+        `Edge: <b>${(polyEdge*100).toFixed(0)}%</b>\n\n` +
+        `🧠 <i>${polyDecision.reasoning}</i>`
+      );
+    }
+  } catch (e) {
+    console.error('[poly-scan] error:', e.message);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -910,6 +1068,12 @@ async function pollCycle() {
     console.log(`[ai-edge] ${newsItems.length} new items:`, newsItems.map(n => n.headline.slice(0, 50)).join(' | '));
   }
 
+  // Skip all Claude-powered analysis when cash is too low to trade
+  if (kalshiBalance < 3) {
+    console.log(`[ai-edge] Cash $${kalshiBalance.toFixed(2)} < $3 — skipping Claude calls to save API costs`);
+    return;
+  }
+
   // Step 1b: Check live scores for high-certainty winners
   await checkLiveScoreEdges();
 
@@ -923,37 +1087,47 @@ async function pollCycle() {
     const markets = await findMatchingMarkets(news);
     if (markets.length === 0) continue;
 
-    for (const market of markets.slice(0, 2)) { // max 2 markets per news item
-      // Check cooldown
-      const lastTraded = tradeCooldowns.get(market.ticker) ?? 0;
-      if (Date.now() - lastTraded < COOLDOWN_MS) continue;
+    for (const market of markets.slice(0, 2)) {
+      // Position check — don't trade games we already have positions on
+      const mBase = market.ticker.lastIndexOf('-') > 0
+        ? market.ticker.slice(0, market.ticker.lastIndexOf('-'))
+        : market.ticker;
+      const hasPos = openPositions.some(p => {
+        const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
+        return pBase === mBase;
+      });
+      if (hasPos) continue;
 
-      // Step 3: Ask Claude
+      // Date check — sports game-winners must be today
+      const isSports = /^KX(MLB|NBA|NFL|NHL)GAME-/i.test(market.ticker);
+      if (isSports) {
+        const todayParts = new Date().toISOString().slice(0, 10).split('-');
+        const todayShort = `26${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][parseInt(todayParts[1])-1]}${todayParts[2]}`;
+        if (!market.ticker.includes(todayShort)) continue;
+      }
+
+      // Cooldown (ticker + base)
+      if (Date.now() - (tradeCooldowns.get(market.ticker) ?? 0) < COOLDOWN_MS) continue;
+      if (Date.now() - (tradeCooldowns.get(mBase) ?? 0) < COOLDOWN_MS) continue;
+
+      // Ask Claude
       const assessment = await assessEdge(news, market);
       if (!assessment || !assessment.hasEdge) continue;
-      // Validate Claude's response has required fields
       if (!assessment.side || typeof assessment.edgePct !== 'number' ||
-          typeof assessment.fairProbability !== 'number' || !assessment.reasoning) {
-        console.log('[ai-edge] Invalid Claude response, skipping');
-        continue;
-      }
-      // Cross-check: edgePct should roughly match |fairProb - currentPrice|
+          typeof assessment.fairProbability !== 'number' || !assessment.reasoning) continue;
+
+      // Edge must be >= 10%
       const expectedEdge = Math.abs(assessment.fairProbability - (assessment.currentPrice ?? 0)) * 100;
-      if (Math.abs(assessment.edgePct - expectedEdge) > 10) {
-        console.log(`[ai-edge] Edge mismatch: claimed ${assessment.edgePct}% but calc'd ${expectedEdge.toFixed(1)}%, skipping`);
-        continue;
-      }
-      if (assessment.edgePct < MIN_EDGE_PCT) continue;
+      if (expectedEdge < 10) continue;
       if (assessment.confidence === 'low') continue;
 
       stats.edgesFound++;
-      console.log(`[ai-edge] EDGE: ${market.title} — ${assessment.side} ${assessment.edgePct.toFixed(1)}% (${assessment.confidence})`);
-      console.log(`  Reason: ${assessment.reasoning}`);
+      console.log(`[ai-edge] EDGE: ${market.title} — ${assessment.side} ${expectedEdge.toFixed(1)}% (${assessment.confidence})`);
 
-      // Step 4: Execute
+      // Execute + set base cooldown
       await executeTrade(market, assessment);
+      tradeCooldowns.set(mBase, Date.now());
 
-      // Rate limit Claude calls
       await new Promise(r => setTimeout(r, 1000));
     }
   }
