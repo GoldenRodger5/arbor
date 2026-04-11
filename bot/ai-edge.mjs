@@ -731,8 +731,9 @@ async function claudeBroadScan() {
 
   const allMarkets = [];
 
-  // Sports — get a sample of active game-winner markets
-  for (const s of categories[0].series) {
+  // Sports — game-winners + additional sports series
+  const sportsSeries = [...categories[0].series, 'KXMLSGAME', 'KXNFLGAME'];
+  for (const s of sportsSeries) {
     try {
       const data = await kalshiGet(`/markets?series_ticker=${s}&status=open&limit=10`);
       for (const m of data.markets ?? []) {
@@ -749,18 +750,28 @@ async function claudeBroadScan() {
     } catch { /* skip */ }
   }
 
-  // Non-sports — fetch by Kalshi event categories
-  const categoryMap = [
-    { kalshiCat: 'Economics', label: 'Economics' },
-    { kalshiCat: 'Politics', label: 'Politics' },
-    { kalshiCat: 'Crypto', label: 'Crypto' },
-    { kalshiCat: 'Finance', label: 'Finance' },
+  // Non-sports — use series tickers (category API is broken)
+  const nonSportsSeries = [
+    { series: 'KXBTC', label: 'Crypto' },
+    { series: 'KXETH', label: 'Crypto' },
+    { series: 'KXFED', label: 'Economics' },
+    { series: 'KXCPI', label: 'Economics' },
+    { series: 'KXGDP', label: 'Economics' },
+    { series: 'KXSP', label: 'Finance' },
+    { series: 'KXGOLD', label: 'Finance' },
+    { series: 'KXNEWPOPE', label: 'Politics' },
+    { series: 'KXPRES', label: 'Politics' },
+    { series: 'KXSENATE', label: 'Politics' },
+    { series: 'KXHOUSE', label: 'Politics' },
   ];
-  for (const { kalshiCat, label } of categoryMap) {
+  for (const { series: s, label } of nonSportsSeries) {
     try {
-      const data = await kalshiGet(`/markets?status=open&limit=20&event_category=${kalshiCat}`);
+      const data = await kalshiGet(`/markets?series_ticker=${s}&status=open&limit=10`);
       for (const m of data.markets ?? []) {
         if (!m.yes_ask_dollars || !m.no_ask_dollars) continue;
+        const ya = parseFloat(m.yes_ask_dollars);
+        const na = parseFloat(m.no_ask_dollars);
+        if (ya < 0.01 || na < 0.01) continue; // skip resolved/extreme
         allMarkets.push({
           ticker: m.ticker,
           title: m.title,
