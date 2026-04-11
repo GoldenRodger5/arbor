@@ -181,10 +181,20 @@ async function checkArb(baseTicker) {
 
   stats.spreadsChecked++;
 
-  // Orientation A: Buy Kalshi YES + Buy Poly NO (second team)
-  const spreadA = calculateNetSpread(kBook.yesAsk, pBook.side1Price);
-  // Orientation B: Buy Kalshi NO + Buy Poly YES (first team)
-  const spreadB = calculateNetSpread(kBook.noAsk, pBook.side0Price);
+  // POLARITY: the Kalshi ticker suffix tells us what YES means.
+  // pair.kalshiYesIsPolyS0 tells us if Kalshi YES team = Poly side 0.
+  //
+  // A real arb MUST buy OPPOSITE sides:
+  //   If Kalshi YES = Poly S0 → hedge = Kalshi YES + Poly S1 (opposite team)
+  //   If Kalshi YES = Poly S1 → hedge = Kalshi YES + Poly S0 (opposite team)
+  //
+  // Orientation A: Buy Kalshi YES + Buy Poly hedge side
+  // Orientation B: Buy Kalshi NO  + Buy Poly Kalshi-YES side
+  const polyHedgePrice = pair.kalshiYesIsPolyS0 ? pBook.side1Price : pBook.side0Price;
+  const polyYesSidePrice = pair.kalshiYesIsPolyS0 ? pBook.side0Price : pBook.side1Price;
+
+  const spreadA = calculateNetSpread(kBook.yesAsk, polyHedgePrice);
+  const spreadB = calculateNetSpread(kBook.noAsk, polyYesSidePrice);
 
   const bestSpread = Math.max(spreadA, spreadB);
   const orientation = spreadA >= spreadB ? 'A' : 'B';
@@ -192,7 +202,7 @@ async function checkArb(baseTicker) {
   if (bestSpread >= MIN_NET_SPREAD) {
     stats.arbsFound++;
     const kalshiPrice = orientation === 'A' ? kBook.yesAsk : kBook.noAsk;
-    const polyPrice = orientation === 'A' ? pBook.side1Price : pBook.side0Price;
+    const polyPrice = orientation === 'A' ? polyHedgePrice : polyYesSidePrice;
     const kalshiSide = orientation === 'A' ? 'yes' : 'no';
 
     // Skip if game is live (in progress)
@@ -413,17 +423,59 @@ function matchMarkets(kalshiMarkets, polyMarkets) {
     }
 
     if (bestPoly && bestOverlap >= 2) {
-      // Require overlap of at least 2 teams (both teams must match)
       const lastH = km.ticker.lastIndexOf('-');
       const baseTicker = lastH > 0 ? km.ticker.slice(0, lastH) : km.ticker;
+      const suffix = km.ticker.slice(lastH + 1).toLowerCase();
+
+      // Date check: reject cross-day matches. Extract date from ticker and Poly slug.
+      const tickerDateMatch = km.ticker.match(/-(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})/i);
+      let kalshiGameDate = null;
+      if (tickerDateMatch) {
+        const monthIdx = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC']
+          .indexOf(tickerDateMatch[2].toUpperCase());
+        kalshiGameDate = new Date(Date.UTC(2000 + parseInt(tickerDateMatch[1]), monthIdx, parseInt(tickerDateMatch[3])));
+      }
+      if (kalshiGameDate && bestPoly.slug) {
+        const polyDateMatch = bestPoly.slug.match(/(\d{4}-\d{2}-\d{2})/);
+        if (polyDateMatch) {
+          const polyDate = new Date(polyDateMatch[1] + 'T00:00:00Z');
+          const gapMs = Math.abs(kalshiGameDate.getTime() - polyDate.getTime());
+          if (gapMs > 24 * 60 * 60 * 1000) {
+            continue; // different day — not the same game
+          }
+        }
+      }
+
+      // Determine which Poly side corresponds to Kalshi YES.
+      // The ticker suffix (e.g. "CLE" from "-CLE") is the team Kalshi YES pays for.
+      // Match it against Poly team names to find which side (0 or 1) that is.
+      const suffixMatchesS0 =
+        bestPoly.team0.includes(suffix) ||
+        suffix.length >= 3 && bestPoly.team0.split(' ').some(w => w.startsWith(suffix));
+      const suffixMatchesS1 =
+        bestPoly.team1.includes(suffix) ||
+        suffix.length >= 3 && bestPoly.team1.split(' ').some(w => w.startsWith(suffix));
+
+      let kalshiYesIsPolyS0;
+      if (suffixMatchesS0 && !suffixMatchesS1) {
+        kalshiYesIsPolyS0 = true;
+      } else if (suffixMatchesS1 && !suffixMatchesS0) {
+        kalshiYesIsPolyS0 = false;
+      } else {
+        // Ambiguous — skip this pair
+        console.log(`[match] SKIP ambiguous polarity: ${km.ticker} suffix=${suffix} s0=${bestPoly.team0} s1=${bestPoly.team1}`);
+        continue;
+      }
+
       matchedPairs.set(baseTicker, {
         baseTicker,
         kalshiTicker: km.ticker,
         polySlug: bestPoly.slug,
         teams: [bestPoly.team0, bestPoly.team1],
-        kalshiYesTeam: bestPoly.team0,
+        kalshiYesIsPolyS0,
       });
-      console.log(`[match] ${km.ticker} → ${bestPoly.slug} (${bestPoly.team0} vs ${bestPoly.team1}) s0=$${bestPoly.side0Price} s1=$${bestPoly.side1Price}`);
+      const hedgeSide = kalshiYesIsPolyS0 ? 'S1' : 'S0';
+      console.log(`[match] ${km.ticker} YES=${suffix}=Poly${kalshiYesIsPolyS0?'S0':'S1'} hedge=Poly${hedgeSide} → ${bestPoly.slug}`);
     }
   }
 
