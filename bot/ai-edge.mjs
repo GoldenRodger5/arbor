@@ -98,22 +98,37 @@ let polyBalance = 0;
 async function refreshPolyBalance() {
   if (!POLY_US_KEY_ID || !POLY_US_SECRET) return;
   try {
-    // Use the Supabase trade function to check poly balance (Ed25519 auth is complex in Node)
-    const supaUrl = process.env.SUPABASE_URL;
-    const sKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (supaUrl && sKey) {
-      // Trigger a balance check via the trade function's test endpoint
-      const res = await fetch(`${supaUrl}/rest/v1/capital_ledger?select=total_capital&order=updated_at.desc&limit=1`, {
-        headers: { 'apikey': sKey, 'Authorization': `Bearer ${sKey}` },
-      });
-      if (res.ok) {
-        const rows = await res.json();
-        // Total includes both platforms — subtract Kalshi to get Poly estimate
-        const total = rows[0]?.total_capital ?? 0;
-        polyBalance = Math.max(0, total - kalshiBalance - kalshiPositionValue);
-      }
+    const { sign } = await import('@noble/ed25519');
+    const privBytes = Uint8Array.from(atob(POLY_US_SECRET), c => c.charCodeAt(0)).slice(0, 32);
+    const timestamp = String(Date.now());
+    const path = '/v1/account/balances';
+    const message = `${timestamp}GET${path}`;
+    const sigBytes = await sign(new TextEncoder().encode(message), privBytes);
+    const signature = btoa(String.fromCharCode(...sigBytes));
+
+    const res = await fetch(`${POLY_US_API}${path}`, {
+      headers: {
+        'X-PM-Access-Key': POLY_US_KEY_ID,
+        'X-PM-Timestamp': timestamp,
+        'X-PM-Signature': signature,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'User-Agent': 'arbor-ai/1',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const balArr = data?.balances ?? data;
+      const bal = Array.isArray(balArr)
+        ? (balArr[0]?.currentBalance ?? balArr[0]?.buyingPower ?? balArr[0]?.balance ?? 0)
+        : (data?.balance ?? data?.currentBalance ?? 0);
+      polyBalance = parseFloat(String(bal ?? '0'));
+      if (!Number.isFinite(polyBalance)) polyBalance = 0;
     }
-  } catch { /* keep old */ }
+  } catch (e) {
+    console.error('[poly-balance] error:', e.message);
+  }
 }
 
 async function tg(text) {
