@@ -102,7 +102,38 @@ async function tg(text) {
 const tradeCooldowns = new Map(); // ticker → lastTradedMs
 const seenNewsIds = new Set();    // prevent re-processing same news
 let kalshiBalance = 0;
+let kalshiPositionValue = 0;
+let openPositions = [];  // fetched each cycle
 let stats = { newsChecked: 0, claudeCalls: 0, edgesFound: 0, tradesPlaced: 0 };
+
+async function refreshPortfolio() {
+  try {
+    const bal = await kalshiGet('/portfolio/balance');
+    kalshiBalance = (bal.balance ?? 0) / 100;
+    kalshiPositionValue = (bal.portfolio_value ?? 0) / 100;
+  } catch { /* keep old */ }
+
+  // Fetch open positions
+  try {
+    const data = await kalshiGet('/portfolio/positions');
+    openPositions = (data.market_positions ?? data.positions ?? []).map(p => ({
+      ticker: p.ticker ?? p.market_ticker ?? '',
+      yes: p.yes_contracts ?? p.yes ?? 0,
+      no: p.no_contracts ?? p.no ?? 0,
+    })).filter(p => p.yes > 0 || p.no > 0);
+  } catch { openPositions = []; }
+
+  console.log(`[portfolio] Cash: $${kalshiBalance.toFixed(2)} | Positions: $${kalshiPositionValue.toFixed(2)} | Open: ${openPositions.length}`);
+}
+
+function getPortfolioSummary() {
+  return `Cash: $${kalshiBalance.toFixed(2)}, Positions: $${kalshiPositionValue.toFixed(2)}, ` +
+    `Total: $${(kalshiBalance + kalshiPositionValue).toFixed(2)}, ` +
+    `Open positions: ${openPositions.length}` +
+    (openPositions.length > 0 ? '\n' + openPositions.map(p =>
+      `  ${p.ticker}: ${p.yes > 0 ? 'YES×' + p.yes : ''} ${p.no > 0 ? 'NO×' + p.no : ''}`
+    ).join('\n') : '');
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Step 1: Fetch ESPN News & Injuries
@@ -250,7 +281,10 @@ async function findMatchingMarkets(newsItem) {
 async function assessEdge(newsItem, market) {
   if (!ANTHROPIC_KEY) return null;
 
-  const prompt = `You are a sports prediction market analyst. Analyze this news and determine if it creates a trading edge.
+  const prompt = `You are a sports prediction market trader managing a real portfolio.
+
+MY PORTFOLIO:
+${getPortfolioSummary()}
 
 NEWS:
 Type: ${newsItem.type}
@@ -438,8 +472,9 @@ async function checkLiveScoreEdges() {
 
         if (marketList.length === 0) continue;
 
-        // Use Claude to: 1) find the right market, 2) assess win probability, 3) pick the side
+        // Use Claude to: 1) find the right market, 2) assess win probability, 3) pick side, 4) decide bet size
         stats.claudeCalls++;
+        const portfolioInfo = getPortfolioSummary();
         const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: {
@@ -449,21 +484,26 @@ async function checkLiveScoreEdges() {
           },
           body: JSON.stringify({
             model: 'claude-haiku-4-5-20251001',
-            max_tokens: 200,
+            max_tokens: 300,
             messages: [{ role: 'user', content:
+              `You are a sports prediction market trader managing a real portfolio.\n\n` +
+              `MY PORTFOLIO:\n${portfolioInfo}\n\n` +
               `LIVE ${league.toUpperCase()} GAME RIGHT NOW (today ${new Date().toISOString().slice(0,10)}):\n` +
               `${away.team?.displayName} ${awayScore} at ${home.team?.displayName} ${homeScore}\n` +
               `Game status: ${gameDetail}\n\n` +
-              `KALSHI MARKETS (some may be for DIFFERENT DATES — only match TODAY's game):\n` +
+              `KALSHI MARKETS (some may be for DIFFERENT DATES):\n` +
               marketList.join('\n') + '\n\n' +
+              `RULES:\n` +
+              `- Ticker dates: 26APR11 = April 11, 26APR12 = April 12, etc.\n` +
+              `- Today is ${new Date().toISOString().slice(0,10)}. ONLY pick a ticker with TODAY's date.\n` +
+              `- If I already have a position on this game, DON'T add more.\n` +
+              `- Never bet more than 25% of my cash balance on one trade.\n` +
+              `- If cash balance is below $5, return {"ticker": null} — not enough to trade.\n` +
+              `- Only trade if you're very confident (>80% win probability).\n\n` +
               `Respond in JSON ONLY:\n` +
-              `{"ticker": "exact ticker string for TODAY's game or null if none match today", ` +
-              `"side": "yes" or "no" (the side that wins based on current score)", ` +
-              `"winProbability": 0.XX, ` +
-              `"reasoning": "one sentence"}\n\n` +
-              `CRITICAL: The ticker contains a date like 26APR11 meaning April 11. ` +
-              `Today is ${new Date().toISOString().slice(0,10)}. ONLY pick a ticker with TODAY's date. ` +
-              `If no ticker matches today, return {"ticker": null}.`
+              `{"ticker": "exact ticker for TODAY or null", "side": "yes"/"no", ` +
+              `"winProbability": 0.XX, "betAmount": dollars to bet (max 25% of cash), ` +
+              `"reasoning": "one sentence"}`
             }],
           }),
         });
@@ -500,8 +540,14 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
-        const maxTrade = Math.min(MAX_TRADE_CAP, kalshiBalance * MAX_TRADE_FRACTION);
-        const qty = Math.max(1, Math.floor(maxTrade / price));
+        // Use Claude's recommended bet amount, capped by actual balance
+        const claudeBet = decision.betAmount ?? 0;
+        const safeBet = Math.min(claudeBet, kalshiBalance * 0.25, MAX_TRADE_CAP);
+        if (safeBet < 1) {
+          console.log(`[live-edge] Not enough cash ($${kalshiBalance.toFixed(2)}) or Claude said $0`);
+          continue;
+        }
+        const qty = Math.max(1, Math.floor(safeBet / price));
         const priceInCents = Math.round(price * 100);
 
         console.log(`[live-edge] Claude matched: ${decision.ticker} ${side} @${priceInCents}¢ edge=${(edge*100).toFixed(1)}%`);
@@ -543,11 +589,8 @@ async function checkLiveScoreEdges() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function pollCycle() {
-  // Refresh balance
-  try {
-    const bal = await kalshiGet('/portfolio/balance');
-    kalshiBalance = (bal.balance ?? 0) / 100;
-  } catch { /* keep old */ }
+  // Refresh full portfolio (balance + positions)
+  await refreshPortfolio();
 
   // Step 1: Fetch news
   const newsItems = await fetchESPNNews();
@@ -620,13 +663,11 @@ async function main() {
     process.exit(1);
   }
 
-  // Initial balance
+  // Initial portfolio
   try {
-    const bal = await kalshiGet('/portfolio/balance');
-    kalshiBalance = (bal.balance ?? 0) / 100;
-    console.log(`[ai-edge] Balance: $${kalshiBalance.toFixed(2)}`);
+    await refreshPortfolio();
   } catch (e) {
-    console.error('[ai-edge] Balance check failed:', e.message);
+    console.error('[ai-edge] Portfolio check failed:', e.message);
   }
 
   // Initial poll
