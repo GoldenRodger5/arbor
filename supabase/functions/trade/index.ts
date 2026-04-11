@@ -730,13 +730,74 @@ async function executePolymarketOrder(
     if (!res.ok) return null;
 
     const order = data.order ?? data;
-    return {
-      orderId: order.id ?? order.orderId ?? order.order_id ?? String(Date.now()),
-      filled:  parseFloat(String(order.filledQuantity ?? order.filled ?? order.sizeMatched ?? 0)),
-      avgPrice: parseFloat(String(order.avgPrice ?? order.avg_price ?? price)),
-    };
+    const orderId = order.id ?? order.orderId ?? order.order_id ?? String(Date.now());
+
+    // Extract fills from immediate response.
+    const executions: any[] = order.executions ?? data.executions ?? [];
+    let filled = executions.reduce(
+      (sum: number, e: any) => sum + parseFloat(String(e.quantity ?? e.size ?? e.filledQuantity ?? 0)),
+      0,
+    );
+    // Fall back to top-level fill fields if executions array is empty.
+    if (filled === 0) {
+      filled = parseFloat(String(order.filledQuantity ?? order.filled ?? order.sizeMatched ?? 0));
+    }
+
+    let avgPrice = parseFloat(String(order.avgPrice ?? order.avg_price ?? crossPrice));
+
+    // Polymarket fills asynchronously — the POST response may show executions:[]
+    // even when the order filled. If no immediate fills but the order was accepted,
+    // wait 3 seconds and re-check the order status.
+    if (filled === 0) {
+      console.log('[poly-us-order] no immediate fills, waiting 3s to recheck...');
+      await new Promise(r => setTimeout(r, 3000));
+      const status = await checkPolymarketOrderStatus(orderId);
+      if (status && status.filled > 0) {
+        filled = status.filled;
+        if (status.avgPrice > 0) avgPrice = status.avgPrice;
+        console.log('[poly-us-order] async fill confirmed:', { filled, avgPrice });
+      }
+    }
+
+    return { orderId, filled, avgPrice };
   } catch (err) {
     console.error('[poly-us-order] threw', err);
+    return null;
+  }
+}
+
+/**
+ * Poll Polymarket US for the actual fill status of an order.
+ * Called when the POST /v1/orders response shows executions:[] but the order
+ * was accepted — Polymarket fills asynchronously and the POST response may
+ * not include executions even when the order filled immediately.
+ */
+async function checkPolymarketOrderStatus(
+  orderId: string,
+): Promise<{ filled: number; avgPrice: number } | null> {
+  try {
+    const path = `/v1/orders/${orderId}`;
+    const headers = await polyUsAuthHeaders('GET', path);
+    const res = await fetch(`${POLY_US_API}${path}`, {
+      headers,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json() as any;
+    console.log('[poly-order-status]', JSON.stringify({
+      orderId,
+      status: data.status,
+      filledQty: data.filledQuantity ?? data.filled,
+      executions: data.executions?.length ?? 0,
+      responseBody: JSON.stringify(data).slice(0, 300),
+    }));
+    const filled = parseFloat(String(
+      data.filledQuantity ?? data.filled ?? data.sizeMatched ?? 0,
+    ));
+    const avgPrice = parseFloat(String(data.avgPrice ?? data.avg_price ?? 0));
+    return { filled, avgPrice };
+  } catch (err) {
+    console.error('[poly-order-status] threw', err);
     return null;
   }
 }
