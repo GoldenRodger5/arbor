@@ -1193,6 +1193,12 @@ async function kalshiFetchSeriesMarkets(
   }
 }
 
+// Tracks base tickers for game-winner markets so only ONE per game is kept.
+// Kalshi creates separate markets per team outcome (e.g. -ATH and -NYM for the
+// same A's vs Mets game). YES on -ATH = NO on -NYM. Pairing both with the same
+// Polymarket market creates a phantom arb on the one with inverted polarity.
+const _kalshiGameBaseSeen = new Set<string>();
+
 function pushKalshiMarket(
   list: UnifiedMarket[],
   seen: Set<string>,
@@ -1202,6 +1208,20 @@ function pushKalshiMarket(
   if (!m.ticker) return;
   if (m.mve_collection_ticker) return;
   if (seen.has(m.ticker)) return;
+
+  // Deduplicate game-winner markets by base ticker. Kalshi creates two
+  // markets per game: KXMLBGAME-26APR121340ATHNYM-ATH (YES=A's win) and
+  // KXMLBGAME-26APR121340ATHNYM-NYM (YES=Mets win). These are the SAME
+  // game — YES on one = NO on the other. Strip the last team-code suffix
+  // to get the base, and only keep the first seen per base.
+  const ticker = m.ticker;
+  const lastHyphen = ticker.lastIndexOf('-');
+  if (lastHyphen > 0 && /^KX(?:MLB|NBA|NFL|NHL|MLS)GAME-/i.test(ticker)) {
+    const baseTicker = ticker.slice(0, lastHyphen);
+    if (_kalshiGameBaseSeen.has(baseTicker)) return; // duplicate team outcome
+    _kalshiGameBaseSeen.add(baseTicker);
+  }
+
   seen.add(m.ticker);
   // Prefer dollar-string fields (current API); fall back to legacy cent fields.
   const yesAsk = m.yes_ask_dollars != null
@@ -3875,6 +3895,7 @@ async function runScanCycle(
   _recurrenceRejected = 0;
   _recurrenceRejectionSamples = [];
   _polyUSSportsRawLogged = 0;
+  _kalshiGameBaseSeen.clear();
   // 1. Fetch markets in parallel — Kalshi, Polymarket, PredictIt, and new platforms.
   // New platform stubs (cryptocom/fanduel/fanatics/og) return [] until their APIs
   // are accessible; they each log [platform-fetch] with the HTTP status so we can
