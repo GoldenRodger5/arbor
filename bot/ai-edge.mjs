@@ -874,7 +874,7 @@ async function claudeBroadScan() {
           (cryptoPrices ? `LIVE CRYPTO PRICES: ${cryptoPrices}\n` : '') +
           `\nMARKETS I CAN TRADE:\n${marketSummaryFiltered}\n\n` +
           `STRICT RULES — violating ANY means return {"trade":false}:\n` +
-          `1. Your probability MUST differ from market price by at least 10 percentage points\n` +
+          `1. Your probability MUST differ from market price by at least 7 percentage points\n` +
           `2. YES price + NO price on Kalshi always sums to ~$1.00-1.03. This is NOT mispricing — it's the bid-ask spread. Do NOT trade based on YES+NO sum.\n` +
           `3. For SPORTS game-winner tickers: ONLY trade if ticker contains "${todayShort}" (today) or "${tomorrowShort}" (tonight's late games). Non-sports tickers don't have dates — trade those anytime.\n` +
           `4. Max bet: $${Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25).toFixed(2)} (25% of $${kalshiBalance.toFixed(2)} cash)\n` +
@@ -925,8 +925,8 @@ async function claudeBroadScan() {
     // Block if edge < 10%
     const price = decision.side === 'yes' ? parseFloat(market.yesAsk) : parseFloat(market.noAsk);
     const edge = Math.abs((decision.probability ?? 0) - price);
-    if (edge < 0.10) {
-      console.log(`[broad-scan] BLOCKED: edge ${(edge*100).toFixed(1)}% < 10% minimum`);
+    if (edge < 0.07) {
+      console.log(`[broad-scan] BLOCKED: edge ${(edge*100).toFixed(1)}% < 7% minimum`);
       return;
     }
 
