@@ -722,7 +722,8 @@ async function executePolymarketOrder(
       status: res.status,
       slug,
       intent,
-      price,
+      scanPrice: price,
+      crossPrice,
       size: Math.round(size),
       responseBody: data,
     }));
