@@ -160,12 +160,10 @@ async function findWideSpreadMarkets() {
         const noSpread = Math.round((noAsk - noBid) * 100);
         const bestSpread = Math.max(yesSpread, noSpread);
 
-        // Skip live/in-progress games — only quote on future games
+        // Skip completed/settled games
         const closeTime = m.close_time ?? m.expected_expiration_time ?? '';
-        const closeMs = Date.parse(closeTime);
-        if (Number.isFinite(closeMs) && closeMs < Date.now()) continue; // game already started/closed
-        // Also skip if status is not 'active' or 'open'
         if (m.result && m.result !== '') continue; // game has a result — skip
+        if (m.status === 'settled' || m.status === 'finalized' || m.status === 'determined') continue;
 
         if (bestSpread >= MIN_SPREAD_CENTS) {
           candidates.push({
