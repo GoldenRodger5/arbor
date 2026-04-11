@@ -430,12 +430,17 @@ async function checkLiveScoreEdges() {
 
         if (!highCertainty) continue;
 
+        console.log(`[live-edge] High certainty: ${leadingName} leading ${homeScore}-${awayScore} in P${period} (${league}) ~${(estimatedWinProb*100).toFixed(0)}%`);
+
         // Find matching Kalshi market
         const params = new URLSearchParams({ series_ticker: series, status: 'open', limit: '100' });
         const mkts = await kalshiGet(`/markets?${params}`);
         for (const m of mkts.markets ?? []) {
           const title = (m.title ?? '').toLowerCase();
-          if (!title.includes(leadingName.split(' ').pop())) continue;
+          // Match by any word in the team name (>3 chars) against the market title
+          const teamWords = leadingName.split(' ').filter(w => w.length > 3);
+          const matchesTitle = teamWords.some(w => title.includes(w));
+          if (!matchesTitle) continue;
 
           // Check cooldown
           if (Date.now() - (tradeCooldowns.get(m.ticker) ?? 0) < COOLDOWN_MS) continue;
@@ -444,14 +449,15 @@ async function checkLiveScoreEdges() {
           const noAsk = m.no_ask_dollars ? parseFloat(m.no_ask_dollars) : null;
           if (!yesAsk || !noAsk) continue;
 
-          // Determine which side is the winning team
-          // The ticker suffix tells us what YES means
-          const lastH = m.ticker.lastIndexOf('-');
-          const suffix = m.ticker.slice(lastH + 1).toLowerCase();
-          const leadingTeamCode = leadingName.split(' ').pop();
+          // Determine which side is the winning team.
+          // Kalshi title format: "Minnesota vs Toronto Winner?"
+          // The first team in the title = YES side on this specific ticker.
+          const titleParts = title.replace(/winner\??/i, '').trim().split(/\s+(?:vs\.?|at)\s+/);
+          const yesTeamInTitle = (titleParts[0] ?? '').trim();
+          const leadingWords = leadingName.split(' ').filter(w => w.length > 3);
 
           let winningSide, winningPrice;
-          if (suffix.includes(leadingTeamCode?.slice(0, 3) ?? '???')) {
+          if (leadingWords.some(w => yesTeamInTitle.includes(w))) {
             winningSide = 'yes';
             winningPrice = yesAsk;
           } else {
