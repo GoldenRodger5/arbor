@@ -869,7 +869,7 @@ async function findOpportunityBySlug(
     .from('scan_results')
     .select('opportunities, scanned_at')
     .order('scanned_at', { ascending: false })
-    .limit(3);
+    .limit(10);
   if (error) { console.error('[trade] scan_results query failed', error); return null; }
   for (const row of data ?? []) {
     const opps = (row as any).opportunities as Opportunity[] | null;
@@ -1013,10 +1013,11 @@ async function handleBuy(
   passedRawTotal?: number,
 ): Promise<void> {
   const opp = await findOpportunityBySlug(sb, slug);
+  console.log('[handleBuy]', { slug, found: !!opp });
   if (!opp) {
     await answerCallback(callbackId, 'Opportunity not found');
     await editMessage(chatId, messageId,
-      '⚠️ <b>Opportunity not found</b>\nCouldn\'t match this alert against the 3 most recent scans.');
+      '⚠️ <b>Opportunity not found</b>\nCouldn\'t match this alert against the 10 most recent scans.');
     return;
   }
 
