@@ -602,7 +602,9 @@ async function executeKalshiOrder(
     side,
     count,
     yes_price: side === 'yes' ? priceInCents : 100 - priceInCents,
-    time_in_force: 'fill_or_kill',
+    // Use GTC limit orders to qualify for maker fee (0.0175 vs 0.07 taker).
+    // The sequential execution with auto-sellback handles partial/no fills.
+    time_in_force: 'good_til_cancelled',
   };
   if (dryRun) {
     console.log('[kalshi-order-dry-run]', JSON.stringify({
@@ -634,11 +636,46 @@ async function executeKalshiOrder(
     }));
     if (!res.ok) return null;
     const order = data.order ?? data;
-    return {
-      orderId: order.order_id ?? order.id ?? String(Date.now()),
-      filled: order.quantity_filled ?? order.filled ?? 0,
-      avgPrice: (order.avg_price ?? priceInCents) / 100,
-    };
+    const orderId = order.order_id ?? order.id ?? String(Date.now());
+    let filled = order.quantity_filled ?? order.filled ?? 0;
+    let avgPrice = (order.avg_price ?? priceInCents) / 100;
+
+    // GTC maker orders may not fill immediately. Wait 3s and re-check.
+    if (filled === 0 && orderId) {
+      console.log('[kalshi-order] no immediate fill, waiting 3s...');
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const checkPath = `/portfolio/orders/${orderId}`;
+        const checkHeaders = await kalshiAuthHeaders('GET', checkPath);
+        const checkRes = await fetch(`${KALSHI_TRADING_BASE}${checkPath}`, { headers: checkHeaders });
+        if (checkRes.ok) {
+          const checkData = await checkRes.json() as any;
+          const o = checkData.order ?? checkData;
+          const recheckedFilled = o.quantity_filled ?? o.filled ?? 0;
+          console.log('[kalshi-order-recheck]', JSON.stringify({
+            orderId, status: o.status, filled: recheckedFilled,
+          }));
+          if (recheckedFilled > 0) {
+            filled = recheckedFilled;
+            avgPrice = (o.avg_price ?? priceInCents) / 100;
+          } else if (o.status === 'resting') {
+            // Still resting after 3s — cancel it to avoid ghost orders.
+            try {
+              const cancelPath = `/portfolio/orders/${orderId}`;
+              const cancelHeaders = await kalshiAuthHeaders('DELETE', cancelPath);
+              await fetch(`${KALSHI_TRADING_BASE}${cancelPath}`, {
+                method: 'DELETE', headers: cancelHeaders,
+              });
+              console.log('[kalshi-order] cancelled resting order', orderId);
+            } catch { /* best effort */ }
+          }
+        }
+      } catch (err) {
+        console.error('[kalshi-order-recheck] threw', err);
+      }
+    }
+
+    return { orderId, filled, avgPrice };
   } catch (err) {
     console.error('[kalshi-order] threw', err);
     return null;

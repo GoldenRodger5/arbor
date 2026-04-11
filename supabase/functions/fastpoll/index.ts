@@ -36,17 +36,20 @@ const TELEGRAM_CHAT_ID = Deno.env.get('TELEGRAM_CHAT_ID') ?? '';
 const MS_PER_HOUR  = 3_600_000;
 const WINDOW_MS    = 72 * MS_PER_HOUR; // fetch markets closing within 72h
 const ALERT_REFIRE_MS = 6 * MS_PER_HOUR;
-const MIN_RAW_SPREAD_FOR_CLOB  = 0.02;
-const MIN_NET_SPREAD_FOR_ALERT = 0.03;
-const ALERT_DAYS_MAX   = 2;
-const SPORTS_FEE       = 0.03;
+const MIN_RAW_SPREAD_FOR_CLOB  = 0.005;
+const MIN_NET_SPREAD_FOR_ALERT = 0.01; // 1% — catch real arbs
+const ALERT_DAYS_MAX   = 3;
+// Correct fees: Kalshi 0.07 parabolic taker, Poly US 0.30% flat.
+const KALSHI_FEE_RATE  = 0.07;
+const POLY_US_FEE_RATE = 0.003;
 const GAME_SERIES      = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXNFLGAME', 'KXMLSGAME'];
 
-// Kelly sizing constants (mirrored from trade/index.ts)
-const MIN_POSITION_USD     = 20;
-const MAX_POSITION_CAUTION = 100;
-const MAX_CAPITAL_FRACTION = 0.40;
-const QUARTER_KELLY        = 0.25;
+// Sizing constants (mirrored from trade/index.ts)
+const MIN_POSITION_USD     = 10;
+const MAX_POSITION_SAFE    = 500;
+const MAX_CAPITAL_FRACTION = 0.90;
+const HALF_KELLY           = 0.50;
+const MAX_POSITION_USD     = 500;
 
 function calculatePositionSize(
   netSpread: number,
@@ -59,8 +62,8 @@ function calculatePositionSize(
   }
   const odds = (1 / totalCostPerContract) - 1;
   const kellyFraction = Math.min(odds > 0 ? netSpread / odds : 0, 1.0);
-  const rawPosition   = QUARTER_KELLY * kellyFraction * activeCapital;
-  const verdictCap    = MAX_POSITION_CAUTION; // game-winner pairs default to CAUTION
+  const rawPosition   = HALF_KELLY * kellyFraction * activeCapital;
+  const verdictCap    = MAX_POSITION_SAFE;
   const capitalCap    = MAX_CAPITAL_FRACTION * activeCapital;
   let   finalUSD      = rawPosition;
   let   limitingFactor = 'kelly';
@@ -86,8 +89,8 @@ async function fetchActiveCapital(sb: ReturnType<typeof import('https://esm.sh/@
     .order('updated_at', { ascending: false })
     .limit(1)
     .maybeSingle();
-  if (!data) return 400;
-  return ((data.total_capital as number) ?? 500) * (1 - ((data.safety_reserve_pct as number) ?? 0.2))
+  if (!data) return 200;
+  return ((data.total_capital as number) ?? 0) * (1 - ((data.safety_reserve_pct as number) ?? 0.10))
        - ((data.deployed_capital as number) ?? 0)
        + ((data.realized_pnl as number) ?? 0);
 }
@@ -258,6 +261,9 @@ async function fetchKalshiGameMarkets(): Promise<KalshiGameMarket[]> {
   const now = Date.now();
   const cutoff = now + WINDOW_MS;
   const markets: KalshiGameMarket[] = [];
+  // Dedup: Kalshi creates two markets per game (-ATH and -NYM for A's vs Mets).
+  // Only keep one per base ticker to prevent phantom arbs.
+  const gameBaseSeen = new Set<string>();
 
   for (const series of GAME_SERIES) {
     try {
@@ -273,6 +279,13 @@ async function fetchKalshiGameMarkets(): Promise<KalshiGameMarket[]> {
         if (!m.ticker) continue;
         // Kalshi game markets use status='active'. Skip anything settled/closed.
         if (m.status && m.status !== 'active' && m.status !== 'open') continue;
+        // Dedup per-team game markets (e.g. -ATH and -NYM are the same game).
+        const lastHyphen = m.ticker.lastIndexOf('-');
+        if (lastHyphen > 0) {
+          const baseTicker = m.ticker.slice(0, lastHyphen);
+          if (gameBaseSeen.has(baseTicker)) continue;
+          gameBaseSeen.add(baseTicker);
+        }
         // Use expected_expiration_time (actual game end) for the 72h window.
         // Fall back to close_time (settlement deadline, often +2d buffer).
         const expiryStr = m.expected_expiration_time ?? m.close_time ?? '';
@@ -710,10 +723,13 @@ async function calculateSpread(pair: MatchedPair): Promise<SpreadResult | null> 
     [grossB, kalshi.noAsk,  bestPolyYesAsk, 'no',  pair.polyYesTokenId, yesBook] as const,
   ]) {
     if (gross < MIN_RAW_SPREAD_FOR_CLOB) continue;
-    const net = gross - SPORTS_FEE * (kPrice * (1 - kPrice) + pPrice * (1 - pPrice));
+    // Kalshi: 0.07 parabolic. Poly US: 0.30% flat on premium.
+    const kFee = KALSHI_FEE_RATE * kPrice * (1 - kPrice);
+    const pFee = POLY_US_FEE_RATE * pPrice;
+    const net = gross - kFee - pFee;
     if (net <= 0) continue;
 
-    // Size: limited by CLOB depth + $50 cap.
+    // Size: limited by CLOB depth + position cap.
     const polyQtyAvail = pBook.asks.sort((a,b) => a.price-b.price)[0]?.size ?? 0;
     const maxByBudget  = MAX_POSITION_USD / (kPrice + pPrice);
     const qty = Math.max(1, Math.min(Math.floor(polyQtyAvail), Math.floor(maxByBudget)));
