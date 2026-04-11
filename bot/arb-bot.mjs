@@ -93,10 +93,16 @@ const polyBooks = new Map();  // slug → { side0Price, side1Price }
 // Matched pairs: baseTicker → { kalshiTicker, polySlug, teams, kalshiYesTeam }
 const matchedPairs = new Map();
 
-// Cooldown: prevent re-executing same arb within 5 minutes
-const executionCooldown = new Map(); // baseTicker → lastExecutedMs
+// Cooldown: prevent re-alerting same arb within 10 minutes
+const executionCooldown = new Map(); // baseTicker → lastAlertedMs
+
+// ESPN live games — refreshed every 2 minutes
+let liveGameTeams = new Set();
 
 let stats = { wsUpdates: 0, spreadsChecked: 0, arbsFound: 0, executed: 0 };
+
+// Don't auto-execute yet — alert only until spreads are verified real
+const ALERT_ONLY = true;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Telegram
@@ -113,6 +119,44 @@ async function sendTelegram(text) {
   } catch (e) {
     console.error('[tg] failed:', e.message);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ESPN Live Game Filter
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function refreshLiveGames() {
+  const keys = new Set();
+  const sports = [
+    'baseball/mlb', 'basketball/nba', 'hockey/nhl', 'football/nfl',
+  ];
+  const results = await Promise.allSettled(
+    sports.map(path =>
+      fetch(`http://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard`, {
+        headers: { 'User-Agent': 'arbor-bot/1' },
+        signal: AbortSignal.timeout(5000),
+      }).then(r => r.ok ? r.json() : { events: [] })
+    ),
+  );
+  for (const r of results) {
+    if (r.status !== 'fulfilled') continue;
+    for (const ev of r.value.events ?? []) {
+      const comp = ev.competitions?.[0];
+      if (!comp || comp.status?.type?.state !== 'in') continue;
+      const names = (comp.competitors ?? [])
+        .map(c => (c.team?.displayName ?? '').toLowerCase())
+        .filter(Boolean).sort();
+      if (names.length >= 2) keys.add(names.join(' '));
+    }
+  }
+  liveGameTeams = keys;
+  if (keys.size > 0) console.log(`[espn] ${keys.size} live games:`, [...keys].join(', '));
+}
+
+function isGameLive(teams) {
+  if (!teams || teams.length < 2 || liveGameTeams.size === 0) return false;
+  const key = [...teams].sort().join(' ');
+  return liveGameTeams.has(key);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -151,18 +195,41 @@ function checkArb(baseTicker) {
     const polyPrice = orientation === 'A' ? pBook.side1Price : pBook.side0Price;
     const kalshiSide = orientation === 'A' ? 'yes' : 'no';
 
-    console.log(`[ARB] ${baseTicker} ${orientation} spread=${(bestSpread * 100).toFixed(2)}% K${kalshiSide}=$${kalshiPrice.toFixed(3)} P=$${polyPrice.toFixed(3)}`);
-
-    // Check cooldown
-    const lastExec = executionCooldown.get(baseTicker) ?? 0;
-    if (Date.now() - lastExec < 5 * 60 * 1000) {
-      console.log(`[ARB] ${baseTicker} on cooldown, skipping`);
-      return;
+    // Skip if game is live (in progress)
+    if (isGameLive(pair.teams)) {
+      return; // silently skip — live games have collapsed spreads, not real arbs
     }
 
-    executeArb(pair, kalshiPrice, polyPrice, kalshiSide, bestSpread).catch(e =>
-      console.error('[execute] threw:', e.message)
-    );
+    // Check cooldown (10 min)
+    const lastAlert = executionCooldown.get(baseTicker) ?? 0;
+    if (Date.now() - lastAlert < 10 * 60 * 1000) {
+      return; // silently skip — already alerted recently
+    }
+
+    console.log(`[ARB] ${baseTicker} ${orientation} spread=${(bestSpread * 100).toFixed(2)}% K${kalshiSide}=$${kalshiPrice.toFixed(3)} P=$${polyPrice.toFixed(3)}`);
+    executionCooldown.set(baseTicker, Date.now());
+
+    if (ALERT_ONLY) {
+      // Alert only — don't execute until spreads are verified real
+      const totalCost = kalshiPrice + polyPrice;
+      const qty = Math.max(1, Math.floor(MAX_TRADE_USD / totalCost));
+      const deployed = qty * totalCost;
+      const profit = qty * bestSpread;
+      await sendTelegram(
+        `🔔 <b>WS ARB DETECTED</b>\n\n` +
+        `<b>${pair.teams.join(' vs ')}</b>\n\n` +
+        `Kalshi ${kalshiSide.toUpperCase()} ask: $${kalshiPrice.toFixed(3)}\n` +
+        `Polymarket ask: $${polyPrice.toFixed(3)}\n` +
+        `Total: $${totalCost.toFixed(3)} → gross ${((1-totalCost)*100).toFixed(1)}%\n\n` +
+        `Net spread: <b>${(bestSpread * 100).toFixed(2)}%</b> (after fees)\n` +
+        `Qty: ${qty} → deploy $${deployed.toFixed(2)} → profit $${profit.toFixed(2)}\n\n` +
+        `⚠️ <i>Alert only — verify on platforms before executing</i>`
+      );
+    } else {
+      executeArb(pair, kalshiPrice, polyPrice, kalshiSide, bestSpread).catch(e =>
+        console.error('[execute] threw:', e.message)
+      );
+    }
   }
 }
 
@@ -530,13 +597,19 @@ async function main() {
     console.log('No matched pairs found. Waiting for markets...');
   }
 
-  // Step 3: Connect Kalshi websocket
+  // Step 3: Fetch live games from ESPN (filter in-progress)
+  await refreshLiveGames();
+
+  // Step 4: Connect Kalshi websocket
   connectKalshiWS();
 
-  // Step 4: Poll Polymarket every 10 seconds
+  // Step 5: Poll Polymarket every 10 seconds
   setInterval(pollPolyPrices, 10_000);
 
-  // Step 5: Refresh market discovery every 5 minutes
+  // Step 6: Refresh ESPN live games every 2 minutes
+  setInterval(refreshLiveGames, 2 * 60 * 1000);
+
+  // Step 7: Refresh market discovery every 5 minutes
   setInterval(async () => {
     const [km, pm] = await Promise.all([
       fetchKalshiSportsMarkets(),
@@ -545,7 +618,7 @@ async function main() {
     matchMarkets(km, pm);
   }, 5 * 60 * 1000);
 
-  // Step 6: Log stats every 30 seconds
+  // Step 8: Log stats every 30 seconds
   setInterval(logStats, 30_000);
 
   // Startup notification
