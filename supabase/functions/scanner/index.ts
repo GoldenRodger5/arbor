@@ -158,7 +158,7 @@ const FINANCIAL_FUZZY_THRESHOLD = 0.35;
 // Use 0.45 as the minimum for PI×Kalshi pairs so real matches survive.
 const PREDICTIT_FUZZY_THRESHOLD = 0.45;
 const STALENESS_THRESHOLD_MS = 120_000;
-// TEMP: diagnostic, raise to 0.02 once spread distribution is understood.
+// Minimum net spread after fees to consider actionable. Real arbs are 1-4%.
 const MIN_NET_SPREAD = 0.005;
 // Threshold passed into the orderbook walk so we collect all profitable +
 // unprofitable levels for diagnostics. The display threshold above flags
@@ -200,13 +200,13 @@ const MAX_DAYS_TO_CLOSE_FINANCIAL = 30;
 // Sports/economic categories deserve different floors because their
 // average days-to-close is shorter, so even small spreads still produce
 // large APYs (50% / 20% respectively).
-const MIN_ANNUALIZED_RETURN = 0.15;
-const MIN_APY_SPORTS = 0.50;
-const MIN_APY_ECONOMIC = 0.20;
-const MIN_APY_POLITICS = 0.15;
-const MIN_APY_ENTERTAINMENT = 0.10;
-const MIN_APY_SCIENCE = 0.12;
-const MIN_APY_FINANCIAL = 0.20;
+const MIN_ANNUALIZED_RETURN = 0.05; // 5% APY floor — catch real small arbs
+const MIN_APY_SPORTS = 0.10;       // sports settle fast, even small spreads compound
+const MIN_APY_ECONOMIC = 0.08;
+const MIN_APY_POLITICS = 0.05;
+const MIN_APY_ENTERTAINMENT = 0.05;
+const MIN_APY_SCIENCE = 0.05;
+const MIN_APY_FINANCIAL = 0.08;
 // Priority = annualizedReturn * categoryMultiplier. Faster-recycling
 // categories rank above equivalent-APY long-dated ones because the same
 // dollar can be redeployed sooner.

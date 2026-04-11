@@ -17,8 +17,8 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.39.0';
 const TELEGRAM_BOT_TOKEN = Deno.env.get('TELEGRAM_BOT_TOKEN') ?? '';
 const TELEGRAM_CHAT_ID   = Deno.env.get('TELEGRAM_CHAT_ID') ?? '';
 
-const MAX_ALERTS_PER_SCAN    = 3;
-const MIN_NET_SPREAD         = 0.03;
+const MAX_ALERTS_PER_SCAN    = 5;
+const MIN_NET_SPREAD         = 0.01;  // 1% — catch smaller real arbs
 function getMaxLockupDays(o: Opportunity): number {
   // Prefer explicit category if populated (from scanner's pairCategory())
   const cat = (o.category ?? o.kalshiMarket?.category ?? '').toLowerCase();
@@ -39,8 +39,8 @@ function getMaxLockupDays(o: Opportunity): number {
 
   return 14; // safe default for unrecognized
 }
-const AUTO_EXECUTE_SPREAD    = 0.07; // 7% net → auto-execute
-const AUTO_EXECUTE_MAX_DAYS  = 1;    // same-day only
+const AUTO_EXECUTE_SPREAD    = 0.02; // 2% net → auto-execute (real arbs after fees)
+const AUTO_EXECUTE_MAX_DAYS  = 3;    // execute up to 3 days out for faster capital recycling
 const GLOBAL_DRY_RUN         = Deno.env.get('TRADE_DRY_RUN') === 'true';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -102,10 +102,11 @@ function calculatePositionSize(
 // ─────────────────────────────────────────────────────────────────────────────
 
 function getTargetPositions(totalCapital: number): number {
-  if (totalCapital < 500)   return 2;
-  if (totalCapital < 2000)  return 3;
-  if (totalCapital < 10000) return 4;
-  if (totalCapital < 50000) return 5;
+  if (totalCapital < 300)   return 1;  // $200 start: go all-in on best arb
+  if (totalCapital < 700)   return 2;  // month 1-2 with deposits
+  if (totalCapital < 2000)  return 3;  // month 2-3
+  if (totalCapital < 5000)  return 4;  // month 3-4
+  if (totalCapital < 15000) return 5;  // month 4-5, hitting $4K/mo target
   return 6;
 }
 

@@ -381,10 +381,11 @@ function calculatePositionSize(
 // ─────────────────────────────────────────────────────────────────────────────
 
 function getTargetPositions(totalCapital: number): number {
-  if (totalCapital < 500)   return 2;
-  if (totalCapital < 2000)  return 3;
-  if (totalCapital < 10000) return 4;
-  if (totalCapital < 50000) return 5;
+  if (totalCapital < 300)   return 1;  // $200 start: go all-in on best arb
+  if (totalCapital < 700)   return 2;  // month 1-2 with deposits
+  if (totalCapital < 2000)  return 3;  // month 2-3
+  if (totalCapital < 5000)  return 4;  // month 3-4
+  if (totalCapital < 15000) return 5;  // month 4-5, hitting $4K/mo target
   return 6;
 }
 
@@ -400,7 +401,7 @@ function calculateAutoExecuteSize(
   const maxAllowed = Math.max(0, liveRawTotal - reserve);
   const finalUSD = Math.min(perTradeTarget, maxAllowed, availableLiquidity);
 
-  const MIN_TRADE_USD = 20;
+  const MIN_TRADE_USD = 10;  // lowered from 20 — allow $10 trades at small capital
   if (finalUSD < MIN_TRADE_USD) {
     return { contracts: 0, deployedUSD: 0, limitingFactor: 'below_minimum', reserve };
   }
