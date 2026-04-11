@@ -4430,6 +4430,33 @@ async function runScanCycle(
             ),
           ]);
         }
+
+        // Override Kalshi asks with market-listing prices when available.
+        // The orderbook derives asks from opposite-side bids (YES ask = 1 - NO bid)
+        // which is mathematically wrong when there is a wide bid-ask spread.
+        // The market listing yes_ask_dollars/no_ask_dollars are the actual ask
+        // prices Kalshi shows users and should be preferred.
+        if (pair.kalshi.yesAsk != null || pair.kalshi.noAsk != null) {
+          const totalYesSize = kalshiBook.yesAsks.reduce((s, l) => s + l.size, 0) || 100;
+          const totalNoSize  = kalshiBook.noAsks.reduce((s, l) => s + l.size, 0) || 100;
+          if (pair.kalshi.yesAsk != null) {
+            kalshiBook = {
+              ...kalshiBook,
+              yesAsks: [{ price: pair.kalshi.yesAsk, size: totalYesSize }],
+            };
+          }
+          if (pair.kalshi.noAsk != null) {
+            kalshiBook = {
+              ...kalshiBook,
+              noAsks: [{ price: pair.kalshi.noAsk, size: totalNoSize }],
+            };
+          }
+          console.log('[kalshi-ask-override]', {
+            marketId: pair.kalshi.marketId,
+            yesAsk: pair.kalshi.yesAsk,
+            noAsk: pair.kalshi.noAsk,
+          });
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(
