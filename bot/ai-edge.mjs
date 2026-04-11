@@ -99,13 +99,15 @@ async function refreshPolyBalance() {
   if (!POLY_US_KEY_ID || !POLY_US_SECRET) return;
   try {
     const ed = await import('@noble/ed25519');
-    // Configure sha512 for ed25519 using Node's built-in crypto
-    const { createHash } = await import('crypto');
-    ed.etc.sha512Sync = (...m) => {
-      const h = createHash('sha512');
-      for (const msg of m) h.update(msg);
-      return new Uint8Array(h.digest());
-    };
+    // Configure sha512 only once (ed.etc may be frozen after first call)
+    try {
+      const { createHash } = await import('crypto');
+      ed.etc.sha512Sync = (...m) => {
+        const h = createHash('sha512');
+        for (const msg of m) h.update(msg);
+        return new Uint8Array(h.digest());
+      };
+    } catch { /* already set */ }
     const sign = ed.signAsync ?? ed.sign;
     const privBytes = Uint8Array.from(atob(POLY_US_SECRET), c => c.charCodeAt(0)).slice(0, 32);
     const timestamp = String(Date.now());
