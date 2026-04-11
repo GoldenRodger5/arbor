@@ -379,7 +379,11 @@ function formatMessage(
   );
   const qty           = Math.max(1, sizing.contracts);
   const kellyDeployed = sizing.totalDeployed > 0 ? sizing.totalDeployed : costPerPair * qty;
-  const maxProfit     = (o.totalMaxProfit * (qty / lvl.quantity));
+  const netProfitPerContract =
+    1.0 - (lvl.buyYesPrice + lvl.buyNoPrice)
+    - (0.02 * lvl.buyYesPrice * (1 - lvl.buyYesPrice))
+    - (0.05 * lvl.buyNoPrice * (1 - lvl.buyNoPrice));
+  const maxProfit = qty * netProfitPerContract;
   const netPct        = (o.bestNetSpread * 100).toFixed(1);
   const apyPct        = (o.annualizedReturn * 100).toFixed(1);
   const emoji         = verdict === 'SAFE' ? '🟢' : '🟡';
@@ -641,20 +645,22 @@ serve(async (req) => {
         });
         sent++;
 
-        // Upsert spread_events after sending alert.
-        // Use upsert (not update) so the row is created if it doesn't exist yet.
-        // Without this, a brand-new spread never gets alerted_at written and
-        // fires every scan.
+        // Upsert spread_events after sending alert so alerted_at is written
+        // and the 6h refire dedup fires correctly on the next scan.
         if (sb) {
-          await sb.from('spread_events')
-            .upsert({
+          try {
+            const peakSpread = typeof spreadEvent?.peak_net_spread === 'number'
+              ? spreadEvent.peak_net_spread : 0;
+            await sb.from('spread_events').upsert({
               pair_id: pairId,
               was_alerted: true,
               alerted_at: new Date().toISOString(),
               last_net_spread: o.bestNetSpread,
-              peak_net_spread: Math.max((spreadEvent as any)?.peak_net_spread ?? 0, o.bestNetSpread),
-            }, { onConflict: 'pair_id', ignoreDuplicates: false })
-            .catch(() => {});
+              peak_net_spread: Math.max(peakSpread, o.bestNetSpread),
+            }, { onConflict: 'pair_id' });
+          } catch (upsertErr) {
+            console.error('[notify] upsert failed', upsertErr);
+          }
         }
       } catch (err) {
         console.error('[notify] failed to send alert', err);
