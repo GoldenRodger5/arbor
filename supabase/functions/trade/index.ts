@@ -896,24 +896,42 @@ async function fetchLiveKalshiAsk(ticker: string, side: 'yes' | 'no'): Promise<n
     const signPath = `/markets/${ticker}/orderbook`;
     const headers = await kalshiAuthHeaders('GET', signPath);
     const res = await fetch(`${KALSHI_BASE}${signPath}?depth=1`, { headers });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.log('[fetchLiveKalshiAsk]', { ticker, side, httpStatus: res.status, derivedAsk: null });
+      return null;
+    }
     const data = await res.json() as any;
     const fp = data.orderbook_fp ?? data.orderbook;
-    if (!fp) return null;
-    // Best ask for YES = 1 - best NO bid; best ask for NO = 1 - best YES bid.
-    // Kalshi returns bids; asks are derived from opposite side.
-    if (side === 'yes') {
-      const noBids: [string | number, string | number][] = fp.no_dollars ?? fp.no ?? [];
-      if (noBids.length === 0) return null;
-      const topNoBid = parseFloat(String(noBids[0][0]));
-      return Number.isFinite(topNoBid) ? 1 - topNoBid : null;
-    } else {
-      const yesBids: [string | number, string | number][] = fp.yes_dollars ?? fp.yes ?? [];
-      if (yesBids.length === 0) return null;
-      const topYesBid = parseFloat(String(yesBids[0][0]));
-      return Number.isFinite(topYesBid) ? 1 - topYesBid : null;
+    let result: number | null = null;
+    if (fp) {
+      if (side === 'yes') {
+        // YES ask = 1 - best NO bid (highest NO bid → lowest YES ask)
+        const noBids: [string | number, string | number][] = fp.no_dollars ?? fp.no ?? [];
+        const sorted = [...noBids].sort((a, b) => parseFloat(String(b[0])) - parseFloat(String(a[0])));
+        if (sorted.length > 0) {
+          const topNoBid = parseFloat(String(sorted[0][0]));
+          result = Number.isFinite(topNoBid) ? 1 - topNoBid : null;
+        }
+      } else {
+        // NO ask = 1 - best YES bid (highest YES bid → lowest NO ask)
+        const yesBids: [string | number, string | number][] = fp.yes_dollars ?? fp.yes ?? [];
+        const sorted = [...yesBids].sort((a, b) => parseFloat(String(b[0])) - parseFloat(String(a[0])));
+        if (sorted.length > 0) {
+          const topYesBid = parseFloat(String(sorted[0][0]));
+          result = Number.isFinite(topYesBid) ? 1 - topYesBid : null;
+        }
+      }
     }
-  } catch { return null; }
+    console.log('[fetchLiveKalshiAsk]', JSON.stringify({
+      ticker, side,
+      rawResponse: JSON.stringify(data).slice(0, 300),
+      derivedAsk: result,
+    }));
+    return result;
+  } catch (err) {
+    console.log('[fetchLiveKalshiAsk]', { ticker, side, error: String(err), derivedAsk: null });
+    return null;
+  }
 }
 
 /**
@@ -927,16 +945,31 @@ async function fetchLivePolyAsk(slug: string, isHedge: boolean): Promise<number 
       headers: { 'User-Agent': 'arbor-trade/1', 'Accept': 'application/json' },
       signal: AbortSignal.timeout(5000),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.log('[fetchLivePolyAsk]', { slug, isHedge, httpStatus: res.status, derivedAsk: null });
+      return null;
+    }
     const data = await res.json() as any;
-    const mkt = (data.markets ?? data)?.[0] ?? data;
+    // Safely extract first market whether response is { markets: [...] } or direct array/object.
+    const marketsArr = Array.isArray(data?.markets) ? data.markets
+                     : Array.isArray(data) ? data
+                     : [data];
+    const mkt = marketsArr[0];
     const sides = mkt?.marketSides ?? [];
-    if (sides.length < 2) return null;
     // Side 0 = long (YES/not-hedge), side 1 = short (NO/hedge)
     const side = isHedge ? sides[1] : sides[0];
     const price = parseFloat(String(side?.price ?? ''));
-    return Number.isFinite(price) ? price : null;
-  } catch { return null; }
+    const result = (sides.length >= 2 && Number.isFinite(price)) ? price : null;
+    console.log('[fetchLivePolyAsk]', JSON.stringify({
+      slug, isHedge,
+      rawResponse: JSON.stringify(data).slice(0, 300),
+      derivedAsk: result,
+    }));
+    return result;
+  } catch (err) {
+    console.log('[fetchLivePolyAsk]', { slug, isHedge, error: String(err), derivedAsk: null });
+    return null;
+  }
 }
 
 /**
@@ -981,13 +1014,15 @@ async function refreshOpportunityPrices(
                 Math.abs(polyPrice   - originalPolyPrice)   > 0.02;
 
   console.log('[price-refresh]', JSON.stringify({
-    kalshiAsk: kalshiPrice.toFixed(4),
-    polyAsk: polyPrice.toFixed(4),
-    originalSpread: (originalNetSpread * 100).toFixed(2) + '%',
-    currentSpread: (netSpread * 100).toFixed(2) + '%',
+    kalshiRawPrice: originalKalshiPrice,
+    polyRawPrice: originalPolyPrice,
+    liveKalshiPrice: kalshiPrice,
+    livePolyPrice: polyPrice,
+    liveTotalCost: costPerPair,
+    liveGrossSpread: grossSpread,
+    liveNetSpread: netSpread,
     liveKalshiFetched: liveKalshi !== null,
     livePolyFetched: livePoly !== null,
-    stale,
     action: netSpread < MIN_NET_SPREAD ? 'abort' : 'proceed',
   }));
 
