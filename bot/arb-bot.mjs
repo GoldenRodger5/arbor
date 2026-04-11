@@ -272,24 +272,30 @@ async function fetchKalshiSportsMarkets() {
 
 async function fetchPolymarketSportsMarkets() {
   const markets = [];
-  try {
-    const res = await fetch('https://gateway.polymarket.us/v1/markets?limit=200&active=true&closed=false', {
-      headers: { 'User-Agent': 'arbor-bot/1', 'Accept': 'application/json' },
-    });
-    if (!res.ok) { console.error('[init] Poly US HTTP', res.status); return []; }
-    const data = await res.json();
-    for (const m of data.markets ?? []) {
-      if (m.closed || !m.active) continue;
-      const sides = m.marketSides ?? [];
-      if (sides.length < 2) continue;
-      const team0 = sides[0]?.team;
-      const team1 = sides[1]?.team;
-      if (!team0?.name || !team1?.name) continue; // sports markets have team objects
+  // Paginate to catch moneyline markets which may not be on page 1
+  for (let offset = 0; offset < 1000; offset += 200) {
+    try {
+      const res = await fetch(`https://gateway.polymarket.us/v1/markets?limit=200&offset=${offset}&active=true&closed=false`, {
+        headers: { 'User-Agent': 'arbor-bot/1', 'Accept': 'application/json' },
+      });
+      if (!res.ok) break;
+      const data = await res.json();
+      const batch = data.markets ?? [];
+      if (batch.length === 0) break;
+      for (const m of batch) {
+        if (m.closed || !m.active) continue;
+        // Only moneyline (game-winner) markets — skip futures, props, drawable
+        if (m.marketType !== 'moneyline') continue;
+        const sides = m.marketSides ?? [];
+        if (sides.length < 2) continue;
+        const team0 = sides[0]?.team;
+        const team1 = sides[1]?.team;
+        if (!team0?.name || !team1?.name) continue;
 
-      const slug = m.slug ?? '';
-      const side0Price = parseFloat(String(sides[0].price ?? '0'));
-      const side1Price = parseFloat(String(sides[1].price ?? '0'));
-      if (!side0Price || !side1Price) continue;
+        const slug = m.slug ?? '';
+        const side0Price = parseFloat(String(sides[0].price ?? '0'));
+        const side1Price = parseFloat(String(sides[1].price ?? '0'));
+        if (!side0Price || !side1Price) continue;
 
       markets.push({
         slug,
@@ -299,11 +305,13 @@ async function fetchPolymarketSportsMarkets() {
         team1: (team1.alias ?? team1.name).toLowerCase(),
       });
       polyBooks.set(slug, { side0Price, side1Price });
+      }
+    } catch (e) {
+      console.error('[init] Poly fetch failed:', e.message);
+      break;
     }
-  } catch (e) {
-    console.error('[init] Poly fetch failed:', e.message);
   }
-  console.log(`[init] Polymarket: ${markets.length} sports markets`);
+  console.log(`[init] Polymarket: ${markets.length} moneyline markets`);
   return markets;
 }
 
@@ -337,7 +345,8 @@ function matchMarkets(kalshiMarkets, polyMarkets) {
       }
     }
 
-    if (bestPoly) {
+    if (bestPoly && bestOverlap >= 2) {
+      // Require overlap of at least 2 teams (both teams must match)
       const lastH = km.ticker.lastIndexOf('-');
       const baseTicker = lastH > 0 ? km.ticker.slice(0, lastH) : km.ticker;
       matchedPairs.set(baseTicker, {
@@ -345,8 +354,9 @@ function matchMarkets(kalshiMarkets, polyMarkets) {
         kalshiTicker: km.ticker,
         polySlug: bestPoly.slug,
         teams: [bestPoly.team0, bestPoly.team1],
-        kalshiYesTeam: bestPoly.team0, // first team = YES on Kalshi (after dedup)
+        kalshiYesTeam: bestPoly.team0,
       });
+      console.log(`[match] ${km.ticker} → ${bestPoly.slug} (${bestPoly.team0} vs ${bestPoly.team1}) s0=$${bestPoly.side0Price} s1=$${bestPoly.side1Price}`);
     }
   }
 
@@ -377,12 +387,13 @@ function connectKalshiWS() {
 
   ws.on('open', () => {
     console.log('[kalshi-ws] connected');
-    // Subscribe to orderbook deltas for all matched tickers
+    // Subscribe to orderbook deltas for all matched tickers (one at a time per API docs)
+    let subId = 1;
     for (const pair of matchedPairs.values()) {
       ws.send(JSON.stringify({
-        id: 1,
+        id: subId++,
         cmd: 'subscribe',
-        params: { channels: ['orderbook_delta'], market_tickers: [pair.kalshiTicker] },
+        params: { channels: ['orderbook_delta'], market_ticker: pair.kalshiTicker },
       }));
     }
     console.log(`[kalshi-ws] subscribed to ${matchedPairs.size} tickers`);
@@ -398,21 +409,18 @@ function connectKalshiWS() {
 
         // Update local book from snapshot or delta
         const book = kalshiBooks.get(ticker) ?? { yesAsk: 0.5, noAsk: 0.5 };
+        // Update bids from WS data, but DON'T derive asks from bids
+        // (bid-ask spread makes that inaccurate). Keep the listing ask prices.
         if (msg.msg.yes) {
-          // Parse best yes bid → derive no ask
           const yesBids = msg.msg.yes ?? [];
           if (yesBids.length > 0) {
-            const topBid = Math.max(...yesBids.map(([p]) => parseFloat(String(p))));
-            book.noAsk = 1 - topBid;
-            book.yesBid = topBid;
+            book.yesBid = Math.max(...yesBids.map(([p]) => parseFloat(String(p))));
           }
         }
         if (msg.msg.no) {
           const noBids = msg.msg.no ?? [];
           if (noBids.length > 0) {
-            const topBid = Math.max(...noBids.map(([p]) => parseFloat(String(p))));
-            book.yesAsk = 1 - topBid;
-            book.noBid = topBid;
+            book.noBid = Math.max(...noBids.map(([p]) => parseFloat(String(p))));
           }
         }
         kalshiBooks.set(ticker, book);
