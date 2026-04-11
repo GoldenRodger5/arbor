@@ -417,30 +417,62 @@ async function checkLiveScoreEdges() {
         let highCertainty = false;
         let estimatedWinProb = 0.5;
 
-        if (league === 'mlb' && period >= 8 && diff >= 4) {
+        // Threshold to trigger Claude assessment — not the final probability
+        if (league === 'mlb' && period >= 7 && diff >= 3) {
           highCertainty = true;
-          estimatedWinProb = 0.95;
-        } else if (league === 'nba' && period >= 4 && diff >= 15) {
+        } else if (league === 'nba' && period >= 3 && diff >= 12) {
           highCertainty = true;
-          estimatedWinProb = 0.97;
         } else if (league === 'nhl' && period >= 3 && diff >= 2) {
           highCertainty = true;
-          estimatedWinProb = 0.92;
         }
+
+        // Ask Claude for precise win probability instead of hardcoded values
+        if (highCertainty && ANTHROPIC_KEY) {
+          try {
+            stats.claudeCalls++;
+            const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+              method: 'POST',
+              headers: {
+                'x-api-key': ANTHROPIC_KEY,
+                'anthropic-version': '2023-06-01',
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                model: 'claude-haiku-4-5-20251001',
+                max_tokens: 100,
+                messages: [{ role: 'user', content:
+                  `${league.toUpperCase()} game: ${away.team?.displayName} ${awayScore} at ${home.team?.displayName} ${homeScore}, ` +
+                  `${comp.status?.type?.shortDetail ?? period + 'th period'}. ` +
+                  `What is the probability that ${leadingName} wins? Reply with ONLY a number between 0.50 and 0.99, nothing else.`
+                }],
+              }),
+            });
+            if (claudeRes.ok) {
+              const cData = await claudeRes.json();
+              const probStr = cData.content?.[0]?.text?.match(/0\.\d+/)?.[0];
+              if (probStr) estimatedWinProb = parseFloat(probStr);
+            }
+          } catch { /* keep default */ }
+        }
+        if (estimatedWinProb <= 0.5) estimatedWinProb = 0.90; // fallback
 
         if (!highCertainty) continue;
 
+        const homeName = (home.team?.displayName ?? '').toLowerCase();
+        const awayName = (away.team?.displayName ?? '').toLowerCase();
+        const homeWords = homeName.split(' ').filter(w => w.length > 3);
+        const awayWords = awayName.split(' ').filter(w => w.length > 3);
+
         console.log(`[live-edge] High certainty: ${leadingName} leading ${homeScore}-${awayScore} in P${period} (${league}) ~${(estimatedWinProb*100).toFixed(0)}%`);
 
-        // Find matching Kalshi market
+        // Find matching Kalshi market — BOTH teams must appear in the title
         const params = new URLSearchParams({ series_ticker: series, status: 'open', limit: '100' });
         const mkts = await kalshiGet(`/markets?${params}`);
         for (const m of mkts.markets ?? []) {
           const title = (m.title ?? '').toLowerCase();
-          // Match by any word in the team name (>3 chars) against the market title
-          const teamWords = leadingName.split(' ').filter(w => w.length > 3);
-          const matchesTitle = teamWords.some(w => title.includes(w));
-          if (!matchesTitle) continue;
+          const matchesHome = homeWords.some(w => title.includes(w));
+          const matchesAway = awayWords.some(w => title.includes(w));
+          if (!matchesHome || !matchesAway) continue; // BOTH teams must match
 
           // Check cooldown
           if (Date.now() - (tradeCooldowns.get(m.ticker) ?? 0) < COOLDOWN_MS) continue;
