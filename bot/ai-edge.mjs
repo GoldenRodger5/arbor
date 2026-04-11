@@ -474,6 +474,21 @@ async function checkLiveScoreEdges() {
           const matchesAway = awayWords.some(w => title.includes(w));
           if (!matchesHome || !matchesAway) continue; // BOTH teams must match
 
+          // Date check: only match TODAY's game, not future dates
+          const tickerDateMatch = m.ticker.match(/-(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})/i);
+          if (tickerDateMatch) {
+            const monthIdx = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC']
+              .indexOf(tickerDateMatch[2].toUpperCase());
+            const tickerDay = parseInt(tickerDateMatch[3]);
+            const tickerMonth = monthIdx;
+            const today = new Date();
+            const todayDay = today.getUTCDate();
+            const todayMonth = today.getUTCMonth();
+            if (tickerDay !== todayDay || tickerMonth !== todayMonth) {
+              continue; // wrong day — skip
+            }
+          }
+
           // Check cooldown
           if (Date.now() - (tradeCooldowns.get(m.ticker) ?? 0) < COOLDOWN_MS) continue;
 
