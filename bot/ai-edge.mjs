@@ -34,10 +34,11 @@ const ANTHROPIC_KEY = process.env.VITE_ANTHROPIC_API_KEY ?? process.env.ANTHROPI
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 
-const MIN_EDGE_PCT = 5;          // Claude must estimate >= 5% edge to trade
-const MAX_TRADE_USD = 30;        // Conservative: $30 per directional bet
-const POLL_INTERVAL_MS = 2 * 60 * 1000; // Check news every 2 minutes
-const COOLDOWN_MS = 30 * 60 * 1000;     // 30 min cooldown per market after trading
+const MIN_EDGE_PCT = 3;          // 3% edge minimum — real edges are small but frequent
+const MAX_TRADE_FRACTION = 0.25; // Use up to 25% of balance per trade
+const MAX_TRADE_CAP = 50;        // Hard cap $50 per trade
+const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
+const COOLDOWN_MS = 15 * 60 * 1000; // 15 min cooldown per market
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth
@@ -332,8 +333,9 @@ async function executeTrade(market, assessment) {
   const kellyFraction = odds > 0 ? edge / odds : 0;
   const halfKelly = 0.5 * kellyFraction;
 
-  // Size: half Kelly on available balance, capped at MAX_TRADE_USD
-  const budget = Math.min(MAX_TRADE_USD, kalshiBalance * halfKelly);
+  // Size: half Kelly on available balance, capped at 25% of balance or $50
+  const maxTrade = Math.min(MAX_TRADE_CAP, kalshiBalance * MAX_TRADE_FRACTION);
+  const budget = Math.min(maxTrade, kalshiBalance * halfKelly);
   const qty = Math.max(1, Math.floor(budget / price));
   const deployed = qty * price;
   const priceInCents = Math.round(price * 100);
@@ -373,6 +375,132 @@ async function executeTrade(market, assessment) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Live Score Edge — buy winning sides in late games at discount
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkLiveScoreEdges() {
+  const sports = [
+    { league: 'mlb', path: 'baseball/mlb', series: 'KXMLBGAME' },
+    { league: 'nba', path: 'basketball/nba', series: 'KXNBAGAME' },
+    { league: 'nhl', path: 'hockey/nhl', series: 'KXNHLGAME' },
+  ];
+
+  for (const { league, path, series } of sports) {
+    try {
+      const res = await fetch(
+        `http://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard`,
+        { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) },
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+
+      for (const ev of data.events ?? []) {
+        const comp = ev.competitions?.[0];
+        if (!comp || comp.status?.type?.state !== 'in') continue;
+
+        const period = parseInt(comp.status?.period ?? '0');
+        const clock = comp.status?.displayClock ?? '';
+        const competitors = comp.competitors ?? [];
+        if (competitors.length < 2) continue;
+
+        const home = competitors.find(c => c.homeAway === 'home');
+        const away = competitors.find(c => c.homeAway === 'away');
+        if (!home || !away) continue;
+
+        const homeScore = parseInt(home.score ?? '0');
+        const awayScore = parseInt(away.score ?? '0');
+        const diff = Math.abs(homeScore - awayScore);
+        const leading = homeScore > awayScore ? home : away;
+        const leadingName = (leading.team?.displayName ?? '').toLowerCase();
+
+        // High-certainty late-game situations
+        let highCertainty = false;
+        let estimatedWinProb = 0.5;
+
+        if (league === 'mlb' && period >= 8 && diff >= 4) {
+          highCertainty = true;
+          estimatedWinProb = 0.95;
+        } else if (league === 'nba' && period >= 4 && diff >= 15) {
+          highCertainty = true;
+          estimatedWinProb = 0.97;
+        } else if (league === 'nhl' && period >= 3 && diff >= 2) {
+          highCertainty = true;
+          estimatedWinProb = 0.92;
+        }
+
+        if (!highCertainty) continue;
+
+        // Find matching Kalshi market
+        const params = new URLSearchParams({ series_ticker: series, status: 'open', limit: '100' });
+        const mkts = await kalshiGet(`/markets?${params}`);
+        for (const m of mkts.markets ?? []) {
+          const title = (m.title ?? '').toLowerCase();
+          if (!title.includes(leadingName.split(' ').pop())) continue;
+
+          // Check cooldown
+          if (Date.now() - (tradeCooldowns.get(m.ticker) ?? 0) < COOLDOWN_MS) continue;
+
+          const yesAsk = m.yes_ask_dollars ? parseFloat(m.yes_ask_dollars) : null;
+          const noAsk = m.no_ask_dollars ? parseFloat(m.no_ask_dollars) : null;
+          if (!yesAsk || !noAsk) continue;
+
+          // Determine which side is the winning team
+          // The ticker suffix tells us what YES means
+          const lastH = m.ticker.lastIndexOf('-');
+          const suffix = m.ticker.slice(lastH + 1).toLowerCase();
+          const leadingTeamCode = leadingName.split(' ').pop();
+
+          let winningSide, winningPrice;
+          if (suffix.includes(leadingTeamCode?.slice(0, 3) ?? '???')) {
+            winningSide = 'yes';
+            winningPrice = yesAsk;
+          } else {
+            winningSide = 'no';
+            winningPrice = noAsk;
+          }
+
+          // Only trade if market is mispriced — winning side should be near estimatedWinProb
+          // but market has it lower
+          const edge = estimatedWinProb - winningPrice;
+          if (edge < 0.03) continue; // need at least 3% edge
+
+          const maxTrade = Math.min(MAX_TRADE_CAP, kalshiBalance * MAX_TRADE_FRACTION);
+          const qty = Math.max(1, Math.floor(maxTrade / winningPrice));
+          const priceInCents = Math.round(winningPrice * 100);
+
+          console.log(`[live-edge] ${m.title} — ${leadingName} winning ${homeScore}-${awayScore} P${period}`);
+          console.log(`  ${winningSide.toUpperCase()} @${priceInCents}¢ (market) vs ${(estimatedWinProb*100).toFixed(0)}% (est) → edge ${(edge*100).toFixed(1)}%`);
+
+          tradeCooldowns.set(m.ticker, Date.now());
+          const result = await kalshiPost('/portfolio/orders', {
+            ticker: m.ticker, action: 'buy', side: winningSide, count: qty,
+            yes_price: winningSide === 'yes' ? priceInCents : 100 - priceInCents,
+          });
+
+          if (result.ok) {
+            stats.tradesPlaced++;
+            const deployed = qty * winningPrice;
+            const profit = qty * edge;
+            await tg(
+              `⚡ <b>LIVE SCORE EDGE</b>\n\n` +
+              `<b>${m.title}</b>\n` +
+              `Score: ${homeScore}-${awayScore} (${comp.status?.type?.shortDetail ?? ''})\n\n` +
+              `BUY ${winningSide.toUpperCase()} @ $${winningPrice.toFixed(2)} × ${qty}\n` +
+              `Deployed: <b>$${deployed.toFixed(2)}</b>\n` +
+              `Est win prob: ${(estimatedWinProb*100).toFixed(0)}% vs market ${(winningPrice*100).toFixed(0)}%\n` +
+              `Edge: <b>${(edge*100).toFixed(1)}%</b> → profit ~$${profit.toFixed(2)}`
+            );
+          }
+          break; // one trade per game
+        }
+      }
+    } catch (e) {
+      console.error(`[live-edge] ${league} error:`, e.message);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main Loop
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -390,6 +518,9 @@ async function pollCycle() {
   if (newsItems.length > 0) {
     console.log(`[ai-edge] ${newsItems.length} new items:`, newsItems.map(n => n.headline.slice(0, 50)).join(' | '));
   }
+
+  // Step 1b: Check live scores for high-certainty winners
+  await checkLiveScoreEdges();
 
   // Step 2-4: For each news item, find markets and assess edge
   for (const news of newsItems) {

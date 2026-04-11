@@ -14,20 +14,11 @@ module.exports = {
       out_file: './logs/arb-out.log',
       merge_logs: true,
     },
-    {
-      name: 'arbor-mm',
-      script: 'market-maker.mjs',
-      watch: false,
-      autorestart: true,
-      max_restarts: 50,
-      restart_delay: 10000,
-      max_memory_restart: '200M',
-      env: { NODE_ENV: 'production' },
-      log_date_format: 'YYYY-MM-DD HH:mm:ss',
-      error_file: './logs/mm-error.log',
-      out_file: './logs/mm-out.log',
-      merge_logs: true,
-    },
+    // Market maker disabled — thin sports markets cause one-sided fills
+    // {
+    //   name: 'arbor-mm',
+    //   script: 'market-maker.mjs',
+    // },
     {
       name: 'arbor-ai',
       script: 'ai-edge.mjs',
