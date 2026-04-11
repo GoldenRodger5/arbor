@@ -956,8 +956,10 @@ async function fetchLivePolyAsk(slug: string, isHedge: boolean): Promise<number 
                      : [data];
     const mkt = marketsArr[0];
     const sides = mkt?.marketSides ?? [];
-    // Side 0 = long (YES/not-hedge), side 1 = short (NO/hedge)
-    const side = isHedge ? sides[1] : sides[0];
+    // sides[0] = long/YES, sides[1] = short/NO
+    // isHedge=true → Poly buys NO (sides[1]); isHedge=false → Poly buys YES (sides[0])
+    const sideIdx = isHedge ? 1 : 0;
+    const side = sides[sideIdx];
     const price = parseFloat(String(side?.price ?? ''));
     const result = (sides.length >= 2 && Number.isFinite(price)) ? price : null;
     console.log('[fetchLivePolyAsk]', JSON.stringify({
@@ -996,7 +998,10 @@ async function refreshOpportunityPrices(
 }> {
   const [liveKalshi, livePoly] = await Promise.all([
     fetchLiveKalshiAsk(kTicker, kalshiSide),
-    polySlug ? fetchLivePolyAsk(polySlug, true) : Promise.resolve(null),
+    // Polymarket buys the OPPOSITE side to Kalshi.
+    // kalshiSide=yes → poly buys NO (isHedge=true → sides[1])
+    // kalshiSide=no  → poly buys YES (isHedge=false → sides[0])
+    polySlug ? fetchLivePolyAsk(polySlug, kalshiSide === 'yes') : Promise.resolve(null),
   ]);
 
   const kalshiPrice = liveKalshi ?? originalKalshiPrice;
