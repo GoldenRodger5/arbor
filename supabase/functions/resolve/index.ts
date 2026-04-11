@@ -45,14 +45,14 @@ const TG_API             = `https://api.telegram.org/bot${Deno.env.get('TELEGRAM
 const TELEGRAM_CHAT_ID   = Deno.env.get('TELEGRAM_CHAT_ID') ?? '';
 const GLOBAL_DRY_RUN     = Deno.env.get('TRADE_DRY_RUN') === 'true';
 
-// Alert threshold: only fire if winning side is below this
-const ARB_THRESHOLD = 0.95;
-// Fee: Kalshi charges ~1% on winning contracts at settlement
-const RESOLUTION_FEE_RATE = 0.01;
-// Only check markets closed within last N hours
-const LOOKBACK_HOURS = 6;
-// $850 PredictIt-style cap per single-leg resolution trade
-const MAX_RESOLUTION_USD = 200;
+// Alert threshold: winning side below this → profitable to buy
+const ARB_THRESHOLD = 0.99;  // catch even 1% arbs — they compound fast
+// Fee: Kalshi taker 0.07 parabolic. At $0.95 price: 0.07 * 0.95 * 0.05 = 0.33¢/contract
+const RESOLUTION_FEE_RATE = 0.07;
+// Check markets closed within last N hours
+const LOOKBACK_HOURS = 12;
+// Max USD per resolution trade — scales with capital
+const MAX_RESOLUTION_USD = 500;
 // Sports game ticker pattern — only these have ESPN cross-check
 const SPORTS_GAME_RE = /^KX(MLB|NBA|NFL|NHL)GAME-/i;
 
@@ -252,7 +252,9 @@ function findOpportunities(markets: KalshiMarketRaw[]): ResolutionOpportunity[] 
     if (winningAsk <= 0.001) continue;
 
     const gross    = 1.0 - winningAsk;
-    const netProfit = gross * (1 - RESOLUTION_FEE_RATE);
+    // Kalshi fee: 0.07 * P * (1-P) parabolic
+    const fee = RESOLUTION_FEE_RATE * winningAsk * (1 - winningAsk);
+    const netProfit = gross - fee;
     const netPct    = netProfit / winningAsk;
 
     const sportInfo = parseTicker(m.event_ticker ?? m.ticker ?? '');
@@ -471,7 +473,7 @@ async function executeResolutionOrder(
     console.log('[resolve-order]', JSON.stringify({ status: res.status, ticker, side, count, response: data }));
     if (!res.ok) return null;
     const ord = data.order ?? data;
-    return { orderId: ord.order_id ?? String(Date.now()), filled: ord.quantity_filled ?? count };
+    return { orderId: ord.order_id ?? String(Date.now()), filled: ord.quantity_filled ?? ord.filled ?? 0 };
   } catch (err) {
     console.error('[resolve-order] threw', err);
     return null;
@@ -991,10 +993,11 @@ serve(async (req) => {
   }));
 
   let alertsFired = 0;
+  let autoExecuted = 0;
   for (const opp of actionable) {
     // Persist to resolution_opportunities so trade.ts can look up by slugified ID.
     if (sb) {
-      const qty = Math.max(1, Math.floor(200 / opp.winningAsk));
+      const qty = Math.max(1, Math.floor(MAX_RESOLUTION_USD / opp.winningAsk));
       await sb.from('resolution_opportunities').upsert({
         platform:             'kalshi',
         market_id:            opp.ticker,
@@ -1013,6 +1016,42 @@ serve(async (req) => {
     // Alert via Telegram.
     await alertOpportunity(opp, dryRun);
     alertsFired++;
+
+    // Auto-execute ESPN-verified resolution arbs (single-leg, guaranteed profit).
+    if (opp.espnVerified && !dryRun && opp.netPct > 0.005) {
+      const qty = Math.max(1, Math.floor(MAX_RESOLUTION_USD / opp.winningAsk));
+      const priceInCents = Math.round(opp.winningAsk * 100);
+      console.log('[resolve-auto-execute]', JSON.stringify({
+        ticker: opp.ticker, side: opp.winningSide, qty, priceInCents,
+        netPct: (opp.netPct * 100).toFixed(2) + '%',
+      }));
+      const result = await executeResolutionOrder(
+        opp.ticker, opp.winningSide, qty, priceInCents, false,
+      );
+      if (result && result.filled > 0) {
+        autoExecuted++;
+        const deployed = result.filled * opp.winningAsk;
+        const profit = result.filled * opp.netProfit;
+        // Mark as executed
+        if (sb) {
+          await sb.from('resolution_opportunities')
+            .update({ executed: true })
+            .eq('market_id', opp.ticker).catch(() => {});
+        }
+        await sendTelegram({
+          text:
+            `🏁 <b>RESOLUTION AUTO-EXECUTED</b>\n\n` +
+            `<b>${trunc(htmlEscape(opp.title))}</b>\n\n` +
+            `${opp.espnVerified ? 'ESPN confirmed ✅' : ''}\n` +
+            `BUY ${opp.winningSide.toUpperCase()} @ $${opp.winningAsk.toFixed(2)} × ${result.filled}\n\n` +
+            `Deployed: <b>$${deployed.toFixed(2)}</b>\n` +
+            `Expected profit: <b>+$${profit.toFixed(2)}</b> (${(opp.netPct * 100).toFixed(1)}%)\n` +
+            `Settles within 2 hours`,
+        });
+      } else {
+        console.log('[resolve-auto-execute] failed or 0 filled', opp.ticker);
+      }
+    }
 
     // Log to spread_events for tracking.
     if (sb) {

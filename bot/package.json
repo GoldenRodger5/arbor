@@ -1,0 +1,13 @@
+{
+  "name": "arbor-ws-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node arb-bot.mjs",
+    "dev": "node --watch arb-bot.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "dotenv": "^16.4.0"
+  }
+}
