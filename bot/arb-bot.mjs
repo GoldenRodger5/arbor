@@ -399,7 +399,7 @@ function connectKalshiWS() {
     console.log(`[kalshi-ws] subscribed to ${matchedPairs.size} tickers`);
   });
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.type === 'orderbook_snapshot' || msg.type === 'orderbook_delta') {
@@ -407,22 +407,34 @@ function connectKalshiWS() {
         const ticker = msg.msg?.market_ticker;
         if (!ticker) return;
 
-        // Update local book from snapshot or delta
-        const book = kalshiBooks.get(ticker) ?? { yesAsk: 0.5, noAsk: 0.5 };
-        // Update bids from WS data, but DON'T derive asks from bids
-        // (bid-ask spread makes that inaccurate). Keep the listing ask prices.
-        if (msg.msg.yes) {
-          const yesBids = msg.msg.yes ?? [];
-          if (yesBids.length > 0) {
-            book.yesBid = Math.max(...yesBids.map(([p]) => parseFloat(String(p))));
+        // WS gives us bid levels. We need ask prices. Two sources:
+        //   1. Listing: yes_ask_dollars/no_ask_dollars (authoritative but stale)
+        //   2. Derived: 1 - opposite_bid (real-time but wider due to bid-ask spread)
+        // Strategy: on every WS update, re-fetch the individual market listing
+        // for real ask prices. This adds ~100ms latency but ensures accuracy.
+        // Only re-fetch if we haven't in the last 5 seconds (rate limit).
+        const book = kalshiBooks.get(ticker);
+        if (!book) { kalshiBooks.set(ticker, { yesAsk: 0.5, noAsk: 0.5, yesBid: 0, noBid: 0, lastFetch: 0 }); return; }
+
+        const now = Date.now();
+        if (now - (book.lastFetch ?? 0) < 5000) return; // rate limit re-fetch
+        book.lastFetch = now;
+
+        // Re-fetch individual market for real ask prices
+        try {
+          const mktPath = `/markets/${ticker}`;
+          const mktHeaders = kalshiSign('GET', mktPath);
+          const mktRes = await fetch(`${KALSHI_REST}${mktPath}`, { headers: mktHeaders });
+          if (mktRes.ok) {
+            const mktData = await mktRes.json();
+            const mkt = mktData.market ?? mktData;
+            const ya = mkt.yes_ask_dollars != null ? parseFloat(mkt.yes_ask_dollars) : null;
+            const na = mkt.no_ask_dollars != null ? parseFloat(mkt.no_ask_dollars) : null;
+            if (ya != null && ya > 0) book.yesAsk = ya;
+            if (na != null && na > 0) book.noAsk = na;
           }
-        }
-        if (msg.msg.no) {
-          const noBids = msg.msg.no ?? [];
-          if (noBids.length > 0) {
-            book.noBid = Math.max(...noBids.map(([p]) => parseFloat(String(p))));
-          }
-        }
+        } catch { /* keep existing prices */ }
+
         kalshiBooks.set(ticker, book);
 
         // Find which pair this ticker belongs to and check arb
