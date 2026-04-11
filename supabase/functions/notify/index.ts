@@ -790,6 +790,19 @@ serve(async (req) => {
           console.error('[auto-execute] fetch threw:', err);
         }
 
+        // Write alerted_at so the 6h dedup prevents re-alerting this opp.
+        try {
+          await sb.from('spread_events').upsert({
+            pair_id: fullPairId,
+            was_alerted: true,
+            alerted_at: new Date().toISOString(),
+            last_net_spread: o.bestNetSpread,
+            peak_net_spread: o.bestNetSpread,
+          }, { onConflict: 'pair_id' });
+        } catch (upsertErr) {
+          console.error('[auto-execute] upsert failed', upsertErr);
+        }
+
         // Step 6: 3 second pause for balance to settle before next trade.
         await new Promise(r => setTimeout(r, 3000));
       }
