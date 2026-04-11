@@ -240,6 +240,17 @@ export async function getAnalyticsSummary(): Promise<AnalyticsSummary> {
     deployedCapital = (c.deployed_capital as number) ?? 0;
     safetyReservePct = (c.safety_reserve_pct as number) ?? 0.2;
     realizedPnl     = (c.realized_pnl     as number) ?? 0;
+  } else if (capitalRes.status === 'fulfilled' && !capitalRes.value.data) {
+    // No capital_ledger row exists — insert a default so the dashboard shows real values.
+    // $291 = Kalshi ~$191 + Polymarket ~$100 starting capital.
+    sb.from('capital_ledger').insert({
+      total_capital: 291,
+      deployed_capital: 0,
+      safety_reserve_pct: 0.10,
+      realized_pnl: 0,
+    }).catch(() => {/* anon key may not have insert rights — silent */});
+    totalCapital = 291;
+    safetyReservePct = 0.10;
   }
   const activeCapital = totalCapital * (1 - safetyReservePct) - deployedCapital + realizedPnl;
 

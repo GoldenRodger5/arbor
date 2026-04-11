@@ -1922,6 +1922,8 @@ const POLY_US_GATEWAY = 'https://gateway.polymarket.us';
  *   outcomes: ["Label0","Label1"], outcomePrices: ["0.55","0.45"],
  *   marketSides: [{ id, description, price, long, team: { name, abbreviation, league } }]
  */
+let _polyUSSportsRawLogged = 0;
+
 function normalizePolyUSMarket(m: any): UnifiedMarket | null {
   if (!m || m.closed || !m.active) return null;
 
@@ -1958,6 +1960,18 @@ function normalizePolyUSMarket(m: any): UnifiedMarket | null {
 
   // Build URL to polymarket.us
   const url = m.slug ? `https://polymarket.us/market/${m.slug}` : undefined;
+
+  // Log raw time fields for the first 3 sports markets to confirm gameStartTime.
+  if (sportLeague && _polyUSSportsRawLogged < 3) {
+    _polyUSSportsRawLogged++;
+    console.log('[poly-us-raw-sample]', JSON.stringify({
+      slug: m.slug,
+      endDate: m.endDate,
+      gameStartTime: m.gameStartTime,
+      startDate: m.startDate,
+      startTime: m.startTime,
+    }));
+  }
 
   // Use gameStartTime as closeTime when available — it's the actual game time.
   // endDate is the settlement deadline (often 2 weeks later) which breaks
@@ -3712,6 +3726,47 @@ interface VerdictDistribution {
   PENDING: number;
 }
 
+/**
+ * Fetch in-progress games from ESPN for all four sports.
+ * Returns a Set of sorted team-name pairs like "athletics mets"
+ * so the date filter can drop pairs whose game has already started.
+ * Fails open — returns empty Set if ESPN is unreachable.
+ */
+async function fetchESPNLiveGames(): Promise<Set<string>> {
+  const liveKeys = new Set<string>();
+  const sports = [
+    { path: 'baseball/mlb' },
+    { path: 'basketball/nba' },
+    { path: 'hockey/nhl' },
+    { path: 'football/nfl' },
+  ];
+  const results = await Promise.allSettled(
+    sports.map(({ path }) =>
+      fetch(`http://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard`, {
+        headers: { 'User-Agent': 'arbor-scanner/1' },
+        signal: AbortSignal.timeout(6000),
+      }).then(r => r.ok ? r.json() as Promise<{ events?: any[] }> : Promise.resolve({ events: [] }))
+    ),
+  );
+  for (const r of results) {
+    if (r.status === 'rejected') continue;
+    for (const ev of r.value.events ?? []) {
+      const comp = ev.competitions?.[0];
+      if (!comp) continue;
+      if (comp.status?.type?.state !== 'in') continue;
+      const names = (comp.competitors ?? [])
+        .map((c: any) => (c.team?.displayName ?? c.team?.name ?? '').toLowerCase())
+        .filter(Boolean)
+        .sort();
+      if (names.length >= 2) liveKeys.add(names.join(' '));
+    }
+  }
+  if (liveKeys.size > 0) {
+    console.log('[espn-live-games]', JSON.stringify([...liveKeys]));
+  }
+  return liveKeys;
+}
+
 async function runScanCycle(
   sb: SupabaseClient,
   opts: { skipClaude?: boolean } = {},
@@ -3816,9 +3871,10 @@ async function runScanCycle(
   errors: string[];
 }> {
   const errors: string[] = [];
-  // Reset module-level recurrence-filter state for this scan.
+  // Reset module-level state for this scan.
   _recurrenceRejected = 0;
   _recurrenceRejectionSamples = [];
+  _polyUSSportsRawLogged = 0;
   // 1. Fetch markets in parallel — Kalshi, Polymarket, PredictIt, and new platforms.
   // New platform stubs (cryptocom/fanduel/fanatics/og) return [] until their APIs
   // are accessible; they each log [platform-fetch] with the HTTP status so we can
@@ -3886,6 +3942,10 @@ async function runScanCycle(
     JSON.stringify(kalshiMarkets.slice(0, 5).map((m) => m.title)),
   );
   console.log(`[scanner] fuzzy threshold: ${FUZZY_THRESHOLD}`);
+
+  // Fetch ESPN live games in parallel with market processing — used to drop
+  // pairs whose game is already in progress before pairing/scoring.
+  const liveGamesPromise = fetchESPNLiveGames();
 
   console.log(
     `[scanner] poly sample:`,
@@ -3984,6 +4044,9 @@ async function runScanCycle(
   // both legs. Pairs also have to clear a per-category fuzzy threshold
   // check at this stage because the matcher uses a single low cutoff to
   // keep all categories.
+  // Await live game list (started earlier in parallel with market fetching).
+  const liveGames = await liveGamesPromise;
+
   const filterNow = Date.now();
   const beforeDateFilter = allCandidates.length;
   const droppedByDate: Record<PairCategory, number> = {
@@ -4069,6 +4132,15 @@ async function runScanCycle(
       dropDetail.minFloor[cat]++;
       if (cat === 'sports') droppedSportsInProgress++;
       return false;
+    }
+    // Drop sports pairs where the game is currently in progress.
+    if (cat === 'sports' && p.kalshi.sportTeams && p.kalshi.sportTeams.length >= 2) {
+      const key = [...p.kalshi.sportTeams].sort().join(' ');
+      if (liveGames.has(key)) {
+        droppedSportsInProgress++;
+        dropDetail.minFloor[cat]++;
+        return false;
+      }
     }
     const maxDays = maxDaysForCategory(cat);
     const kDays = daysFromNow(k, filterNow);
@@ -4164,6 +4236,10 @@ async function runScanCycle(
     afterDateFilter: piPostFilter,
     survived: '(see [predictit-survived] after sort)',
   }));
+  console.log('[live-game-filter]', {
+    liveGamesCount: liveGames.size,
+    droppedInProgress: droppedSportsInProgress,
+  });
   console.log('[dropDetail]', JSON.stringify(dropDetail));
   if (sportsProximityGapsHours.length > 0) {
     console.log(

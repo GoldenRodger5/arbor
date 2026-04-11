@@ -734,9 +734,9 @@ serve(async (req) => {
         }
 
         // Step 4: Preview sizing before firing.
-        const costPerPair = o.bestLevel?.totalCost ?? 0.96;
-        const availableLiquidity =
-          (o.bestLevel?.totalCost ?? 0.96) * (o.bestLevel?.quantity ?? 0);
+        const lvl = o.levels[0];
+        const costPerPair = lvl ? (lvl.buyYesPrice + lvl.buyNoPrice) : 0.96;
+        const availableLiquidity = lvl ? costPerPair * lvl.quantity : 0;
         const sizing = calculateAutoExecuteSize(liveRawTotal, costPerPair, availableLiquidity);
 
         if (sizing.contracts === 0) {
