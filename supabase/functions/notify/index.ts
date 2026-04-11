@@ -288,7 +288,7 @@ async function fetchActiveCapital(): Promise<{ activeCapital: number; kalshiBala
   // Fallback: read capital_ledger.
   const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
   const serviceKey  = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
-  if (!supabaseUrl || !serviceKey) return { activeCapital: 400, kalshiBalance: 0, polyBalance: 0 };
+  if (!supabaseUrl || !serviceKey) return { activeCapital: 0, kalshiBalance: 0, polyBalance: 0 };
   const sb = createClient(supabaseUrl, serviceKey);
   const { data } = await sb
     .from('capital_ledger')
@@ -296,8 +296,8 @@ async function fetchActiveCapital(): Promise<{ activeCapital: number; kalshiBala
     .order('updated_at', { ascending: false })
     .limit(1)
     .maybeSingle();
-  if (!data) return { activeCapital: 400, kalshiBalance: 0, polyBalance: 0 };
-  const active = ((data.total_capital as number) ?? 500) * (1 - ((data.safety_reserve_pct as number) ?? SAFETY_RESERVE_PCT))
+  if (!data) return { activeCapital: 0, kalshiBalance: 0, polyBalance: 0 };
+  const active = ((data.total_capital as number) ?? 0) * (1 - ((data.safety_reserve_pct as number) ?? SAFETY_RESERVE_PCT))
                - ((data.deployed_capital as number) ?? 0)
                + ((data.realized_pnl as number) ?? 0);
   return { activeCapital: active, kalshiBalance: 0, polyBalance: 0 };

@@ -179,13 +179,13 @@ async function refreshPortfolio() {
   // Also refresh Poly balance
   await refreshPolyBalance();
 
-  console.log(`[portfolio] Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions | Poly: ~$${polyBalance.toFixed(2)} | Open: ${openPositions.length}`);
+  console.log(`[portfolio] Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions | Poly: $${polyBalance.toFixed(2)} | Open: ${openPositions.length}`);
 }
 
 function getPortfolioSummary() {
   const total = kalshiBalance + kalshiPositionValue + polyBalance;
   return `KALSHI — Cash: $${kalshiBalance.toFixed(2)}, Positions: $${kalshiPositionValue.toFixed(2)}\n` +
-    `POLYMARKET — Balance: ~$${polyBalance.toFixed(2)}\n` +
+    `POLYMARKET — Balance: $${polyBalance.toFixed(2)}\n` +
     `TOTAL: $${total.toFixed(2)}\n` +
     `Open Kalshi positions: ${openPositions.length}` +
     (openPositions.length > 0 ? '\n' + openPositions.map(p =>
@@ -920,7 +920,7 @@ async function main() {
     `Max trade: $${MAX_TRADE_CAP} (25% of cash)\n` +
     `Poll: every ${POLL_INTERVAL_MS / 1000}s | Broad scan: every 5min\n\n` +
     `💰 Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions\n` +
-    `💰 Polymarket: ~$${polyBalance.toFixed(2)}\n` +
+    `💰 Polymarket: $${polyBalance.toFixed(2)}\n` +
     `Model: claude-haiku-4-5`
   );
 

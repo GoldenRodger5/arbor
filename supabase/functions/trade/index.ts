@@ -258,8 +258,8 @@ async function fetchActiveCapital(
   sb: ReturnType<typeof createClient>,
 ): Promise<CapitalState> {
   const defaults: CapitalState = {
-    totalCapital: 500, deployedCapital: 0,
-    safetyReservePct: 0.2, realizedPnl: 0, activeCapital: 400,
+    totalCapital: 0, deployedCapital: 0,
+    safetyReservePct: 0.10, realizedPnl: 0, activeCapital: 0,
   };
   const { data, error } = await sb
     .from('capital_ledger')
@@ -268,7 +268,7 @@ async function fetchActiveCapital(
     .limit(1)
     .maybeSingle();
   if (error || !data) return defaults;
-  const total    = (data.total_capital    as number) ?? 500;
+  const total    = (data.total_capital    as number) ?? 0;
   const deployed = (data.deployed_capital as number) ?? 0;
   const reserve  = (data.safety_reserve_pct as number) ?? SAFETY_RESERVE_PCT;
   const pnl      = (data.realized_pnl     as number) ?? 0;

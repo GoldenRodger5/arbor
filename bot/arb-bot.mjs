@@ -114,22 +114,44 @@ async function refreshBalances() {
     const bal = await kalshiGet('/portfolio/balance');
     liveBalances.kalshi = (bal.balance ?? 0) / 100;
   } catch { /* keep old value */ }
-  // Poly balance via US API would need Ed25519 auth — use the Supabase function instead
+  // Poly balance via Ed25519 auth
   try {
-    const tradeUrl = process.env.SUPABASE_URL;
-    const sKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (tradeUrl && sKey) {
-      const res = await fetch(`${tradeUrl}/rest/v1/capital_ledger?select=total_capital&order=updated_at.desc&limit=1`, {
-        headers: { 'apikey': sKey, 'Authorization': `Bearer ${sKey}` },
+    const polyKeyId = process.env.POLY_US_KEY_ID ?? '';
+    const polySecret = process.env.POLY_US_SECRET_KEY ?? '';
+    if (polyKeyId && polySecret) {
+      const ed = await import('@noble/ed25519');
+      const { createHash } = await import('crypto');
+      ed.etc.sha512Sync = (...m) => {
+        const h = createHash('sha512');
+        for (const msg of m) h.update(msg);
+        return new Uint8Array(h.digest());
+      };
+      const sign = ed.signAsync ?? ed.sign;
+      const privBytes = Uint8Array.from(atob(polySecret), c => c.charCodeAt(0)).slice(0, 32);
+      const ts = String(Date.now());
+      const path = '/v1/account/balances';
+      const sigBytes = await sign(new TextEncoder().encode(`${ts}GET${path}`), privBytes);
+      const sig = btoa(String.fromCharCode(...sigBytes));
+      const res = await fetch(`https://api.polymarket.us${path}`, {
+        headers: {
+          'X-PM-Access-Key': polyKeyId, 'X-PM-Timestamp': ts,
+          'X-PM-Signature': sig, 'User-Agent': 'arbor-arb/1',
+        },
+        signal: AbortSignal.timeout(8000),
       });
       if (res.ok) {
-        const rows = await res.json();
-        if (rows.length > 0) liveBalances.total = rows[0].total_capital ?? 0;
+        const data = await res.json();
+        const balArr = data?.balances ?? data;
+        const bal = Array.isArray(balArr)
+          ? (balArr[0]?.currentBalance ?? balArr[0]?.buyingPower ?? 0)
+          : (data?.balance ?? 0);
+        liveBalances.poly = parseFloat(String(bal ?? '0')) || 0;
       }
     }
   } catch { /* keep old value */ }
+  liveBalances.total = liveBalances.kalshi + (liveBalances.poly ?? 0);
   liveBalances.lastFetch = Date.now();
-  console.log(`[balance] Kalshi: $${liveBalances.kalshi.toFixed(2)} | Total: $${liveBalances.total.toFixed(2)}`);
+  console.log(`[balance] Kalshi: $${liveBalances.kalshi.toFixed(2)} | Poly: $${(liveBalances.poly ?? 0).toFixed(2)} | Total: $${liveBalances.total.toFixed(2)}`);
 }
 
 let stats = { wsUpdates: 0, spreadsChecked: 0, arbsFound: 0, executed: 0 };
