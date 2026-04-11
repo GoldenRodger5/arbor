@@ -171,7 +171,7 @@ function calculateNetSpread(kalshiAsk, polyAsk) {
   return gross - kFee - pFee;
 }
 
-function checkArb(baseTicker) {
+async function checkArb(baseTicker) {
   const pair = matchedPairs.get(baseTicker);
   if (!pair) return;
 
@@ -507,7 +507,7 @@ function connectKalshiWS() {
         // Find which pair this ticker belongs to and check arb
         for (const [base, pair] of matchedPairs) {
           if (pair.kalshiTicker === ticker) {
-            checkArb(base);
+            checkArb(base).catch(() => {});
             break;
           }
         }
@@ -552,7 +552,7 @@ async function pollPolyPrices() {
           // Check arb for any pair using this slug
           for (const [base, pair] of matchedPairs) {
             if (pair.polySlug === slug) {
-              checkArb(base);
+              checkArb(base).catch(() => {});
             }
           }
         }
