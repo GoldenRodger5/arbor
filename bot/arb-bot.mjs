@@ -17,7 +17,7 @@
 
 import { WebSocket } from 'ws';
 import { readFileSync } from 'fs';
-import { createSign, createPrivateKey } from 'crypto';
+import { createPrivateKey, sign as cryptoSign, constants as cryptoConstants } from 'crypto';
 import 'dotenv/config';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -51,14 +51,17 @@ let kalshiPrivateKey = null;
 try {
   const keyPath = process.env.KALSHI_PRIVATE_KEY_PATH ?? './kalshi-private-key.pem';
   const pem = readFileSync(keyPath, 'utf-8');
-  kalshiPrivateKey = createPrivateKey(pem);
+  // createPrivateKey handles both PKCS#1 (RSA PRIVATE KEY) and PKCS#8 (PRIVATE KEY)
+  kalshiPrivateKey = createPrivateKey({ key: pem, format: 'pem' });
+  console.log('[auth] Loaded Kalshi private key from', keyPath);
 } catch (e) {
   // Try inline key from env
   const inline = process.env.KALSHI_PRIVATE_KEY ?? '';
   if (inline) {
-    kalshiPrivateKey = createPrivateKey(inline);
+    kalshiPrivateKey = createPrivateKey({ key: inline, format: 'pem' });
+    console.log('[auth] Loaded Kalshi private key from env');
   } else {
-    console.error('No Kalshi private key found');
+    console.error('No Kalshi private key found:', e.message);
   }
 }
 
@@ -66,13 +69,15 @@ function kalshiSign(method, path) {
   const ts = String(Date.now());
   const fullPath = path.startsWith('/trade-api/v2') ? path : `/trade-api/v2${path}`;
   const message = `${ts}${method}${fullPath}`;
-  const sign = createSign('RSA-SHA256');
-  sign.update(message);
-  const sig = sign.sign({ key: kalshiPrivateKey, padding: 6 /* RSA_PKCS1_PSS_PADDING */, saltLength: 32 }, 'base64');
+  const sig = cryptoSign('sha256', Buffer.from(message), {
+    key: kalshiPrivateKey,
+    padding: cryptoConstants.RSA_PKCS1_PSS_PADDING,
+    saltLength: 32,
+  });
   return {
     'KALSHI-ACCESS-KEY': KALSHI_API_KEY,
     'KALSHI-ACCESS-TIMESTAMP': ts,
-    'KALSHI-ACCESS-SIGNATURE': sig,
+    'KALSHI-ACCESS-SIGNATURE': sig.toString('base64'),
     'Content-Type': 'application/json',
   };
 }
@@ -353,8 +358,22 @@ function matchMarkets(kalshiMarkets, polyMarkets) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function connectKalshiWS() {
-  const headers = kalshiSign('GET', '/trade-api/ws/v2');
-  const ws = new WebSocket(KALSHI_WS_URL, { headers });
+  // Kalshi WS requires auth headers on the HTTP upgrade request.
+  // Sign with the EXACT WS path (not the REST prefix).
+  const ts = String(Date.now());
+  const wsPath = '/trade-api/ws/v2';
+  const message = `${ts}GET${wsPath}`;
+  const sig = cryptoSign('sha256', Buffer.from(message), {
+    key: kalshiPrivateKey,
+    padding: cryptoConstants.RSA_PKCS1_PSS_PADDING,
+    saltLength: 32,
+  });
+  const authHeaders = {
+    'KALSHI-ACCESS-KEY': KALSHI_API_KEY,
+    'KALSHI-ACCESS-TIMESTAMP': ts,
+    'KALSHI-ACCESS-SIGNATURE': sig.toString('base64'),
+  };
+  const ws = new WebSocket(KALSHI_WS_URL, { headers: authHeaders });
 
   ws.on('open', () => {
     console.log('[kalshi-ws] connected');
