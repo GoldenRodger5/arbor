@@ -583,8 +583,18 @@ async function checkLiveScoreEdges() {
         const market = (mkts.markets ?? []).find(m => m.ticker === decision.ticker);
         if (!market) { console.log(`[live-edge] Claude picked invalid ticker: ${decision.ticker}`); continue; }
 
-        // Check cooldown
+        // Block if we already have a position on this game
+        const lastH = decision.ticker.lastIndexOf('-');
+        const gameBase = lastH > 0 ? decision.ticker.slice(0, lastH) : decision.ticker;
+        const hasPosition = openPositions.some(p => {
+          const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
+          return pBase === gameBase;
+        });
+        if (hasPosition) { console.log(`[live-edge] BLOCKED: already have position on ${gameBase}`); continue; }
+
+        // Check cooldown (also blocks base ticker to prevent opposite-side trades)
         if (Date.now() - (tradeCooldowns.get(decision.ticker) ?? 0) < COOLDOWN_MS) continue;
+        if (Date.now() - (tradeCooldowns.get(gameBase) ?? 0) < COOLDOWN_MS) continue;
 
         const winProb = decision.winProbability ?? 0.90;
         const side = decision.side;
@@ -612,6 +622,7 @@ async function checkLiveScoreEdges() {
         console.log(`  Reason: ${decision.reasoning}`);
 
         tradeCooldowns.set(decision.ticker, Date.now());
+        tradeCooldowns.set(gameBase, Date.now()); // block opposite-side trades
         const result = await kalshiPost('/portfolio/orders', {
           ticker: decision.ticker, action: 'buy', side, count: qty,
           yes_price: side === 'yes' ? priceInCents : 100 - priceInCents,
@@ -725,9 +736,34 @@ async function claudeBroadScan() {
     }
   } catch { /* skip */ }
 
-  // Ask Claude to analyze all markets and find the best trade
+  // Build list of game base tickers we already have positions on
+  const positionBases = new Set();
+  for (const p of openPositions) {
+    const lastH = p.ticker.lastIndexOf('-');
+    if (lastH > 0) positionBases.add(p.ticker.slice(0, lastH));
+    positionBases.add(p.ticker);
+  }
+
+  // Filter out markets we already have positions on
+  const tradeable = allMarkets.filter(m => {
+    const lastH = m.ticker.lastIndexOf('-');
+    const base = lastH > 0 ? m.ticker.slice(0, lastH) : m.ticker;
+    return !positionBases.has(base) && !positionBases.has(m.ticker);
+  });
+
+  if (tradeable.length === 0) { console.log('[broad-scan] No tradeable markets (all have positions)'); return; }
+
+  const marketSummaryFiltered = tradeable.slice(0, 25).map(m =>
+    `[${m.category}] ${m.ticker}: "${m.title}" YES=$${m.yesAsk} NO=$${m.noAsk}`
+  ).join('\n');
+
+  // Ask Claude — strict rules
   stats.claudeCalls++;
   try {
+    const today = new Date().toISOString().slice(0, 10);
+    const todayParts = today.split('-');
+    const todayShort = `26${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][parseInt(todayParts[1])-1]}${todayParts[2]}`;
+
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -739,23 +775,24 @@ async function claudeBroadScan() {
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 400,
         messages: [{ role: 'user', content:
-          `You are an autonomous prediction market trader. Your job is to find the single best trade right now.\n\n` +
-          `MY PORTFOLIO:\n${getPortfolioSummary()}\n\n` +
-          `TODAY: ${new Date().toISOString().slice(0, 10)} (ticker dates: 26APR11 = April 11)\n\n` +
-          `RECENT NEWS: ${recentNews || 'None'}\n\n` +
-          `AVAILABLE MARKETS:\n${marketSummary}\n\n` +
-          `RULES:\n` +
-          `- Only trade if you see a CLEAR mispricing (market price significantly wrong)\n` +
-          `- Don't trade if cash < $5\n` +
-          `- Max bet: 25% of cash balance\n` +
-          `- Don't add to positions I already hold\n` +
-          `- Prefer markets closing soon (capital recycles faster)\n` +
-          `- Sports: only trade TODAY's games (match ticker date to today)\n` +
-          `- Consider fees: Kalshi taker = 0.07 × P × (1-P)\n\n` +
+          `You are a professional sports bettor. Find ONE trade with a real edge.\n\n` +
+          `AVAILABLE CASH: $${kalshiBalance.toFixed(2)} (this is ALL I can bet with — positions value is LOCKED)\n\n` +
+          `MY EXISTING POSITIONS (DO NOT trade these games again):\n` +
+          (openPositions.length > 0 ? openPositions.map(p => `  ${p.ticker}`).join('\n') : '  None') + '\n\n' +
+          `TODAY: ${today} (tickers use format ${todayShort} for today)\n\n` +
+          `MARKETS I CAN TRADE:\n${marketSummaryFiltered}\n\n` +
+          `STRICT RULES — violating ANY means return {"trade":false}:\n` +
+          `1. Your probability MUST differ from market price by at least 10 percentage points\n` +
+          `2. YES price + NO price on Kalshi always sums to ~$1.00-1.03. This is NOT mispricing — it's the bid-ask spread. Do NOT trade based on YES+NO sum.\n` +
+          `3. ONLY trade games with tickers containing "${todayShort}" (today's date). Reject all other dates.\n` +
+          `4. Max bet: $${Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25).toFixed(2)} (25% of $${kalshiBalance.toFixed(2)} cash)\n` +
+          `5. If cash < $3, return {"trade":false}\n` +
+          `6. You need a REAL reason the market is wrong — not just "asymmetric pricing" or "bid-ask spread"\n` +
+          `7. Fees eat ~1.75¢ per contract at 50¢. Account for this.\n\n` +
           `Respond JSON ONLY:\n` +
-          `{"trade": true/false, "ticker": "exact ticker", "side": "yes"/"no", ` +
-          `"betAmount": dollars, "probability": 0.XX, "reasoning": "why this is mispriced"}\n\n` +
-          `If no good trades exist right now, return {"trade": false, "reasoning": "why"}`
+          `{"trade":false,"reasoning":"why no good trade"}\n` +
+          `OR\n` +
+          `{"trade":true,"ticker":"exact","side":"yes"/"no","betAmount":N,"probability":0.XX,"reasoning":"specific reason market is wrong"}`
         }],
       }),
     });
@@ -774,24 +811,56 @@ async function claudeBroadScan() {
       return;
     }
 
-    // Validate ticker exists
-    const market = allMarkets.find(m => m.ticker === decision.ticker);
-    if (!market) { console.log(`[broad-scan] Invalid ticker: ${decision.ticker}`); return; }
+    // HARD VALIDATIONS (override Claude if it breaks rules)
+    const market = tradeable.find(m => m.ticker === decision.ticker);
+    if (!market) { console.log(`[broad-scan] BLOCKED: invalid ticker ${decision.ticker}`); return; }
 
-    // Check cooldown
+    // Block if ticker date isn't today
+    if (!decision.ticker.includes(todayShort)) {
+      console.log(`[broad-scan] BLOCKED: ticker ${decision.ticker} is not today (${todayShort})`);
+      return;
+    }
+
+    // Block if we already have a position on this game
+    const lastH = decision.ticker.lastIndexOf('-');
+    const base = lastH > 0 ? decision.ticker.slice(0, lastH) : decision.ticker;
+    if (positionBases.has(base)) {
+      console.log(`[broad-scan] BLOCKED: already have position on ${base}`);
+      return;
+    }
+
+    // Block if edge < 10%
+    const price = decision.side === 'yes' ? parseFloat(market.yesAsk) : parseFloat(market.noAsk);
+    const edge = Math.abs((decision.probability ?? 0) - price);
+    if (edge < 0.10) {
+      console.log(`[broad-scan] BLOCKED: edge ${(edge*100).toFixed(1)}% < 10% minimum`);
+      return;
+    }
+
+    // Block if cash too low
+    if (kalshiBalance < 3) {
+      console.log(`[broad-scan] BLOCKED: cash $${kalshiBalance.toFixed(2)} < $3`);
+      return;
+    }
+
+    // Cooldown
     if (Date.now() - (tradeCooldowns.get(decision.ticker) ?? 0) < COOLDOWN_MS) return;
 
-    const price = decision.side === 'yes' ? parseFloat(market.yesAsk) : parseFloat(market.noAsk);
-    const safeBet = Math.min(decision.betAmount ?? 0, kalshiBalance * 0.25, MAX_TRADE_CAP);
+    // Size — strictly from cash, NOT positions
+    const maxBet = Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25);
+    const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
     if (safeBet < 1 || price <= 0) return;
 
     const qty = Math.max(1, Math.floor(safeBet / price));
     const priceInCents = Math.round(price * 100);
 
-    console.log(`[broad-scan] TRADE: ${market.title} ${decision.side} @${priceInCents}¢ × ${qty}`);
+    console.log(`[broad-scan] TRADE: ${market.title} ${decision.side} @${priceInCents}¢ × ${qty} edge=${(edge*100).toFixed(1)}%`);
     console.log(`  Reason: ${decision.reasoning}`);
 
     tradeCooldowns.set(decision.ticker, Date.now());
+    // Also cooldown the base ticker to prevent opposite-side trades
+    tradeCooldowns.set(base, Date.now());
+
     const result = await kalshiPost('/portfolio/orders', {
       ticker: decision.ticker, action: 'buy', side: decision.side, count: qty,
       yes_price: decision.side === 'yes' ? priceInCents : 100 - priceInCents,
@@ -805,7 +874,7 @@ async function claudeBroadScan() {
         `Category: ${market.category}\n\n` +
         `BUY ${decision.side.toUpperCase()} @ $${price.toFixed(2)} × ${qty}\n` +
         `Deployed: <b>$${(qty * price).toFixed(2)}</b>\n` +
-        `Claude prob: ${((decision.probability ?? 0) * 100).toFixed(0)}% vs market ${(price * 100).toFixed(0)}%\n\n` +
+        `Edge: <b>${(edge*100).toFixed(0)}%</b> (Claude ${((decision.probability ?? 0)*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}%)\n\n` +
         `🧠 <i>${decision.reasoning}</i>`
       );
     }
