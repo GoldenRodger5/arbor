@@ -4436,6 +4436,12 @@ async function runScanCycle(
         // which is mathematically wrong when there is a wide bid-ask spread.
         // The market listing yes_ask_dollars/no_ask_dollars are the actual ask
         // prices Kalshi shows users and should be preferred.
+        console.log('[kalshi-ask-check]', JSON.stringify({
+          marketId: pair.kalshi.marketId,
+          yesAsk: pair.kalshi.yesAsk ?? null,
+          noAsk: pair.kalshi.noAsk ?? null,
+          hasOverride: pair.kalshi.yesAsk != null || pair.kalshi.noAsk != null,
+        }));
         if (pair.kalshi.yesAsk != null || pair.kalshi.noAsk != null) {
           const totalYesSize = kalshiBook.yesAsks.reduce((s, l) => s + l.size, 0) || 100;
           const totalNoSize  = kalshiBook.noAsks.reduce((s, l) => s + l.size, 0) || 100;
@@ -4451,11 +4457,13 @@ async function runScanCycle(
               noAsks: [{ price: pair.kalshi.noAsk, size: totalNoSize }],
             };
           }
-          console.log('[kalshi-ask-override]', {
+          console.log('[kalshi-ask-override]', JSON.stringify({
             marketId: pair.kalshi.marketId,
             yesAsk: pair.kalshi.yesAsk,
             noAsk: pair.kalshi.noAsk,
-          });
+            overrodeYes: pair.kalshi.yesAsk != null,
+            overrodeNo: pair.kalshi.noAsk != null,
+          }));
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
