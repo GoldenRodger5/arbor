@@ -160,13 +160,20 @@ async function findWideSpreadMarkets() {
         const noSpread = Math.round((noAsk - noBid) * 100);
         const bestSpread = Math.max(yesSpread, noSpread);
 
+        // Skip live/in-progress games — only quote on future games
+        const closeTime = m.close_time ?? m.expected_expiration_time ?? '';
+        const closeMs = Date.parse(closeTime);
+        if (Number.isFinite(closeMs) && closeMs < Date.now()) continue; // game already started/closed
+        // Also skip if status is not 'active' or 'open'
+        if (m.result && m.result !== '') continue; // game has a result — skip
+
         if (bestSpread >= MIN_SPREAD_CENTS) {
           candidates.push({
             ticker: m.ticker,
             title: m.title ?? '',
             yesAsk, noAsk, yesBid, noBid,
             yesSpread, noSpread,
-            closeTime: m.close_time ?? m.expected_expiration_time ?? '',
+            closeTime,
             volume: m.volume ?? 0,
           });
         }
