@@ -34,7 +34,8 @@ const ANTHROPIC_KEY = process.env.VITE_ANTHROPIC_API_KEY ?? process.env.ANTHROPI
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 
-const MIN_EDGE_PCT = 3;          // 3% edge minimum — real edges are small but frequent
+const MIN_EDGE = 0.07;           // 7% edge minimum — consistent across ALL strategies
+const MIN_EDGE_PCT = 7;          // same × 100 for display
 const MAX_TRADE_FRACTION = 0.25; // Use up to 25% of balance per trade
 const MAX_TRADE_CAP = 50;        // Hard cap $50 per trade
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
@@ -209,7 +210,7 @@ async function tg(text) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const tradeCooldowns = new Map(); // ticker → lastTradedMs
-const seenNewsIds = new Set();    // prevent re-processing same news
+const seenNewsIds = new Map();    // id → timestamp (pruned every cycle)
 let kalshiBalance = 0;
 let kalshiPositionValue = 0;
 let openPositions = [];  // fetched each cycle
@@ -275,7 +276,7 @@ async function fetchESPNNews() {
           // Only care about recent articles (last 30 minutes)
           const published = Date.parse(article.published ?? '');
           if (!Number.isFinite(published) || Date.now() - published > 30 * 60 * 1000) continue;
-          seenNewsIds.add(id);
+          seenNewsIds.set(id, Date.now());
           items.push({
             league,
             type: 'news',
@@ -305,7 +306,7 @@ async function fetchESPNNews() {
             for (const inj of injuries) {
               const id = `inj-${c.team?.abbreviation}-${inj.id ?? inj.athlete?.id}`;
               if (seenNewsIds.has(id)) continue;
-              seenNewsIds.add(id);
+              seenNewsIds.set(id, Date.now());
               const status = inj.status ?? inj.type?.name ?? '';
               if (status === 'Active') continue; // not newsworthy
               items.push({
@@ -430,7 +431,7 @@ If the news doesn't meaningfully change the probability (e.g. minor roster move,
 
   try {
     stats.claudeCalls++;
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    const res = await fetch('https://api.anthropic.com/v1/messages', { signal: AbortSignal.timeout(15000),
       method: 'POST',
       headers: {
         'x-api-key': ANTHROPIC_KEY,
@@ -588,7 +589,7 @@ async function checkLiveScoreEdges() {
         // Use Claude to: 1) find the right market, 2) assess win probability, 3) pick side, 4) decide bet size
         stats.claudeCalls++;
         const portfolioInfo = getPortfolioSummary();
-        const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+        const claudeRes = await fetch('https://api.anthropic.com/v1/messages', { signal: AbortSignal.timeout(15000),
           method: 'POST',
           headers: {
             'x-api-key': ANTHROPIC_KEY,
@@ -658,7 +659,7 @@ async function checkLiveScoreEdges() {
           : parseFloat(market.no_ask_dollars);
 
         const edge = winProb - price;
-        if (edge < 0.03) {
+        if (edge < MIN_EDGE) {
           console.log(`[live-edge] Edge too small: ${(edge*100).toFixed(1)}% (${side} @${(price*100).toFixed(0)}¢ vs ${(winProb*100).toFixed(0)}%)`);
           continue;
         }
@@ -850,12 +851,12 @@ async function claudeBroadScan() {
     const now = new Date();
     const etNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
     const etTomorrow = new Date(etNow.getTime() + 24 * 60 * 60 * 1000);
-    const toShort = (d) => `26${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
+    const toShort = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
     const todayShort = toShort(etNow);
     const tomorrowShort = toShort(etTomorrow);
     const today = etNow.toISOString().slice(0, 10);
 
-    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', { signal: AbortSignal.timeout(15000),
       method: 'POST',
       headers: {
         'x-api-key': ANTHROPIC_KEY,
@@ -925,8 +926,8 @@ async function claudeBroadScan() {
     // Block if edge < 10%
     const price = decision.side === 'yes' ? parseFloat(market.yesAsk) : parseFloat(market.noAsk);
     const edge = Math.abs((decision.probability ?? 0) - price);
-    if (edge < 0.07) {
-      console.log(`[broad-scan] BLOCKED: edge ${(edge*100).toFixed(1)}% < 7% minimum`);
+    if (edge < MIN_EDGE) {
+      console.log(`[broad-scan] BLOCKED: edge ${(edge*100).toFixed(1)}% < ${MIN_EDGE_PCT}% minimum`);
       return;
     }
 
@@ -980,12 +981,15 @@ async function claudeBroadScan() {
   if (polyBalance < 3) return; // not enough Poly cash
   try {
     const polyMarkets = [];
-    const polyRes = await fetch('https://gateway.polymarket.us/v1/markets?limit=200&offset=200&active=true&closed=false', {
-      headers: { 'User-Agent': 'arbor-ai/1', 'Accept': 'application/json' },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (polyRes.ok) {
+    // Paginate all pages to find moneyline markets
+    for (let polyOffset = 0; polyOffset < 1000; polyOffset += 200) {
+      const polyRes = await fetch(`https://gateway.polymarket.us/v1/markets?limit=200&offset=${polyOffset}&active=true&closed=false`, {
+        headers: { 'User-Agent': 'arbor-ai/1', 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!polyRes.ok) break;
       const pd = await polyRes.json();
+      if (!pd.markets?.length) break;
       for (const m of pd.markets ?? []) {
         if (m.closed || !m.active) continue;
         if (m.marketType !== 'moneyline') continue;
@@ -1011,7 +1015,7 @@ async function claudeBroadScan() {
     ).join('\n');
 
     stats.claudeCalls++;
-    const polyClaudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+    const polyClaudeRes = await fetch('https://api.anthropic.com/v1/messages', { signal: AbortSignal.timeout(15000),
       method: 'POST',
       headers: {
         'x-api-key': ANTHROPIC_KEY,
@@ -1052,9 +1056,16 @@ async function claudeBroadScan() {
     const polyMkt = polyMarkets.find(m => m.slug === polyDecision.slug);
     if (!polyMkt) { console.log(`[poly-scan] Invalid slug: ${polyDecision.slug}`); return; }
 
+    // Polymarket cooldown check
+    const polyKey = 'poly:' + polyDecision.slug;
+    if (Date.now() - (tradeCooldowns.get(polyKey) ?? 0) < COOLDOWN_MS) {
+      console.log(`[poly-scan] On cooldown: ${polyDecision.slug}`);
+      return;
+    }
+
     const polyPrice = polyDecision.side === 'side0' ? polyMkt.s0Price : polyMkt.s1Price;
     const polyEdge = Math.abs((polyDecision.probability ?? 0) - polyPrice);
-    if (polyEdge < 0.10) { console.log(`[poly-scan] Edge too small: ${(polyEdge*100).toFixed(1)}%`); return; }
+    if (polyEdge < MIN_EDGE) { console.log(`[poly-scan] Edge too small: ${(polyEdge*100).toFixed(1)}%`); return; }
 
     const polyIntent = polyDecision.side === 'side0' ? 'ORDER_INTENT_BUY_LONG' : 'ORDER_INTENT_BUY_SHORT';
     const polyBet = Math.min(polyDecision.betAmount ?? 0, polyBalance * 0.25, 50);
@@ -1066,6 +1077,7 @@ async function claudeBroadScan() {
 
     if (polyResult.ok) {
       stats.tradesPlaced++;
+      tradeCooldowns.set(polyKey, Date.now());
       await tg(
         `🧠 <b>CLAUDE TRADE — POLYMARKET</b>\n\n` +
         `<b>${polyMkt.title}</b>\n` +
@@ -1089,12 +1101,10 @@ async function pollCycle() {
   // Refresh full portfolio (balance + positions)
   await refreshPortfolio();
 
-  // Prune old seen news IDs (keep last 500)
-  if (seenNewsIds.size > 500) {
-    const arr = [...seenNewsIds];
-    arr.splice(0, arr.length - 200);
-    seenNewsIds.clear();
-    for (const id of arr) seenNewsIds.add(id);
+  // Prune news IDs older than 2 hours
+  const pruneThreshold = Date.now() - 2 * 60 * 60 * 1000;
+  for (const [id, ts] of seenNewsIds) {
+    if (ts < pruneThreshold) seenNewsIds.delete(id);
   }
 
   // Step 1: Fetch news
@@ -1140,7 +1150,7 @@ async function pollCycle() {
       if (isSports) {
         const etNow2 = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
         const etTmrw = new Date(etNow2.getTime() + 24 * 60 * 60 * 1000);
-        const toS = (d) => `26${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
+        const toS = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
         if (!market.ticker.includes(toS(etNow2)) && !market.ticker.includes(toS(etTmrw))) continue;
       }
 
@@ -1156,7 +1166,7 @@ async function pollCycle() {
 
       // Edge must be >= 10%
       const expectedEdge = Math.abs(assessment.fairProbability - (assessment.currentPrice ?? 0)) * 100;
-      if (expectedEdge < 10) continue;
+      if (expectedEdge < MIN_EDGE * 100) continue;
       if (assessment.confidence === 'low') continue;
 
       stats.edgesFound++;
@@ -1195,19 +1205,24 @@ async function main() {
     console.error('[ai-edge] Portfolio check failed:', e.message);
   }
 
-  // Initial poll
-  await pollCycle();
+  // Initial poll, then chain with setTimeout (prevents overlap)
+  async function pollLoop() {
+    try { await pollCycle(); } catch (e) { console.error('[poll] error:', e.message); }
+    setTimeout(pollLoop, POLL_INTERVAL_MS);
+  }
+  await pollLoop();
 
-  // Poll every 2 minutes
-  setInterval(pollCycle, POLL_INTERVAL_MS);
-
-  // Stats every 5 minutes
-  setInterval(logStats, 5 * 60 * 1000);
+  // Stats on a separate non-overlapping chain
+  async function statsLoop() {
+    logStats();
+    setTimeout(statsLoop, 5 * 60 * 1000);
+  }
+  setTimeout(statsLoop, 5 * 60 * 1000);
 
   await tg(
     `🧠 <b>AI Edge Bot Started</b>\n\n` +
     `Markets: Sports + Crypto + Economics + Politics + Finance\n` +
-    `Platform: Kalshi (Polymarket balance tracked, trading coming soon)\n` +
+    `Platforms: Kalshi + Polymarket US\n` +
     `Min edge: ${MIN_EDGE_PCT}%\n` +
     `Max trade: $${MAX_TRADE_CAP} (25% of cash)\n` +
     `Poll: every ${POLL_INTERVAL_MS / 1000}s | Broad scan: every 5min\n\n` +

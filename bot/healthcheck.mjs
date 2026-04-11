@@ -53,6 +53,7 @@ async function kalshiGet(path) {
       'KALSHI-ACCESS-TIMESTAMP': ts,
       'KALSHI-ACCESS-SIGNATURE': sig.toString('base64'),
     },
+    signal: AbortSignal.timeout(10000),
   });
   return res.ok ? res.json() : null;
 }
@@ -101,6 +102,24 @@ async function run() {
     }
   } catch {
     lines.push('⚠️ Kalshi balance check failed');
+  }
+  lines.push('');
+
+  // Open positions
+  try {
+    const posData = await kalshiGet('/portfolio/positions');
+    const positions = (posData?.event_positions ?? []).filter(p => parseFloat(p.total_cost_dollars ?? '0') > 0);
+    if (positions.length > 0) {
+      lines.push(`📊 <b>Open Positions: ${positions.length}</b>`);
+      for (const p of positions.slice(0, 5)) {
+        lines.push(`  ${p.event_ticker}: $${parseFloat(p.total_cost_dollars ?? '0').toFixed(2)}`);
+      }
+      if (positions.length > 5) lines.push(`  ... and ${positions.length - 5} more`);
+    } else {
+      lines.push('📊 No open positions');
+    }
+  } catch {
+    lines.push('⚠️ Could not fetch positions');
   }
   lines.push('');
 
