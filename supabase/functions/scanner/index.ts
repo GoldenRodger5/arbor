@@ -675,7 +675,7 @@ function classifyEventRecurrence(
     /^KX(MLB|NBA|NFL|NHL|MLS)GAME-/i.test(kId)
   );
   if (isSportsWinner) {
-    return { type: 'RECURRING', subtype: 'sports-game', maxGapMs: 36 * MS_PER_HOUR };
+    return { type: 'RECURRING', subtype: 'sports-game', maxGapMs: 20 * MS_PER_HOUR };
   }
 
   // 2) Weekly recurring — check before monthly so "weekly jobless" doesn't
@@ -4068,7 +4068,7 @@ async function runScanCycle(
   // Poly closes after game finalization), so the gate has to be wide
   // enough to keep legitimate same-game pairs. 5 days catches the
   // common platform offset while still rejecting wrong-week pairings.
-  const SPORTS_MAX_CLOSE_GAP_MS = 5 * 24 * 60 * 60 * 1000;
+  const SPORTS_MAX_CLOSE_GAP_MS = 2 * 24 * 60 * 60 * 1000;
   let droppedBySportsProximity = 0;
   const sportsProximityGapsHours: number[] = [];
   // [FIX 1] Per-category silent-drop counters so we can see exactly where
