@@ -571,7 +571,7 @@ function logStats() {
 
 async function main() {
   console.log('=== Arbor AI Edge Trading Bot ===');
-  console.log(`Config: MIN_EDGE=${MIN_EDGE_PCT}% MAX_TRADE=$${MAX_TRADE_USD} POLL=${POLL_INTERVAL_MS / 1000}s`);
+  console.log(`Config: MIN_EDGE=${MIN_EDGE_PCT}% MAX_TRADE=$${MAX_TRADE_CAP} POLL=${POLL_INTERVAL_MS / 1000}s`);
 
   if (!KALSHI_API_KEY || !kalshiPrivateKey) {
     console.error('Missing Kalshi credentials');
@@ -603,7 +603,7 @@ async function main() {
   await tg(
     `🧠 <b>AI Edge Bot Started</b>\n\n` +
     `Min edge: ${MIN_EDGE_PCT}%\n` +
-    `Max trade: $${MAX_TRADE_USD}\n` +
+    `Max trade: $${MAX_TRADE_CAP}\n` +
     `Poll: every ${POLL_INTERVAL_MS / 1000}s\n` +
     `Balance: $${kalshiBalance.toFixed(2)}\n` +
     `Model: claude-haiku-4-5`
