@@ -675,7 +675,7 @@ function classifyEventRecurrence(
     /^KX(MLB|NBA|NFL|NHL|MLS)GAME-/i.test(kId)
   );
   if (isSportsWinner) {
-    return { type: 'RECURRING', subtype: 'sports-game', maxGapMs: 20 * MS_PER_HOUR };
+    return { type: 'RECURRING', subtype: 'sports-game', maxGapMs: 48 * MS_PER_HOUR };
   }
 
   // 2) Weekly recurring — check before monthly so "weekly jobless" doesn't
@@ -1212,13 +1212,22 @@ function pushKalshiMarket(
   // Deduplicate game-winner markets by base ticker. Kalshi creates two
   // markets per game: KXMLBGAME-26APR121340ATHNYM-ATH (YES=A's win) and
   // KXMLBGAME-26APR121340ATHNYM-NYM (YES=Mets win). These are the SAME
-  // game — YES on one = NO on the other. Strip the last team-code suffix
-  // to get the base, and only keep the first seen per base.
+  // game — YES on one = NO on the other. Keep only the market where the
+  // suffix matches the FIRST team code in the base (e.g. ATH from ATHNYM).
+  // This ensures Kalshi YES = first team = Polymarket side0 convention.
   const ticker = m.ticker;
   const lastHyphen = ticker.lastIndexOf('-');
   if (lastHyphen > 0 && /^KX(?:MLB|NBA|NFL|NHL|MLS)GAME-/i.test(ticker)) {
     const baseTicker = ticker.slice(0, lastHyphen);
+    const suffix = ticker.slice(lastHyphen + 1);
     if (_kalshiGameBaseSeen.has(baseTicker)) return; // duplicate team outcome
+    // Only accept this market if suffix matches the FIRST team in the base.
+    // The base has format like "26APR121340ATHNYM" — extract team codes.
+    const baseMatch = baseTicker.match(/([A-Z]{2,4})([A-Z]{2,4})$/);
+    if (baseMatch) {
+      const firstTeamCode = baseMatch[1];
+      if (suffix !== firstTeamCode) return; // skip — this is the second-team market
+    }
     _kalshiGameBaseSeen.add(baseTicker);
   }
 
