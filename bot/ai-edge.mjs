@@ -713,7 +713,7 @@ async function checkLiveScoreEdges() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 let lastBroadScan = 0;
-const BROAD_SCAN_INTERVAL = 5 * 60 * 1000; // every 5 min (uses more Claude tokens)
+const BROAD_SCAN_INTERVAL = 2 * 60 * 1000; // every 2 min — fast enough to catch edges
 
 async function claudeBroadScan() {
   if (Date.now() - lastBroadScan < BROAD_SCAN_INTERVAL) return;
@@ -815,9 +815,14 @@ async function claudeBroadScan() {
   // Ask Claude — strict rules
   stats.claudeCalls++;
   try {
-    const today = new Date().toISOString().slice(0, 10);
-    const todayParts = today.split('-');
-    const todayShort = `26${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][parseInt(todayParts[1])-1]}${todayParts[2]}`;
+    // Use ET date AND next day (games starting at 10pm ET = Apr12 in ticker but Apr11 locally)
+    const now = new Date();
+    const etNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const etTomorrow = new Date(etNow.getTime() + 24 * 60 * 60 * 1000);
+    const toShort = (d) => `26${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
+    const todayShort = toShort(etNow);
+    const tomorrowShort = toShort(etTomorrow);
+    const today = etNow.toISOString().slice(0, 10);
 
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -839,7 +844,7 @@ async function claudeBroadScan() {
           `STRICT RULES — violating ANY means return {"trade":false}:\n` +
           `1. Your probability MUST differ from market price by at least 10 percentage points\n` +
           `2. YES price + NO price on Kalshi always sums to ~$1.00-1.03. This is NOT mispricing — it's the bid-ask spread. Do NOT trade based on YES+NO sum.\n` +
-          `3. For SPORTS game-winner tickers (KXMLBGAME/KXNBAGAME/KXNHLGAME): ONLY trade if ticker contains "${todayShort}" (today's date). Non-sports tickers (crypto/economics/politics) don't have dates — trade those anytime.\n` +
+          `3. For SPORTS game-winner tickers: ONLY trade if ticker contains "${todayShort}" (today) or "${tomorrowShort}" (tonight's late games). Non-sports tickers don't have dates — trade those anytime.\n` +
           `4. Max bet: $${Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25).toFixed(2)} (25% of $${kalshiBalance.toFixed(2)} cash)\n` +
           `5. If cash < $3, return {"trade":false}\n` +
           `6. You need a REAL reason the market is wrong — not just "asymmetric pricing" or "bid-ask spread"\n` +
@@ -870,10 +875,10 @@ async function claudeBroadScan() {
     const market = tradeable.find(m => m.ticker === decision.ticker);
     if (!market) { console.log(`[broad-scan] BLOCKED: invalid ticker ${decision.ticker}`); return; }
 
-    // Block sports game-winner tickers that aren't today
+    // Block sports game-winner tickers that aren't today or tonight (tomorrow UTC)
     const isSportsGame = /^KX(MLB|NBA|NFL|NHL)GAME-/i.test(decision.ticker);
-    if (isSportsGame && !decision.ticker.includes(todayShort)) {
-      console.log(`[broad-scan] BLOCKED: sports ticker ${decision.ticker} is not today (${todayShort})`);
+    if (isSportsGame && !decision.ticker.includes(todayShort) && !decision.ticker.includes(tomorrowShort)) {
+      console.log(`[broad-scan] BLOCKED: sports ticker ${decision.ticker} is not today (${todayShort}) or tonight (${tomorrowShort})`);
       return;
     }
 
@@ -1098,12 +1103,13 @@ async function pollCycle() {
       });
       if (hasPos) continue;
 
-      // Date check — sports game-winners must be today
+      // Date check — sports game-winners must be today or tonight
       const isSports = /^KX(MLB|NBA|NFL|NHL)GAME-/i.test(market.ticker);
       if (isSports) {
-        const todayParts = new Date().toISOString().slice(0, 10).split('-');
-        const todayShort = `26${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][parseInt(todayParts[1])-1]}${todayParts[2]}`;
-        if (!market.ticker.includes(todayShort)) continue;
+        const etNow2 = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+        const etTmrw = new Date(etNow2.getTime() + 24 * 60 * 60 * 1000);
+        const toS = (d) => `26${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
+        if (!market.ticker.includes(toS(etNow2)) && !market.ticker.includes(toS(etTmrw))) continue;
       }
 
       // Cooldown (ticker + base)
