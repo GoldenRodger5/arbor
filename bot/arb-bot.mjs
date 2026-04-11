@@ -134,8 +134,8 @@ async function refreshBalances() {
 
 let stats = { wsUpdates: 0, spreadsChecked: 0, arbsFound: 0, executed: 0 };
 
-// Don't auto-execute yet — alert only until spreads are verified real
-const ALERT_ONLY = true;
+// Fully autonomous mode — execute trades automatically
+const ALERT_ONLY = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Telegram
