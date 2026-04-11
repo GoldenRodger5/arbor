@@ -406,11 +406,20 @@ function formatMessage(
     ? `\n🤖 Auto-executes · ${targets} position target · $${(kalshiBalance + polyBalance).toFixed(0)} capital`
     : `\nHalf Kelly · $${activeCapital.toFixed(0)} active capital`;
 
+  // Extract team names from title: "{Team1} vs {Team2} Winner?"
+  const titleParts = (o.kalshiMarket.title || '')
+    .replace(/Winner\??$/i, '').trim().split(' vs ');
+  const team1 = titleParts[0]?.trim() || 'Team 1';
+  const team2 = titleParts[1]?.trim() || 'Team 2';
+  // YES = team1 wins, NO = team2 wins (Kalshi convention: first team = YES)
+  const yesOutcome = team1.length <= 12 ? team1 : team1.slice(0, 11) + '…';
+  const noOutcome  = team2.length <= 12 ? team2 : team2.slice(0, 11) + '…';
+
   const text =
     `${emoji} <b>${verdict} · ${netPct}% net · ${o.daysToClose.toFixed(0)}d</b>\n\n` +
     `<b>${kTitle}</b>\n\n` +
-    `<code>BUY YES  ${lvl.buyYesPlatform.padEnd(12)}$${lvl.buyYesPrice.toFixed(2)}  ×  ${qty}</code>\n` +
-    `<code>BUY NO   ${lvl.buyNoPlatform.padEnd(12)}$${lvl.buyNoPrice.toFixed(2)}  ×  ${qty}</code>\n\n` +
+    `<code>BUY YES  ${lvl.buyYesPlatform.padEnd(12)}$${lvl.buyYesPrice.toFixed(2)}  ×  ${qty}   → ${yesOutcome} wins</code>\n` +
+    `<code>BUY NO   ${lvl.buyNoPlatform.padEnd(12)}$${lvl.buyNoPrice.toFixed(2)}  ×  ${qty}   → ${noOutcome} wins</code>\n\n` +
     `💰 Deploy <b>$${kellyDeployed.toFixed(2)}</b>  →  profit <b>+$${maxProfit.toFixed(2)}</b>\n` +
     `📅 Settles ${settleDate}  ·  APY <b>+${apyPct}%</b>` +
     reasoning +
