@@ -399,7 +399,6 @@ async function checkLiveScoreEdges() {
         if (!comp || comp.status?.type?.state !== 'in') continue;
 
         const period = parseInt(comp.status?.period ?? '0');
-        const clock = comp.status?.displayClock ?? '';
         const competitors = comp.competitors ?? [];
         if (competitors.length < 2) continue;
 
@@ -411,140 +410,126 @@ async function checkLiveScoreEdges() {
         const awayScore = parseInt(away.score ?? '0');
         const diff = Math.abs(homeScore - awayScore);
         const leading = homeScore > awayScore ? home : away;
-        const leadingName = (leading.team?.displayName ?? '').toLowerCase();
+        const leadingName = leading.team?.displayName ?? '';
+        const gameDetail = comp.status?.type?.shortDetail ?? '';
 
-        // High-certainty late-game situations
+        // Threshold to trigger — must be a decisive lead in late game
         let highCertainty = false;
-        let estimatedWinProb = 0.5;
-
-        // Threshold to trigger Claude assessment — not the final probability
-        if (league === 'mlb' && period >= 7 && diff >= 3) {
-          highCertainty = true;
-        } else if (league === 'nba' && period >= 3 && diff >= 12) {
-          highCertainty = true;
-        } else if (league === 'nhl' && period >= 3 && diff >= 2) {
-          highCertainty = true;
-        }
-
-        // Ask Claude for precise win probability instead of hardcoded values
-        if (highCertainty && ANTHROPIC_KEY) {
-          try {
-            stats.claudeCalls++;
-            const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
-              method: 'POST',
-              headers: {
-                'x-api-key': ANTHROPIC_KEY,
-                'anthropic-version': '2023-06-01',
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                model: 'claude-haiku-4-5-20251001',
-                max_tokens: 100,
-                messages: [{ role: 'user', content:
-                  `${league.toUpperCase()} game: ${away.team?.displayName} ${awayScore} at ${home.team?.displayName} ${homeScore}, ` +
-                  `${comp.status?.type?.shortDetail ?? period + 'th period'}. ` +
-                  `What is the probability that ${leadingName} wins? Reply with ONLY a number between 0.50 and 0.99, nothing else.`
-                }],
-              }),
-            });
-            if (claudeRes.ok) {
-              const cData = await claudeRes.json();
-              const probStr = cData.content?.[0]?.text?.match(/0\.\d+/)?.[0];
-              if (probStr) estimatedWinProb = parseFloat(probStr);
-            }
-          } catch { /* keep default */ }
-        }
-        if (estimatedWinProb <= 0.5) estimatedWinProb = 0.90; // fallback
-
+        if (league === 'mlb' && period >= 7 && diff >= 3) highCertainty = true;
+        else if (league === 'nba' && period >= 3 && diff >= 12) highCertainty = true;
+        else if (league === 'nhl' && period >= 3 && diff >= 2) highCertainty = true;
         if (!highCertainty) continue;
 
-        const homeName = (home.team?.displayName ?? '').toLowerCase();
-        const awayName = (away.team?.displayName ?? '').toLowerCase();
-        const homeWords = homeName.split(' ').filter(w => w.length > 3);
-        const awayWords = awayName.split(' ').filter(w => w.length > 3);
+        console.log(`[live-edge] Checking: ${away.team?.displayName} ${awayScore} @ ${home.team?.displayName} ${homeScore} (${gameDetail})`);
 
-        console.log(`[live-edge] High certainty: ${leadingName} leading ${homeScore}-${awayScore} in P${period} (${league}) ~${(estimatedWinProb*100).toFixed(0)}%`);
-
-        // Find matching Kalshi market — BOTH teams must appear in the title
+        // Get today's Kalshi markets for this sport
         const params = new URLSearchParams({ series_ticker: series, status: 'open', limit: '100' });
         const mkts = await kalshiGet(`/markets?${params}`);
-        for (const m of mkts.markets ?? []) {
-          const title = (m.title ?? '').toLowerCase();
-          const matchesHome = homeWords.some(w => title.includes(w));
-          const matchesAway = awayWords.some(w => title.includes(w));
-          if (!matchesHome || !matchesAway) continue; // BOTH teams must match
+        const marketList = (mkts.markets ?? [])
+          .filter(m => {
+            if (!m.yes_ask_dollars || !m.no_ask_dollars) return false;
+            // Only include markets that could be today's game
+            const ya = parseFloat(m.yes_ask_dollars);
+            const na = parseFloat(m.no_ask_dollars);
+            return ya > 0.01 && ya < 0.99 && na > 0.01 && na < 0.99;
+          })
+          .slice(0, 20) // limit to avoid huge prompt
+          .map(m => `${m.ticker}: "${m.title}" YES=$${m.yes_ask_dollars} NO=$${m.no_ask_dollars}`);
 
-          // Date check: only match TODAY's game, not future dates
-          const tickerDateMatch = m.ticker.match(/-(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})/i);
-          if (tickerDateMatch) {
-            const monthIdx = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC']
-              .indexOf(tickerDateMatch[2].toUpperCase());
-            const tickerDay = parseInt(tickerDateMatch[3]);
-            const tickerMonth = monthIdx;
-            const today = new Date();
-            const todayDay = today.getUTCDate();
-            const todayMonth = today.getUTCMonth();
-            if (tickerDay !== todayDay || tickerMonth !== todayMonth) {
-              continue; // wrong day — skip
-            }
-          }
+        if (marketList.length === 0) continue;
 
-          // Check cooldown
-          if (Date.now() - (tradeCooldowns.get(m.ticker) ?? 0) < COOLDOWN_MS) continue;
+        // Use Claude to: 1) find the right market, 2) assess win probability, 3) pick the side
+        stats.claudeCalls++;
+        const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'x-api-key': ANTHROPIC_KEY,
+            'anthropic-version': '2023-06-01',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'claude-haiku-4-5-20251001',
+            max_tokens: 200,
+            messages: [{ role: 'user', content:
+              `LIVE ${league.toUpperCase()} GAME RIGHT NOW (today ${new Date().toISOString().slice(0,10)}):\n` +
+              `${away.team?.displayName} ${awayScore} at ${home.team?.displayName} ${homeScore}\n` +
+              `Game status: ${gameDetail}\n\n` +
+              `KALSHI MARKETS (some may be for DIFFERENT DATES — only match TODAY's game):\n` +
+              marketList.join('\n') + '\n\n' +
+              `Respond in JSON ONLY:\n` +
+              `{"ticker": "exact ticker string for TODAY's game or null if none match today", ` +
+              `"side": "yes" or "no" (the side that wins based on current score)", ` +
+              `"winProbability": 0.XX, ` +
+              `"reasoning": "one sentence"}\n\n` +
+              `CRITICAL: The ticker contains a date like 26APR11 meaning April 11. ` +
+              `Today is ${new Date().toISOString().slice(0,10)}. ONLY pick a ticker with TODAY's date. ` +
+              `If no ticker matches today, return {"ticker": null}.`
+            }],
+          }),
+        });
 
-          const yesAsk = m.yes_ask_dollars ? parseFloat(m.yes_ask_dollars) : null;
-          const noAsk = m.no_ask_dollars ? parseFloat(m.no_ask_dollars) : null;
-          if (!yesAsk || !noAsk) continue;
+        if (!claudeRes.ok) { console.error('[live-edge] Claude HTTP', claudeRes.status); continue; }
+        const cData = await claudeRes.json();
+        const cText = cData.content?.[0]?.text ?? '';
+        const jsonMatch = cText.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) continue;
 
-          // Determine which side is the winning team.
-          // Kalshi title format: "Minnesota vs Toronto Winner?"
-          // The first team in the title = YES side on this specific ticker.
-          const titleParts = title.replace(/winner\??/i, '').trim().split(/\s+(?:vs\.?|at)\s+/);
-          const yesTeamInTitle = (titleParts[0] ?? '').trim();
-          const leadingWords = leadingName.split(' ').filter(w => w.length > 3);
+        let decision;
+        try { decision = JSON.parse(jsonMatch[0]); } catch { continue; }
+        if (!decision.ticker || decision.ticker === 'null') {
+          console.log(`[live-edge] Claude: no matching ticker for today's game`);
+          continue;
+        }
 
-          let winningSide, winningPrice;
-          if (leadingWords.some(w => yesTeamInTitle.includes(w))) {
-            winningSide = 'yes';
-            winningPrice = yesAsk;
-          } else {
-            winningSide = 'no';
-            winningPrice = noAsk;
-          }
+        // Validate the ticker exists in our market list
+        const market = (mkts.markets ?? []).find(m => m.ticker === decision.ticker);
+        if (!market) { console.log(`[live-edge] Claude picked invalid ticker: ${decision.ticker}`); continue; }
 
-          // Only trade if market is mispriced — winning side should be near estimatedWinProb
-          // but market has it lower
-          const edge = estimatedWinProb - winningPrice;
-          if (edge < 0.03) continue; // need at least 3% edge
+        // Check cooldown
+        if (Date.now() - (tradeCooldowns.get(decision.ticker) ?? 0) < COOLDOWN_MS) continue;
 
-          const maxTrade = Math.min(MAX_TRADE_CAP, kalshiBalance * MAX_TRADE_FRACTION);
-          const qty = Math.max(1, Math.floor(maxTrade / winningPrice));
-          const priceInCents = Math.round(winningPrice * 100);
+        const winProb = decision.winProbability ?? 0.90;
+        const side = decision.side;
+        const price = side === 'yes'
+          ? parseFloat(market.yes_ask_dollars)
+          : parseFloat(market.no_ask_dollars);
 
-          console.log(`[live-edge] ${m.title} — ${leadingName} winning ${homeScore}-${awayScore} P${period}`);
-          console.log(`  ${winningSide.toUpperCase()} @${priceInCents}¢ (market) vs ${(estimatedWinProb*100).toFixed(0)}% (est) → edge ${(edge*100).toFixed(1)}%`);
+        const edge = winProb - price;
+        if (edge < 0.03) {
+          console.log(`[live-edge] Edge too small: ${(edge*100).toFixed(1)}% (${side} @${(price*100).toFixed(0)}¢ vs ${(winProb*100).toFixed(0)}%)`);
+          continue;
+        }
 
-          tradeCooldowns.set(m.ticker, Date.now());
-          const result = await kalshiPost('/portfolio/orders', {
-            ticker: m.ticker, action: 'buy', side: winningSide, count: qty,
-            yes_price: winningSide === 'yes' ? priceInCents : 100 - priceInCents,
+        const maxTrade = Math.min(MAX_TRADE_CAP, kalshiBalance * MAX_TRADE_FRACTION);
+        const qty = Math.max(1, Math.floor(maxTrade / price));
+        const priceInCents = Math.round(price * 100);
+
+        console.log(`[live-edge] Claude matched: ${decision.ticker} ${side} @${priceInCents}¢ edge=${(edge*100).toFixed(1)}%`);
+        console.log(`  Reason: ${decision.reasoning}`);
+
+        tradeCooldowns.set(decision.ticker, Date.now());
+        const result = await kalshiPost('/portfolio/orders', {
+          ticker: decision.ticker, action: 'buy', side, count: qty,
+          yes_price: side === 'yes' ? priceInCents : 100 - priceInCents,
           });
 
-          if (result.ok) {
-            stats.tradesPlaced++;
-            const deployed = qty * winningPrice;
-            const profit = qty * edge;
-            await tg(
-              `⚡ <b>LIVE SCORE EDGE</b>\n\n` +
-              `<b>${m.title}</b>\n` +
-              `Score: ${homeScore}-${awayScore} (${comp.status?.type?.shortDetail ?? ''})\n\n` +
-              `BUY ${winningSide.toUpperCase()} @ $${winningPrice.toFixed(2)} × ${qty}\n` +
-              `Deployed: <b>$${deployed.toFixed(2)}</b>\n` +
-              `Est win prob: ${(estimatedWinProb*100).toFixed(0)}% vs market ${(winningPrice*100).toFixed(0)}%\n` +
-              `Edge: <b>${(edge*100).toFixed(1)}%</b> → profit ~$${profit.toFixed(2)}`
-            );
-          }
-          break; // one trade per game
+        if (result.ok) {
+          stats.tradesPlaced++;
+          const deployed = qty * price;
+          const profit = qty * edge;
+          await tg(
+            `⚡ <b>LIVE SCORE EDGE</b>\n\n` +
+            `<b>${market.title}</b>\n` +
+            `Ticker: <code>${decision.ticker}</code>\n` +
+            `Score: ${awayScore}-${homeScore} (${gameDetail})\n\n` +
+            `BUY ${side.toUpperCase()} @ $${price.toFixed(2)} × ${qty}\n` +
+            `Deployed: <b>$${deployed.toFixed(2)}</b>\n` +
+            `Claude prob: ${(winProb*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}%\n` +
+            `Edge: <b>${(edge*100).toFixed(1)}%</b>\n\n` +
+            `🧠 <i>${decision.reasoning}</i>`
+          );
+        } else {
+          console.error(`[live-edge] Order failed:`, result.status, JSON.stringify(result.data));
         }
       }
     } catch (e) {
