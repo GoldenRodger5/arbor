@@ -2453,39 +2453,33 @@ async function polyGetOrderbook(
 // Calculator
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Kalshi taker fee, verified Apr 2026. Parabolic, rounded up to nearest cent.
-// Source: help.kalshi.com/trading/fees and the Feb 2026 fee schedule PDF.
-// Maker rate is 0.0175 but arb fills cross the book, so taker is the right rate.
-// Kalshi taker fee — corrected Apr 2026. The previous 0.07 (7%) coefficient
-// was the parabolic maximum which overstated fees 3-4x. Kalshi's actual
-// taker rate is ~1-2% depending on price. Using 0.02 as a conservative average.
+// Kalshi taker fee (confirmed Apr 2026 from kalshi.com/fee-schedule):
+//   round_up(0.07 × C × P × (1-P))
+// Parabolic, peaks at 1.75¢/contract at P=0.50. Rounded up to nearest cent.
+// Maker rate is 0.0175 but arb fills cross the book, so taker is correct.
+// Source: https://kalshi.com/fee-schedule, https://kalshi.com/docs/kalshi-fee-schedule.pdf
 function kalshiFee(contracts: number, price: number): number {
-  return Math.ceil(0.02 * contracts * price * (1 - price) * 100) / 100;
+  return Math.ceil(0.07 * contracts * price * (1 - price) * 100) / 100;
 }
 
-// Polymarket taker fee, introduced March 2026 (was 0 prior to that — our
-// previous polyFee = 0 was correct then but is now wrong for new markets).
-// Source: docs.polymarket.com/trading/fees. Fee shape is identical to
-// Kalshi: feeRate × contracts × price × (1 - price), no cent rounding.
-// Per-category coefficients (taker):
-//   crypto 0.072, economics/culture/weather/other 0.05,
-//   politics/finance/tech/mentions 0.04, sports 0.03, geopolitics 0.
-// The category here is the PAIR's category (sports/economic/politics)
-// computed from pairCategory(), NOT the per-market raw category string.
-// Polymarket US charges a flat 5% fee (feeCoefficient: 0.05 in every US market
-// response). The tiered global rates below are kept as fallback for any
-// non-US Polymarket markets that may enter the pool via the gamma fallback.
-const POLY_US_FEE = 0.05;
+// Polymarket US taker fee (confirmed Apr 2026 from polymarketexchange.com/fees-hours):
+//   0.30% flat on total contract premium (not parabolic)
+// Maker orders receive a 0.20% rebate. We always model taker since arb fills
+// cross the book.
+// Source: https://www.polymarketexchange.com/fees-hours.html
+//
+// Polymarket International (non-US) uses category-based parabolic fees:
+//   Sports 0.75%, Crypto 1.80%, Politics 1.00%, etc.
+// We keep the international rates as fallback for any global markets.
+const POLY_US_FEE_FLAT_RATE = 0.003; // 0.30% flat on premium
 
 function polyFeeCoefficient(category?: PairCategory): number {
-  // Since the primary source is now Polymarket US, default to flat 5%.
-  // The scanner's normalizePolyUSMarket sets all US markets to platform='polymarket',
-  // so we can't distinguish by platform here. Use the flat US rate as the default
-  // since that's where 95%+ of our markets come from.
-  return POLY_US_FEE;
+  return POLY_US_FEE_FLAT_RATE;
 }
-function polyFee(contracts: number, price: number, category?: PairCategory): number {
-  return polyFeeCoefficient(category) * contracts * price * (1 - price);
+function polyFee(contracts: number, price: number, _category?: PairCategory): number {
+  // Polymarket US: 0.30% flat on total premium (contracts × price).
+  // NOT parabolic — the fee does NOT depend on (1-P).
+  return POLY_US_FEE_FLAT_RATE * contracts * price;
 }
 
 // PredictIt fee model: 10% of net profits on the winning contract + 5%

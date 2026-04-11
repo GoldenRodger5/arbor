@@ -379,10 +379,11 @@ function formatMessage(
   );
   const qty           = Math.max(1, sizing.contracts);
   const kellyDeployed = sizing.totalDeployed > 0 ? sizing.totalDeployed : costPerPair * qty;
+  // Kalshi taker: 0.07 × P × (1-P) parabolic. Poly US: 0.30% flat on premium.
+  const kFee = 0.07 * lvl.buyYesPrice * (1 - lvl.buyYesPrice);
+  const pFee = 0.003 * lvl.buyNoPrice; // flat, not parabolic
   const netProfitPerContract =
-    1.0 - (lvl.buyYesPrice + lvl.buyNoPrice)
-    - (0.02 * lvl.buyYesPrice * (1 - lvl.buyYesPrice))
-    - (0.05 * lvl.buyNoPrice * (1 - lvl.buyNoPrice));
+    1.0 - (lvl.buyYesPrice + lvl.buyNoPrice) - kFee - pFee;
   const maxProfit = qty * netProfitPerContract;
   const netPct        = (o.bestNetSpread * 100).toFixed(1);
   const apyPct        = (o.annualizedReturn * 100).toFixed(1);

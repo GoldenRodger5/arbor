@@ -1055,8 +1055,8 @@ async function refreshOpportunityPrices(
   originalKalshiPrice: number,
   originalPolyPrice: number,
   originalNetSpread: number,
-  kalshiFeeRate = 0.02,
-  polyFeeRate = 0.05,
+  kalshiFeeRate = 0.07,       // Kalshi taker: 0.07 × P × (1-P) parabolic
+  polyUsFeeRate = 0.003,      // Poly US taker: 0.30% flat on premium
 ): Promise<{
   kalshiPrice: number;
   polyPrice: number;
@@ -1079,9 +1079,9 @@ async function refreshOpportunityPrices(
   const costPerPair = kalshiPrice + polyPrice;
   const grossSpread = 1 - costPerPair;
 
-  // Estimate net spread after fees (parabolic, approximate).
+  // Kalshi: parabolic 0.07 × P × (1-P). Poly US: flat 0.30% on premium.
   const kalshiFee = kalshiFeeRate * kalshiPrice * (1 - kalshiPrice);
-  const polyFee   = polyFeeRate   * polyPrice   * (1 - polyPrice);
+  const polyFee   = polyUsFeeRate * polyPrice;  // flat, not parabolic
   const netSpread = grossSpread - kalshiFee - polyFee;
 
   const stale = Math.abs(kalshiPrice - originalKalshiPrice) > 0.02 ||
