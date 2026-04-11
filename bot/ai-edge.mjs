@@ -784,7 +784,11 @@ async function claudeBroadScan() {
     } catch { /* skip */ }
   }
 
-  if (allMarkets.length === 0) return;
+  if (allMarkets.length === 0) { console.log('[broad-scan] 0 markets found'); return; }
+
+  const sportCount = allMarkets.filter(m => m.category === 'Sports').length;
+  const nonSportCount = allMarkets.length - sportCount;
+  console.log(`[broad-scan] Found ${allMarkets.length} markets (${sportCount} sports, ${nonSportCount} non-sports)`);
 
   // Build compact market list for Claude
   const marketSummary = allMarkets.slice(0, 30).map(m =>
