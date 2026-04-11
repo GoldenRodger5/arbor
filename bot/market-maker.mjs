@@ -284,6 +284,7 @@ async function checkFills() {
           totalFills += newFills;
           changed = true;
           console.log(`[mm] FILL YES ${ticker} +${newFills} (total YES: ${filled}/${quote.qty})`);
+          await tg(`📥 <b>MM FILL YES</b> ${quote.title}\n+${newFills} @ ${quote.yesBidCents}¢ (${filled}/${quote.qty})`);
         }
         // If fully filled, mark order as done
         if (order.status === 'filled' || order.status === 'cancelled') {
@@ -305,6 +306,7 @@ async function checkFills() {
           totalFills += newFills;
           changed = true;
           console.log(`[mm] FILL NO  ${ticker} +${newFills} (total NO: ${filled}/${quote.qty})`);
+          await tg(`📥 <b>MM FILL NO</b> ${quote.title}\n+${newFills} @ ${quote.noBidCents}¢ (${filled}/${quote.qty})`);
         }
         if (order.status === 'filled' || order.status === 'cancelled') {
           quote.noOrderId = null;
@@ -313,23 +315,22 @@ async function checkFills() {
     }
 
     // Check for round-trip completion (both sides filled)
-    const roundTrips = Math.min(quote.yesFilled, quote.noFilled);
-    if (roundTrips > 0 && changed) {
-      // Each round trip = 1 contract YES + 1 contract NO = always pays $1
-      // Cost = yesBidCents + noBidCents per pair
-      // Profit per pair = 100 - yesBidCents - noBidCents (in cents)
+    const totalRoundTrips = Math.min(quote.yesFilled, quote.noFilled);
+    const newRoundTrips = totalRoundTrips - (quote.lastReportedRoundTrips ?? 0);
+    if (newRoundTrips > 0 && changed) {
+      quote.lastReportedRoundTrips = totalRoundTrips;
       const profitPerPairCents = 100 - quote.yesBidCents - quote.noBidCents;
-      const totalProfitCents = roundTrips * profitPerPairCents;
-      totalProfit = (totalProfit * 100 + totalProfitCents) / 100;
-      stats.roundTrips += roundTrips;
+      const newProfitCents = newRoundTrips * profitPerPairCents;
+      totalProfit += newProfitCents / 100;
+      stats.roundTrips += newRoundTrips;
 
       if (profitPerPairCents > 0) {
-        console.log(`[mm] ROUND TRIP ${ticker}: ${roundTrips} pairs × ${profitPerPairCents}¢ = +$${(totalProfitCents / 100).toFixed(2)}`);
+        console.log(`[mm] ROUND TRIP ${ticker}: +${newRoundTrips} new pairs × ${profitPerPairCents}¢ = +$${(newProfitCents / 100).toFixed(2)}`);
         await tg(
           `💰 <b>MM ROUND TRIP</b>\n\n` +
           `${quote.title}\n` +
-          `${roundTrips} pairs × ${profitPerPairCents}¢ = <b>+$${(totalProfitCents / 100).toFixed(2)}</b>\n` +
-          `Total session profit: <b>$${totalProfit.toFixed(2)}</b>`
+          `+${newRoundTrips} pairs × ${profitPerPairCents}¢ = <b>+$${(newProfitCents / 100).toFixed(2)}</b>\n` +
+          `Total: ${totalRoundTrips} round trips | Session profit: <b>$${totalProfit.toFixed(2)}</b>`
         );
       }
     }
@@ -412,6 +413,20 @@ async function main() {
   if (!KALSHI_API_KEY || !kalshiPrivateKey) {
     console.error('Missing Kalshi credentials');
     process.exit(1);
+  }
+
+  // Cancel any stale orders from a previous crashed session
+  try {
+    const openOrders = await kalshiGet('/portfolio/orders?status=resting&limit=100');
+    const stale = (openOrders.orders ?? []).filter(o => o.ticker?.includes('GAME'));
+    if (stale.length > 0) {
+      console.log(`[mm] Cancelling ${stale.length} stale orders from previous session`);
+      for (const o of stale) {
+        await kalshiDelete(`/portfolio/orders/${o.order_id}`).catch(() => {});
+      }
+    }
+  } catch (e) {
+    console.log('[mm] Could not check stale orders:', e.message);
   }
 
   // Check balance

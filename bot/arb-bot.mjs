@@ -605,6 +605,7 @@ function connectKalshiWS() {
 
   ws.on('close', () => {
     console.log('[kalshi-ws] disconnected, reconnecting in 5s...');
+    sendTelegram('⚠️ Kalshi WS disconnected — reconnecting...').catch(() => {});
     setTimeout(connectKalshiWS, 5000);
   });
 
@@ -718,6 +719,16 @@ async function main() {
     `Min spread: ${(MIN_NET_SPREAD * 100).toFixed(1)}%\n` +
     `Max trade: $${MAX_TRADE_USD}`
   );
+
+  // Graceful shutdown
+  process.on('SIGINT', async () => {
+    await sendTelegram('🛑 <b>Arb Bot Stopped</b>');
+    process.exit(0);
+  });
+  process.on('SIGTERM', async () => {
+    await sendTelegram('🛑 <b>Arb Bot Stopped</b>');
+    process.exit(0);
+  });
 
   console.log('Bot running. Press Ctrl+C to stop.');
 }

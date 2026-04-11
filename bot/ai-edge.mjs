@@ -156,7 +156,6 @@ async function fetchESPNNews() {
           if (!comp) continue;
           // Check for injury/status notes
           for (const c of comp.competitors ?? []) {
-            const notes = comp.notes ?? [];
             const injuries = c.injuries ?? [];
             for (const inj of injuries) {
               const id = `inj-${c.team?.abbreviation}-${inj.id ?? inj.athlete?.id}`;
@@ -322,6 +321,10 @@ async function executeTrade(market, assessment) {
   const { side, edgePct, fairProbability, reasoning } = assessment;
   const price = side === 'yes' ? market.yesAsk : market.noAsk;
   if (!price || price <= 0) return;
+  if (kalshiBalance < 5) {
+    console.log('[ai-trade] Balance too low ($' + kalshiBalance.toFixed(2) + '), skipping');
+    return;
+  }
 
   // Kelly sizing: f = edge / odds
   const odds = (1 / price) - 1;
@@ -365,6 +368,7 @@ async function executeTrade(market, assessment) {
     console.log(`[ai-trade] placed: filled=${filled} orderId=${order.order_id ?? 'unknown'}`);
   } else {
     console.error(`[ai-trade] order failed: ${result.status}`, JSON.stringify(result.data));
+    await tg(`❌ <b>AI Trade FAILED</b>\n${market.title}\n${side.toUpperCase()} @ $${price.toFixed(2)}\nHTTP ${result.status}`);
   }
 }
 
@@ -402,6 +406,18 @@ async function pollCycle() {
       // Step 3: Ask Claude
       const assessment = await assessEdge(news, market);
       if (!assessment || !assessment.hasEdge) continue;
+      // Validate Claude's response has required fields
+      if (!assessment.side || typeof assessment.edgePct !== 'number' ||
+          typeof assessment.fairProbability !== 'number' || !assessment.reasoning) {
+        console.log('[ai-edge] Invalid Claude response, skipping');
+        continue;
+      }
+      // Cross-check: edgePct should roughly match |fairProb - currentPrice|
+      const expectedEdge = Math.abs(assessment.fairProbability - (assessment.currentPrice ?? 0)) * 100;
+      if (Math.abs(assessment.edgePct - expectedEdge) > 10) {
+        console.log(`[ai-edge] Edge mismatch: claimed ${assessment.edgePct}% but calc'd ${expectedEdge.toFixed(1)}%, skipping`);
+        continue;
+      }
       if (assessment.edgePct < MIN_EDGE_PCT) continue;
       if (assessment.confidence === 'low') continue;
 
@@ -461,6 +477,16 @@ async function main() {
     `Balance: $${kalshiBalance.toFixed(2)}\n` +
     `Model: claude-haiku-4-5`
   );
+
+  // Graceful shutdown
+  process.on('SIGINT', async () => {
+    await tg('🛑 <b>AI Edge Bot Stopped</b>');
+    process.exit(0);
+  });
+  process.on('SIGTERM', async () => {
+    await tg('🛑 <b>AI Edge Bot Stopped</b>');
+    process.exit(0);
+  });
 
   console.log('AI edge bot running. Press Ctrl+C to stop.');
 }
