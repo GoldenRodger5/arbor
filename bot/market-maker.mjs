@@ -117,6 +117,9 @@ async function tg(text) {
 // State
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Live balance — refreshed before each requote cycle
+let kalshiBalanceDollars = 0;
+
 // Active quotes: ticker → { yesOrderId, noOrderId, yesFilled, noFilled, ... }
 const activeQuotes = new Map();
 let totalProfit = 0;
@@ -206,9 +209,13 @@ async function placeQuotes(market) {
   // Size: max contracts we can afford per side
   const yesPrice = ourYesBidCents / 100;
   const noPrice = ourNoBidCents / 100;
-  const maxQtyYes = Math.floor(MAX_PER_MARKET_USD / yesPrice);
-  const maxQtyNo = Math.floor(MAX_PER_MARKET_USD / noPrice);
-  const qty = Math.min(maxQtyYes, maxQtyNo, 50); // cap at 50 contracts
+  // Dynamic sizing: use 90% of balance / number of concurrent markets
+  const perMarketBudget = kalshiBalanceDollars > 0
+    ? Math.min(MAX_PER_MARKET_USD, (kalshiBalanceDollars * 0.9) / MAX_CONCURRENT)
+    : MAX_PER_MARKET_USD;
+  const maxQtyYes = Math.floor(perMarketBudget / yesPrice);
+  const maxQtyNo = Math.floor(perMarketBudget / noPrice);
+  const qty = Math.min(maxQtyYes, maxQtyNo, 100);
 
   if (qty < 1) return null;
 
@@ -351,6 +358,13 @@ async function cancelAllOrders() {
 }
 
 async function requote() {
+  // Refresh balance before requoting
+  try {
+    const bal = await kalshiGet('/portfolio/balance');
+    kalshiBalanceDollars = (bal.balance ?? 0) / 100;
+    console.log(`[mm] Balance: $${kalshiBalanceDollars.toFixed(2)}`);
+  } catch { /* keep old value */ }
+
   // Cancel existing orders and re-place with updated prices
   const currentTickers = [...activeQuotes.keys()];
   await cancelAllOrders();

@@ -82,6 +82,13 @@ function kalshiSign(method, path) {
   };
 }
 
+async function kalshiGet(path) {
+  const headers = kalshiSign('GET', path);
+  const res = await fetch(`${KALSHI_REST}${path}`, { headers });
+  if (!res.ok) throw new Error(`Kalshi GET ${path}: ${res.status}`);
+  return res.json();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // State
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,6 +105,32 @@ const executionCooldown = new Map(); // baseTicker → lastAlertedMs
 
 // ESPN live games — refreshed every 2 minutes
 let liveGameTeams = new Set();
+
+// Live balances — refreshed every 60 seconds
+let liveBalances = { kalshi: 0, poly: 0, total: 0, lastFetch: 0 };
+
+async function refreshBalances() {
+  try {
+    const bal = await kalshiGet('/portfolio/balance');
+    liveBalances.kalshi = (bal.balance ?? 0) / 100;
+  } catch { /* keep old value */ }
+  // Poly balance via US API would need Ed25519 auth — use the Supabase function instead
+  try {
+    const tradeUrl = process.env.SUPABASE_URL;
+    const sKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (tradeUrl && sKey) {
+      const res = await fetch(`${tradeUrl}/rest/v1/capital_ledger?select=total_capital&order=updated_at.desc&limit=1`, {
+        headers: { 'apikey': sKey, 'Authorization': `Bearer ${sKey}` },
+      });
+      if (res.ok) {
+        const rows = await res.json();
+        if (rows.length > 0) liveBalances.total = rows[0].total_capital ?? 0;
+      }
+    }
+  } catch { /* keep old value */ }
+  liveBalances.lastFetch = Date.now();
+  console.log(`[balance] Kalshi: $${liveBalances.kalshi.toFixed(2)} | Total: $${liveBalances.total.toFixed(2)}`);
+}
 
 let stats = { wsUpdates: 0, spreadsChecked: 0, arbsFound: 0, executed: 0 };
 
@@ -222,7 +255,7 @@ async function checkArb(baseTicker) {
     if (ALERT_ONLY) {
       // Alert only — don't execute until spreads are verified real
       const totalCost = kalshiPrice + polyPrice;
-      const qty = Math.max(1, Math.floor(MAX_TRADE_USD / totalCost));
+      const qty = Math.max(1, Math.floor(Math.min(MAX_TRADE_USD, liveBalances.kalshi * 0.9) / totalCost));
       const deployed = qty * totalCost;
       const profit = qty * bestSpread;
       await sendTelegram(
@@ -249,7 +282,7 @@ async function checkArb(baseTicker) {
 
 async function executeArb(pair, kalshiPrice, polyPrice, kalshiSide, netSpread) {
   const totalCost = kalshiPrice + polyPrice;
-  const qty = Math.max(1, Math.floor(MAX_TRADE_USD / totalCost));
+  const qty = Math.max(1, Math.floor(Math.min(MAX_TRADE_USD, liveBalances.kalshi * 0.9) / totalCost));
   const deployed = qty * totalCost;
   const profit = qty * netSpread;
 
@@ -439,9 +472,10 @@ function matchMarkets(kalshiMarkets, polyMarkets) {
         const polyDateMatch = bestPoly.slug.match(/(\d{4}-\d{2}-\d{2})/);
         if (polyDateMatch) {
           const polyDate = new Date(polyDateMatch[1] + 'T00:00:00Z');
-          const gapMs = Math.abs(kalshiGameDate.getTime() - polyDate.getTime());
-          if (gapMs > 24 * 60 * 60 * 1000) {
-            continue; // different day — not the same game
+          const kalshiDay = kalshiGameDate.toISOString().slice(0, 10);
+          const polyDay = polyDateMatch[1];
+          if (kalshiDay !== polyDay) {
+            continue; // different calendar day — not the same game
           }
         }
       }
@@ -649,7 +683,8 @@ async function main() {
     console.log('No matched pairs found. Waiting for markets...');
   }
 
-  // Step 3: Fetch live games from ESPN (filter in-progress)
+  // Step 3: Fetch balances and live games
+  await refreshBalances();
   await refreshLiveGames();
 
   // Step 4: Connect Kalshi websocket
@@ -658,8 +693,9 @@ async function main() {
   // Step 5: Poll Polymarket every 10 seconds
   setInterval(pollPolyPrices, 10_000);
 
-  // Step 6: Refresh ESPN live games every 2 minutes
+  // Step 6: Refresh ESPN live games every 2 minutes + balances every 60s
   setInterval(refreshLiveGames, 2 * 60 * 1000);
+  setInterval(refreshBalances, 60_000);
 
   // Step 7: Refresh market discovery every 5 minutes
   setInterval(async () => {
