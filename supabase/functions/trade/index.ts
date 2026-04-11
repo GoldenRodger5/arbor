@@ -671,11 +671,17 @@ async function executePolymarketOrder(
   const slug = polyUrl ? extractPolyUSSlug(polyUrl) : null;
   const intent = isHedge ? 'ORDER_INTENT_BUY_SHORT' : 'ORDER_INTENT_BUY_LONG';
 
+  // Add 2¢ buffer to cross the spread — the listed price is a synthetic/mid
+  // price from the market listing, not the real ask. Without a buffer the IOC
+  // order lands below resting asks and fills nothing.
+  const crossPrice = Math.min(price + 0.02, 0.99);
+  console.log('[poly-us-order-price]', { scanPrice: price, crossPrice, buffer: 0.02 });
+
   const orderBody = {
     marketSlug: slug ?? tokenId, // slug preferred; fall back to tokenId as identifier
     intent,
     type: 'ORDER_TYPE_LIMIT',
-    price: { value: price.toFixed(2), currency: 'USD' },
+    price: { value: crossPrice.toFixed(2), currency: 'USD' },
     quantity: Math.round(size),
     tif: 'TIME_IN_FORCE_IMMEDIATE_OR_CANCEL',
   };
