@@ -751,6 +751,31 @@ async function claudeBroadScan() {
     } catch { /* skip */ }
   }
 
+  // Golf/Masters — high volume event, scan parlays by keyword
+  try {
+    let cursor = '';
+    for (let p = 0; p < 3; p++) {
+      const url = `/markets?status=open&limit=100${cursor ? '&cursor=' + cursor : ''}`;
+      const data = await kalshiGet(url);
+      for (const m of data.markets ?? []) {
+        if (!m.yes_ask_dollars || !m.no_ask_dollars) continue;
+        const t = (m.title ?? '').toLowerCase();
+        const ya = parseFloat(m.yes_ask_dollars);
+        if (ya < 0.01 || ya > 0.99) continue;
+        if (t.includes('masters') || t.includes('rory') || t.includes('scheffler') ||
+            t.includes('scottie') || t.includes('cameron young') || t.includes('mcilroy')) {
+          allMarkets.push({
+            ticker: m.ticker, title: m.title, category: 'Golf/Masters',
+            yesAsk: m.yes_ask_dollars, noAsk: m.no_ask_dollars,
+            closeTime: m.close_time ?? '',
+          });
+        }
+      }
+      cursor = data.cursor ?? '';
+      if (!cursor || (data.markets ?? []).length < 100) break;
+    }
+  } catch { /* skip */ }
+
   // Non-sports — use series tickers (category API is broken)
   const nonSportsSeries = [
     { series: 'KXBTC', label: 'Crypto' },
@@ -992,7 +1017,8 @@ async function claudeBroadScan() {
       if (!pd.markets?.length) break;
       for (const m of pd.markets ?? []) {
         if (m.closed || !m.active) continue;
-        if (m.marketType !== 'moneyline') continue;
+        // Include moneyline (game-winners) AND futures (Masters, MVP, etc.)
+        if (m.marketType !== 'moneyline' && m.marketType !== 'futures') continue;
         const sides = m.marketSides ?? [];
         if (sides.length < 2) continue;
         const s0 = parseFloat(String(sides[0]?.price ?? '0'));
