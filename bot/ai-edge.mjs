@@ -795,14 +795,26 @@ async function claudeBroadScan() {
     `[${m.category}] ${m.ticker}: "${m.title}" YES=$${m.yesAsk} NO=$${m.noAsk}`
   ).join('\n');
 
-  // Fetch recent headlines for context
+  // Fetch context: news + crypto prices
   let recentNews = '';
+  let cryptoPrices = '';
   try {
     const newsRes = await fetch('http://site.api.espn.com/apis/site/v2/sports/baseball/mlb/news?limit=3',
       { headers: { 'User-Agent': 'arbor/1' }, signal: AbortSignal.timeout(3000) });
     if (newsRes.ok) {
       const nd = await newsRes.json();
       recentNews = (nd.articles ?? []).slice(0, 3).map(a => a.headline).join('; ');
+    }
+  } catch { /* skip */ }
+  // Fetch BTC/ETH spot prices for crypto market analysis
+  try {
+    const cryptoRes = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd',
+      { signal: AbortSignal.timeout(3000) });
+    if (cryptoRes.ok) {
+      const cd = await cryptoRes.json();
+      const btc = cd.bitcoin?.usd ?? 0;
+      const eth = cd.ethereum?.usd ?? 0;
+      if (btc > 0) cryptoPrices = `BTC: $${btc.toLocaleString()} | ETH: $${eth.toLocaleString()}`;
     }
   } catch { /* skip */ }
 
@@ -854,12 +866,13 @@ async function claudeBroadScan() {
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 400,
         messages: [{ role: 'user', content:
-          `You are a professional sports bettor. Find ONE trade with a real edge.\n\n` +
+          `You are a professional prediction market trader. Find ONE trade with a real edge across sports, crypto, economics, or politics.\n\n` +
           `AVAILABLE CASH: $${kalshiBalance.toFixed(2)} (this is ALL I can bet with — positions value is LOCKED)\n\n` +
-          `MY EXISTING POSITIONS (DO NOT trade these games again):\n` +
+          `MY EXISTING POSITIONS (DO NOT trade these again):\n` +
           (openPositions.length > 0 ? openPositions.map(p => `  ${p.ticker}`).join('\n') : '  None') + '\n\n' +
-          `TODAY: ${today} (tickers use format ${todayShort} for today)\n\n` +
-          `MARKETS I CAN TRADE:\n${marketSummaryFiltered}\n\n` +
+          `TODAY: ${today} (sports tickers use ${todayShort} for today, ${tomorrowShort} for tonight's late games)\n` +
+          (cryptoPrices ? `LIVE CRYPTO PRICES: ${cryptoPrices}\n` : '') +
+          `\nMARKETS I CAN TRADE:\n${marketSummaryFiltered}\n\n` +
           `STRICT RULES — violating ANY means return {"trade":false}:\n` +
           `1. Your probability MUST differ from market price by at least 10 percentage points\n` +
           `2. YES price + NO price on Kalshi always sums to ~$1.00-1.03. This is NOT mispricing — it's the bid-ask spread. Do NOT trade based on YES+NO sum.\n` +
