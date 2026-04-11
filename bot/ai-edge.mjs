@@ -823,7 +823,11 @@ async function claudeBroadScan() {
 
   if (tradeable.length === 0) { console.log('[broad-scan] No tradeable markets (all have positions)'); return; }
 
-  const marketSummaryFiltered = tradeable.slice(0, 25).map(m =>
+  // Put non-sports first so Claude sees crypto/economics/politics before the 25 cap
+  const nonSports = tradeable.filter(m => m.category !== 'Sports');
+  const sports = tradeable.filter(m => m.category === 'Sports');
+  const ordered = [...nonSports, ...sports];
+  const marketSummaryFiltered = ordered.slice(0, 30).map(m =>
     `[${m.category}] ${m.ticker}: "${m.title}" YES=$${m.yesAsk} NO=$${m.noAsk}`
   ).join('\n');
 
