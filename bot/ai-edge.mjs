@@ -440,10 +440,21 @@ function canTrade() {
   return true;
 }
 
-function getPositionSize(exchange = 'kalshi') {
+function getPositionSize(exchange = 'kalshi', confidenceMargin = 0) {
   let size = getDynamicMaxTrade(exchange);
 
-  // Reduce size after consecutive losses — half size, not a fixed floor
+  // Scale UP for high-confidence trades — bigger margin = bigger bet
+  // margin 5% = 1x (base), 10% = 1.5x, 15% = 2x, 20%+ = 2.5x (max)
+  if (confidenceMargin > 0.05) {
+    const multiplier = Math.min(2.5, 1 + (confidenceMargin - 0.05) * 10);
+    const scaledSize = size * multiplier;
+    // Still respect deployment cap and ceiling
+    const ceiling = getTradeCapCeiling();
+    size = Math.min(scaledSize, ceiling);
+    if (multiplier > 1.1) console.log(`[sizing] High confidence (+${(confidenceMargin*100).toFixed(0)}%): ${multiplier.toFixed(1)}x → $${size.toFixed(2)}`);
+  }
+
+  // Reduce size after consecutive losses
   if (consecutiveLosses >= MAX_CONSECUTIVE_LOSSES) {
     size = size * 0.5;
     console.log(`[risk] Reduced position size to $${size.toFixed(2)} (50%) after ${consecutiveLosses} consecutive losses`);
@@ -1091,7 +1102,7 @@ async function checkLiveScoreEdges() {
         const bestEdge = confidence - bestPrice;
         if (bestEdge < CONFIDENCE_MARGIN) continue; // recheck with best price
 
-        const maxBetLE = getPositionSize(best.platform);
+        const maxBetLE = getPositionSize(best.platform, bestEdge);
         const claudeBet = decision.betAmount ?? 0;
         const safeBet = Math.min(claudeBet, maxBetLE);
         if (safeBet < 1) {
@@ -1310,7 +1321,7 @@ async function checkPreGamePredictions() {
     const edge = confidence - bestPrice;
     if (edge < CONFIDENCE_MARGIN) continue;
 
-    const maxBet = getPositionSize(pgBest.platform);
+    const maxBet = getPositionSize(pgBest.platform, edge);
     const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
     if (safeBet < 1) continue;
 
@@ -1471,7 +1482,8 @@ async function checkUFCPredictions() {
     }
 
     if (!canTrade()) break;
-    const maxBet = getPositionSize('polymarket');
+    const ufcEdge = confidence - price;
+    const maxBet = getPositionSize('polymarket', ufcEdge);
     const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
     if (safeBet < 1) continue;
     if (!canDeployMore(safeBet)) continue;
