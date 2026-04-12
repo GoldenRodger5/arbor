@@ -40,6 +40,7 @@ const MAX_TRADE_FRACTION = 0.25; // Use up to 25% of balance per trade
 const MAX_TRADE_CAP = 50;        // Hard cap $50 per trade
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 15 * 60 * 1000; // 15 min cooldown per market
+const MAX_DAYS_OUT = 14;           // Only trade markets closing within 14 days — capital efficiency
 const CLAUDE_MODEL = 'claude-sonnet-4-6';  // Sonnet 4.6 for better analysis
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -830,6 +831,21 @@ async function claudeBroadScan() {
     } catch { /* skip */ }
   }
 
+  // Filter out markets closing too far in the future — capital efficiency
+  const maxCloseMs = Date.now() + MAX_DAYS_OUT * 24 * 60 * 60 * 1000;
+  const beforeFilter = allMarkets.length;
+  for (let i = allMarkets.length - 1; i >= 0; i--) {
+    const ct = allMarkets[i].closeTime;
+    if (ct) {
+      const closeMs = Date.parse(ct);
+      if (Number.isFinite(closeMs) && closeMs > maxCloseMs) {
+        allMarkets.splice(i, 1);
+      }
+    }
+  }
+  const filtered = beforeFilter - allMarkets.length;
+  if (filtered > 0) console.log(`[broad-scan] Filtered ${filtered} markets closing > ${MAX_DAYS_OUT} days out`);
+
   if (allMarkets.length === 0) { console.log('[broad-scan] 0 markets found'); return; }
 
   const sportCount = allMarkets.filter(m => m.category === 'Sports').length;
@@ -923,7 +939,8 @@ async function claudeBroadScan() {
       `5. If cash < $3, return {"trade":false}\n` +
       `6. You need a REAL reason the market is wrong — not just "asymmetric pricing" or "bid-ask spread"\n` +
       `7. Fees eat ~1.75¢ per contract at 50¢. Account for this.\n` +
-      `8. Do NOT bet on heavy underdogs (price below $0.25) unless your research found SPECIFIC breaking news (injury, rest day, etc). General "upset potential" is NOT an edge.\n\n` +
+      `8. Do NOT bet on heavy underdogs (price below $0.25) unless your research found SPECIFIC breaking news (injury, rest day, etc). General "upset potential" is NOT an edge.\n` +
+      `9. All markets shown close within ${MAX_DAYS_OUT} days. Prefer markets closing SOONER for faster capital turnover.\n\n` +
       `Respond JSON ONLY:\n` +
       `{"trade":false,"reasoning":"why no good trade"}\n` +
       `OR\n` +
@@ -1000,14 +1017,16 @@ async function claudeBroadScan() {
 
     if (result.ok) {
       stats.tradesPlaced++;
-      // Extract team from ticker suffix for clear notification
+      // Extract team from ticker suffix and calculate days to close
       const teamSuffix = decision.ticker.split('-').pop() ?? '';
+      const closeMs = Date.parse(market.closeTime);
+      const daysOut = Number.isFinite(closeMs) ? Math.ceil((closeMs - Date.now()) / (24*60*60*1000)) : '?';
       await tg(
         `🧠 <b>CLAUDE TRADE — KALSHI</b>\n\n` +
         `<b>${market.title}</b>\n` +
         `Category: ${market.category}\n` +
         `Ticker: <code>${decision.ticker}</code>\n` +
-        `Team: <b>${teamSuffix}</b>\n\n` +
+        `Team: <b>${teamSuffix}</b> | Closes in <b>${daysOut}d</b>\n\n` +
         `BUY ${decision.side.toUpperCase()} @ $${price.toFixed(2)} × ${qty}\n` +
         `Deployed: <b>$${(qty * price).toFixed(2)}</b>\n` +
         `Edge: <b>${(edge*100).toFixed(0)}%</b> (Claude ${((decision.probability ?? 0)*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}%)\n\n` +
