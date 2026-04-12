@@ -36,7 +36,7 @@ const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 
 const MIN_EDGE = 0.07;           // 7% edge minimum — consistent across ALL strategies
 const MIN_EDGE_PCT = 7;          // same × 100 for display
-const MAX_TRADE_FRACTION = 0.05; // 5% of bankroll per trade — aggressive but backed by biweekly $400 injections
+const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — must generate enough to cover API costs + grow
 const MAX_TRADE_CAP = 50;        // Absolute ceiling — dynamic cap handles the real limit
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 30 * 60 * 1000; // 30 min cooldown per market (was 15 — too short)
