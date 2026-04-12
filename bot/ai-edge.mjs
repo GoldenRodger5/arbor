@@ -40,6 +40,7 @@ const MAX_TRADE_FRACTION = 0.25; // Use up to 25% of balance per trade
 const MAX_TRADE_CAP = 50;        // Hard cap $50 per trade
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 15 * 60 * 1000; // 15 min cooldown per market
+const CLAUDE_MODEL = 'claude-sonnet-4-6';  // Sonnet 4.6 for better analysis
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth
@@ -203,6 +204,51 @@ async function tg(text) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: TG_CHAT, text, parse_mode: 'HTML' }),
   }).catch(() => {});
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Claude with Web Search — researches before deciding
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, timeout = 45000 } = {}) {
+  stats.claudeCalls++;
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      signal: AbortSignal.timeout(timeout),
+      method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: CLAUDE_MODEL,
+        max_tokens: maxTokens,
+        tools: [{
+          type: 'web_search_20250305',
+          name: 'web_search',
+          max_uses: maxSearches,
+        }],
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    if (!res.ok) {
+      console.error('[claude-search] HTTP', res.status, await res.text().catch(() => ''));
+      return null;
+    }
+
+    const data = await res.json();
+    const textBlocks = (data.content ?? []).filter(b => b.type === 'text');
+    const searches = (data.content ?? []).filter(b => b.type === 'server_tool_use').length;
+    if (searches > 0) console.log(`[claude-search] Used ${searches} web searches`);
+
+    // Return last text block (Claude's final answer after research)
+    return textBlocks.length > 0 ? textBlocks[textBlocks.length - 1].text : '';
+  } catch (e) {
+    console.error('[claude-search] error:', e.message);
+    return null;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -411,10 +457,19 @@ Title: ${market.title}
 Current YES price: $${market.yesAsk?.toFixed(2) ?? 'unknown'}
 Current NO price: $${market.noAsk?.toFixed(2) ?? 'unknown'}
 
+RESEARCH FIRST: Use web search to look up CURRENT information before deciding:
+- Both teams' current win-loss records and standings
+- Recent form (last 5-10 games)
+- Key injuries or lineup changes
+- Head-to-head record this season
+Your probability MUST be grounded in real data you find, not assumptions.
+
 QUESTION: Does this news materially change the probability of this game's outcome? If so:
 1. Which side benefits (YES or NO)?
 2. What should the fair probability be after this news?
 3. What is the edge (difference between fair prob and current market price)?
+
+IMPORTANT: Do NOT bet on heavy underdogs (market price below $0.25) unless your research reveals a SPECIFIC concrete reason (e.g., star player injury on favorite, confirmed rest day). "Upset potential" alone is NOT an edge.
 
 Respond in JSON only:
 {
@@ -424,35 +479,14 @@ Respond in JSON only:
   "currentPrice": 0.XX,
   "edgePct": X.X,
   "confidence": "high"/"medium"/"low",
-  "reasoning": "one sentence"
+  "reasoning": "one sentence citing specific facts from your research"
 }
 
 If the news doesn't meaningfully change the probability (e.g. minor roster move, already priced in, not relevant to this game), return {"hasEdge": false}.`;
 
   try {
-    stats.claudeCalls++;
-    const res = await fetch('https://api.anthropic.com/v1/messages', { signal: AbortSignal.timeout(15000),
-      method: 'POST',
-      headers: {
-        'x-api-key': ANTHROPIC_KEY,
-        'anthropic-version': '2023-06-01',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 300,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
-
-    if (!res.ok) {
-      console.error('[claude] HTTP', res.status);
-      return null;
-    }
-
-    const data = await res.json();
-    const text = data.content?.[0]?.text ?? '';
-    // Extract JSON from response
+    const text = await claudeWithSearch(prompt);
+    if (!text) return null;
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return null;
     return JSON.parse(jsonMatch[0]);
@@ -586,45 +620,31 @@ async function checkLiveScoreEdges() {
 
         if (marketList.length === 0) continue;
 
-        // Use Claude to: 1) find the right market, 2) assess win probability, 3) pick side, 4) decide bet size
-        stats.claudeCalls++;
+        // Use Claude with web search to research teams and assess
         const portfolioInfo = getPortfolioSummary();
-        const claudeRes = await fetch('https://api.anthropic.com/v1/messages', { signal: AbortSignal.timeout(15000),
-          method: 'POST',
-          headers: {
-            'x-api-key': ANTHROPIC_KEY,
-            'anthropic-version': '2023-06-01',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'claude-haiku-4-5-20251001',
-            max_tokens: 300,
-            messages: [{ role: 'user', content:
-              `You are a sports prediction market trader managing a real portfolio.\n\n` +
-              `MY PORTFOLIO:\n${portfolioInfo}\n\n` +
-              `LIVE ${league.toUpperCase()} GAME RIGHT NOW (today ${new Date().toISOString().slice(0,10)}):\n` +
-              `${away.team?.displayName} ${awayScore} at ${home.team?.displayName} ${homeScore}\n` +
-              `Game status: ${gameDetail}\n\n` +
-              `KALSHI MARKETS (some may be for DIFFERENT DATES):\n` +
-              marketList.join('\n') + '\n\n' +
-              `RULES:\n` +
-              `- Ticker dates: 26APR11 = April 11, 26APR12 = April 12, etc.\n` +
-              `- Today is ${new Date().toISOString().slice(0,10)}. ONLY pick a ticker with TODAY's date.\n` +
-              `- If I already have a position on this game, DON'T add more.\n` +
-              `- Never bet more than 25% of my cash balance on one trade.\n` +
-              `- If cash balance is below $5, return {"ticker": null} — not enough to trade.\n` +
-              `- Only trade if you're very confident (>80% win probability).\n\n` +
-              `Respond in JSON ONLY:\n` +
-              `{"ticker": "exact ticker for TODAY or null", "side": "yes"/"no", ` +
-              `"winProbability": 0.XX, "betAmount": dollars to bet (max 25% of cash), ` +
-              `"reasoning": "one sentence"}`
-            }],
-          }),
-        });
-
-        if (!claudeRes.ok) { console.error('[live-edge] Claude HTTP', claudeRes.status); continue; }
-        const cData = await claudeRes.json();
-        const cText = cData.content?.[0]?.text ?? '';
+        const livePrompt =
+          `You are a sports prediction market trader managing a real portfolio.\n\n` +
+          `MY PORTFOLIO:\n${portfolioInfo}\n\n` +
+          `LIVE ${league.toUpperCase()} GAME RIGHT NOW (today ${new Date().toISOString().slice(0,10)}):\n` +
+          `${away.team?.displayName} ${awayScore} at ${home.team?.displayName} ${homeScore}\n` +
+          `Game status: ${gameDetail}\n\n` +
+          `KALSHI MARKETS (some may be for DIFFERENT DATES):\n` +
+          marketList.join('\n') + '\n\n' +
+          `RESEARCH FIRST: Use web search to look up both teams' current records, standings, and any key context. Your win probability MUST be based on real data.\n\n` +
+          `RULES:\n` +
+          `- Ticker dates use format like 26APR11 = April 11, 26APR12 = April 12.\n` +
+          `- Today is ${new Date().toISOString().slice(0,10)}. ONLY pick a ticker with TODAY's date.\n` +
+          `- If I already have a position on this game, DON'T add more.\n` +
+          `- Never bet more than 25% of my cash balance on one trade.\n` +
+          `- If cash balance is below $5, return {"ticker": null}.\n` +
+          `- Only trade if you're very confident (>80% win probability).\n` +
+          `- Do NOT bet on heavy underdogs (price below 25¢) unless you found specific breaking news.\n\n` +
+          `Respond in JSON ONLY:\n` +
+          `{"ticker": "exact ticker for TODAY or null", "side": "yes"/"no", ` +
+          `"winProbability": 0.XX, "betAmount": dollars to bet (max 25% of cash), ` +
+          `"reasoning": "one sentence citing facts from your research"}`;
+        const cText = await claudeWithSearch(livePrompt);
+        if (!cText) continue;
         const jsonMatch = cText.match(/\{[\s\S]*\}/);
         if (!jsonMatch) continue;
 
@@ -869,8 +889,7 @@ async function claudeBroadScan() {
     `[${m.category}] ${m.ticker}: "${m.title}" YES=$${m.yesAsk} NO=$${m.noAsk}`
   ).join('\n');
 
-  // Ask Claude — strict rules
-  stats.claudeCalls++;
+  // Ask Claude with web search — strict rules
   try {
     // Use ET date AND next day (games starting at 10pm ET = Apr12 in ticker but Apr11 locally)
     const now = new Date();
@@ -881,43 +900,37 @@ async function claudeBroadScan() {
     const tomorrowShort = toShort(etTomorrow);
     const today = etNow.toISOString().slice(0, 10);
 
-    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', { signal: AbortSignal.timeout(15000),
-      method: 'POST',
-      headers: {
-        'x-api-key': ANTHROPIC_KEY,
-        'anthropic-version': '2023-06-01',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 400,
-        messages: [{ role: 'user', content:
-          `You are a professional prediction market trader. Find ONE trade with a real edge across sports, crypto, economics, or politics.\n\n` +
-          `AVAILABLE CASH: $${kalshiBalance.toFixed(2)} (this is ALL I can bet with — positions value is LOCKED)\n\n` +
-          `MY EXISTING POSITIONS (DO NOT trade these again):\n` +
-          (openPositions.length > 0 ? openPositions.map(p => `  ${p.ticker}`).join('\n') : '  None') + '\n\n' +
-          `TODAY: ${today} (sports tickers use ${todayShort} for today, ${tomorrowShort} for tonight's late games)\n` +
-          (cryptoPrices ? `LIVE CRYPTO PRICES: ${cryptoPrices}\n` : '') +
-          `\nMARKETS I CAN TRADE:\n${marketSummaryFiltered}\n\n` +
-          `STRICT RULES — violating ANY means return {"trade":false}:\n` +
-          `1. Your probability MUST differ from market price by at least 7 percentage points\n` +
-          `2. YES price + NO price on Kalshi always sums to ~$1.00-1.03. This is NOT mispricing — it's the bid-ask spread. Do NOT trade based on YES+NO sum.\n` +
-          `3. For SPORTS game-winner tickers: ONLY trade if ticker contains "${todayShort}" (today) or "${tomorrowShort}" (tonight's late games). Non-sports tickers don't have dates — trade those anytime.\n` +
-          `4. Max bet: $${Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25).toFixed(2)} (25% of $${kalshiBalance.toFixed(2)} cash)\n` +
-          `5. If cash < $3, return {"trade":false}\n` +
-          `6. You need a REAL reason the market is wrong — not just "asymmetric pricing" or "bid-ask spread"\n` +
-          `7. Fees eat ~1.75¢ per contract at 50¢. Account for this.\n\n` +
-          `Respond JSON ONLY:\n` +
-          `{"trade":false,"reasoning":"why no good trade"}\n` +
-          `OR\n` +
-          `{"trade":true,"ticker":"exact","side":"yes"/"no","betAmount":N,"probability":0.XX,"reasoning":"specific reason market is wrong"}`
-        }],
-      }),
-    });
+    const broadPrompt =
+      `You are a professional prediction market trader. Find ONE trade with a real edge across sports, crypto, economics, or politics.\n\n` +
+      `AVAILABLE CASH: $${kalshiBalance.toFixed(2)} (this is ALL I can bet with — positions value is LOCKED)\n\n` +
+      `MY EXISTING POSITIONS (DO NOT trade these again):\n` +
+      (openPositions.length > 0 ? openPositions.map(p => `  ${p.ticker}`).join('\n') : '  None') + '\n\n' +
+      `TODAY: ${today} (sports tickers use ${todayShort} for today, ${tomorrowShort} for tonight's late games)\n` +
+      (cryptoPrices ? `LIVE CRYPTO PRICES: ${cryptoPrices}\n` : '') +
+      `\nMARKETS I CAN TRADE:\n${marketSummaryFiltered}\n\n` +
+      `RESEARCH FIRST: You have web search. BEFORE picking any trade, SEARCH for current real-world data:\n` +
+      `- Sports: search both teams' current records/standings, injuries, recent form. A 20-win team at 25¢ is correctly priced, NOT an edge.\n` +
+      `- Crypto: search current price action, major news, on-chain data\n` +
+      `- Economics: search latest CPI/jobs data, Fed commentary, consensus forecasts\n` +
+      `- Politics: search latest polls, expert predictions, recent developments\n` +
+      `- Golf/Masters: search leaderboard, player form, course history\n` +
+      `Your probability MUST come from facts you researched. If you can't find data supporting an edge, return {"trade":false}.\n\n` +
+      `STRICT RULES — violating ANY means return {"trade":false}:\n` +
+      `1. Your probability MUST differ from market price by at least 7 percentage points\n` +
+      `2. YES price + NO price on Kalshi always sums to ~$1.00-1.03. This is NOT mispricing — it's the bid-ask spread. Do NOT trade based on YES+NO sum.\n` +
+      `3. For SPORTS game-winner tickers: ONLY trade if ticker contains "${todayShort}" (today) or "${tomorrowShort}" (tonight's late games). Non-sports tickers don't have dates — trade those anytime.\n` +
+      `4. Max bet: $${Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25).toFixed(2)} (25% of $${kalshiBalance.toFixed(2)} cash)\n` +
+      `5. If cash < $3, return {"trade":false}\n` +
+      `6. You need a REAL reason the market is wrong — not just "asymmetric pricing" or "bid-ask spread"\n` +
+      `7. Fees eat ~1.75¢ per contract at 50¢. Account for this.\n` +
+      `8. Do NOT bet on heavy underdogs (price below $0.25) unless your research found SPECIFIC breaking news (injury, rest day, etc). General "upset potential" is NOT an edge.\n\n` +
+      `Respond JSON ONLY:\n` +
+      `{"trade":false,"reasoning":"why no good trade"}\n` +
+      `OR\n` +
+      `{"trade":true,"ticker":"exact","side":"yes"/"no","betAmount":N,"probability":0.XX,"reasoning":"specific facts from research proving market is wrong"}`;
 
-    if (!claudeRes.ok) { console.error('[broad-scan] Claude HTTP', claudeRes.status); return; }
-    const cData = await claudeRes.json();
-    const cText = cData.content?.[0]?.text ?? '';
+    const cText = await claudeWithSearch(broadPrompt, { maxTokens: 1024, maxSearches: 5 });
+    if (!cText) return;
     const jsonMatch = cText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return;
 
@@ -987,15 +1000,18 @@ async function claudeBroadScan() {
 
     if (result.ok) {
       stats.tradesPlaced++;
+      // Extract team from ticker suffix for clear notification
+      const teamSuffix = decision.ticker.split('-').pop() ?? '';
       await tg(
         `🧠 <b>CLAUDE TRADE — KALSHI</b>\n\n` +
         `<b>${market.title}</b>\n` +
         `Category: ${market.category}\n` +
-        `Ticker: <code>${decision.ticker}</code>\n\n` +
+        `Ticker: <code>${decision.ticker}</code>\n` +
+        `Team: <b>${teamSuffix}</b>\n\n` +
         `BUY ${decision.side.toUpperCase()} @ $${price.toFixed(2)} × ${qty}\n` +
         `Deployed: <b>$${(qty * price).toFixed(2)}</b>\n` +
         `Edge: <b>${(edge*100).toFixed(0)}%</b> (Claude ${((decision.probability ?? 0)*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}%)\n\n` +
-        `🧠 <i>${decision.reasoning}</i>`
+        `🔍 <i>Research-backed: ${decision.reasoning}</i>`
       );
     }
   } catch (e) {
@@ -1040,35 +1056,27 @@ async function claudeBroadScan() {
       `"${m.title}" — ${m.side0} | ${m.side1} [slug: ${m.slug}]`
     ).join('\n');
 
-    stats.claudeCalls++;
-    const polyClaudeRes = await fetch('https://api.anthropic.com/v1/messages', { signal: AbortSignal.timeout(15000),
-      method: 'POST',
-      headers: {
-        'x-api-key': ANTHROPIC_KEY,
-        'anthropic-version': '2023-06-01',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 300,
-        messages: [{ role: 'user', content:
-          `You are a sports bettor. Find ONE trade on Polymarket US with a real edge.\n\n` +
-          `POLYMARKET CASH: $${polyBalance.toFixed(2)}\n\n` +
-          `MARKETS:\n${polyList}\n\n` +
-          `RULES:\n` +
-          `- Need 10%+ edge (your probability vs market price)\n` +
-          `- Max bet: $${Math.min(50, polyBalance * 0.25).toFixed(2)}\n` +
-          `- Need a REAL reason — not just "price seems off"\n` +
-          `- side0 = ORDER_INTENT_BUY_LONG, side1 = ORDER_INTENT_BUY_SHORT\n\n` +
-          `JSON ONLY:\n` +
-          `{"trade":false,"reasoning":"why"}\n` +
-          `OR {"trade":true,"slug":"exact slug","side":"side0"/"side1","betAmount":N,"probability":0.XX,"reasoning":"why mispriced"}`
-        }],
-      }),
-    });
-    if (!polyClaudeRes.ok) return;
-    const pcData = await polyClaudeRes.json();
-    const pcText = pcData.content?.[0]?.text ?? '';
+    const polyPrompt =
+      `You are a prediction market trader. Find ONE trade on Polymarket US with a real edge.\n\n` +
+      `POLYMARKET CASH: $${polyBalance.toFixed(2)}\n\n` +
+      `MARKETS:\n${polyList}\n\n` +
+      `RESEARCH FIRST: Use web search to look up current facts before deciding:\n` +
+      `- Sports: team records, standings, injuries, recent form\n` +
+      `- Futures (MVP, awards, tournament winners): current favorites, recent performance, expert analysis\n` +
+      `- Any other market type: search for the latest relevant data\n` +
+      `Your probability MUST be based on researched facts, not assumptions.\n\n` +
+      `RULES:\n` +
+      `- Need 10%+ edge (your researched probability vs market price)\n` +
+      `- Max bet: $${Math.min(50, polyBalance * 0.25).toFixed(2)}\n` +
+      `- Need a REAL reason backed by specific facts from your research\n` +
+      `- Do NOT bet on heavy underdogs without specific breaking news\n` +
+      `- side0 = ORDER_INTENT_BUY_LONG, side1 = ORDER_INTENT_BUY_SHORT\n\n` +
+      `JSON ONLY:\n` +
+      `{"trade":false,"reasoning":"why"}\n` +
+      `OR {"trade":true,"slug":"exact slug","side":"side0"/"side1","betAmount":N,"probability":0.XX,"reasoning":"specific facts proving market is wrong"}`;
+
+    const pcText = await claudeWithSearch(polyPrompt, { maxTokens: 1024, maxSearches: 3 });
+    if (!pcText) return;
     const pcMatch = pcText.match(/\{[\s\S]*\}/);
     if (!pcMatch) return;
     let polyDecision;
@@ -1254,7 +1262,7 @@ async function main() {
     `Poll: every ${POLL_INTERVAL_MS / 1000}s | Broad scan: every 5min\n\n` +
     `💰 Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions\n` +
     `💰 Polymarket: $${polyBalance.toFixed(2)}\n` +
-    `Model: claude-haiku-4-5`
+    `Model: ${CLAUDE_MODEL} + web search`
   );
 
   // Graceful shutdown
