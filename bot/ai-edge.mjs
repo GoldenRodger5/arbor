@@ -2138,110 +2138,196 @@ async function pollCycle() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
-// Stop-Loss — sell positions that have dropped >30% from entry
+// Position Management — profit-taking, stop-loss, Claude-assisted exits
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function checkStopLosses() {
+async function managePositions() {
   if (!existsSync(TRADES_LOG)) return;
   try {
     const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
     const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    // Check both Kalshi and Poly open trades
     const openTrades = trades.filter(t => t.status === 'open');
     if (openTrades.length === 0) return;
 
-    // Batch fetch Kalshi prices — one call instead of N
-    let kalshiPrices = new Map();
-    const kalshiTickers = openTrades.filter(t => t.exchange === 'kalshi').map(t => t.ticker);
-    if (kalshiTickers.length > 0) {
-      for (const ticker of kalshiTickers) {
-        try {
-          const data = await kalshiGet(`/markets/${ticker}`);
-          const m = data.market ?? data;
-          if (m.yes_ask_dollars) {
-            kalshiPrices.set(ticker, { yes: parseFloat(m.yes_ask_dollars), no: parseFloat(m.no_ask_dollars) });
-          }
-        } catch { /* skip */ }
-      }
+    // Batch fetch current prices
+    const kalshiPrices = new Map();
+    for (const t of openTrades.filter(t => t.exchange === 'kalshi')) {
+      try {
+        const data = await kalshiGet(`/markets/${t.ticker}`);
+        const m = data.market ?? data;
+        if (m.yes_ask_dollars) {
+          kalshiPrices.set(t.ticker, {
+            yes: parseFloat(m.yes_ask_dollars), no: parseFloat(m.no_ask_dollars),
+            yesBid: parseFloat(m.yes_bid_dollars ?? m.yes_ask_dollars),
+          });
+        }
+      } catch { /* skip */ }
     }
 
-    // Fetch Poly prices from cached moneylines
     const polyPrices = new Map();
     const polyMoneylines = await getPolyMoneylines();
     for (const pm of polyMoneylines) {
       polyPrices.set(pm.slug, { s0: pm.s0Price, s1: pm.s1Price });
     }
 
+    let anyUpdated = false;
+
     for (const trade of openTrades) {
       try {
-        let currentPrice = null;
+        if (trade.exchange !== 'kalshi') continue; // Can only sell on Kalshi
 
-        if (trade.exchange === 'kalshi') {
-          const prices = kalshiPrices.get(trade.ticker);
-          if (!prices) continue;
-          currentPrice = trade.side === 'yes' ? prices.yes : prices.no;
-        } else if (trade.exchange === 'polymarket') {
-          const prices = polyPrices.get(trade.ticker);
-          if (!prices) continue;
-          // Use whichever side matches (long=s0, short=s1)
-          currentPrice = trade.side === 'long' || trade.side === 'yes' ? prices.s0 : prices.s1;
-        }
-        if (!currentPrice) continue;
+        const prices = kalshiPrices.get(trade.ticker);
+        if (!prices) continue;
 
+        const currentPrice = trade.side === 'yes' ? prices.yes : prices.no;
+        const bidPrice = trade.side === 'yes' ? prices.yesBid : (1 - prices.yesBid); // what we'd get selling
         const entryPrice = trade.entryPrice ?? 0;
-        if (entryPrice <= 0) continue;
+        if (entryPrice <= 0 || currentPrice <= 0) continue;
 
-        const pctChange = (currentPrice - entryPrice) / entryPrice;
+        const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / entryPrice);
+        if (qty <= 0) continue;
 
-        // Stop-loss: if position dropped >30% from entry, sell (Kalshi only — Poly settles at expiry)
+        const profitPerContract = currentPrice - entryPrice;
+        const pctChange = profitPerContract / entryPrice;
+
+        // === TIER 1: Rule-based auto-exits (no Claude needed) ===
+
+        // STOP-LOSS: Down 30%+ → sell immediately
         if (pctChange < -0.30) {
-          const qty = trade.filled ?? trade.quantity ?? 0;
-          if (qty <= 0) continue;
+          console.log(`[exit] 🛑 STOP-LOSS: ${trade.ticker} down ${(pctChange*100).toFixed(0)}% (${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢)`);
+          const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
+          if (result) anyUpdated = true;
+          continue;
+        }
 
-          console.log(`[stop-loss] 🛑 ${trade.ticker} on ${trade.exchange} dropped ${(pctChange*100).toFixed(0)}% (${entryPrice.toFixed(2)}→${currentPrice.toFixed(2)})`);
+        // PROFIT-TAKE: Up 25¢+ AND price is 90¢+ (game nearly decided) → sell all
+        if (profitPerContract >= 0.25 && currentPrice >= 0.90) {
+          console.log(`[exit] 💰 PROFIT-TAKE: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ at ${(currentPrice*100).toFixed(0)}¢ (nearly decided)`);
+          const result = await executeSell(trade, qty, currentPrice, 'profit-take');
+          if (result) anyUpdated = true;
+          continue;
+        }
 
-          if (trade.exchange === 'polymarket') {
-            // Polymarket doesn't support selling — just alert
-            await tg(`⚠️ <b>POLY POSITION DOWN ${(pctChange*100).toFixed(0)}%</b>\n${trade.title}\nEntry: ${(entryPrice*100).toFixed(0)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢`);
-            continue;
-          }
+        // PROFIT-TAKE: Up 30¢+ at any price → sell half, lock in profit
+        if (profitPerContract >= 0.30 && qty >= 2) {
+          const halfQty = Math.floor(qty / 2);
+          console.log(`[exit] 💰 SCALE-OUT: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ — selling ${halfQty}/${qty} contracts`);
+          const result = await executeSell(trade, halfQty, currentPrice, 'scale-out');
+          if (result) anyUpdated = true;
+          continue;
+        }
 
-          const priceInCents = Math.round(currentPrice * 100);
-          const result = await kalshiPost('/portfolio/orders', {
-            ticker: trade.ticker,
-            action: 'sell',
-            side: trade.side ?? 'yes',
-            count: qty,
-            yes_price: trade.side === 'yes' ? Math.max(1, priceInCents - 2) : 100 - Math.max(1, priceInCents - 2),
-          });
+        // === TIER 2: Claude-assisted exit for ambiguous situations ===
+        // Up 10-24¢ mid-game — should we take profit or hold?
+        if (profitPerContract >= 0.10 && profitPerContract < 0.25 && currentPrice < 0.90) {
+          // Only ask Claude once per position per 15 minutes
+          const exitCooldownKey = 'exit:' + trade.ticker;
+          if (Date.now() - (tradeCooldowns.get(exitCooldownKey) ?? 0) < 15 * 60 * 1000) continue;
+          tradeCooldowns.set(exitCooldownKey, Date.now());
 
-          if (result.ok) {
-            const loss = (currentPrice - entryPrice) * qty;
-            trade.status = 'sold-stoploss';
-            trade.exitPrice = currentPrice;
-            trade.realizedPnL = Math.round(loss * 100) / 100;
-            trade.settledAt = new Date().toISOString();
+          const exitPrompt =
+            `You manage a live sports bet. Should you SELL now or HOLD?\n\n` +
+            `POSITION: Bought ${trade.side?.toUpperCase()} at ${(entryPrice*100).toFixed(0)}¢. Now worth ${(currentPrice*100).toFixed(0)}¢. Profit: +${(profitPerContract*100).toFixed(0)}¢/contract.\n` +
+            `Game: ${trade.title}\n` +
+            `${trade.liveScore ? 'Score: ' + trade.liveScore + '\n' : ''}` +
+            `Contracts: ${qty}\n\n` +
+            `OPTIONS:\n` +
+            `A) SELL ALL NOW: Lock in $${(qty * profitPerContract).toFixed(2)} guaranteed. Capital freed for next trade.\n` +
+            `B) SELL HALF: Lock in $${(Math.floor(qty/2) * profitPerContract).toFixed(2)}, ride rest to settlement.\n` +
+            `C) HOLD: If team wins → $${(qty * (1 - entryPrice)).toFixed(2)} total profit. If loses → -$${(qty * entryPrice).toFixed(2)} loss.\n\n` +
+            `Consider: Is the game nearly decided? Is the profit good enough? Is capital better used elsewhere?\n\n` +
+            `JSON ONLY: {"action": "sell_all"/"sell_half"/"hold", "reasoning": "why"}`;
 
-            await tg(
-              `🛑 <b>STOP-LOSS TRIGGERED</b>\n\n` +
-              `<b>${trade.title}</b>\n` +
-              `Sold ${trade.side?.toUpperCase()} @ ${(currentPrice*100).toFixed(0)}¢ × ${qty}\n` +
-              `Entry: ${(entryPrice*100).toFixed(0)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢\n` +
-              `Loss: <b>$${Math.abs(loss).toFixed(2)}</b> (${(pctChange*100).toFixed(0)}%)`
-            );
+          const exitText = await claudeScreen(exitPrompt, { maxTokens: 200, timeout: 8000 });
+          if (!exitText) continue;
+
+          let exitDecision;
+          try {
+            const match = exitText.match(/\{[\s\S]*\}/);
+            if (match) exitDecision = JSON.parse(match[0]);
+          } catch { continue; }
+
+          if (!exitDecision) continue;
+
+          if (exitDecision.action === 'sell_all') {
+            console.log(`[exit] 🧠 CLAUDE SELL ALL: ${trade.ticker} +${(profitPerContract*100).toFixed(0)}¢ | ${exitDecision.reasoning?.slice(0, 60)}`);
+            const result = await executeSell(trade, qty, currentPrice, 'claude-sell');
+            if (result) anyUpdated = true;
+          } else if (exitDecision.action === 'sell_half' && qty >= 2) {
+            const halfQty = Math.floor(qty / 2);
+            console.log(`[exit] 🧠 CLAUDE SELL HALF: ${trade.ticker} +${(profitPerContract*100).toFixed(0)}¢ selling ${halfQty}/${qty} | ${exitDecision.reasoning?.slice(0, 60)}`);
+            const result = await executeSell(trade, halfQty, currentPrice, 'claude-scale');
+            if (result) anyUpdated = true;
+          } else {
+            console.log(`[exit] 🧠 CLAUDE HOLD: ${trade.ticker} +${(profitPerContract*100).toFixed(0)}¢ | ${exitDecision.reasoning?.slice(0, 60)}`);
           }
         }
-      } catch { /* skip individual ticker check failures */ }
+
+      } catch (e) { console.error(`[exit] error on ${trade.ticker}:`, e.message); }
     }
 
-    // Rewrite trades log if any were updated
-    const updated = trades.some(t => t.status === 'sold-stoploss' && !t._saved);
-    if (updated) {
+    if (anyUpdated) {
       writeFileSync(TRADES_LOG, trades.map(t => JSON.stringify(t)).join('\n') + '\n');
     }
   } catch (e) {
-    console.error('[stop-loss] error:', e.message);
+    console.error('[exit] error:', e.message);
   }
+}
+
+// Execute a sell order on Kalshi and update the trade record
+async function executeSell(trade, sellQty, currentPrice, reason) {
+  const entryPrice = trade.entryPrice ?? 0;
+  const priceInCents = Math.round(currentPrice * 100);
+
+  const result = await kalshiPost('/portfolio/orders', {
+    ticker: trade.ticker,
+    action: 'sell',
+    side: trade.side ?? 'yes',
+    count: sellQty,
+    // Sell 2¢ below current to ensure fill
+    yes_price: trade.side === 'yes' ? Math.max(1, priceInCents - 2) : 100 - Math.max(1, priceInCents - 2),
+  });
+
+  if (!result.ok) {
+    console.error(`[exit] Sell failed for ${trade.ticker}: ${result.status}`);
+    return false;
+  }
+
+  const totalQty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / entryPrice);
+  const profit = (currentPrice - entryPrice) * sellQty;
+
+  if (sellQty >= totalQty) {
+    // Full exit
+    trade.status = `sold-${reason}`;
+    trade.exitPrice = currentPrice;
+    trade.realizedPnL = Math.round(profit * 100) / 100;
+    trade.settledAt = new Date().toISOString();
+  } else {
+    // Partial exit — update quantity and cost, keep open
+    const remainQty = totalQty - sellQty;
+    trade.quantity = remainQty;
+    trade.deployCost = Math.round(remainQty * entryPrice * 100) / 100;
+    // Log the partial profit separately
+    trade.partialProfitTaken = (trade.partialProfitTaken ?? 0) + Math.round(profit * 100) / 100;
+  }
+
+  const profitStr = profit >= 0 ? `+$${profit.toFixed(2)}` : `-$${Math.abs(profit).toFixed(2)}`;
+  const icon = reason.includes('stop') ? '🛑' : reason.includes('claude') ? '🧠' : '💰';
+  const label = reason === 'stop-loss' ? 'STOP-LOSS' : reason === 'profit-take' ? 'PROFIT LOCKED' :
+    reason === 'scale-out' ? 'SCALED OUT (half)' : reason === 'claude-sell' ? 'SMART EXIT' :
+    reason === 'claude-scale' ? 'SMART SCALE-OUT' : reason.toUpperCase();
+
+  await tg(
+    `${icon} <b>${label}</b>\n\n` +
+    `<b>${trade.title}</b>\n` +
+    `${sellQty < totalQty ? `Sold ${sellQty}/${totalQty} contracts` : `Sold all ${sellQty} contracts`}\n` +
+    `Entry: ${(entryPrice*100).toFixed(0)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢\n` +
+    `P&L: <b>${profitStr}</b>\n` +
+    `${sellQty < totalQty ? `Remaining: ${totalQty - sellQty} contracts still open` : 'Position closed'}`
+  );
+
+  logScreen({ stage: 'exit', ticker: trade.ticker, reason, sellQty, totalQty, entryPrice, exitPrice: currentPrice, profit });
+  return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2534,7 +2620,7 @@ async function main() {
 
   // Settlement reconciliation + resolution arbs — every 5 min
   async function settlementLoop() {
-    try { await checkStopLosses(); } catch (e) { console.error('[stop-loss] error:', e.message); }
+    try { await managePositions(); } catch (e) { console.error('[exit] error:', e.message); }
     try { await checkSettlements(); } catch (e) { console.error('[settlement] error:', e.message); }
     try { await checkResolutionArbs(); } catch (e) { console.error('[resolve] error:', e.message); }
     setTimeout(settlementLoop, 5 * 60 * 1000);
