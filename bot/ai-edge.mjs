@@ -38,7 +38,7 @@ const MIN_EDGE_AFTER_FEES = 0.05; // 5% edge AFTER fees — the real profitabili
 const MIN_EDGE_PCT_AFTER_FEES = 5;
 const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — base fraction
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
-const COOLDOWN_MS = 30 * 60 * 1000; // 30 min cooldown per market (was 15 — too short)
+const COOLDOWN_MS = 15 * 60 * 1000; // 15 min — allows scaling into winners
 const MAX_DAYS_OUT = 1;            // Same-day only — capital turns over nightly
 const CLAUDE_SCREENER = 'claude-haiku-4-5-20251001';  // Cheap screening — $0.002/call
 const CLAUDE_DECIDER = 'claude-sonnet-4-6';            // Expensive analysis — only on candidates
@@ -1074,18 +1074,39 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
-        // Pick the market for the leading team (buy YES on the winner)
+        // Check BOTH sides — leading team AND trailing team (underdog value)
         const leadingAbbr = leading.team?.abbreviation ?? '';
-        const trailingAbbr = (leadingAbbr === homeAbbr) ? awayAbbr : homeAbbr;
+        const trailing = homeScore > awayScore ? away : home;
+        const trailingAbbr = trailing.team?.abbreviation ?? '';
 
-        // Find the market ticker for the leading team
-        let targetMarket = gameMarkets.find(m => m.ticker?.toUpperCase().endsWith('-' + leadingAbbr));
-        if (!targetMarket) targetMarket = gameMarkets[0]; // fallback
+        // Find markets for both teams
+        const leadMarket = gameMarkets.find(m => m.ticker?.toUpperCase().endsWith('-' + leadingAbbr));
+        const trailMarket = gameMarkets.find(m => m.ticker?.toUpperCase().endsWith('-' + trailingAbbr));
 
-        const price = parseFloat(targetMarket.yes_ask_dollars);
+        // Pick the better entry: leading team at cheap price OR trailing underdog at very cheap price
+        const leadPrice = leadMarket ? parseFloat(leadMarket.yes_ask_dollars) : 1;
+        const trailPrice = trailMarket ? parseFloat(trailMarket.yes_ask_dollars) : 1;
+
+        // Default to leading team, but consider trailing if they're cheap enough (<40¢)
+        let targetMarket = leadMarket;
+        let targetAbbr = leadingAbbr;
+        let targetTeam = leading;
+        let price = leadPrice;
+
+        // Underdog check: if trailing team is very cheap AND it's early in the game, consider them
+        if (trailMarket && trailPrice >= 0.15 && trailPrice <= 0.40 && period <= 4) {
+          // Early game + small deficit + cheap price = potential underdog value
+          targetMarket = trailMarket;
+          targetAbbr = trailingAbbr;
+          targetTeam = trailing;
+          price = trailPrice;
+          console.log(`[live-edge] 🐕 Underdog check: ${trailingAbbr} trailing by ${diff} at ${(trailPrice*100).toFixed(0)}¢ (early game)`);
+        }
+
+        if (!targetMarket) continue;
         const title = targetMarket.title ?? '';
 
-        console.log(`[live-edge] Found market: ${targetMarket.ticker} "${title}" YES=$${price.toFixed(2)}`);
+        console.log(`[live-edge] Found market: ${targetMarket.ticker} "${title}" ${targetAbbr} YES=$${price.toFixed(2)}`);
 
         // === BUILD RICH CONTEXT FROM ESPN DATA ===
         const homeRecord = home.records?.[0]?.summary ?? '';
@@ -1141,11 +1162,12 @@ async function checkLiveScoreEdges() {
           (pitcherInfo ? `\n${pitcherInfo}` : '') +
           (homeAvg || awayAvg ? `Team batting: ${homeAbbr} ${homeAvg} | ${awayAbbr} ${awayAvg}\n` : '') +
           `\n═══ MARKET ═══\n` +
-          `${leadingAbbr} YES @ ${(price*100).toFixed(0)}¢ → pay ${(price*100).toFixed(0)}¢, win $1.00 if ${leadingAbbr} wins\n` +
-          `${homeIsLeading ? '(leading team is HOME — advantage)' : '(leading team is AWAY)'}\n\n` +
+          `${targetAbbr} YES @ ${(price*100).toFixed(0)}¢ → pay ${(price*100).toFixed(0)}¢, win $1.00 if ${targetTeam.team?.displayName} wins\n` +
+          `${targetAbbr === leadingAbbr ? '(LEADING team' : '(TRAILING team — underdog value?'}${targetAbbr === homeAbbr ? ', HOME)' : ', AWAY)'}\n\n` +
           `═══ YOUR JOB ═══\n` +
-          `Use web search ONLY if you need additional context (recent injuries, streaks). The data above should be enough for most predictions.\n\n` +
-          `Based on: score, inning/period, team records, home/away, pitching — how confident are you ${leading.team?.displayName} wins?\n\n` +
+          `Use web search ONLY if you need additional context (recent injuries, streaks).\n\n` +
+          `Based on: score, game stage, team records, home/away, pitching — how confident are you ${targetTeam.team?.displayName} wins?\n` +
+          `${targetAbbr !== leadingAbbr ? 'NOTE: This team is BEHIND. Only bet if you believe they come back (early game, better team, weak opposing bullpen).\n' : ''}\n` +
           `BUY RULE: confidence ≥ 65% AND at least 5 points above price.\n` +
           `Example: 72% confident + 60¢ price = BUY. 68% confident + 65¢ = PASS.\n\n` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
@@ -1171,7 +1193,7 @@ async function checkLiveScoreEdges() {
           console.log(`[live-edge] Skipping: ${leadingAbbr} @${(price*100).toFixed(0)}¢ (lottery ticket)`);
           continue;
         }
-        if (price >= 0.80) {
+        if (price >= 0.85) {
           console.log(`[live-edge] Skipping: ${leadingAbbr} @${(price*100).toFixed(0)}¢ (too expensive, not enough upside)`);
           continue;
         }
@@ -1218,7 +1240,7 @@ async function checkLiveScoreEdges() {
         const qty = Math.max(1, Math.floor(safeBet / price));
         const priceInCents = Math.round(price * 100);
 
-        console.log(`[live-edge] 🎯 TRADE: ${ticker} ${leadingAbbr} YES @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
+        console.log(`[live-edge] 🎯 TRADE: ${ticker} ${targetAbbr} YES @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
         console.log(`  Score: ${awayAbbr} ${awayScore} @ ${homeAbbr} ${homeScore} (${gameDetail})`);
         console.log(`  Reason: ${decision.reasoning}`);
         logScreen({ stage: 'live-edge', ticker, result: 'TRADE', confidence, price, reasoning: decision.reasoning });
@@ -1247,9 +1269,9 @@ async function checkLiveScoreEdges() {
           });
 
           await tg(
-            `🎯 <b>PREDICTION BET — KALSHI</b>\n\n` +
+            `🎯 <b>${targetAbbr === leadingAbbr ? 'PREDICTION' : '🐕 UNDERDOG'} BET — KALSHI</b>\n\n` +
             `<b>${title}</b>\n` +
-            `Team: <b>${leadingAbbr}</b> | Score: ${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore}\n` +
+            `Team: <b>${targetAbbr}</b> | Score: ${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore}\n` +
             `Status: ${gameDetail}\n\n` +
             `BUY YES @ ${(price*100).toFixed(0)}¢ × ${qty} = <b>$${deployed.toFixed(2)}</b>\n` +
             `Confidence: <b>${(confidence*100).toFixed(0)}%</b> vs price ${(price*100).toFixed(0)}¢\n` +
@@ -1356,7 +1378,7 @@ async function checkPreGamePredictions() {
     if (!market) continue;
 
     const price = pick.side === 'yes' ? market.yesAsk : market.noAsk;
-    if (price > 0.80 || price < 0.05) continue;
+    if (price > 0.85 || price < 0.05) continue;
 
     const decideText = await claudeWithSearch(
       `You are a professional sports bettor. Make a prediction on this game.\n\n` +
@@ -1807,7 +1829,7 @@ async function claudeBroadScan() {
       if (positionBases.has(base)) { console.log(`[broad-scan] BLOCKED: position on ${base}`); continue; }
 
       const price = decision.side === 'yes' ? parseFloat(mktValid.yesAsk) : parseFloat(mktValid.noAsk);
-      if (price <= 0.05 || price >= 0.80) {
+      if (price <= 0.05 || price >= 0.85) {
         console.log(`[broad-scan] BLOCKED: price ${(price*100).toFixed(0)}¢ outside 5-80¢ range`); continue;
       }
 
@@ -1918,22 +1940,19 @@ async function claudeBroadScan() {
     ).join('\n');
 
     const polyPrompt =
-      `You are a skeptical prediction market analyst. Your DEFAULT answer is {"trade":false}. Most markets are efficiently priced.\n\n` +
+      `You are a sports prediction analyst. Pick ONE game you're most confident about.\n\n` +
       `POLYMARKET CASH: $${polyBalance.toFixed(2)}\n\n` +
       `MARKETS:\n${polyList}\n\n` +
-      `PROCESS:\n` +
-      `1. Research any interesting market with web search (team records, standings, player stats, expert analysis)\n` +
-      `2. Estimate true probability from your research\n` +
-      `3. Ask yourself: "Why would thousands of other traders have this wrong?"\n` +
-      `4. Only trade if you have a SPECIFIC answer to that question backed by concrete facts\n\n` +
-      `CONSTRAINTS:\n` +
-      `- Need 10%+ edge (researched probability vs market price)\n` +
-      `- Max bet: $${Math.min(50, polyBalance * 0.25).toFixed(2)}\n` +
-      `- Min price: $0.05 (no lottery tickets)\n` +
-      `- side0 = ORDER_INTENT_BUY_LONG, side1 = ORDER_INTENT_BUY_SHORT\n\n` +
+      `RESEARCH: Look up team records, recent form, and any relevant factors for games that interest you.\n\n` +
+      `PREDICT: Pick the game where you're most confident. Who wins?\n` +
+      `- Buy the side you think wins\n` +
+      `- Confidence must be ≥ 65% AND at least 5 points above the price\n` +
+      `- Prices ≤ 85¢ only (need profit margin)\n` +
+      `- side0 = LONG (first team), side1 = SHORT (second team)\n` +
+      `- Max bet: $${getPositionSize('polymarket').toFixed(2)}\n\n` +
       `JSON ONLY:\n` +
-      `{"trade":false,"reasoning":"why"}\n` +
-      `OR {"trade":true,"slug":"exact slug","side":"side0"/"side1","betAmount":N,"probability":0.XX,"counterArgument":"why this trade could be wrong","reasoning":"specific facts proving market is wrong despite counter-argument"}`;
+      `{"trade":false,"reasoning":"no confident pick"}\n` +
+      `OR {"trade":true,"slug":"exact slug","side":"side0"/"side1","confidence":0.XX,"betAmount":N,"reasoning":"who wins and why"}`;
 
     const pcText = await claudeWithSearch(polyPrompt, { maxTokens: 1024, maxSearches: 3 });
     if (!pcText) return;
@@ -1958,9 +1977,11 @@ async function claudeBroadScan() {
     }
 
     const polyPrice = polyDecision.side === 'side0' ? polyMkt.s0Price : polyMkt.s1Price;
-    const polyEdge = Math.abs((polyDecision.probability ?? 0) - polyPrice);
-    if (polyPrice <= 0.05) { console.log(`[poly-scan] BLOCKED: price ${(polyPrice*100).toFixed(0)}¢ is a lottery ticket`); return; }
-    if (!isProfitableAfterFees('polymarket', polyPrice, polyEdge, polyMkt.slug)) return;
+    const polyConf = polyDecision.confidence ?? polyDecision.probability ?? 0;
+    if (polyPrice <= 0.05 || polyPrice >= 0.85) { console.log(`[poly-scan] BLOCKED: price ${(polyPrice*100).toFixed(0)}¢ outside range`); return; }
+    if (polyConf < 0.65) { console.log(`[poly-scan] Confidence too low: ${(polyConf*100).toFixed(0)}%`); return; }
+    if (polyConf < polyPrice + 0.05) { console.log(`[poly-scan] Not enough margin: conf=${(polyConf*100).toFixed(0)}% vs price=${(polyPrice*100).toFixed(0)}¢`); return; }
+    const polyEdge = polyConf - polyPrice;
 
     if (!canTrade()) return;
     const polyIntent = polyDecision.side === 'side0' ? 'ORDER_INTENT_BUY_LONG' : 'ORDER_INTENT_BUY_SHORT';
@@ -1978,23 +1999,22 @@ async function claudeBroadScan() {
       tradeCooldowns.set(polyKey, Date.now());
 
       logTrade({
-        exchange: 'polymarket', strategy: 'claude-scan',
+        exchange: 'polymarket', strategy: 'poly-prediction',
         ticker: polyMkt.slug, title: polyMkt.title,
         side: polyDecision.side === 'side0' ? 'long' : 'short',
         quantity: polyQty, entryPrice: polyPrice,
         deployCost: polyQty * polyPrice,
-        edge: polyEdge * 100, fairProb: polyDecision.probability,
+        edge: polyEdge * 100, confidence: polyConf,
         reasoning: polyDecision.reasoning,
-        counterArgument: polyDecision.counterArgument ?? null,
       });
 
       await tg(
-        `🧠 <b>CLAUDE TRADE — POLYMARKET</b>\n\n` +
+        `🎯 <b>PREDICTION BET — POLYMARKET</b>\n\n` +
         `<b>${polyMkt.title}</b>\n` +
-        `Slug: <code>${polyMkt.slug}</code>\n\n` +
-        `BUY ${polyDecision.side === 'side0' ? 'LONG' : 'SHORT'} @ $${polyPrice.toFixed(2)} × ${polyQty}\n` +
+        `BUY ${polyDecision.side === 'side0' ? 'LONG' : 'SHORT'} @ ${(polyPrice*100).toFixed(0)}¢ × ${polyQty}\n` +
         `Deployed: <b>$${(polyQty * polyPrice).toFixed(2)}</b>\n` +
-        `Edge: <b>${(polyEdge*100).toFixed(0)}%</b>\n\n` +
+        `Confidence: <b>${(polyConf*100).toFixed(0)}%</b> vs price ${(polyPrice*100).toFixed(0)}¢\n` +
+        `Potential profit: <b>$${(polyQty * (1 - polyPrice)).toFixed(2)}</b>\n\n` +
         `🧠 <i>${polyDecision.reasoning}</i>`
       );
     }
