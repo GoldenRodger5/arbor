@@ -1363,6 +1363,152 @@ async function checkPreGamePredictions() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// UFC Predictions — Polymarket-only fight predictions
+// ─────────────────────────────────────────────────────────────────────────────
+
+let lastUFCScan = 0;
+const UFC_SCAN_INTERVAL = 30 * 60 * 1000; // every 30 min (fights don't change fast)
+
+async function checkUFCPredictions() {
+  if (Date.now() - lastUFCScan < UFC_SCAN_INTERVAL) return;
+  lastUFCScan = Date.now();
+  if (!canTrade()) return;
+  if (polyBalance < 3) return;
+
+  // Fetch UFC moneylines from Poly
+  const polyMoneylines = await getPolyMoneylines();
+  const ufcMarkets = polyMoneylines.filter(m => m.slug.includes('-ufc-'));
+
+  if (ufcMarkets.length === 0) return;
+  console.log(`[ufc] Found ${ufcMarkets.length} UFC fights on Polymarket`);
+
+  // Filter to tradeable price range + no existing positions
+  const tradeable = ufcMarkets.filter(m => {
+    const price = Math.min(m.s0Price, m.s1Price);
+    if (price < 0.05) return false;
+    // Check if we already have a position on this fight
+    const hasPos = openPositions.some(p => (p.ticker ?? '').toLowerCase() === m.slug.toLowerCase());
+    if (hasPos) return false;
+    if (Date.now() - (tradeCooldowns.get('poly:' + m.slug) ?? 0) < COOLDOWN_MS) return false;
+    return true;
+  });
+
+  if (tradeable.length === 0) return;
+
+  // Haiku screen: which fights are predictable?
+  const fightList = tradeable.slice(0, 10).map(m =>
+    `"${m.title}" — ${m.s0Name} @ ${(m.s0Price*100).toFixed(0)}¢ vs ${m.s1Name} @ ${(m.s1Price*100).toFixed(0)}¢ [slug: ${m.slug}]`
+  ).join('\n');
+
+  const screenText = await claudeScreen(
+    `You are an MMA/UFC analyst. Pick up to 2 fights where you're most confident predicting the winner.\n\n` +
+    `UPCOMING UFC FIGHTS:\n${fightList}\n\n` +
+    `For each pick, consider: fighter records, recent form, style matchup, weight class.\n` +
+    `Only pick fights where you're genuinely confident (≥65%).\n\n` +
+    `JSON array: [{"slug":"exact slug","fighter":"name","side":"side0"/"side1","reason":"why they win"}] or []`
+  );
+  if (!screenText) return;
+
+  let picks = [];
+  try {
+    const arr = screenText.match(/\[[\s\S]*\]/);
+    if (arr) picks = JSON.parse(arr[0]);
+  } catch { return; }
+
+  if (!Array.isArray(picks) || picks.length === 0) {
+    console.log('[ufc] Haiku: no confident picks');
+    return;
+  }
+  console.log(`[ufc] Haiku picked ${picks.length}: ${picks.map(p => p.fighter).join(', ')}`);
+
+  for (const pick of picks.slice(0, 2)) {
+    const market = tradeable.find(m => m.slug === pick.slug);
+    if (!market) continue;
+
+    const price = pick.side === 'side0' ? market.s0Price : market.s1Price;
+    if (price > MAX_PRICE || price < 0.05) continue;
+
+    // Sonnet deep dive on this fight
+    const decideText = await claudeWithSearch(
+      `You are a professional MMA bettor. Predict this fight.\n\n` +
+      `FIGHT: ${market.title}\n` +
+      `${market.s0Name} @ ${(market.s0Price*100).toFixed(0)}¢ vs ${market.s1Name} @ ${(market.s1Price*100).toFixed(0)}¢\n` +
+      `Haiku's pick: ${pick.fighter} — "${pick.reason}"\n\n` +
+      `RESEARCH: Look up both fighters' records, recent fights, fighting style, strengths/weaknesses.\n\n` +
+      `PREDICT: How confident are you? Consider:\n` +
+      `- Overall MMA record and recent form (last 3-5 fights)\n` +
+      `- Fighting style matchup (striker vs grappler, etc.)\n` +
+      `- Physical advantages (reach, size, cardio)\n` +
+      `- Level of competition faced\n\n` +
+      `BUY if confidence ≥ 65% AND at least 5 points above price.\n` +
+      `Max bet: $${getPositionSize('polymarket').toFixed(2)}\n\n` +
+      `JSON ONLY:\n` +
+      `{"trade":false,"confidence":0.XX,"reasoning":"prediction"}\n` +
+      `OR {"trade":true,"side":"${pick.side}","confidence":0.XX,"betAmount":N,"reasoning":"who wins and why"}`,
+      { maxTokens: 800, maxSearches: 3 }
+    );
+    if (!decideText) continue;
+
+    const jsonMatch = decideText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) continue;
+    let decision;
+    try { decision = JSON.parse(jsonMatch[0]); } catch { continue; }
+
+    if (!decision.trade) {
+      console.log(`[ufc] Sonnet rejected ${pick.fighter}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
+      logScreen({ stage: 'ufc', slug: pick.slug, result: 'rejected', confidence: decision.confidence, reasoning: decision.reasoning });
+      continue;
+    }
+
+    const confidence = decision.confidence ?? 0;
+    if (confidence < MIN_CONFIDENCE || confidence < price + CONFIDENCE_MARGIN) {
+      console.log(`[ufc] Confidence check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢`);
+      continue;
+    }
+
+    if (!canTrade()) break;
+    const maxBet = getPositionSize('polymarket');
+    const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
+    if (safeBet < 1) continue;
+    if (!canDeployMore(safeBet)) continue;
+
+    const qty = Math.max(1, Math.floor(safeBet / (price + 0.02)));
+    const intent = pick.side === 'side0' ? 'ORDER_INTENT_BUY_LONG' : 'ORDER_INTENT_BUY_SHORT';
+    const edge = confidence - price;
+
+    console.log(`[ufc] 🥊 TRADE: ${pick.fighter} @ ${(price*100).toFixed(0)}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
+    logScreen({ stage: 'ufc', slug: pick.slug, result: 'TRADE', confidence, price, reasoning: decision.reasoning });
+
+    tradeCooldowns.set('poly:' + market.slug, Date.now());
+
+    const result = await polymarketPost(market.slug, intent, price + 0.02, qty);
+    if (result.ok) {
+      stats.tradesPlaced++;
+      const deployed = qty * price;
+      logTrade({
+        exchange: 'polymarket', strategy: 'ufc-prediction',
+        ticker: market.slug, title: market.title,
+        side: pick.side === 'side0' ? 'long' : 'short',
+        quantity: qty, entryPrice: price, deployCost: deployed,
+        edge: edge * 100, confidence,
+        reasoning: decision.reasoning,
+      });
+
+      await tg(
+        `🥊 <b>UFC BET — POLYMARKET</b>\n\n` +
+        `<b>${market.title}</b>\n` +
+        `Fighter: <b>${pick.fighter}</b>\n` +
+        `BUY @ ${(price*100).toFixed(0)}¢ × ${qty} = <b>$${deployed.toFixed(2)}</b>\n` +
+        `Confidence: <b>${(confidence*100).toFixed(0)}%</b> vs price ${(price*100).toFixed(0)}¢\n` +
+        `Potential profit: <b>$${(qty * (1 - price)).toFixed(2)}</b>\n\n` +
+        `🧠 <i>${decision.reasoning}</i>`
+      );
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Claude Broad Market Scan — finds edges across ALL market types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1829,6 +1975,9 @@ async function pollCycle() {
 
   // Pre-game predictions (best entry prices, runs every 10 min)
   await checkPreGamePredictions();
+
+  // UFC predictions (Polymarket only, runs every 30 min)
+  await checkUFCPredictions();
 
   // Live in-game predictions (runs every cycle)
   await checkLiveScoreEdges();
