@@ -36,12 +36,17 @@ const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 
 const MIN_EDGE = 0.07;           // 7% edge minimum — consistent across ALL strategies
 const MIN_EDGE_PCT = 7;          // same × 100 for display
-const MAX_TRADE_FRACTION = 0.25; // Use up to 25% of balance per trade
-const MAX_TRADE_CAP = 50;        // Hard cap $50 per trade
+const MAX_TRADE_FRACTION = 0.03; // 3% of bankroll per trade (was 25% — way too aggressive)
+const MAX_TRADE_CAP = 5;         // Hard cap $5 per trade (scales up as bankroll grows)
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
-const COOLDOWN_MS = 15 * 60 * 1000; // 15 min cooldown per market
-const MAX_DAYS_OUT = 1;            // Same-day only — capital turns over nightly at $200 scale
-const CLAUDE_MODEL = 'claude-sonnet-4-6';  // Sonnet 4.6 for better analysis
+const COOLDOWN_MS = 30 * 60 * 1000; // 30 min cooldown per market (was 15 — too short)
+const MAX_DAYS_OUT = 1;            // Same-day only — capital turns over nightly
+const CLAUDE_MODEL = 'claude-sonnet-4-6';
+const MAX_POSITIONS = 5;           // Max concurrent open positions
+const DAILY_LOSS_LIMIT = 10;       // Stop trading if down $10 in a day
+const CAPITAL_RESERVE = 0.10;      // Always keep 10% of bankroll untouched
+const MAX_CONSECUTIVE_LOSSES = 3;  // After 3 losses → reduce size + wait
+const MAX_SPORT_EXPOSURE = 15;     // Max $ deployed on same sport per day
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth
@@ -286,6 +291,137 @@ let kalshiBalance = 0;
 let kalshiPositionValue = 0;
 let openPositions = [];  // fetched each cycle
 let stats = { newsChecked: 0, claudeCalls: 0, edgesFound: 0, tradesPlaced: 0 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Risk Management State
+// ─────────────────────────────────────────────────────────────────────────────
+
+let dailyOpenBankroll = 0;       // snapshot at start of day / bot restart
+let consecutiveLosses = 0;       // reset on any win
+let tradingHalted = false;       // circuit breaker flag
+let haltReason = '';
+let lastHaltCheck = 0;
+
+function getBankroll() {
+  return kalshiBalance + kalshiPositionValue + polyBalance;
+}
+
+function getAvailableCash(exchange = 'kalshi') {
+  const bal = exchange === 'polymarket' ? polyBalance : kalshiBalance;
+  const reserve = getBankroll() * CAPITAL_RESERVE;
+  return Math.max(0, bal - reserve);
+}
+
+function getDynamicMaxTrade(exchange = 'kalshi') {
+  const bankroll = getBankroll();
+  // Scale position size with bankroll: 3% of total, capped
+  // At $200: max $6. At $1000: max $30. At $5000: max $50 (hard cap)
+  const dynamicCap = Math.min(50, bankroll * MAX_TRADE_FRACTION);
+  const available = getAvailableCash(exchange);
+  return Math.min(dynamicCap, available * 0.25, MAX_TRADE_CAP);
+}
+
+function canTrade() {
+  if (tradingHalted) {
+    console.log(`[risk] HALTED: ${haltReason}`);
+    return false;
+  }
+
+  // Check daily loss limit
+  const currentBankroll = getBankroll();
+  const dailyPnL = currentBankroll - dailyOpenBankroll;
+  if (dailyOpenBankroll > 0 && dailyPnL < -DAILY_LOSS_LIMIT) {
+    tradingHalted = true;
+    haltReason = `Daily loss limit hit: $${Math.abs(dailyPnL).toFixed(2)} lost today (limit: $${DAILY_LOSS_LIMIT})`;
+    tg(`🛑 <b>TRADING HALTED</b>\n\n${haltReason}\n\nBot will resume tomorrow.`);
+    console.log(`[risk] ${haltReason}`);
+    return false;
+  }
+
+  // Check max positions
+  if (openPositions.length >= MAX_POSITIONS) {
+    console.log(`[risk] Max positions reached: ${openPositions.length}/${MAX_POSITIONS}`);
+    return false;
+  }
+
+  // Check consecutive losses (reduce size, don't halt until 5)
+  if (consecutiveLosses >= 5) {
+    tradingHalted = true;
+    haltReason = `5 consecutive losses — full halt for safety`;
+    tg(`🛑 <b>TRADING HALTED</b>\n\n${haltReason}`);
+    console.log(`[risk] ${haltReason}`);
+    return false;
+  }
+
+  return true;
+}
+
+function getPositionSize(exchange = 'kalshi') {
+  let size = getDynamicMaxTrade(exchange);
+
+  // Reduce size after consecutive losses
+  if (consecutiveLosses >= MAX_CONSECUTIVE_LOSSES) {
+    size = Math.min(size, 2); // Drop to $2 max after 3 losses
+    console.log(`[risk] Reduced position size to $${size.toFixed(2)} after ${consecutiveLosses} consecutive losses`);
+  }
+
+  return Math.max(1, size); // minimum $1
+}
+
+function getSportExposure(sport) {
+  // Calculate how much is deployed on a given sport today
+  let exposure = 0;
+  for (const p of openPositions) {
+    const ticker = p.ticker ?? '';
+    if (sport === 'MLB' && ticker.includes('MLB')) exposure += p.cost;
+    else if (sport === 'NBA' && ticker.includes('NBA')) exposure += p.cost;
+    else if (sport === 'NHL' && ticker.includes('NHL')) exposure += p.cost;
+    else if (sport === 'NFL' && ticker.includes('NFL')) exposure += p.cost;
+  }
+  return exposure;
+}
+
+function checkSportExposure(ticker) {
+  for (const sport of ['MLB', 'NBA', 'NHL', 'NFL']) {
+    if (ticker.includes(sport)) {
+      const current = getSportExposure(sport);
+      if (current >= MAX_SPORT_EXPOSURE) {
+        console.log(`[risk] ${sport} exposure $${current.toFixed(2)} >= $${MAX_SPORT_EXPOSURE} cap`);
+        return false;
+      }
+      return true;
+    }
+  }
+  return true; // non-sports — no cap
+}
+
+// Update consecutive losses from trade log
+function updateConsecutiveLosses() {
+  if (!existsSync(TRADES_LOG)) return;
+  try {
+    const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+    // Read settled trades in reverse order
+    let streak = 0;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const t = JSON.parse(lines[i]);
+        if (t.status !== 'settled') continue;
+        if (t.realizedPnL >= 0) break; // win breaks the streak
+        streak++;
+      } catch { continue; }
+    }
+    consecutiveLosses = streak;
+  } catch { /* keep current */ }
+}
+
+// Reset daily tracking (called at midnight ET or on restart)
+function resetDailyTracking() {
+  dailyOpenBankroll = getBankroll();
+  tradingHalted = false;
+  haltReason = '';
+  updateConsecutiveLosses();
+  console.log(`[risk] Daily reset: bankroll=$${dailyOpenBankroll.toFixed(2)} consecutiveLosses=${consecutiveLosses}`);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // P&L Trade Logging — append-only JSONL for every trade placed
@@ -554,20 +690,18 @@ async function executeTrade(market, assessment) {
   const { side, edgePct, fairProbability, reasoning } = assessment;
   const price = side === 'yes' ? market.yesAsk : market.noAsk;
   if (!price || price <= 0) return;
-  if (kalshiBalance < 5) {
-    console.log('[ai-trade] Balance too low ($' + kalshiBalance.toFixed(2) + '), skipping');
-    return;
-  }
+  if (!canTrade()) return;
+  if (!checkSportExposure(market.ticker)) return;
 
-  // Kelly sizing: f = edge / odds
+  // 1/4 Kelly sizing (conservative for AI-estimated edges)
   const odds = (1 / price) - 1;
   const edge = edgePct / 100;
   const kellyFraction = odds > 0 ? edge / odds : 0;
-  const halfKelly = 0.5 * kellyFraction;
+  const quarterKelly = 0.25 * kellyFraction;
 
-  // Size: half Kelly on available balance, capped at 25% of balance or $50
-  const maxTrade = Math.min(MAX_TRADE_CAP, kalshiBalance * MAX_TRADE_FRACTION);
-  const budget = Math.min(maxTrade, kalshiBalance * halfKelly);
+  // Dynamic cap based on bankroll + consecutive loss adjustment
+  const maxTrade = getPositionSize('kalshi');
+  const budget = Math.min(maxTrade, getBankroll() * quarterKelly);
   const qty = Math.max(1, Math.floor(budget / price));
   const deployed = qty * price;
   const priceInCents = Math.round(price * 100);
@@ -770,11 +904,14 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
-        // Size the bet
+        // Size the bet — dynamic + risk-managed
+        if (!canTrade()) continue;
+        if (!checkSportExposure(ticker)) continue;
+        const maxBetLE = getPositionSize('kalshi');
         const claudeBet = decision.betAmount ?? 0;
-        const safeBet = Math.min(claudeBet, kalshiBalance * 0.25, MAX_TRADE_CAP);
+        const safeBet = Math.min(claudeBet, maxBetLE);
         if (safeBet < 1) {
-          console.log(`[live-edge] Bet too small: Claude=$${claudeBet} cash=$${kalshiBalance.toFixed(2)}`);
+          console.log(`[live-edge] Bet too small: max=$${maxBetLE.toFixed(2)} Claude=$${claudeBet}`);
           continue;
         }
         const qty = Math.max(1, Math.floor(safeBet / price));
@@ -1153,8 +1290,12 @@ async function claudeBroadScan() {
     // Cooldown
     if (Date.now() - (tradeCooldowns.get(decision.ticker) ?? 0) < COOLDOWN_MS) return;
 
-    // Size — strictly from cash, NOT positions
-    const maxBet = Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25);
+    // Risk checks
+    if (!canTrade()) return;
+    if (!checkSportExposure(decision.ticker)) return;
+
+    // Dynamic sizing — scales with bankroll, reduces after losses
+    const maxBet = getPositionSize('kalshi');
     const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
     if (safeBet < 1 || price <= 0) return;
 
@@ -1291,8 +1432,10 @@ async function claudeBroadScan() {
     if (polyPrice <= 0.05) { console.log(`[poly-scan] BLOCKED: price ${(polyPrice*100).toFixed(0)}¢ is a lottery ticket`); return; }
     if (polyEdge < MIN_EDGE) { console.log(`[poly-scan] Edge too small: ${(polyEdge*100).toFixed(1)}%`); return; }
 
+    if (!canTrade()) return;
     const polyIntent = polyDecision.side === 'side0' ? 'ORDER_INTENT_BUY_LONG' : 'ORDER_INTENT_BUY_SHORT';
-    const polyBet = Math.min(polyDecision.betAmount ?? 0, polyBalance * 0.25, 50);
+    const polyMaxBet = getPositionSize('polymarket');
+    const polyBet = Math.min(polyDecision.betAmount ?? 0, polyMaxBet);
     if (polyBet < 1) return;
     const polyQty = Math.max(1, Math.floor(polyBet / (polyPrice + 0.02))); // +2¢ buffer
 
@@ -1337,6 +1480,20 @@ async function pollCycle() {
   // Refresh full portfolio (balance + positions)
   await refreshPortfolio();
 
+  // Initialize daily tracking on first cycle
+  if (dailyOpenBankroll === 0) resetDailyTracking();
+
+  // Check for midnight ET reset (new trading day)
+  const etHour = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })).getHours();
+  if (etHour === 0 && Date.now() - lastHaltCheck > 60 * 60 * 1000) {
+    lastHaltCheck = Date.now();
+    resetDailyTracking();
+    console.log('[risk] New trading day — reset daily limits');
+  }
+
+  // Risk check — skip everything if halted
+  if (!canTrade()) return;
+
   // Prune news IDs older than 2 hours
   const pruneThreshold = Date.now() - 2 * 60 * 60 * 1000;
   for (const [id, ts] of seenNewsIds) {
@@ -1351,9 +1508,10 @@ async function pollCycle() {
     console.log(`[ai-edge] ${newsItems.length} new items:`, newsItems.map(n => n.headline.slice(0, 50)).join(' | '));
   }
 
-  // Skip all Claude-powered analysis when cash is too low to trade
-  if (kalshiBalance < 3) {
-    console.log(`[ai-edge] Cash $${kalshiBalance.toFixed(2)} < $3 — skipping Claude calls to save API costs`);
+  // Skip all Claude-powered analysis when available cash is too low
+  const availCash = getAvailableCash('kalshi');
+  if (availCash < 3) {
+    console.log(`[ai-edge] Available cash $${availCash.toFixed(2)} < $3 (reserve protected) — skipping`);
     return;
   }
 
@@ -1473,6 +1631,27 @@ async function checkSettlements() {
       const newContent = trades.map(t => JSON.stringify(t)).join('\n') + '\n';
       const { writeFileSync } = await import('fs');
       writeFileSync(TRADES_LOG, newContent);
+
+      // Update consecutive loss tracking
+      updateConsecutiveLosses();
+
+      // Strategy performance check — disable strategies with <40% win rate after 10+ trades
+      const stratStats = {};
+      for (const t of trades) {
+        if (t.status !== 'settled' || !t.strategy) continue;
+        if (!stratStats[t.strategy]) stratStats[t.strategy] = { wins: 0, losses: 0, pnl: 0 };
+        if (t.realizedPnL >= 0) stratStats[t.strategy].wins++;
+        else stratStats[t.strategy].losses++;
+        stratStats[t.strategy].pnl += t.realizedPnL ?? 0;
+      }
+      for (const [strat, s] of Object.entries(stratStats)) {
+        const total = s.wins + s.losses;
+        const winRate = total > 0 ? s.wins / total : 0;
+        if (total >= 10 && winRate < 0.40) {
+          console.log(`[risk] ⚠️ Strategy "${strat}" has ${(winRate*100).toFixed(0)}% win rate over ${total} trades (P&L: $${s.pnl.toFixed(2)}). Consider disabling.`);
+          await tg(`⚠️ <b>Strategy Alert</b>\n\n"${strat}" has ${(winRate*100).toFixed(0)}% win rate over ${total} trades.\nP&L: $${s.pnl.toFixed(2)}\n\nConsider disabling this strategy.`);
+        }
+      }
     }
   } catch (e) {
     console.error('[pnl] settlement check error:', e.message);
@@ -1687,17 +1866,25 @@ async function main() {
   }
   setTimeout(settlementLoop, 2 * 60 * 1000); // first run after 2 min
 
+  // Initialize risk tracking
+  resetDailyTracking();
+
+  const bankroll = getBankroll();
+  const maxTrade = getDynamicMaxTrade();
   await tg(
     `🧠 <b>AI Edge Bot Started</b>\n\n` +
-    `Markets: Sports + Crypto + Economics + Politics + Finance\n` +
-    `Platforms: Kalshi + Polymarket US\n` +
-    `Min edge: ${MIN_EDGE_PCT}%\n` +
-    `Max trade: $${MAX_TRADE_CAP} (25% of cash)\n` +
-    `Poll: every ${POLL_INTERVAL_MS / 1000}s | Broad scan: every ${BROAD_SCAN_INTERVAL / 60000}min\n` +
-    `Max days out: ${MAX_DAYS_OUT}d | Min price: 5¢\n\n` +
+    `<b>Risk Controls Active:</b>\n` +
+    `Max trade: $${maxTrade.toFixed(2)} (3% of $${bankroll.toFixed(2)} bankroll)\n` +
+    `Max positions: ${MAX_POSITIONS} | Daily loss limit: $${DAILY_LOSS_LIMIT}\n` +
+    `Capital reserve: ${(CAPITAL_RESERVE*100).toFixed(0)}% ($${(bankroll*CAPITAL_RESERVE).toFixed(2)} protected)\n` +
+    `Sport exposure cap: $${MAX_SPORT_EXPOSURE}/sport\n` +
+    `Consecutive loss halt: ${MAX_CONSECUTIVE_LOSSES}→reduce, 5→halt\n\n` +
+    `<b>Config:</b>\n` +
+    `Min edge: ${MIN_EDGE_PCT}% | Cooldown: ${COOLDOWN_MS/60000}min\n` +
+    `Model: ${CLAUDE_MODEL} + web search\n\n` +
     `💰 Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions\n` +
     `💰 Polymarket: $${polyBalance.toFixed(2)}\n` +
-    `Model: ${CLAUDE_MODEL} + web search`
+    `💰 Total bankroll: <b>$${bankroll.toFixed(2)}</b>`
   );
 
   // Graceful shutdown
