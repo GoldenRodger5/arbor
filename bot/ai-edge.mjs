@@ -1969,6 +1969,20 @@ async function claudeBroadScan() {
     const polyMkt = polyMarkets.find(m => m.slug === polyDecision.slug);
     if (!polyMkt) { console.log(`[poly-scan] Invalid slug: ${polyDecision.slug}`); return; }
 
+    // Cross-platform conflict check: don't bet on Poly if we have a Kalshi position on same game
+    const polyTitleLower = (polyMkt.title ?? '').toLowerCase();
+    const crossConflict = openPositions.some(p => {
+      const kalshiTicker = (p.ticker ?? '').toUpperCase();
+      // Extract team abbreviations from Kalshi ticker and check if they appear in Poly title
+      const parts = kalshiTicker.split('-');
+      const teamPart = parts.length >= 2 ? parts[parts.length - 1] : '';
+      return teamPart.length >= 2 && polyTitleLower.includes(teamPart.toLowerCase());
+    });
+    if (crossConflict) {
+      console.log(`[poly-scan] BLOCKED: cross-platform conflict — already have Kalshi position on "${polyMkt.title}"`);
+      return;
+    }
+
     // Polymarket cooldown check
     const polyKey = 'poly:' + polyDecision.slug;
     if (Date.now() - (tradeCooldowns.get(polyKey) ?? 0) < COOLDOWN_MS) {
