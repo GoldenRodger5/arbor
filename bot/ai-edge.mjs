@@ -42,9 +42,9 @@ const COOLDOWN_MS = 30 * 60 * 1000; // 30 min cooldown per market (was 15 — to
 const MAX_DAYS_OUT = 1;            // Same-day only — capital turns over nightly
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
 // MAX_POSITIONS and deployment limits are DYNAMIC — see getMaxPositions() and getMaxDeployment()
-const DAILY_LOSS_PCT = 0.05;       // Stop trading if down 5% in a day (scales with bankroll)
-const CAPITAL_RESERVE = 0.10;      // Always keep 10% of bankroll untouched
-const MAX_CONSECUTIVE_LOSSES = 3;  // After 3 losses → reduce size + wait
+const DAILY_LOSS_PCT = 0.15;       // Stop trading if down 15% in a day (room for 2-3 bad trades)
+const CAPITAL_RESERVE = 0.05;      // Keep 5% of bankroll untouched (more capital working)
+const MAX_CONSECUTIVE_LOSSES = 5;  // After 5 losses → reduce size (3 was too tight)
 const SPORT_EXPOSURE_PCT = 0.08;   // Max 8% of bankroll deployed on same sport per day
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -439,10 +439,10 @@ function canTrade() {
     return false;
   }
 
-  // Check consecutive losses (reduce size, don't halt until 5)
-  if (consecutiveLosses >= 5) {
+  // Check consecutive losses (reduce size at 5, don't halt until 8)
+  if (consecutiveLosses >= 8) {
     tradingHalted = true;
-    haltReason = `5 consecutive losses — full halt for safety`;
+    haltReason = `8 consecutive losses — full halt, something is wrong`;
     tg(`🛑 <b>TRADING HALTED</b>\n\n${haltReason}`);
     console.log(`[risk] ${haltReason}`);
     return false;
@@ -454,10 +454,10 @@ function canTrade() {
 function getPositionSize(exchange = 'kalshi') {
   let size = getDynamicMaxTrade(exchange);
 
-  // Reduce size after consecutive losses
+  // Reduce size after consecutive losses — half size, not a fixed floor
   if (consecutiveLosses >= MAX_CONSECUTIVE_LOSSES) {
-    size = Math.min(size, 2); // Drop to $2 max after 3 losses
-    console.log(`[risk] Reduced position size to $${size.toFixed(2)} after ${consecutiveLosses} consecutive losses`);
+    size = size * 0.5;
+    console.log(`[risk] Reduced position size to $${size.toFixed(2)} (50%) after ${consecutiveLosses} consecutive losses`);
   }
 
   return Math.max(1, size); // minimum $1
