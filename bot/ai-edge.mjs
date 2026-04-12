@@ -1970,7 +1970,7 @@ async function main() {
     `Reserve: ${(CAPITAL_RESERVE*100).toFixed(0)}% ($${(bankroll*CAPITAL_RESERVE).toFixed(2)}) | Sport cap: $${Math.max(15, bankroll * SPORT_EXPOSURE_PCT).toFixed(2)}\n` +
     `Consecutive loss halt: ${MAX_CONSECUTIVE_LOSSES}→reduce, 5→halt\n\n` +
     `<b>Config:</b>\n` +
-    `Min edge: ${MIN_EDGE_PCT}% | Cooldown: ${COOLDOWN_MS/60000}min\n` +
+    `Min net edge: ${MIN_EDGE_PCT_AFTER_FEES}% (after fees) | Cooldown: ${COOLDOWN_MS/60000}min\n` +
     `Model: ${CLAUDE_MODEL} + web search\n\n` +
     `💰 Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions\n` +
     `💰 Polymarket: $${polyBalance.toFixed(2)}\n` +
