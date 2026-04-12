@@ -684,10 +684,85 @@ function getPortfolioSummary() {
 // Live Predictions + Market Scanning
 // ─────────────────────────────────────────────────────────────────────────────
 
-// [Dead news-edge pipeline removed — 270 lines of fetchESPNNews, extractTeamNames,
-//  findMatchingMarkets, assessEdge, executeTrade. Replaced by prediction engine.]
 // ─────────────────────────────────────────────────────────────────────────────
-// Live Score Edge — buy winning sides in late games at discount
+// Cross-Platform Market Mapper — find same game on both Kalshi + Polymarket
+// ─────────────────────────────────────────────────────────────────────────────
+
+let cachedPolyMoneylines = [];
+let polyMoneylinesFetchedAt = 0;
+const POLY_CACHE_MS = 3 * 60 * 1000; // refresh every 3 min
+
+async function getPolyMoneylines() {
+  if (Date.now() - polyMoneylinesFetchedAt < POLY_CACHE_MS && cachedPolyMoneylines.length > 0) {
+    return cachedPolyMoneylines;
+  }
+  const markets = [];
+  try {
+    for (let offset = 0; offset < 1000; offset += 200) {
+      const res = await fetch(`https://gateway.polymarket.us/v1/markets?limit=200&offset=${offset}&active=true&closed=false`, {
+        headers: { 'User-Agent': 'arbor-ai/1', 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) break;
+      const data = await res.json();
+      if (!data.markets?.length) break;
+      for (const m of data.markets) {
+        if (m.marketType !== 'moneyline' || m.closed || !m.active) continue;
+        const sides = m.marketSides ?? [];
+        if (sides.length < 2) continue;
+        const s0 = parseFloat(String(sides[0]?.price ?? '0'));
+        const s1 = parseFloat(String(sides[1]?.price ?? '0'));
+        if (s0 < 0.05 || s1 < 0.05) continue;
+        markets.push({
+          slug: m.slug ?? '',
+          title: m.question ?? '',
+          s0Name: sides[0]?.team?.name ?? sides[0]?.description ?? '',
+          s1Name: sides[1]?.team?.name ?? sides[1]?.description ?? '',
+          s0Price: s0, s1Price: s1,
+        });
+      }
+    }
+  } catch (e) {
+    console.error('[poly-mapper] fetch error:', e.message);
+  }
+  cachedPolyMoneylines = markets;
+  polyMoneylinesFetchedAt = Date.now();
+  return markets;
+}
+
+// Find the Poly market matching a Kalshi game (by team abbreviations)
+function findPolyMarketForGame(homeAbbr, awayAbbr, polyMarkets) {
+  const ha = homeAbbr.toLowerCase();
+  const aa = awayAbbr.toLowerCase();
+  return polyMarkets.find(m => {
+    const slug = m.slug.toLowerCase();
+    return slug.includes(ha) && slug.includes(aa);
+  }) ?? null;
+}
+
+// Compare prices and pick the best platform to buy on
+function pickBestPlatform(side, kalshiPrice, polyMatch) {
+  if (!polyMatch) return { platform: 'kalshi', price: kalshiPrice };
+
+  // Map side: 'yes' on Kalshi = the team named in the ticker
+  // On Poly, s0 = first team in slug (away), s1 = second team (home)
+  // This varies — safest to compare by checking which side is cheaper
+  const polyS0 = polyMatch.s0Price;
+  const polyS1 = polyMatch.s1Price;
+
+  // If we're buying the leading team, find which Poly side matches
+  // For now, use the cheaper of the two Poly sides that's < kalshiPrice
+  const polyPrice = Math.min(polyS0, polyS1);
+
+  if (polyPrice < kalshiPrice - 0.02 && polyPrice >= 0.05) {
+    return { platform: 'polymarket', price: polyPrice, slug: polyMatch.slug,
+      intent: polyPrice === polyS0 ? 'ORDER_INTENT_BUY_LONG' : 'ORDER_INTENT_BUY_SHORT' };
+  }
+  return { platform: 'kalshi', price: kalshiPrice };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live Predictions — predict winners during live games
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function checkLiveScoreEdges() {
@@ -964,52 +1039,75 @@ async function checkLiveScoreEdges() {
         // Risk checks
         if (!canTrade()) continue;
         if (!checkSportExposure(ticker)) continue;
-        const maxBetLE = getPositionSize('kalshi');
+
+        // === CROSS-PLATFORM PRICE CHECK — buy on cheaper platform ===
+        const polyMoneylines = await getPolyMoneylines();
+        const polyMatch = findPolyMarketForGame(homeAbbr, awayAbbr, polyMoneylines);
+        const best = pickBestPlatform('yes', price, polyMatch);
+
+        // Use the better price for sizing
+        const bestPrice = best.price;
+        const bestEdge = confidence - bestPrice;
+        if (bestEdge < CONFIDENCE_MARGIN) continue; // recheck with best price
+
+        const maxBetLE = getPositionSize(best.platform);
         const claudeBet = decision.betAmount ?? 0;
         const safeBet = Math.min(claudeBet, maxBetLE);
         if (safeBet < 1) {
           console.log(`[live-edge] Bet too small: max=$${maxBetLE.toFixed(2)} Claude=$${claudeBet}`);
           continue;
         }
-        const qty = Math.max(1, Math.floor(safeBet / price));
-        const priceInCents = Math.round(price * 100);
+        if (!canDeployMore(safeBet)) continue;
 
-        console.log(`[live-edge] 🎯 TRADE: ${ticker} ${targetAbbr} YES @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
+        const qty = Math.max(1, Math.floor(safeBet / bestPrice));
+        const priceInCents = Math.round(bestPrice * 100);
+
+        const platformLabel = best.platform === 'polymarket' ? `POLY (${(price*100).toFixed(0)}¢ Kalshi → ${priceInCents}¢ Poly, saved ${((price-bestPrice)*100).toFixed(0)}¢)` : 'KALSHI';
+        console.log(`[live-edge] 🎯 TRADE on ${platformLabel}: ${ticker} ${targetAbbr} YES @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
         console.log(`  Score: ${awayAbbr} ${awayScore} @ ${homeAbbr} ${homeScore} (${gameDetail})`);
         console.log(`  Reason: ${decision.reasoning}`);
-        logScreen({ stage: 'live-edge', ticker, result: 'TRADE', confidence, price, reasoning: decision.reasoning });
-        if (!canDeployMore(qty * price)) continue;
+        logScreen({ stage: 'live-edge', ticker, result: 'TRADE', confidence, price: bestPrice, platform: best.platform, reasoning: decision.reasoning });
 
         tradeCooldowns.set(ticker, Date.now());
         tradeCooldowns.set(gameBase, Date.now());
-        const result = await kalshiPost('/portfolio/orders', {
-          ticker, action: 'buy', side: 'yes', count: qty,
-          yes_price: priceInCents,
-        });
+
+        let result, deployed;
+        if (best.platform === 'polymarket' && best.slug) {
+          result = await polymarketPost(best.slug, best.intent, bestPrice + 0.02, qty);
+          deployed = qty * bestPrice;
+        } else {
+          result = await kalshiPost('/portfolio/orders', {
+            ticker, action: 'buy', side: 'yes', count: qty,
+            yes_price: priceInCents,
+          });
+          deployed = qty * bestPrice;
+        }
 
         if (result.ok) {
           stats.tradesPlaced++;
-          const deployed = qty * price;
 
           logTrade({
-            exchange: 'kalshi', strategy: 'live-prediction',
-            ticker, title, side: 'yes',
-            quantity: qty, entryPrice: price, deployCost: deployed,
-            filled: (result.data.order ?? result.data).quantity_filled ?? 0,
-            orderId: (result.data.order ?? result.data).order_id ?? null,
-            edge: edge * 100, confidence,
+            exchange: best.platform, strategy: 'live-prediction',
+            ticker: best.platform === 'polymarket' ? best.slug : ticker,
+            title, side: 'yes',
+            quantity: qty, entryPrice: bestPrice, deployCost: deployed,
+            filled: (result.data?.order ?? result.data)?.quantity_filled ?? 0,
+            orderId: (result.data?.order ?? result.data)?.order_id ?? result.data?.id ?? null,
+            edge: bestEdge * 100, confidence,
             reasoning: decision.reasoning,
             liveScore: `${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore} (${gameDetail})`,
+            otherPlatformPrice: best.platform === 'polymarket' ? price : (polyMatch?.s0Price ?? null),
           });
 
+          const savedMsg = best.platform === 'polymarket' ? `\n💡 Bought on Poly (${(price*100).toFixed(0)}¢ Kalshi → ${priceInCents}¢ Poly)` : '';
           await tg(
-            `🎯 <b>${targetAbbr === leadingAbbr ? 'PREDICTION' : '🐕 UNDERDOG'} BET — KALSHI</b>\n\n` +
+            `🎯 <b>${targetAbbr === leadingAbbr ? 'PREDICTION' : '🐕 UNDERDOG'} BET — ${best.platform.toUpperCase()}</b>\n\n` +
             `<b>${title}</b>\n` +
             `Team: <b>${targetAbbr}</b> | Score: ${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore}\n` +
             `Status: ${gameDetail}\n\n` +
-            `BUY YES @ ${(price*100).toFixed(0)}¢ × ${qty} = <b>$${deployed.toFixed(2)}</b>\n` +
-            `Confidence: <b>${(confidence*100).toFixed(0)}%</b> vs price ${(price*100).toFixed(0)}¢\n` +
-            `Potential profit: <b>$${(qty * (1 - price)).toFixed(2)}</b> if ${leadingAbbr} wins\n\n` +
+            `BUY @ ${priceInCents}¢ × ${qty} = <b>$${deployed.toFixed(2)}</b>\n` +
+            `Confidence: <b>${(confidence*100).toFixed(0)}%</b> vs price ${priceInCents}¢\n` +
+            `Potential profit: <b>$${(qty * (1 - bestPrice)).toFixed(2)}</b>${savedMsg}\n\n` +
             `🧠 <i>${decision.reasoning}</i>`
           );
         } else {
@@ -1154,47 +1252,69 @@ async function checkPreGamePredictions() {
     if (!canTrade()) break;
     if (!checkSportExposure(market.ticker)) continue;
 
-    const maxBet = getPositionSize('kalshi');
+    // Cross-platform price check — extract team abbreviations from ticker
+    const tickerParts = market.ticker.split('-');
+    const teamBlock = tickerParts.length >= 3 ? tickerParts[tickerParts.length - 2] : '';
+    // teamBlock is like "26APR121340ATHNYM" — last 6 chars are team codes
+    const team1 = teamBlock.slice(-6, -3);
+    const team2 = teamBlock.slice(-3);
+    const pgPolyMarkets = await getPolyMoneylines();
+    const pgPolyMatch = findPolyMarketForGame(team1, team2, pgPolyMarkets);
+    const pgBest = pickBestPlatform(pick.side, price, pgPolyMatch);
+
+    const bestPrice = pgBest.price;
+    const edge = confidence - bestPrice;
+    if (edge < CONFIDENCE_MARGIN) continue;
+
+    const maxBet = getPositionSize(pgBest.platform);
     const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
     if (safeBet < 1) continue;
 
-    const qty = Math.max(1, Math.floor(safeBet / price));
-    const priceInCents = Math.round(price * 100);
-    const edge = confidence - price;
+    const qty = Math.max(1, Math.floor(safeBet / bestPrice));
+    const priceInCents = Math.round(bestPrice * 100);
 
-    if (!canDeployMore(qty * price)) continue;
+    if (!canDeployMore(qty * bestPrice)) continue;
 
-    console.log(`[pre-game] 🎯 TRADE: ${market.ticker} ${pick.side.toUpperCase()} @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
-    logScreen({ stage: 'pre-game', ticker: market.ticker, result: 'TRADE', confidence, price, reasoning: decision.reasoning });
+    const pgPlatformLabel = pgBest.platform === 'polymarket' ? `POLY (saved ${((price-bestPrice)*100).toFixed(0)}¢ vs Kalshi)` : 'KALSHI';
+    console.log(`[pre-game] 🎯 TRADE on ${pgPlatformLabel}: ${market.ticker} ${pick.side.toUpperCase()} @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
+    logScreen({ stage: 'pre-game', ticker: market.ticker, result: 'TRADE', confidence, price: bestPrice, platform: pgBest.platform, reasoning: decision.reasoning });
 
     tradeCooldowns.set(market.ticker, Date.now());
     tradeCooldowns.set(market.base, Date.now());
 
-    const result = await kalshiPost('/portfolio/orders', {
-      ticker: market.ticker, action: 'buy', side: pick.side, count: qty,
-      yes_price: pick.side === 'yes' ? priceInCents : 100 - priceInCents,
-    });
+    let pgResult, deployed;
+    if (pgBest.platform === 'polymarket' && pgBest.slug) {
+      pgResult = await polymarketPost(pgBest.slug, pgBest.intent, bestPrice + 0.02, qty);
+      deployed = qty * bestPrice;
+    } else {
+      pgResult = await kalshiPost('/portfolio/orders', {
+        ticker: market.ticker, action: 'buy', side: pick.side, count: qty,
+        yes_price: pick.side === 'yes' ? priceInCents : 100 - priceInCents,
+      });
+      deployed = qty * bestPrice;
+    }
 
-    if (result.ok) {
+    if (pgResult.ok) {
       stats.tradesPlaced++;
-      const deployed = qty * price;
       logTrade({
-        exchange: 'kalshi', strategy: 'pre-game-prediction',
-        ticker: market.ticker, title: market.title,
-        side: pick.side, quantity: qty, entryPrice: price,
+        exchange: pgBest.platform, strategy: 'pre-game-prediction',
+        ticker: pgBest.platform === 'polymarket' ? pgBest.slug : market.ticker,
+        title: market.title,
+        side: pick.side, quantity: qty, entryPrice: bestPrice,
         deployCost: deployed,
-        filled: (result.data.order ?? result.data).quantity_filled ?? 0,
-        orderId: (result.data.order ?? result.data).order_id ?? null,
+        filled: (pgResult.data?.order ?? pgResult.data)?.quantity_filled ?? 0,
+        orderId: (pgResult.data?.order ?? pgResult.data)?.order_id ?? pgResult.data?.id ?? null,
         edge: edge * 100, confidence,
         reasoning: decision.reasoning,
       });
 
+      const pgSavedMsg = pgBest.platform === 'polymarket' ? `\n💡 Poly was cheaper than Kalshi` : '';
       await tg(
-        `🎯 <b>PRE-GAME BET — KALSHI</b>\n\n` +
+        `🎯 <b>PRE-GAME BET — ${pgBest.platform.toUpperCase()}</b>\n\n` +
         `<b>${market.title}</b>\n` +
         `BUY ${pick.side.toUpperCase()} @ ${priceInCents}¢ × ${qty} = <b>$${deployed.toFixed(2)}</b>\n` +
         `Confidence: <b>${(confidence*100).toFixed(0)}%</b> vs price ${priceInCents}¢\n` +
-        `Potential profit: <b>$${(qty * (1 - price)).toFixed(2)}</b>\n\n` +
+        `Potential profit: <b>$${(qty * (1 - bestPrice)).toFixed(2)}</b>${pgSavedMsg}\n\n` +
         `🧠 <i>${decision.reasoning}</i>`
       );
     }
@@ -1634,140 +1754,7 @@ async function claudeBroadScan() {
     console.error('[broad-scan] error:', e.message);
   }
 
-  // === POLYMARKET SCAN ===
-  if (polyBalance < 3) return; // not enough Poly cash
-  try {
-    const polyMarkets = [];
-    // Paginate all pages to find moneyline markets
-    for (let polyOffset = 0; polyOffset < 1000; polyOffset += 200) {
-      const polyRes = await fetch(`https://gateway.polymarket.us/v1/markets?limit=200&offset=${polyOffset}&active=true&closed=false`, {
-        headers: { 'User-Agent': 'arbor-ai/1', 'Accept': 'application/json' },
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!polyRes.ok) break;
-      const pd = await polyRes.json();
-      if (!pd.markets?.length) break;
-      for (const m of pd.markets ?? []) {
-        if (m.closed || !m.active) continue;
-        // Only moneyline (game-winners) — futures lock capital for months
-        if (m.marketType !== 'moneyline') continue;
-        const sides = m.marketSides ?? [];
-        if (sides.length < 2) continue;
-        const s0 = parseFloat(String(sides[0]?.price ?? '0'));
-        const s1 = parseFloat(String(sides[1]?.price ?? '0'));
-        if (s0 < 0.05 || s1 < 0.05) continue; // skip resolved/extreme
-        polyMarkets.push({
-          slug: m.slug ?? '',
-          title: m.question ?? '',
-          side0: `${sides[0]?.team?.name ?? sides[0]?.description ?? 'Side0'} @ $${s0.toFixed(2)}`,
-          side1: `${sides[1]?.team?.name ?? sides[1]?.description ?? 'Side1'} @ $${s1.toFixed(2)}`,
-          s0Price: s0,
-          s1Price: s1,
-        });
-      }
-    }
-    if (polyMarkets.length === 0) return;
-
-    const polyList = polyMarkets.slice(0, 15).map(m =>
-      `"${m.title}" — ${m.side0} | ${m.side1} [slug: ${m.slug}]`
-    ).join('\n');
-
-    const polyPrompt =
-      `You are a sports prediction analyst. Pick ONE game you're most confident about.\n\n` +
-      `POLYMARKET CASH: $${polyBalance.toFixed(2)}\n\n` +
-      `MARKETS:\n${polyList}\n\n` +
-      `RESEARCH: Look up team records, recent form, and any relevant factors for games that interest you.\n\n` +
-      `PREDICT: Pick the game where you're most confident. Who wins?\n` +
-      `- Buy the side you think wins\n` +
-      `- Confidence must be ≥ 65% AND at least 5 points above the price\n` +
-      `- Prices ≤ 85¢ only (need profit margin)\n` +
-      `- side0 = LONG (first team), side1 = SHORT (second team)\n` +
-      `- Max bet: $${getPositionSize('polymarket').toFixed(2)}\n\n` +
-      `JSON ONLY:\n` +
-      `{"trade":false,"reasoning":"no confident pick"}\n` +
-      `OR {"trade":true,"slug":"exact slug","side":"side0"/"side1","confidence":0.XX,"betAmount":N,"reasoning":"who wins and why"}`;
-
-    const pcText = await claudeWithSearch(polyPrompt, { maxTokens: 1024, maxSearches: 3 });
-    if (!pcText) return;
-    const pcMatch = pcText.match(/\{[\s\S]*\}/);
-    if (!pcMatch) return;
-    let polyDecision;
-    try { polyDecision = JSON.parse(pcMatch[0]); } catch { return; }
-
-    if (!polyDecision.trade) {
-      console.log(`[poly-scan] No trade: ${polyDecision.reasoning}`);
-      return;
-    }
-
-    const polyMkt = polyMarkets.find(m => m.slug === polyDecision.slug);
-    if (!polyMkt) { console.log(`[poly-scan] Invalid slug: ${polyDecision.slug}`); return; }
-
-    // Cross-platform conflict check: don't bet on Poly if we have a Kalshi position on same game
-    const polyTitleLower = (polyMkt.title ?? '').toLowerCase();
-    const crossConflict = openPositions.some(p => {
-      const kalshiTicker = (p.ticker ?? '').toUpperCase();
-      // Extract team abbreviations from Kalshi ticker and check if they appear in Poly title
-      const parts = kalshiTicker.split('-');
-      const teamPart = parts.length >= 2 ? parts[parts.length - 1] : '';
-      return teamPart.length >= 2 && polyTitleLower.includes(teamPart.toLowerCase());
-    });
-    if (crossConflict) {
-      console.log(`[poly-scan] BLOCKED: cross-platform conflict — already have Kalshi position on "${polyMkt.title}"`);
-      return;
-    }
-
-    // Polymarket cooldown check
-    const polyKey = 'poly:' + polyDecision.slug;
-    if (Date.now() - (tradeCooldowns.get(polyKey) ?? 0) < COOLDOWN_MS) {
-      console.log(`[poly-scan] On cooldown: ${polyDecision.slug}`);
-      return;
-    }
-
-    const polyPrice = polyDecision.side === 'side0' ? polyMkt.s0Price : polyMkt.s1Price;
-    const polyConf = polyDecision.confidence ?? polyDecision.probability ?? 0;
-    if (polyPrice <= 0.05 || polyPrice >= MAX_PRICE) { console.log(`[poly-scan] BLOCKED: price ${(polyPrice*100).toFixed(0)}¢ outside range`); return; }
-    if (polyConf < MIN_CONFIDENCE) { console.log(`[poly-scan] Confidence too low: ${(polyConf*100).toFixed(0)}%`); return; }
-    if (polyConf < polyPrice + CONFIDENCE_MARGIN) { console.log(`[poly-scan] Not enough margin: conf=${(polyConf*100).toFixed(0)}% vs price=${(polyPrice*100).toFixed(0)}¢`); return; }
-    const polyEdge = polyConf - polyPrice;
-
-    if (!canTrade()) return;
-    const polyIntent = polyDecision.side === 'side0' ? 'ORDER_INTENT_BUY_LONG' : 'ORDER_INTENT_BUY_SHORT';
-    const polyMaxBet = getPositionSize('polymarket');
-    const polyBet = Math.min(polyDecision.betAmount ?? 0, polyMaxBet);
-    if (polyBet < 1) return;
-    const polyQty = Math.max(1, Math.floor(polyBet / (polyPrice + 0.02))); // +2¢ buffer
-
-    if (!canDeployMore(polyBet)) return;
-    console.log(`[poly-scan] TRADE: ${polyMkt.title} ${polyDecision.side} @${(polyPrice*100).toFixed(0)}¢ × ${polyQty}`);
-    const polyResult = await polymarketPost(polyMkt.slug, polyIntent, polyPrice + 0.02, polyQty);
-
-    if (polyResult.ok) {
-      stats.tradesPlaced++;
-      tradeCooldowns.set(polyKey, Date.now());
-
-      logTrade({
-        exchange: 'polymarket', strategy: 'poly-prediction',
-        ticker: polyMkt.slug, title: polyMkt.title,
-        side: polyDecision.side === 'side0' ? 'long' : 'short',
-        quantity: polyQty, entryPrice: polyPrice,
-        deployCost: polyQty * polyPrice,
-        edge: polyEdge * 100, confidence: polyConf,
-        reasoning: polyDecision.reasoning,
-      });
-
-      await tg(
-        `🎯 <b>PREDICTION BET — POLYMARKET</b>\n\n` +
-        `<b>${polyMkt.title}</b>\n` +
-        `BUY ${polyDecision.side === 'side0' ? 'LONG' : 'SHORT'} @ ${(polyPrice*100).toFixed(0)}¢ × ${polyQty}\n` +
-        `Deployed: <b>$${(polyQty * polyPrice).toFixed(2)}</b>\n` +
-        `Confidence: <b>${(polyConf*100).toFixed(0)}%</b> vs price ${(polyPrice*100).toFixed(0)}¢\n` +
-        `Potential profit: <b>$${(polyQty * (1 - polyPrice)).toFixed(2)}</b>\n\n` +
-        `🧠 <i>${polyDecision.reasoning}</i>`
-      );
-    }
-  } catch (e) {
-    console.error('[poly-scan] error:', e.message);
-  }
+  // [Polymarket scan removed — integrated into live-edge and pre-game via cross-platform price check]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
