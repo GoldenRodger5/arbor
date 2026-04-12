@@ -40,7 +40,8 @@ const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — base fraction
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 30 * 60 * 1000; // 30 min cooldown per market (was 15 — too short)
 const MAX_DAYS_OUT = 1;            // Same-day only — capital turns over nightly
-const CLAUDE_MODEL = 'claude-sonnet-4-6';
+const CLAUDE_SCREENER = 'claude-haiku-4-5-20251001';  // Cheap screening — $0.002/call
+const CLAUDE_DECIDER = 'claude-sonnet-4-6';            // Expensive analysis — only on candidates
 // MAX_POSITIONS and deployment limits are DYNAMIC — see getMaxPositions() and getMaxDeployment()
 const DAILY_LOSS_PCT = 0.15;       // Stop trading if down 15% in a day (room for 2-3 bad trades)
 const CAPITAL_RESERVE = 0.05;      // Keep 5% of bankroll untouched (more capital working)
@@ -239,6 +240,34 @@ async function tg(text) {
 // Claude with Web Search — researches before deciding
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Cheap Haiku screen — no web search, fast, $0.002/call
+async function claudeScreen(prompt, { maxTokens = 300, timeout = 10000 } = {}) {
+  stats.claudeCalls++;
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      signal: AbortSignal.timeout(timeout),
+      method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: CLAUDE_SCREENER,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.content?.[0]?.text ?? '';
+  } catch (e) {
+    console.error('[claude-screen] error:', e.message);
+    return null;
+  }
+}
+
+// Expensive Sonnet + web search — only for final trade decisions
 async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, timeout = 45000 } = {}) {
   stats.claudeCalls++;
   try {
@@ -251,7 +280,7 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: CLAUDE_MODEL,
+        model: CLAUDE_DECIDER,
         max_tokens: maxTokens,
         tools: [{
           type: 'web_search_20250305',
@@ -888,11 +917,11 @@ async function checkLiveScoreEdges() {
         const leadingName = leading.team?.displayName ?? '';
         const gameDetail = comp.status?.type?.shortDetail ?? '';
 
-        // Threshold to trigger — must be a decisive lead in late game
+        // Lower thresholds — catch the edge window BEFORE market fully reprices
         let highCertainty = false;
-        if (league === 'mlb' && period >= 7 && diff >= 3) highCertainty = true;
-        else if (league === 'nba' && period >= 3 && diff >= 12) highCertainty = true;
-        else if (league === 'nhl' && period >= 3 && diff >= 2) highCertainty = true;
+        if (league === 'mlb' && period >= 5 && diff >= 3) highCertainty = true;     // was 7th+
+        else if (league === 'nba' && period >= 2 && diff >= 8) highCertainty = true;  // was 3rd+, 12+
+        else if (league === 'nhl' && period >= 2 && diff >= 2) highCertainty = true;  // was 3rd+
         if (!highCertainty) continue;
 
         const homeAbbr = home.team?.abbreviation ?? '';
@@ -1070,7 +1099,7 @@ async function checkLiveScoreEdges() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 let lastBroadScan = 0;
-const BROAD_SCAN_INTERVAL = 2 * 60 * 1000; // every 2 min — fast enough to catch edges
+const BROAD_SCAN_INTERVAL = 5 * 60 * 1000; // every 5 min — markets don't reprice faster
 
 async function claudeBroadScan() {
   if (Date.now() - lastBroadScan < BROAD_SCAN_INTERVAL) return;
@@ -1333,95 +1362,89 @@ async function claudeBroadScan() {
     const tomorrowShort = toShort(etTomorrow);
     const today = etNow.toISOString().slice(0, 10);
 
-    const broadPrompt =
-      `You are a skeptical prediction market analyst. Your DEFAULT answer is {"trade":false}. Most markets are efficiently priced — finding a real edge is rare. Your job is to check if any of these markets have a GENUINE mispricing, not to force a trade.\n\n` +
-      `AVAILABLE CASH: $${kalshiBalance.toFixed(2)} (positions value is LOCKED, not available)\n\n` +
-      `MY EXISTING POSITIONS (DO NOT trade these again):\n` +
-      (openPositions.length > 0 ? openPositions.map(p => `  ${p.ticker}`).join('\n') : '  None') + '\n\n' +
-      `TODAY: ${today} (sports tickers: ${todayShort} = today, ${tomorrowShort} = tonight's late games)\n` +
-      (cryptoPrices ? `LIVE CRYPTO PRICES: ${cryptoPrices}\n` : '') +
-      `\nMARKETS:\n${marketSummaryFiltered}\n\n` +
-      `PROCESS — follow this EXACTLY:\n` +
-      `1. RESEARCH: Use web search to look up current facts for any market that catches your eye\n` +
-      `2. ASSESS: Based on your research, estimate the true probability\n` +
-      `3. COMPARE: Is your probability at least 7 percentage points different from the market price?\n` +
-      `4. CHALLENGE YOURSELF: Ask "Why would the market be wrong here? Thousands of traders are pricing this — what do I know that they don't?" If your answer is vague (e.g. "undervalued", "upset potential", "seems mispriced"), you do NOT have an edge.\n` +
-      `5. DECIDE: Only trade if you have a SPECIFIC, CONCRETE reason backed by facts from your research.\n\n` +
-      `MARKET STRUCTURE — understand before trading:\n` +
-      `- YES + NO sums to ~$1.00-1.03. This is bid-ask spread, NOT mispricing.\n` +
-      `- KXBTC/KXETH are NARROW $250 RANGE bets. BTC must land in that exact window. A 1¢ price on a range far from current price is CORRECTLY priced.\n` +
-      `- Sports underdogs at 15-25¢ are usually correctly priced. Bad teams lose a lot.\n` +
-      `- Contracts at $0.01-$0.05 are lottery tickets. The market knows they're unlikely.\n` +
-      `- BRACKET MARKETS (CPI, GDP, Fed, BTC): These are CUMULATIVE thresholds shown together. "GDP > 2.0% YES=$0.53" means market thinks 53% chance GDP exceeds 2.0%. The IMPLIED range probability comes from the DIFFERENCE between adjacent thresholds. Pick the threshold where your research shows the biggest mispricing vs market. You only need ONE ticker from a bracket.\n\n` +
-      `HARD CONSTRAINTS:\n` +
-      `- Sports game tickers: ONLY "${todayShort}" or "${tomorrowShort}"\n` +
-      `- Max bet: $${getDynamicMaxTrade().toFixed(2)}\n` +
-      `- If cash < $3: return {"trade":false}\n` +
-      `- Min price: $0.05 (no lottery tickets)\n` +
-      `- Markets close within ${MAX_DAYS_OUT} days. Prefer sooner.\n` +
-      `- FEES MATTER: Kalshi fee = 7% × P × (1-P). At 50¢ = 1.75¢/contract. Your edge AFTER fees must be ≥${MIN_EDGE_PCT_AFTER_FEES}%. Example: 8% raw edge at 50¢ → 8% - 1.75% = 6.25% net → PASSES. 6% raw at 50¢ → 6% - 1.75% = 4.25% → REJECTED.\n\n` +
-      `Respond JSON ONLY:\n` +
-      `{"trade":false,"reasoning":"why no good trade"}\n` +
-      `OR\n` +
-      `{"trade":true,"ticker":"exact","side":"yes"/"no","betAmount":N,"probability":0.XX,"counterArgument":"strongest reason this trade could be WRONG","reasoning":"specific facts proving market is mispriced DESPITE the counter-argument"}`;
+    // === STAGE 1: Cheap Haiku screen — find 0-3 candidates ($0.002/call) ===
+    const screenPrompt =
+      `Scan these prediction markets. List up to 3 that MIGHT be mispriced. Most are efficiently priced — return [] if nothing looks off.\n\n` +
+      `TODAY: ${today} | Sports tickers: ${todayShort}/${tomorrowShort} only\n` +
+      (cryptoPrices ? `CRYPTO: ${cryptoPrices}\n` : '') +
+      `\n${marketSummaryFiltered}\n\n` +
+      `SKIP: contracts at $0.01-$0.05 (lottery tickets), BTC narrow ranges far from current price, YES+NO≈$1 is bid-ask spread not mispricing.\n\n` +
+      `Return JSON array of candidates (max 3): [{"ticker":"exact","reason":"one line why it might be mispriced"}] or []`;
 
-    const cText = await claudeWithSearch(broadPrompt, { maxTokens: 1024, maxSearches: 5 });
-    if (!cText) return;
-    const jsonMatch = cText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return;
+    const screenText = await claudeScreen(screenPrompt);
+    if (!screenText) return;
 
-    let decision;
-    try { decision = JSON.parse(jsonMatch[0]); } catch { return; }
+    let candidates = [];
+    try {
+      const arrMatch = screenText.match(/\[[\s\S]*\]/);
+      if (arrMatch) candidates = JSON.parse(arrMatch[0]);
+    } catch { /* not valid JSON */ }
 
-    if (!decision.trade) {
-      console.log(`[broad-scan] No trade: ${decision.reasoning}`);
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      console.log('[broad-scan] Haiku screen: no candidates');
       return;
     }
+    console.log(`[broad-scan] Haiku found ${candidates.length} candidates: ${candidates.map(c => c.ticker).join(', ')}`);
 
-    // HARD VALIDATIONS (override Claude if it breaks rules)
-    const market = tradeable.find(m => m.ticker === decision.ticker);
-    if (!market) { console.log(`[broad-scan] BLOCKED: invalid ticker ${decision.ticker}`); return; }
+    // === STAGE 2: Sonnet + web search on each candidate ($0.08/call, max 3) ===
+    for (const candidate of candidates.slice(0, 3)) {
+      const market = deduped.find(m => m.ticker === candidate.ticker);
+      if (!market) continue;
 
-    // Block sports game-winner tickers that aren't today or tonight (tomorrow UTC)
-    const isSportsGame = /^KX(MLB|NBA|NFL|NHL)GAME-/i.test(decision.ticker);
-    if (isSportsGame && !decision.ticker.includes(todayShort) && !decision.ticker.includes(tomorrowShort)) {
-      console.log(`[broad-scan] BLOCKED: sports ticker ${decision.ticker} is not today (${todayShort}) or tonight (${tomorrowShort})`);
-      return;
-    }
+      const decidePrompt =
+        `You are a skeptical prediction market analyst. DEFAULT: {"trade":false}.\n\n` +
+        `CANDIDATE: ${market.ticker}: "${market.title}" YES=$${market.yesAsk} NO=$${market.noAsk}\n` +
+        `Category: ${market.category}\n` +
+        `Screening note: "${candidate.reason}"\n\n` +
+        `CASH: $${kalshiBalance.toFixed(2)} | Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
+        `RESEARCH: Use web search to verify the screening note. Look up current facts.\n\n` +
+        `CHALLENGE: Why would thousands of traders have this wrong? You need SPECIFIC facts, not vibes.\n\n` +
+        `FEES: Kalshi fee = 7% × P × (1-P). Your edge AFTER fees must be ≥${MIN_EDGE_PCT_AFTER_FEES}%.\n\n` +
+        `JSON ONLY:\n{"trade":false,"reasoning":"why"}\nOR\n{"trade":true,"ticker":"exact","side":"yes"/"no","betAmount":N,"probability":0.XX,"counterArgument":"why this could fail","reasoning":"specific facts"}`;
 
-    // Block if we already have a position on this game
-    const lastH = decision.ticker.lastIndexOf('-');
-    const base = lastH > 0 ? decision.ticker.slice(0, lastH) : decision.ticker;
-    if (positionBases.has(base)) {
-      console.log(`[broad-scan] BLOCKED: already have position on ${base}`);
-      return;
-    }
+      const cText = await claudeWithSearch(decidePrompt, { maxTokens: 800, maxSearches: 3 });
+      if (!cText) continue;
+      const jsonMatch = cText.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) continue;
 
-    // Block if edge < 10%
-    const price = decision.side === 'yes' ? parseFloat(market.yesAsk) : parseFloat(market.noAsk);
+      let decision;
+      try { decision = JSON.parse(jsonMatch[0]); } catch { continue; }
 
-    // Block lottery tickets — contracts at 1-3¢ are tail bets, not edges
-    if (price <= 0.03) {
-      console.log(`[broad-scan] BLOCKED: price ${(price*100).toFixed(0)}¢ is a lottery ticket, not an edge`);
-      return;
-    }
+      if (!decision.trade) {
+        console.log(`[broad-scan] Sonnet rejected ${candidate.ticker}: ${decision.reasoning?.slice(0, 100)}`);
+        continue;
+      }
 
-    const rawEdge = Math.abs((decision.probability ?? 0) - price);
-    if (!isProfitableAfterFees('kalshi', price, rawEdge, decision.ticker)) return;
-    const { netEdge: edge } = calcNetEdge('kalshi', price, rawEdge);
+      // Found a trade — break out to the existing validation logic
+      // Inject into the same flow below
+      const cTextFinal = JSON.stringify(decision);
+      const jsonMatchFinal = cTextFinal.match(/\{[\s\S]*\}/);
+      if (!jsonMatchFinal) continue;
 
-    // Block if cash too low
-    if (kalshiBalance < 3) {
-      console.log(`[broad-scan] BLOCKED: cash $${kalshiBalance.toFixed(2)} < $3`);
-      return;
-    }
+      // HARD VALIDATIONS (override Claude)
+      const mktValid = deduped.find(m => m.ticker === decision.ticker);
+      if (!mktValid) { console.log(`[broad-scan] BLOCKED: invalid ticker ${decision.ticker}`); continue; }
 
-    // Cooldown
-    if (Date.now() - (tradeCooldowns.get(decision.ticker) ?? 0) < COOLDOWN_MS) return;
+      const isSportsGame = /^KX(MLB|NBA|NFL|NHL)GAME-/i.test(decision.ticker);
+      if (isSportsGame && !decision.ticker.includes(todayShort) && !decision.ticker.includes(tomorrowShort)) {
+        console.log(`[broad-scan] BLOCKED: wrong date ${decision.ticker}`); continue;
+      }
 
-    // Risk checks
-    if (!canTrade()) return;
-    if (!checkSportExposure(decision.ticker)) return;
+      const lastH = decision.ticker.lastIndexOf('-');
+      const base = lastH > 0 ? decision.ticker.slice(0, lastH) : decision.ticker;
+      if (positionBases.has(base)) { console.log(`[broad-scan] BLOCKED: position on ${base}`); continue; }
+
+      const price = decision.side === 'yes' ? parseFloat(mktValid.yesAsk) : parseFloat(mktValid.noAsk);
+      if (price <= 0.03) { console.log(`[broad-scan] BLOCKED: lottery ticket ${(price*100).toFixed(0)}¢`); continue; }
+
+      const rawEdge = Math.abs((decision.probability ?? 0) - price);
+      if (!isProfitableAfterFees('kalshi', price, rawEdge, decision.ticker)) continue;
+      const { netEdge: edge } = calcNetEdge('kalshi', price, rawEdge);
+
+      if (kalshiBalance < 3) continue;
+      if (Date.now() - (tradeCooldowns.get(decision.ticker) ?? 0) < COOLDOWN_MS) continue;
+      if (!canTrade()) continue;
+      if (!checkSportExposure(decision.ticker)) continue;
 
     // Dynamic sizing — scales with bankroll, reduces after losses
     const maxBet = getPositionSize('kalshi');
@@ -1431,27 +1454,27 @@ async function claudeBroadScan() {
     const qty = Math.max(1, Math.floor(safeBet / price));
     const priceInCents = Math.round(price * 100);
 
-    console.log(`[broad-scan] TRADE: ${market.title} ${decision.side} @${priceInCents}¢ × ${qty} edge=${(edge*100).toFixed(1)}%`);
-    console.log(`  Reason: ${decision.reasoning}`);
-    if (!canDeployMore(safeBet)) return;
+      console.log(`[broad-scan] TRADE: ${mktValid.title} ${decision.side} @${priceInCents}¢ × ${qty} edge=${(edge*100).toFixed(1)}%`);
+      console.log(`  Reason: ${decision.reasoning}`);
+      if (!canDeployMore(safeBet)) continue;
 
-    tradeCooldowns.set(decision.ticker, Date.now());
-    tradeCooldowns.set(base, Date.now());
+      tradeCooldowns.set(decision.ticker, Date.now());
+      tradeCooldowns.set(base, Date.now());
 
-    const result = await kalshiPost('/portfolio/orders', {
-      ticker: decision.ticker, action: 'buy', side: decision.side, count: qty,
-      yes_price: decision.side === 'yes' ? priceInCents : 100 - priceInCents,
-    });
+      const result = await kalshiPost('/portfolio/orders', {
+        ticker: decision.ticker, action: 'buy', side: decision.side, count: qty,
+        yes_price: decision.side === 'yes' ? priceInCents : 100 - priceInCents,
+      });
 
-    if (result.ok) {
-      stats.tradesPlaced++;
-      const teamSuffix = decision.ticker.split('-').pop() ?? '';
-      const closeMs = Date.parse(market.closeTime);
-      const daysOut = Number.isFinite(closeMs) ? Math.ceil((closeMs - Date.now()) / (24*60*60*1000)) : '?';
+      if (result.ok) {
+        stats.tradesPlaced++;
+        const teamSuffix = decision.ticker.split('-').pop() ?? '';
+        const closeMs = Date.parse(mktValid.closeTime);
+        const daysOut = Number.isFinite(closeMs) ? Math.ceil((closeMs - Date.now()) / (24*60*60*1000)) : '?';
 
-      logTrade({
-        exchange: 'kalshi', strategy: 'claude-scan',
-        ticker: decision.ticker, title: market.title, category: market.category,
+        logTrade({
+          exchange: 'kalshi', strategy: 'claude-scan',
+          ticker: decision.ticker, title: mktValid.title, category: mktValid.category,
         side: decision.side, quantity: qty, entryPrice: price,
         deployCost: qty * price,
         filled: (result.data.order ?? result.data).quantity_filled ?? 0,
@@ -1462,17 +1485,19 @@ async function claudeBroadScan() {
         daysOut,
       });
 
-      await tg(
-        `🧠 <b>CLAUDE TRADE — KALSHI</b>\n\n` +
-        `<b>${market.title}</b>\n` +
-        `Category: ${market.category}\n` +
-        `Ticker: <code>${decision.ticker}</code>\n` +
-        `Team: <b>${teamSuffix}</b> | Closes in <b>${daysOut}d</b>\n\n` +
-        `BUY ${decision.side.toUpperCase()} @ $${price.toFixed(2)} × ${qty}\n` +
-        `Deployed: <b>$${(qty * price).toFixed(2)}</b>\n` +
-        `Edge: <b>${(edge*100).toFixed(0)}%</b> (Claude ${((decision.probability ?? 0)*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}%)\n\n` +
-        `🔍 <i>Research-backed: ${decision.reasoning}</i>`
-      );
+        await tg(
+          `🧠 <b>CLAUDE TRADE — KALSHI</b>\n\n` +
+          `<b>${mktValid.title}</b>\n` +
+          `Category: ${mktValid.category}\n` +
+          `Ticker: <code>${decision.ticker}</code>\n` +
+          `Team: <b>${teamSuffix}</b> | Closes in <b>${daysOut}d</b>\n\n` +
+          `BUY ${decision.side.toUpperCase()} @ $${price.toFixed(2)} × ${qty}\n` +
+          `Deployed: <b>$${(qty * price).toFixed(2)}</b>\n` +
+          `Edge: <b>${(edge*100).toFixed(0)}%</b> (Claude ${((decision.probability ?? 0)*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}%)\n\n` +
+          `🔍 <i>${decision.reasoning}</i>`
+        );
+      }
+      break; // placed a trade — don't check more candidates this cycle
     }
   } catch (e) {
     console.error('[broad-scan] error:', e.message);
@@ -2015,7 +2040,8 @@ async function main() {
     `Consecutive loss: ${MAX_CONSECUTIVE_LOSSES}→half size, 8→halt\n\n` +
     `<b>Config:</b>\n` +
     `Min net edge: ${MIN_EDGE_PCT_AFTER_FEES}% (after fees) | Cooldown: ${COOLDOWN_MS/60000}min\n` +
-    `Model: ${CLAUDE_MODEL} + web search\n\n` +
+    `Model: Haiku screen → Sonnet + web search decide\n` +
+    `Broad scan: every ${BROAD_SCAN_INTERVAL/60000}min | Live-edge: every 60s\n\n` +
     `💰 Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions\n` +
     `💰 Polymarket: $${polyBalance.toFixed(2)}\n` +
     `💰 Total bankroll: <b>$${bankroll.toFixed(2)}</b>`
