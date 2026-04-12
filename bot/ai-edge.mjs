@@ -20,7 +20,7 @@
  * Run: node ai-edge.mjs
  */
 
-import { readFileSync, appendFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, appendFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { createPrivateKey, sign as cryptoSign, constants as cryptoConstants } from 'crypto';
 import 'dotenv/config';
 
@@ -417,7 +417,7 @@ function canTrade() {
   const dailyPnL = currentBankroll - dailyOpenBankroll;
   if (dailyOpenBankroll > 0 && dailyPnL < -dailyLossLimit) {
     tradingHalted = true;
-    haltReason = `Daily loss limit hit: $${Math.abs(dailyPnL).toFixed(2)} lost today (limit: $${dailyLossLimit.toFixed(2)} = 5% of $${dailyOpenBankroll.toFixed(2)})`;
+    haltReason = `Daily loss limit hit: $${Math.abs(dailyPnL).toFixed(2)} lost today (limit: $${dailyLossLimit.toFixed(2)} = ${(DAILY_LOSS_PCT*100).toFixed(0)}% of $${dailyOpenBankroll.toFixed(2)})`;
     tg(`🛑 <b>TRADING HALTED</b>\n\n${haltReason}\n\nBot will resume tomorrow.`);
     console.log(`[risk] ${haltReason}`);
     return false;
@@ -897,6 +897,7 @@ async function checkLiveScoreEdges() {
 
         const homeAbbr = home.team?.abbreviation ?? '';
         const awayAbbr = away.team?.abbreviation ?? '';
+        if (!homeAbbr || !awayAbbr) continue; // skip if ESPN missing team data
         console.log(`[live-edge] Checking: ${away.team?.displayName} (${awayAbbr}) ${awayScore} @ ${home.team?.displayName} (${homeAbbr}) ${homeScore} (${gameDetail})`);
 
         // Get today/tonight Kalshi markets — pre-filter to THIS game's teams + today's date
@@ -1567,6 +1568,7 @@ async function claudeBroadScan() {
     if (polyBet < 1) return;
     const polyQty = Math.max(1, Math.floor(polyBet / (polyPrice + 0.02))); // +2¢ buffer
 
+    if (!canDeployMore(polyBet)) return;
     console.log(`[poly-scan] TRADE: ${polyMkt.title} ${polyDecision.side} @${(polyPrice*100).toFixed(0)}¢ × ${polyQty}`);
     const polyResult = await polymarketPost(polyMkt.slug, polyIntent, polyPrice + 0.02, polyQty);
 
@@ -1758,7 +1760,6 @@ async function checkSettlements() {
     if (updated) {
       // Rewrite the file with updated records
       const newContent = trades.map(t => JSON.stringify(t)).join('\n') + '\n';
-      const { writeFileSync } = await import('fs');
       writeFileSync(TRADES_LOG, newContent);
 
       // Update consecutive loss tracking
@@ -1792,7 +1793,8 @@ async function checkSettlements() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function checkResolutionArbs() {
-  if (kalshiBalance < 2) return; // need cash to buy
+  if (kalshiBalance < 2) return;
+  if (!canTrade()) return;
 
   try {
     // Fetch recently closed markets where result is known
@@ -1840,6 +1842,7 @@ async function checkResolutionArbs() {
       const qty = Math.max(1, Math.floor(maxBet / winPrice));
       const priceInCents = Math.round(winPrice * 100);
 
+      if (!canDeployMore(qty * winPrice)) continue;
       console.log(`[resolve] ARB: ${m.ticker} result=${winSide} winPrice=${priceInCents}¢ netProfit=${(netProfit*100).toFixed(1)}¢/contract × ${qty}`);
 
       tradeCooldowns.set('res:' + m.ticker, Date.now());
@@ -2007,9 +2010,9 @@ async function main() {
     `<b>Risk Controls Active:</b>\n` +
     `Max trade: $${maxTrade.toFixed(2)} (10% of bankroll, ceiling $${getTradeCapCeiling()})\n` +
     `Max deploy: ${(getMaxDeployment()*100).toFixed(0)}% ($${(bankroll*getMaxDeployment()).toFixed(2)}) | Positions: ${getMaxPositions()}\n` +
-    `Daily loss halt: $${Math.max(10, bankroll * DAILY_LOSS_PCT).toFixed(2)} (5%)\n` +
+    `Daily loss halt: $${Math.max(10, bankroll * DAILY_LOSS_PCT).toFixed(2)} (${(DAILY_LOSS_PCT*100).toFixed(0)}%)\n` +
     `Reserve: ${(CAPITAL_RESERVE*100).toFixed(0)}% ($${(bankroll*CAPITAL_RESERVE).toFixed(2)}) | Sport cap: $${Math.max(15, bankroll * SPORT_EXPOSURE_PCT).toFixed(2)}\n` +
-    `Consecutive loss halt: ${MAX_CONSECUTIVE_LOSSES}→reduce, 5→halt\n\n` +
+    `Consecutive loss: ${MAX_CONSECUTIVE_LOSSES}→half size, 8→halt\n\n` +
     `<b>Config:</b>\n` +
     `Min net edge: ${MIN_EDGE_PCT_AFTER_FEES}% (after fees) | Cooldown: ${COOLDOWN_MS/60000}min\n` +
     `Model: ${CLAUDE_MODEL} + web search\n\n` +
