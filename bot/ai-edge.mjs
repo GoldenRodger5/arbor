@@ -702,6 +702,36 @@ async function refreshPortfolio() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Team Abbreviation Mapping — ESPN and Kalshi use different abbreviations
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ABBR_MAP = {
+  // ESPN → Kalshi (and vice versa — we normalize to check both)
+  'CHW': 'CWS', 'CWS': 'CHW',    // Chicago White Sox
+  'AZ': 'ARI', 'ARI': 'AZ',       // Arizona Diamondbacks
+  'GS': 'GSW', 'GSW': 'GS',       // Golden State Warriors
+  'NY': 'NYK', 'NYK': 'NY',       // New York Knicks
+  'SA': 'SAS', 'SAS': 'SA',       // San Antonio Spurs
+  'NO': 'NOP', 'NOP': 'NO',       // New Orleans Pelicans
+  'UTAH': 'UTA', 'UTA': 'UTAH',   // Utah Jazz/Hockey
+  'MON': 'MTL', 'MTL': 'MON',     // Montreal Canadiens
+  'LA': 'LAK', 'LAK': 'LA',       // Los Angeles Kings
+  'NJ': 'NJD', 'NJD': 'NJ',       // New Jersey Devils
+  'TB': 'TBL', 'TBL': 'TB',       // Tampa Bay Lightning (NHL only — MLB TB is fine)
+  'WSH': 'WAS', 'WAS': 'WSH',     // Washington (varies by sport)
+  'ATH': 'OAK', 'OAK': 'ATH',     // Oakland/Athletics
+};
+
+// Check if a ticker contains a team abbreviation (tries both ESPN and Kalshi versions)
+function tickerHasTeam(ticker, teamAbbr) {
+  const upper = ticker.toUpperCase();
+  if (upper.includes(teamAbbr.toUpperCase())) return true;
+  const alt = ABBR_MAP[teamAbbr.toUpperCase()];
+  if (alt && upper.includes(alt)) return true;
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Win Expectancy Baselines — historical data for anchoring Claude's predictions
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -977,10 +1007,8 @@ async function checkLiveScoreEdges() {
           // Must be today's date (or tonight's late game after 10pm ET)
           if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) return false;
           // Must match BOTH playing teams (ticker contains both abbreviations)
-          const upperTicker = ticker.toUpperCase();
-          const hasHome = upperTicker.includes(homeAbbr);
-          const hasAway = upperTicker.includes(awayAbbr);
-          return hasHome && hasAway;
+          // Use abbreviation mapper — ESPN "CHW" matches Kalshi "CWS" etc.
+          return tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
         });
 
         if (gameMarkets.length === 0) {
@@ -994,8 +1022,15 @@ async function checkLiveScoreEdges() {
         const trailingAbbr = trailing.team?.abbreviation ?? '';
 
         // Find markets for both teams
-        const leadMarket = gameMarkets.find(m => m.ticker?.toUpperCase().endsWith('-' + leadingAbbr));
-        const trailMarket = gameMarkets.find(m => m.ticker?.toUpperCase().endsWith('-' + trailingAbbr));
+        // Find markets — check both ESPN and Kalshi abbreviation variants
+        const leadMarket = gameMarkets.find(m => {
+          const suffix = m.ticker?.split('-').pop()?.toUpperCase() ?? '';
+          return suffix === leadingAbbr || suffix === (ABBR_MAP[leadingAbbr] ?? '');
+        });
+        const trailMarket = gameMarkets.find(m => {
+          const suffix = m.ticker?.split('-').pop()?.toUpperCase() ?? '';
+          return suffix === trailingAbbr || suffix === (ABBR_MAP[trailingAbbr] ?? '');
+        });
 
         // Pick the better entry: leading team at cheap price OR trailing underdog at very cheap price
         const leadPrice = leadMarket ? parseFloat(leadMarket.yes_ask_dollars) : 1;
@@ -1167,7 +1202,7 @@ async function checkLiveScoreEdges() {
           const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
           if (pBase === gameBase) return true;
           // Match Poly slug (contains team abbreviations)
-          if (p.exchange === 'polymarket' && pt.includes(ha) && pt.includes(aa)) return true;
+          if (p.exchange === 'polymarket' && tickerHasTeam(pt, homeAbbr) && tickerHasTeam(pt, awayAbbr)) return true;
           return false;
         });
         if (hasPosition) { console.log(`[live-edge] BLOCKED: already have position on ${gameBase} (cross-platform check)`); continue; }
