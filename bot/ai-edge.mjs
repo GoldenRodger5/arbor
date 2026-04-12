@@ -1165,20 +1165,38 @@ async function claudeBroadScan() {
     } catch { /* skip */ }
   }
 
-  // Filter out markets closing too far in the future — capital efficiency
+  // Filter: sports use ticker date (close_time is settlement, not game day), non-sports use close_time
+  const etNowFilter = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const etTmrwFilter = new Date(etNowFilter.getTime() + 24 * 60 * 60 * 1000);
+  const toShortFilter = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
+  const todayFilter = toShortFilter(etNowFilter);
+  const tonightFilter = toShortFilter(etTmrwFilter);
   const maxCloseMs = Date.now() + MAX_DAYS_OUT * 24 * 60 * 60 * 1000;
+
   const beforeFilter = allMarkets.length;
   for (let i = allMarkets.length - 1; i >= 0; i--) {
-    const ct = allMarkets[i].closeTime;
-    if (ct) {
-      const closeMs = Date.parse(ct);
-      if (Number.isFinite(closeMs) && closeMs > maxCloseMs) {
+    const m = allMarkets[i];
+    const isSport = m.category === 'Sports' || m.category === 'Golf/Masters';
+
+    if (isSport) {
+      // Sports: filter by ticker date (game date), not close_time (settlement date)
+      const ticker = m.ticker ?? '';
+      if (!ticker.includes(todayFilter) && !ticker.includes(tonightFilter)) {
         allMarkets.splice(i, 1);
+      }
+    } else {
+      // Non-sports: filter by actual close_time
+      const ct = m.closeTime;
+      if (ct) {
+        const closeMs = Date.parse(ct);
+        if (Number.isFinite(closeMs) && closeMs > maxCloseMs) {
+          allMarkets.splice(i, 1);
+        }
       }
     }
   }
   const filtered = beforeFilter - allMarkets.length;
-  if (filtered > 0) console.log(`[broad-scan] Filtered ${filtered} markets closing > ${MAX_DAYS_OUT} days out`);
+  if (filtered > 0) console.log(`[broad-scan] Filtered ${filtered} markets (sports: not today/tonight, non-sports: >${MAX_DAYS_OUT}d)`);
 
   if (allMarkets.length === 0) { console.log('[broad-scan] 0 markets found'); return; }
 
