@@ -803,7 +803,9 @@ function getWinExpectancyText(league, lead, period, isHome) {
   const adjusted = Math.min(0.99, base + homeAdj);
   const sport = league === 'mlb' ? 'MLB' : league === 'nba' ? 'NBA' : 'NHL';
   const periodName = league === 'mlb' ? `inning ${period}` : league === 'nba' ? `Q${period}` : `period ${period}`;
-  return `HISTORICAL BASELINE: Teams leading by ${lead} ${league === 'nba' ? 'points' : league === 'mlb' ? 'runs' : 'goals'} in ${periodName} ${isHome ? '(home)' : '(away)'} win ${(adjusted * 100).toFixed(0)}% of the time historically. Start from this baseline and adjust up/down.`;
+  const isSoccer = ['mls', 'epl', 'laliga'].includes(league);
+  const drawWarning = isSoccer ? ' IMPORTANT: Soccer has draws (~25% of games). Your team must WIN outright — a draw means your contract LOSES.' : '';
+  return `HISTORICAL BASELINE: Teams leading by ${lead} ${league === 'nba' ? 'points' : league === 'mlb' ? 'runs' : 'goals'} in ${periodName} ${isHome ? '(home)' : '(away)'} win ${(adjusted * 100).toFixed(0)}% of the time historically.${drawWarning} Start from this baseline and adjust up/down.`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -916,6 +918,8 @@ async function checkLiveScoreEdges() {
     { league: 'nba', path: 'basketball/nba', series: 'KXNBAGAME' },
     { league: 'nhl', path: 'hockey/nhl', series: 'KXNHLGAME' },
     { league: 'mls', path: 'soccer/usa.1', series: 'KXMLSGAME' },
+    { league: 'epl', path: 'soccer/eng.1', series: 'KXEPLGAME' },
+    { league: 'laliga', path: 'soccer/esp.1', series: 'KXLALIGAGAME' },
   ];
 
   // === PHASE 1: Collect all games with leads (parallel ESPN fetch) ===
@@ -982,7 +986,8 @@ async function checkLiveScoreEdges() {
     const idx = (pick.index ?? 1) - 1;
     if (idx < 0 || idx >= liveGames.length) continue;
     const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail } = liveGames[idx];
-    const series = league === 'mlb' ? 'KXMLBGAME' : league === 'nba' ? 'KXNBAGAME' : league === 'nhl' ? 'KXNHLGAME' : 'KXMLSGAME';
+    const seriesMap = { mlb: 'KXMLBGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME', mls: 'KXMLSGAME', epl: 'KXEPLGAME', laliga: 'KXLALIGAGAME' };
+    const series = seriesMap[league] ?? 'KXMLBGAME';
 
     try {
         const homeAbbr = home.team?.abbreviation ?? '';
@@ -1352,7 +1357,7 @@ async function checkPreGamePredictions() {
   lastPreGameScan = Date.now();
   if (!canTrade()) return;
 
-  const sportsSeries = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME'];
+  const sportsSeries = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME', 'KXEPLGAME', 'KXLALIGAGAME'];
   const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
   const etTmrw = new Date(etNow.getTime() + 24 * 60 * 60 * 1000);
   const toShort = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
@@ -1486,7 +1491,7 @@ async function checkPreGamePredictions() {
     const team1 = teamBlock.slice(-6, -3);
     const team2 = teamBlock.slice(-3);
     // Extract sport from Kalshi series ticker (KXMLBGAME → mlb, KXNBAGAME → nba)
-    const pgSport = market.ticker.includes('MLB') ? 'mlb' : market.ticker.includes('NBA') ? 'nba' : market.ticker.includes('NHL') ? 'nhl' : '';
+    const pgSport = market.ticker.includes('MLB') ? 'mlb' : market.ticker.includes('NBA') ? 'nba' : market.ticker.includes('NHL') ? 'nhl' : market.ticker.includes('MLS') ? 'mls' : market.ticker.includes('EPL') ? 'epl' : market.ticker.includes('LALIGA') ? 'laliga' : '';
     const pgPolyMarkets = await getPolyMoneylines();
     const pgPolyMatch = findPolyMarketForGame(team1, team2, pgPolyMarkets, pgSport);
     // The team we want is in the ticker suffix (e.g., -PIT or -CHC)
@@ -1715,7 +1720,7 @@ async function claudeBroadScan() {
 
   // Fetch markets across categories — sports, crypto, politics, economics
   const categories = [
-    { name: 'Sports', series: ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME'] },
+    { name: 'Sports', series: ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME', 'KXEPLGAME', 'KXLALIGAGAME'] },
     { name: 'Crypto', keywords: ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto'] },
     { name: 'Economics', keywords: ['cpi', 'fed', 'gdp', 'jobs', 'inflation', 'rate'] },
   ];
@@ -1723,7 +1728,7 @@ async function claudeBroadScan() {
   const allMarkets = [];
 
   // Sports — game-winners + additional sports series
-  const sportsSeries = [...categories[0].series, 'KXMLSGAME', 'KXNFLGAME'];
+  const sportsSeries = [...categories[0].series, 'KXNFLGAME'];
   for (const s of sportsSeries) {
     try {
       const data = await kalshiGet(`/markets?series_ticker=${s}&status=open&limit=200`);
@@ -1814,10 +1819,26 @@ async function claudeBroadScan() {
     const isSport = m.category === 'Sports' || m.category === 'Golf/Masters';
 
     if (isSport) {
-      // Sports: filter by ticker date (game date), not close_time (settlement date)
       const ticker = m.ticker ?? '';
-      if (!ticker.includes(todayFilter) && !ticker.includes(tonightFilter)) {
-        allMarkets.splice(i, 1);
+      const isSoccer = ticker.startsWith('KXEPL') || ticker.startsWith('KXLALIGA') || ticker.startsWith('KXMLS');
+
+      if (isSoccer) {
+        // Soccer: allow games within next 3 days (games are scheduled, not daily like US sports)
+        const ct = m.closeTime;
+        if (ct) {
+          const closeMs = Date.parse(ct);
+          const threeDaysMs = Date.now() + 3 * 24 * 60 * 60 * 1000;
+          if (Number.isFinite(closeMs) && closeMs > threeDaysMs) {
+            allMarkets.splice(i, 1);
+          }
+        }
+        // Also skip TIE markets — we only bet on team wins
+        if (ticker.includes('-TIE')) allMarkets.splice(i, 1);
+      } else {
+        // US Sports: filter by ticker date (today/tonight only)
+        if (!ticker.includes(todayFilter) && !ticker.includes(tonightFilter)) {
+          allMarkets.splice(i, 1);
+        }
       }
     } else {
       // Non-sports: filter by actual close_time
@@ -2189,9 +2210,12 @@ async function getGameContext(trade) {
   if (ticker.includes('MLB')) league = 'mlb';
   else if (ticker.includes('NBA')) league = 'nba';
   else if (ticker.includes('NHL')) league = 'nhl';
+  else if (ticker.includes('MLS')) league = 'mls';
+  else if (ticker.includes('EPL')) league = 'epl';
+  else if (ticker.includes('LALIGA')) league = 'laliga';
   else return null;
 
-  const pathMap = { mlb: 'baseball/mlb', nba: 'basketball/nba', nhl: 'hockey/nhl', mls: 'soccer/usa.1' };
+  const pathMap = { mlb: 'baseball/mlb', nba: 'basketball/nba', nhl: 'hockey/nhl', mls: 'soccer/usa.1', epl: 'soccer/eng.1', laliga: 'soccer/esp.1' };
   try {
     const res = await fetch(`http://site.api.espn.com/apis/site/v2/sports/${pathMap[league]}/scoreboard`,
       { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) });
