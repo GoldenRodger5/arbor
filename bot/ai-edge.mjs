@@ -1163,7 +1163,7 @@ async function checkLiveScoreEdges() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 let lastPreGameScan = 0;
-const PREGAME_SCAN_INTERVAL = 10 * 60 * 1000; // every 10 min
+const PREGAME_SCAN_INTERVAL = 5 * 60 * 1000; // every 5 min — catch pre-game price shifts
 
 async function checkPreGamePredictions() {
   if (Date.now() - lastPreGameScan < PREGAME_SCAN_INTERVAL) return;
