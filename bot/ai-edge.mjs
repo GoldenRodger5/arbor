@@ -2130,8 +2130,10 @@ async function checkSettlements() {
       const won = (trade.side === 'yes' && market.result === 'yes') ||
                   (trade.side === 'no' && market.result === 'no');
       const exitPrice = won ? 1.0 : 0.0;
-      const filled = trade.filled ?? trade.quantity ?? 0;
-      const proceeds = filled * exitPrice;
+      // Use quantity (what we ordered), not filled (often 0 from initial API response)
+      // The real fill count is deployCost / entryPrice
+      const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / (trade.entryPrice || 1));
+      const proceeds = qty * exitPrice;
       const pnl = proceeds - (trade.deployCost ?? 0);
 
       trade.status = 'settled';

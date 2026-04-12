@@ -539,7 +539,7 @@ As bankroll grows, deployment percentage decreases:
 
 ## Known Limitations
 
-1. **Unproven win rate.** System has 2 settled trades (both losses). Need 50+ trades to validate prediction accuracy.
+1. **Early validation phase.** The prediction engine placed its first trade on April 12 (ATH YES) which won ($61 payout). Settlement reconciliation in trades.jsonl may not accurately reflect all outcomes — Kalshi's history tab is the source of truth for actual P&L. Need 50+ trades under the new prediction system to validate win rate.
 
 2. **No Polymarket sell capability.** Can buy on Poly but can't sell/exit positions early. Stop-loss is alert-only for Poly.
 
