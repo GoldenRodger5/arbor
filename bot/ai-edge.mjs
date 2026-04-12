@@ -98,36 +98,59 @@ const POLY_US_SECRET = process.env.POLY_US_SECRET_KEY ?? '';
 const POLY_US_API = 'https://api.polymarket.us';
 let polyBalance = 0;
 
-async function refreshPolyBalance() {
+// Initialize Ed25519 signing ONCE at module level — avoids frozen object error
+let polySign = null;
+let polyPrivBytes = null;
+async function initPolySigning() {
+  if (polySign) return; // already initialized
   if (!POLY_US_KEY_ID || !POLY_US_SECRET) return;
   try {
     const ed = await import('@noble/ed25519');
-    // Configure sha512 only once (ed.etc may be frozen after first call)
-    try {
-      const { createHash } = await import('crypto');
+    const { createHash } = await import('crypto');
+    // Set sha512 before any signing call (object freezes after first use)
+    if (ed.etc && typeof ed.etc.sha512Sync !== 'function') {
       ed.etc.sha512Sync = (...m) => {
         const h = createHash('sha512');
         for (const msg of m) h.update(msg);
         return new Uint8Array(h.digest());
       };
-    } catch { /* already set */ }
-    const sign = ed.signAsync ?? ed.sign;
-    const privBytes = Uint8Array.from(atob(POLY_US_SECRET), c => c.charCodeAt(0)).slice(0, 32);
-    const timestamp = String(Date.now());
+    }
+    polySign = ed.signAsync ?? ed.sign;
+    polyPrivBytes = Uint8Array.from(atob(POLY_US_SECRET), c => c.charCodeAt(0)).slice(0, 32);
+    console.log('[poly] Ed25519 signing initialized');
+  } catch (e) {
+    console.error('[poly] init error:', e.message);
+  }
+}
+
+async function polySignRequest(method, path, body = '') {
+  if (!polySign) await initPolySigning();
+  if (!polySign) return null;
+  const ts = String(Date.now());
+  const message = `${ts}${method}${path}${body}`;
+  const sigBytes = await polySign(new TextEncoder().encode(message), polyPrivBytes);
+  const signature = btoa(String.fromCharCode(...sigBytes));
+  return {
+    headers: {
+      'X-PM-Access-Key': POLY_US_KEY_ID,
+      'X-PM-Timestamp': ts,
+      'X-PM-Signature': signature,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'User-Agent': 'arbor-ai/1',
+    },
+  };
+}
+
+async function refreshPolyBalance() {
+  if (!POLY_US_KEY_ID || !POLY_US_SECRET) return;
+  try {
     const path = '/v1/account/balances';
-    const message = `${timestamp}GET${path}`;
-    const sigBytes = await sign(new TextEncoder().encode(message), privBytes);
-    const signature = btoa(String.fromCharCode(...sigBytes));
+    const auth = await polySignRequest('GET', path);
+    if (!auth) return;
 
     const res = await fetch(`${POLY_US_API}${path}`, {
-      headers: {
-        'X-PM-Access-Key': POLY_US_KEY_ID,
-        'X-PM-Timestamp': timestamp,
-        'X-PM-Signature': signature,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'User-Agent': 'arbor-ai/1',
-      },
+      headers: auth.headers,
       signal: AbortSignal.timeout(8000),
     });
     if (res.ok) {
@@ -150,19 +173,6 @@ async function polymarketPost(slug, intent, price, quantity) {
     return { ok: false, status: 0, data: {} };
   }
   try {
-    const ed = await import('@noble/ed25519');
-    try {
-      const { createHash } = await import('crypto');
-      ed.etc.sha512Sync = (...m) => {
-        const h = createHash('sha512');
-        for (const msg of m) h.update(msg);
-        return new Uint8Array(h.digest());
-      };
-    } catch { /* already set */ }
-    const sign = ed.signAsync ?? ed.sign;
-    const privBytes = Uint8Array.from(atob(POLY_US_SECRET), c => c.charCodeAt(0)).slice(0, 32);
-
-    const ts = String(Date.now());
     const path = '/v1/orders';
     const body = {
       marketSlug: slug,
@@ -173,20 +183,13 @@ async function polymarketPost(slug, intent, price, quantity) {
       tif: 'TIME_IN_FORCE_IMMEDIATE_OR_CANCEL',
     };
     const bodyStr = JSON.stringify(body);
-    const message = `${ts}POST${path}`;
-    const sigBytes = await sign(new TextEncoder().encode(message), privBytes);
-    const signature = btoa(String.fromCharCode(...sigBytes));
+    // Signature includes body for POST requests
+    const auth = await polySignRequest('POST', path, bodyStr);
+    if (!auth) return { ok: false, status: 0, data: {} };
 
     const res = await fetch(`${POLY_US_API}${path}`, {
       method: 'POST',
-      headers: {
-        'X-PM-Access-Key': POLY_US_KEY_ID,
-        'X-PM-Timestamp': ts,
-        'X-PM-Signature': signature,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'User-Agent': 'arbor-ai/1',
-      },
+      headers: auth.headers,
       body: bodyStr,
     });
     const data = await res.json().catch(() => ({}));
@@ -1286,7 +1289,8 @@ async function main() {
     `Platforms: Kalshi + Polymarket US\n` +
     `Min edge: ${MIN_EDGE_PCT}%\n` +
     `Max trade: $${MAX_TRADE_CAP} (25% of cash)\n` +
-    `Poll: every ${POLL_INTERVAL_MS / 1000}s | Broad scan: every 5min\n\n` +
+    `Poll: every ${POLL_INTERVAL_MS / 1000}s | Broad scan: every ${BROAD_SCAN_INTERVAL / 60000}min\n` +
+    `Max days out: ${MAX_DAYS_OUT}d | Min price: 5¢\n\n` +
     `💰 Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions\n` +
     `💰 Polymarket: $${polyBalance.toFixed(2)}\n` +
     `Model: ${CLAUDE_MODEL} + web search`
