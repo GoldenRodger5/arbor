@@ -899,10 +899,38 @@ async function claudeBroadScan() {
   const nonSportCount = allMarkets.length - sportCount;
   console.log(`[broad-scan] Found ${allMarkets.length} markets (${sportCount} sports, ${nonSportCount} non-sports)`);
 
-  // Build compact market list for Claude
-  const marketSummary = allMarkets.slice(0, 30).map(m =>
-    `[${m.category}] ${m.ticker}: "${m.title}" YES=$${m.yesAsk} NO=$${m.noAsk}`
-  ).join('\n');
+  // Group markets by event for bracket-aware presentation
+  const eventGroups = new Map();
+  for (const m of allMarkets) {
+    // Derive event key: strip the last segment (threshold/team suffix)
+    const parts = m.ticker.split('-');
+    const lastPart = parts[parts.length - 1];
+    // Sports tickers end with team abbrev (3 letters), brackets end with T/B + number
+    const isBracket = /^[TB]?\d/.test(lastPart);
+    const eventKey = isBracket ? parts.slice(0, -1).join('-') : m.ticker;
+    if (!eventGroups.has(eventKey)) eventGroups.set(eventKey, []);
+    eventGroups.get(eventKey).push(m);
+  }
+
+  // Build compact market list — show brackets together
+  const marketLines = [];
+  for (const [eventKey, markets] of eventGroups) {
+    if (markets.length === 1) {
+      // Single market (sports game-winner)
+      const m = markets[0];
+      marketLines.push(`[${m.category}] ${m.ticker}: "${m.title}" YES=$${m.yesAsk} NO=$${m.noAsk}`);
+    } else {
+      // Bracket/multi-outcome market — show all thresholds together
+      const cat = markets[0].category;
+      const baseTitle = markets[0].title.replace(/more than [\d.%-]+/, 'more than X%').replace(/\$[\d,.]+/, '$X');
+      marketLines.push(`[${cat}] BRACKET: ${eventKey} — "${baseTitle}" (${markets.length} thresholds):`);
+      for (const m of markets) {
+        const threshold = m.ticker.split('-').pop();
+        marketLines.push(`  ${m.ticker}: YES=$${m.yesAsk} NO=$${m.noAsk}`);
+      }
+    }
+  }
+  const marketSummary = marketLines.slice(0, 50).join('\n');
 
   // Fetch context: news + crypto prices
   let recentNews = '';
@@ -944,13 +972,36 @@ async function claudeBroadScan() {
 
   if (tradeable.length === 0) { console.log('[broad-scan] No tradeable markets (all have positions)'); return; }
 
-  // Put non-sports first so Claude sees crypto/economics/politics before the 25 cap
+  // Put non-sports first so Claude sees crypto/economics/politics before the cap
   const nonSports = tradeable.filter(m => m.category !== 'Sports');
   const sports = tradeable.filter(m => m.category === 'Sports');
   const ordered = [...nonSports, ...sports];
-  const marketSummaryFiltered = ordered.slice(0, 30).map(m =>
-    `[${m.category}] ${m.ticker}: "${m.title}" YES=$${m.yesAsk} NO=$${m.noAsk}`
-  ).join('\n');
+
+  // Group tradeable markets by event for bracket-aware presentation
+  const tradeEventGroups = new Map();
+  for (const m of ordered) {
+    const parts = m.ticker.split('-');
+    const lastPart = parts[parts.length - 1];
+    const isBracket = /^[TB]?\d/.test(lastPart);
+    const eventKey = isBracket ? parts.slice(0, -1).join('-') : m.ticker;
+    if (!tradeEventGroups.has(eventKey)) tradeEventGroups.set(eventKey, []);
+    tradeEventGroups.get(eventKey).push(m);
+  }
+
+  const tradeLines = [];
+  for (const [eventKey, markets] of tradeEventGroups) {
+    if (markets.length === 1) {
+      const m = markets[0];
+      tradeLines.push(`[${m.category}] ${m.ticker}: "${m.title}" YES=$${m.yesAsk} NO=$${m.noAsk}`);
+    } else {
+      const cat = markets[0].category;
+      tradeLines.push(`[${cat}] BRACKET EVENT: ${eventKey} (${markets.length} thresholds — these are CUMULATIVE, pick the best one):`);
+      for (const m of markets) {
+        tradeLines.push(`  ${m.ticker}: "${m.title}" YES=$${m.yesAsk} NO=$${m.noAsk}`);
+      }
+    }
+  }
+  const marketSummaryFiltered = tradeLines.slice(0, 60).join('\n');
 
   // Ask Claude with web search — strict rules
   try {
@@ -981,7 +1032,8 @@ async function claudeBroadScan() {
       `- YES + NO sums to ~$1.00-1.03. This is bid-ask spread, NOT mispricing.\n` +
       `- KXBTC/KXETH are NARROW $250 RANGE bets. BTC must land in that exact window. A 1¢ price on a range far from current price is CORRECTLY priced.\n` +
       `- Sports underdogs at 15-25¢ are usually correctly priced. Bad teams lose a lot.\n` +
-      `- Contracts at $0.01-$0.05 are lottery tickets. The market knows they're unlikely.\n\n` +
+      `- Contracts at $0.01-$0.05 are lottery tickets. The market knows they're unlikely.\n` +
+      `- BRACKET MARKETS (CPI, GDP, Fed, BTC): These are CUMULATIVE thresholds shown together. "GDP > 2.0% YES=$0.53" means market thinks 53% chance GDP exceeds 2.0%. The IMPLIED range probability comes from the DIFFERENCE between adjacent thresholds. Pick the threshold where your research shows the biggest mispricing vs market. You only need ONE ticker from a bracket.\n\n` +
       `HARD CONSTRAINTS:\n` +
       `- Sports game tickers: ONLY "${todayShort}" or "${tomorrowShort}"\n` +
       `- Max bet: $${Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25).toFixed(2)}\n` +
