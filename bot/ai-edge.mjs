@@ -902,7 +902,7 @@ async function checkLiveScoreEdges() {
           `MARKET: ${title}\n` +
           `Ticker: ${targetMarket.ticker}\n` +
           `${leadingAbbr} YES price: $${price.toFixed(2)} (implied ${(price*100).toFixed(0)}%)\n\n` +
-          `CASH: $${kalshiBalance.toFixed(2)} | Max bet: $${Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25).toFixed(2)}\n\n` +
+          `CASH: $${kalshiBalance.toFixed(2)} | Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
           `RESEARCH: Use web search to check both teams' records and any relevant context.\n\n` +
           `QUESTION: Given the live score and game situation, what is the TRUE probability ${leading.team?.displayName} wins?\n` +
           `- If your probability is > market price by 7%+, recommend the trade\n` +
@@ -1272,7 +1272,7 @@ async function claudeBroadScan() {
       `- BRACKET MARKETS (CPI, GDP, Fed, BTC): These are CUMULATIVE thresholds shown together. "GDP > 2.0% YES=$0.53" means market thinks 53% chance GDP exceeds 2.0%. The IMPLIED range probability comes from the DIFFERENCE between adjacent thresholds. Pick the threshold where your research shows the biggest mispricing vs market. You only need ONE ticker from a bracket.\n\n` +
       `HARD CONSTRAINTS:\n` +
       `- Sports game tickers: ONLY "${todayShort}" or "${tomorrowShort}"\n` +
-      `- Max bet: $${Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25).toFixed(2)}\n` +
+      `- Max bet: $${getDynamicMaxTrade().toFixed(2)}\n` +
       `- If cash < $3: return {"trade":false}\n` +
       `- Min price: $0.05 (no lottery tickets)\n` +
       `- Markets close within ${MAX_DAYS_OUT} days. Prefer sooner.\n` +
@@ -1875,7 +1875,7 @@ function logStats() {
 
 async function main() {
   console.log('=== Arbor AI Edge Trading Bot ===');
-  console.log(`Config: MIN_EDGE=${MIN_EDGE_PCT}% MAX_TRADE=$${MAX_TRADE_CAP} POLL=${POLL_INTERVAL_MS / 1000}s`);
+  console.log(`Config: MIN_EDGE=${MIN_EDGE_PCT}% MAX_TRADE=$${getDynamicMaxTrade().toFixed(2)} POLL=${POLL_INTERVAL_MS / 1000}s`);
 
   if (!KALSHI_API_KEY || !kalshiPrivateKey) {
     console.error('Missing Kalshi credentials');
