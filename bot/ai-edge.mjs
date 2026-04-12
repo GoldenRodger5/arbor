@@ -1,21 +1,20 @@
 /**
- * Arbor AI Edge Trading Bot
+ * Arbor Prediction Trading Bot
  *
- * Uses Claude to analyze real-time sports news (injuries, lineup changes,
- * weather) and place directional bets on Kalshi when the market hasn't
- * repriced yet.
+ * Autonomous sports prediction engine for Kalshi + Polymarket.
+ * Uses Claude (Haiku screen → Sonnet + web search decide) to predict
+ * game winners and buy contracts on the cheaper platform.
  *
- * Pipeline (runs every 2 minutes):
- *   1. Fetch latest news/injuries from ESPN for MLB, NBA, NHL
- *   2. Match news items to active Kalshi game-winner markets
- *   3. Ask Claude: "Does this news materially change the probability?
- *      If yes, which direction, and by how much?"
- *   4. If Claude says edge > 5% and market price hasn't adjusted,
- *      place a directional bet
- *   5. Size by Kelly criterion on the estimated edge
+ * Pipeline (every 60 seconds):
+ *   1. Pre-game: Scan today's games, predict winners, buy at 25-85¢
+ *   2. Live: Monitor ESPN scores, predict winners of games with leads
+ *   3. Cross-platform: Compare Kalshi vs Poly prices, buy cheaper
+ *   4. Resolution: Buy winning sides of settled games below $1 (risk-free)
+ *   5. Stop-loss: Sell Kalshi positions down >30% from entry
  *
- * Key advantage: Claude processes injury reports in <2 seconds.
- * Markets often take 5-30 minutes to reprice after news breaks.
+ * Risk controls: dynamic sizing (10% of bankroll), 15% daily loss halt,
+ * 5-consecutive-loss reducer, 85¢ max price, 65% min confidence,
+ * 5% confidence-over-price margin, sport exposure caps.
  *
  * Run: node ai-edge.mjs
  */
@@ -318,7 +317,7 @@ const tradeCooldowns = new Map(); // ticker → lastTradedMs
 let kalshiBalance = 0;
 let kalshiPositionValue = 0;
 let openPositions = [];  // fetched each cycle
-let stats = { claudeCalls: 0, tradesPlaced: 0 };
+let stats = { claudeCalls: 0, tradesPlaced: 0 }; // only tracking active metrics
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Risk Management State
@@ -654,31 +653,44 @@ async function refreshPortfolio() {
     kalshiPositionValue = (bal.portfolio_value ?? 0) / 100;
   } catch { /* keep old */ }
 
-  // Fetch open positions
+  // Fetch Kalshi open positions
   try {
     const data = await kalshiGet('/portfolio/positions');
     openPositions = (data.event_positions ?? data.market_positions ?? data.positions ?? []).map(p => ({
       ticker: p.event_ticker ?? p.ticker ?? p.market_ticker ?? '',
       cost: parseFloat(p.total_cost_dollars ?? '0'),
+      exchange: 'kalshi',
     })).filter(p => p.cost > 0);
   } catch { openPositions = []; }
+
+  // Add Polymarket open positions from trades log — Poly API doesn't have a positions endpoint
+  try {
+    if (existsSync(TRADES_LOG)) {
+      const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      for (const l of lines) {
+        try {
+          const t = JSON.parse(l);
+          if (t.status === 'open' && t.exchange === 'polymarket') {
+            openPositions.push({
+              ticker: t.ticker,
+              cost: t.deployCost ?? 0,
+              exchange: 'polymarket',
+            });
+          }
+        } catch { /* skip */ }
+      }
+    }
+  } catch { /* skip */ }
 
   // Also refresh Poly balance
   await refreshPolyBalance();
 
-  console.log(`[portfolio] Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions | Poly: $${polyBalance.toFixed(2)} | Open: ${openPositions.length}`);
+  const kalshiCount = openPositions.filter(p => p.exchange === 'kalshi').length;
+  const polyCount = openPositions.filter(p => p.exchange === 'polymarket').length;
+  console.log(`[portfolio] Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions | Poly: $${polyBalance.toFixed(2)} | Open: ${kalshiCount} Kalshi + ${polyCount} Poly`);
 }
 
-function getPortfolioSummary() {
-  const total = kalshiBalance + kalshiPositionValue + polyBalance;
-  return `KALSHI — Cash: $${kalshiBalance.toFixed(2)}, Positions: $${kalshiPositionValue.toFixed(2)}\n` +
-    `POLYMARKET — Balance: $${polyBalance.toFixed(2)}\n` +
-    `TOTAL: $${total.toFixed(2)}\n` +
-    `Open Kalshi positions: ${openPositions.length}` +
-    (openPositions.length > 0 ? '\n' + openPositions.map(p =>
-      `  ${p.ticker}: $${p.cost.toFixed(2)}`
-    ).join('\n') : '');
-}
+// [getPortfolioSummary removed — was only used by dead news-edge pipeline]
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Live Predictions + Market Scanning
@@ -983,15 +995,22 @@ async function checkLiveScoreEdges() {
           `JSON ONLY:\n` +
           `{"trade": false, "confidence": 0.XX, "reasoning": "who wins and why not buying"}\n` +
           `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "why ${leadingAbbr} wins"}`;
-        // Block if we already have a position on this game
+        // Block if we already have a position on this game (check BOTH platforms)
         const ticker = targetMarket.ticker;
         const lastH = ticker.lastIndexOf('-');
         const gameBase = lastH > 0 ? ticker.slice(0, lastH) : ticker;
+        const ha = homeAbbr.toLowerCase();
+        const aa = awayAbbr.toLowerCase();
         const hasPosition = openPositions.some(p => {
+          const pt = (p.ticker ?? '').toLowerCase();
+          // Match Kalshi base ticker
           const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
-          return pBase === gameBase;
+          if (pBase === gameBase) return true;
+          // Match Poly slug (contains team abbreviations)
+          if (p.exchange === 'polymarket' && pt.includes(ha) && pt.includes(aa)) return true;
+          return false;
         });
-        if (hasPosition) { console.log(`[live-edge] BLOCKED: already have position on ${gameBase}`); continue; }
+        if (hasPosition) { console.log(`[live-edge] BLOCKED: already have position on ${gameBase} (cross-platform check)`); continue; }
 
         // Cooldown check
         if (Date.now() - (tradeCooldowns.get(ticker) ?? 0) < COOLDOWN_MS) continue;
@@ -1151,7 +1170,7 @@ async function checkPreGamePredictions() {
         if (!ticker.includes(todayStr) && !ticker.includes(tonightStr)) continue;
         const ya = parseFloat(m.yes_ask_dollars);
         // Pre-game: 25-85¢ range for value entries
-        if (ya < 0.25 || ya > 0.85) continue;
+        if (ya < 0.25 || ya > MAX_PRICE) continue;
         // Dedup by game base
         const lastH = ticker.lastIndexOf('-');
         const base = lastH > 0 ? ticker.slice(0, lastH) : ticker;
@@ -1209,7 +1228,7 @@ async function checkPreGamePredictions() {
     if (!market) continue;
 
     const price = pick.side === 'yes' ? market.yesAsk : market.noAsk;
-    if (price > 0.85 || price < 0.05) continue;
+    if (price > MAX_PRICE || price < 0.05) continue;
 
     const decideText = await claudeWithSearch(
       `You are a professional sports bettor. Make a prediction on this game.\n\n` +
@@ -1806,31 +1825,65 @@ async function checkStopLosses() {
   try {
     const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
     const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    const openTrades = trades.filter(t => t.status === 'open' && t.exchange === 'kalshi');
+    // Check both Kalshi and Poly open trades
+    const openTrades = trades.filter(t => t.status === 'open');
     if (openTrades.length === 0) return;
+
+    // Batch fetch Kalshi prices — one call instead of N
+    let kalshiPrices = new Map();
+    const kalshiTickers = openTrades.filter(t => t.exchange === 'kalshi').map(t => t.ticker);
+    if (kalshiTickers.length > 0) {
+      for (const ticker of kalshiTickers) {
+        try {
+          const data = await kalshiGet(`/markets/${ticker}`);
+          const m = data.market ?? data;
+          if (m.yes_ask_dollars) {
+            kalshiPrices.set(ticker, { yes: parseFloat(m.yes_ask_dollars), no: parseFloat(m.no_ask_dollars) });
+          }
+        } catch { /* skip */ }
+      }
+    }
+
+    // Fetch Poly prices from cached moneylines
+    const polyPrices = new Map();
+    const polyMoneylines = await getPolyMoneylines();
+    for (const pm of polyMoneylines) {
+      polyPrices.set(pm.slug, { s0: pm.s0Price, s1: pm.s1Price });
+    }
 
     for (const trade of openTrades) {
       try {
-        // Fetch current market price for this ticker
-        const data = await kalshiGet(`/markets/${trade.ticker}`);
-        const market = data.market ?? data;
-        if (!market.yes_ask_dollars) continue;
+        let currentPrice = null;
 
-        const currentPrice = trade.side === 'yes'
-          ? parseFloat(market.yes_ask_dollars)
-          : parseFloat(market.no_ask_dollars);
+        if (trade.exchange === 'kalshi') {
+          const prices = kalshiPrices.get(trade.ticker);
+          if (!prices) continue;
+          currentPrice = trade.side === 'yes' ? prices.yes : prices.no;
+        } else if (trade.exchange === 'polymarket') {
+          const prices = polyPrices.get(trade.ticker);
+          if (!prices) continue;
+          // Use whichever side matches (long=s0, short=s1)
+          currentPrice = trade.side === 'long' || trade.side === 'yes' ? prices.s0 : prices.s1;
+        }
+        if (!currentPrice) continue;
 
         const entryPrice = trade.entryPrice ?? 0;
         if (entryPrice <= 0) continue;
 
         const pctChange = (currentPrice - entryPrice) / entryPrice;
 
-        // Stop-loss: if position dropped >30% from entry, sell
+        // Stop-loss: if position dropped >30% from entry, sell (Kalshi only — Poly settles at expiry)
         if (pctChange < -0.30) {
           const qty = trade.filled ?? trade.quantity ?? 0;
           if (qty <= 0) continue;
 
-          console.log(`[stop-loss] 🛑 ${trade.ticker} dropped ${(pctChange*100).toFixed(0)}% (${entryPrice.toFixed(2)}→${currentPrice.toFixed(2)}). Selling.`);
+          console.log(`[stop-loss] 🛑 ${trade.ticker} on ${trade.exchange} dropped ${(pctChange*100).toFixed(0)}% (${entryPrice.toFixed(2)}→${currentPrice.toFixed(2)})`);
+
+          if (trade.exchange === 'polymarket') {
+            // Polymarket doesn't support selling — just alert
+            await tg(`⚠️ <b>POLY POSITION DOWN ${(pctChange*100).toFixed(0)}%</b>\n${trade.title}\nEntry: ${(entryPrice*100).toFixed(0)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢`);
+            continue;
+          }
 
           const priceInCents = Math.round(currentPrice * 100);
           const result = await kalshiPost('/portfolio/orders', {
@@ -2118,7 +2171,7 @@ function logStats() {
     } catch { /* skip */ }
   }
   const pnlStr = totalPnL >= 0 ? `+$${totalPnL.toFixed(2)}` : `-$${Math.abs(totalPnL).toFixed(2)}`;
-  console.log(`[ai-stats] news=${stats.newsChecked} claude=${stats.claudeCalls} edges=${stats.edgesFound} trades=${stats.tradesPlaced} bal=$${kalshiBalance.toFixed(2)} pnl=${pnlStr} (${settledCount} settled)`);
+  console.log(`[ai-stats] claude=${stats.claudeCalls} trades=${stats.tradesPlaced} bal=$${kalshiBalance.toFixed(2)} poly=$${polyBalance.toFixed(2)} pnl=${pnlStr} (${settledCount} settled)`);
 }
 
 async function main() {
