@@ -360,11 +360,11 @@ function getMaxDeployment() {
 
 function getMaxPositions() {
   const b = getBankroll();
-  if (b < 500) return 8;
-  if (b < 2000) return 12;
-  if (b < 10000) return 15;
-  if (b < 50000) return 20;
-  return 25;
+  if (b < 500) return 20;       // small account — deployment cap is the real limiter
+  if (b < 2000) return 25;
+  if (b < 10000) return 30;
+  if (b < 50000) return 40;
+  return 50;
 }
 
 // Per-trade cap also scales: small accounts need room, big accounts need limits
@@ -1925,7 +1925,6 @@ function logStats() {
 
 async function main() {
   console.log('=== Arbor AI Edge Trading Bot ===');
-  console.log(`Config: MIN_NET_EDGE=${MIN_EDGE_PCT_AFTER_FEES}% (after fees) MAX_TRADE=$${getDynamicMaxTrade().toFixed(2)} POLL=${POLL_INTERVAL_MS / 1000}s`);
 
   if (!KALSHI_API_KEY || !kalshiPrivateKey) {
     console.error('Missing Kalshi credentials');
@@ -1942,6 +1941,8 @@ async function main() {
   } catch (e) {
     console.error('[ai-edge] Portfolio check failed:', e.message);
   }
+
+  console.log(`Config: MIN_NET_EDGE=${MIN_EDGE_PCT_AFTER_FEES}% (after fees) MAX_TRADE=$${getDynamicMaxTrade().toFixed(2)} BANKROLL=$${getBankroll().toFixed(2)} POLL=${POLL_INTERVAL_MS / 1000}s`);
 
   // Initial poll, then chain with setTimeout (prevents overlap)
   async function pollLoop() {
