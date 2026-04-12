@@ -1267,6 +1267,186 @@ async function checkLiveScoreEdges() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Pre-Game Predictions — bet on today's games BEFORE they start
+// ─────────────────────────────────────────────────────────────────────────────
+
+let lastPreGameScan = 0;
+const PREGAME_SCAN_INTERVAL = 10 * 60 * 1000; // every 10 min
+
+async function checkPreGamePredictions() {
+  if (Date.now() - lastPreGameScan < PREGAME_SCAN_INTERVAL) return;
+  lastPreGameScan = Date.now();
+  if (!canTrade()) return;
+
+  const sportsSeries = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME'];
+  const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const etTmrw = new Date(etNow.getTime() + 24 * 60 * 60 * 1000);
+  const toShort = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
+  const todayStr = toShort(etNow);
+  const tonightStr = toShort(etTmrw);
+
+  // Collect today's pre-game markets
+  const preGameMarkets = [];
+  for (const series of sportsSeries) {
+    try {
+      const data = await kalshiGet(`/markets?series_ticker=${series}&status=open&limit=200`);
+      const seenBases = new Set();
+      for (const m of data.markets ?? []) {
+        if (!m.yes_ask_dollars || !m.no_ask_dollars) continue;
+        const ticker = m.ticker ?? '';
+        if (!ticker.includes(todayStr) && !ticker.includes(tonightStr)) continue;
+        const ya = parseFloat(m.yes_ask_dollars);
+        // Only pre-game range: 30-70¢ is the sweet spot for pre-game value
+        if (ya < 0.30 || ya > 0.70) continue;
+        // Dedup by game base
+        const lastH = ticker.lastIndexOf('-');
+        const base = lastH > 0 ? ticker.slice(0, lastH) : ticker;
+        if (seenBases.has(base)) continue;
+        seenBases.add(base);
+        // Skip if we already have a position
+        const hasPos = openPositions.some(p => {
+          const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
+          return pBase === base;
+        });
+        if (hasPos) continue;
+        if (Date.now() - (tradeCooldowns.get(ticker) ?? 0) < COOLDOWN_MS) continue;
+        if (Date.now() - (tradeCooldowns.get(base) ?? 0) < COOLDOWN_MS) continue;
+
+        preGameMarkets.push({
+          ticker, title: m.title, yesAsk: ya, noAsk: parseFloat(m.no_ask_dollars),
+          base, series,
+        });
+      }
+    } catch { /* skip */ }
+  }
+
+  if (preGameMarkets.length === 0) { console.log('[pre-game] No pre-game markets in 30-70¢ range'); return; }
+  console.log(`[pre-game] Found ${preGameMarkets.length} pre-game markets in sweet spot`);
+
+  // Haiku screen: which games look predictable?
+  const marketList = preGameMarkets.slice(0, 20).map(m =>
+    `${m.ticker}: "${m.title}" YES=${(m.yesAsk*100).toFixed(0)}¢ NO=${(m.noAsk*100).toFixed(0)}¢`
+  ).join('\n');
+
+  const screenText = await claudeScreen(
+    `You are a sports handicapper. Pick up to 3 games where you have a strong opinion on who wins.\n\n` +
+    `TODAY'S GAMES (pre-game, not started yet):\n${marketList}\n\n` +
+    `For each pick, say which side (YES = first team listed in title, NO = second team) and why.\n` +
+    `Only pick games where you're genuinely confident (≥65%). Skip coin-flip games.\n\n` +
+    `JSON array: [{"ticker":"exact","side":"yes"/"no","reason":"who wins and why"}] or []`
+  );
+  if (!screenText) return;
+
+  let picks = [];
+  try {
+    const arrMatch = screenText.match(/\[[\s\S]*\]/);
+    if (arrMatch) picks = JSON.parse(arrMatch[0]);
+  } catch { /* bad JSON */ }
+
+  if (!Array.isArray(picks) || picks.length === 0) {
+    console.log('[pre-game] Haiku: no confident picks');
+    return;
+  }
+  console.log(`[pre-game] Haiku picked ${picks.length}: ${picks.map(p => p.ticker).join(', ')}`);
+
+  // Sonnet deep dive on each pick
+  for (const pick of picks.slice(0, 3)) {
+    const market = preGameMarkets.find(m => m.ticker === pick.ticker);
+    if (!market) continue;
+
+    const price = pick.side === 'yes' ? market.yesAsk : market.noAsk;
+    if (price > 0.80 || price < 0.05) continue;
+
+    const decideText = await claudeWithSearch(
+      `You are a professional sports bettor. Make a prediction on this game.\n\n` +
+      `GAME: ${market.title}\n` +
+      `Ticker: ${market.ticker}\n` +
+      `YES price: ${(market.yesAsk*100).toFixed(0)}¢ | NO price: ${(market.noAsk*100).toFixed(0)}¢\n` +
+      `Haiku's pick: ${pick.side.toUpperCase()} — "${pick.reason}"\n\n` +
+      `RESEARCH: Look up both teams' records, starting pitchers (MLB), injury reports, recent form.\n\n` +
+      `PREDICT: How confident are you in ${pick.side.toUpperCase()}? Consider:\n` +
+      `- Team records and quality\n` +
+      `- Home/away advantage\n` +
+      `- Starting pitchers / key players\n` +
+      `- Recent form (last 5 games)\n\n` +
+      `BUY if confidence ≥ 65% AND at least 5 points above price.\n` +
+      `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
+      `JSON ONLY:\n` +
+      `{"trade":false,"confidence":0.XX,"reasoning":"prediction"}\n` +
+      `OR {"trade":true,"side":"${pick.side}","confidence":0.XX,"betAmount":N,"reasoning":"who wins and why"}`,
+      { maxTokens: 800, maxSearches: 3 }
+    );
+    if (!decideText) continue;
+
+    const jsonMatch = decideText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) continue;
+    let decision;
+    try { decision = JSON.parse(jsonMatch[0]); } catch { continue; }
+
+    if (!decision.trade) {
+      console.log(`[pre-game] Sonnet rejected ${pick.ticker}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
+      logScreen({ stage: 'pre-game-sonnet', ticker: pick.ticker, result: 'rejected', confidence: decision.confidence, reasoning: decision.reasoning });
+      continue;
+    }
+
+    const confidence = decision.confidence ?? 0;
+    if (confidence < 0.65 || confidence < price + 0.05) {
+      console.log(`[pre-game] Confidence check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢`);
+      continue;
+    }
+
+    if (!canTrade()) break;
+    if (!checkSportExposure(market.ticker)) continue;
+
+    const maxBet = getPositionSize('kalshi');
+    const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
+    if (safeBet < 1) continue;
+
+    const qty = Math.max(1, Math.floor(safeBet / price));
+    const priceInCents = Math.round(price * 100);
+    const edge = confidence - price;
+
+    if (!canDeployMore(qty * price)) continue;
+
+    console.log(`[pre-game] 🎯 TRADE: ${market.ticker} ${pick.side.toUpperCase()} @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
+    logScreen({ stage: 'pre-game', ticker: market.ticker, result: 'TRADE', confidence, price, reasoning: decision.reasoning });
+
+    tradeCooldowns.set(market.ticker, Date.now());
+    tradeCooldowns.set(market.base, Date.now());
+
+    const result = await kalshiPost('/portfolio/orders', {
+      ticker: market.ticker, action: 'buy', side: pick.side, count: qty,
+      yes_price: pick.side === 'yes' ? priceInCents : 100 - priceInCents,
+    });
+
+    if (result.ok) {
+      stats.tradesPlaced++;
+      const deployed = qty * price;
+      logTrade({
+        exchange: 'kalshi', strategy: 'pre-game-prediction',
+        ticker: market.ticker, title: market.title,
+        side: pick.side, quantity: qty, entryPrice: price,
+        deployCost: deployed,
+        filled: (result.data.order ?? result.data).quantity_filled ?? 0,
+        orderId: (result.data.order ?? result.data).order_id ?? null,
+        edge: edge * 100, confidence,
+        reasoning: decision.reasoning,
+      });
+
+      await tg(
+        `🎯 <b>PRE-GAME BET — KALSHI</b>\n\n` +
+        `<b>${market.title}</b>\n` +
+        `BUY ${pick.side.toUpperCase()} @ ${priceInCents}¢ × ${qty} = <b>$${deployed.toFixed(2)}</b>\n` +
+        `Confidence: <b>${(confidence*100).toFixed(0)}%</b> vs price ${priceInCents}¢\n` +
+        `Potential profit: <b>$${(qty * (1 - price)).toFixed(2)}</b>\n\n` +
+        `🧠 <i>${decision.reasoning}</i>`
+      );
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Claude Broad Market Scan — finds edges across ALL market types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1866,10 +2046,13 @@ async function pollCycle() {
     return;
   }
 
-  // Step 1b: Check live scores for high-certainty winners
+  // Step 1b: Pre-game predictions on today's games (best entry prices)
+  await checkPreGamePredictions();
+
+  // Step 1c: Check live scores for in-game predictions
   await checkLiveScoreEdges();
 
-  // Step 1c: Broad market scan — let Claude find edges across ALL Kalshi markets
+  // Step 1d: Broad market scan — all markets including non-sports
   await claudeBroadScan();
 
   // Step 2-4: For each news item, find markets and assess edge
