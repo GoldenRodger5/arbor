@@ -1030,11 +1030,12 @@ async function checkLiveScoreEdges() {
         const leadingName = leading.team?.displayName ?? '';
         const gameDetail = comp.status?.type?.shortDetail ?? '';
 
-        // Lower thresholds — catch the edge window BEFORE market fully reprices
+        // Aggressive thresholds — catch edges early, let Claude filter via research
         let highCertainty = false;
-        if (league === 'mlb' && period >= 5 && diff >= 3) highCertainty = true;     // was 7th+
-        else if (league === 'nba' && period >= 2 && diff >= 8) highCertainty = true;  // was 3rd+, 12+
-        else if (league === 'nhl' && period >= 2 && diff >= 2) highCertainty = true;  // was 3rd+
+        if (league === 'mlb' && period >= 4 && diff >= 3) highCertainty = true;     // 4th+ with 3+ run lead
+        else if (league === 'mlb' && period >= 3 && diff >= 5) highCertainty = true; // 3rd+ with 5+ blowout
+        else if (league === 'nba' && period >= 2 && diff >= 8) highCertainty = true;  // 2nd half, 8+ lead
+        else if (league === 'nhl' && period >= 2 && diff >= 2) highCertainty = true;  // 2nd period, 2+ goals
         if (!highCertainty) continue;
 
         const homeAbbr = home.team?.abbreviation ?? '';
@@ -1477,12 +1478,13 @@ async function claudeBroadScan() {
 
     // === STAGE 1: Cheap Haiku screen — find 0-3 candidates ($0.002/call) ===
     const screenPrompt =
-      `Scan these prediction markets. List up to 3 that MIGHT be mispriced. Most are efficiently priced — return [] if nothing looks off.\n\n` +
+      `Scan these prediction markets for potential mispricings. Most are efficient — return [] if nothing looks off.\n\n` +
       `TODAY: ${today} | Sports tickers: ${todayShort}/${tomorrowShort} only\n` +
       (cryptoPrices ? `CRYPTO: ${cryptoPrices}\n` : '') +
       `\n${marketSummaryFiltered}\n\n` +
-      `SKIP: contracts at $0.01-$0.05 (lottery tickets), BTC narrow ranges far from current price, YES+NO≈$1 is bid-ask spread not mispricing.\n\n` +
-      `Return JSON array of candidates (max 3): [{"ticker":"exact","reason":"one line why it might be mispriced"}] or []`;
+      `FOCUS on prices in the $0.30-$0.70 range — that's where real edges exist. A team at 55¢ that should be 65¢ is more actionable than a favorite at 93¢.\n` +
+      `SKIP: $0.01-$0.05 (lottery tickets), $0.90+ (heavy favorites — usually correct), BTC ranges far from spot, YES+NO≈$1 (bid-ask spread).\n\n` +
+      `Return JSON array (max 3): [{"ticker":"exact","reason":"why the price seems wrong"}] or []`;
 
     const screenText = await claudeScreen(screenPrompt);
     if (!screenText) return;
