@@ -35,7 +35,7 @@ const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 
 const MIN_CONFIDENCE = 0.65;      // Claude must be ≥65% confident to trade
 const CONFIDENCE_MARGIN = 0.05;   // Confidence must exceed price by 5%+
-const MAX_PRICE = 0.85;           // Don't buy contracts above 85¢
+const MAX_PRICE = 0.90;           // Don't buy contracts above 90¢ — allows high-confidence late-game bets
 const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — base fraction
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 15 * 60 * 1000; // 15 min — allows scaling into winners
@@ -45,7 +45,7 @@ const CLAUDE_DECIDER = 'claude-sonnet-4-6';            // Expensive analysis —
 // MAX_POSITIONS and deployment limits are DYNAMIC — see getMaxPositions() and getMaxDeployment()
 const DAILY_LOSS_PCT = 0.15;       // Stop trading if down 15% in a day (room for 2-3 bad trades)
 const CAPITAL_RESERVE = 0.05;      // Keep 5% of bankroll untouched (more capital working)
-const MAX_CONSECUTIVE_LOSSES = 5;  // After 5 losses → reduce size (3 was too tight)
+const MAX_CONSECUTIVE_LOSSES = 7;  // After 7 losses → reduce size (5 in a row happens naturally every 2-3 weeks)
 const SPORT_EXPOSURE_PCT = 0.25;   // Max 25% of bankroll per sport — sports are the main edge source
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -429,9 +429,9 @@ function canTrade() {
   }
 
   // Check consecutive losses (reduce size at 5, don't halt until 8)
-  if (consecutiveLosses >= 8) {
+  if (consecutiveLosses >= 10) {
     tradingHalted = true;
-    haltReason = `8 consecutive losses — full halt, something is wrong`;
+    haltReason = `10 consecutive losses — full halt, something is wrong`;
     tg(`🛑 <b>TRADING HALTED</b>\n\n${haltReason}`);
     console.log(`[risk] ${haltReason}`);
     return false;
