@@ -927,7 +927,7 @@ async function checkLiveScoreEdges() {
           console.log(`[live-edge] Skipping: ${leadingAbbr} @${(price*100).toFixed(0)}¢ (lottery ticket)`);
           continue;
         }
-        if (price >= 0.85) {
+        if (price >= MAX_PRICE) {
           console.log(`[live-edge] Skipping: ${leadingAbbr} @${(price*100).toFixed(0)}¢ (too expensive, not enough upside)`);
           continue;
         }
@@ -949,12 +949,12 @@ async function checkLiveScoreEdges() {
 
         // Confidence-based gate — simple and clear
         const confidence = decision.confidence ?? 0;
-        if (confidence < 0.65) {
+        if (confidence < MIN_CONFIDENCE) {
           console.log(`[live-edge] Confidence too low: ${(confidence*100).toFixed(0)}% < 65%`);
           continue;
         }
         // Confidence must exceed price for the bet to be +EV
-        if (confidence < price + 0.05) {
+        if (confidence < price + CONFIDENCE_MARGIN) {
           console.log(`[live-edge] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢ (need 5%+ gap)`);
           continue;
         }
@@ -1146,7 +1146,7 @@ async function checkPreGamePredictions() {
     }
 
     const confidence = decision.confidence ?? 0;
-    if (confidence < 0.65 || confidence < price + 0.05) {
+    if (confidence < MIN_CONFIDENCE || confidence < price + CONFIDENCE_MARGIN) {
       console.log(`[pre-game] Confidence check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢`);
       continue;
     }
@@ -1562,14 +1562,14 @@ async function claudeBroadScan() {
       if (positionBases.has(base)) { console.log(`[broad-scan] BLOCKED: position on ${base}`); continue; }
 
       const price = decision.side === 'yes' ? parseFloat(mktValid.yesAsk) : parseFloat(mktValid.noAsk);
-      if (price <= 0.05 || price >= 0.85) {
+      if (price <= 0.05 || price >= MAX_PRICE) {
         console.log(`[broad-scan] BLOCKED: price ${(price*100).toFixed(0)}¢ outside 5-80¢ range`); continue;
       }
 
       // Confidence-based gate
       const confidence = decision.confidence ?? decision.probability ?? 0;
-      if (confidence < 0.65) { console.log(`[broad-scan] Confidence too low: ${(confidence*100).toFixed(0)}%`); continue; }
-      if (confidence < price + 0.05) { console.log(`[broad-scan] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢`); continue; }
+      if (confidence < MIN_CONFIDENCE) { console.log(`[broad-scan] Confidence too low: ${(confidence*100).toFixed(0)}%`); continue; }
+      if (confidence < price + CONFIDENCE_MARGIN) { console.log(`[broad-scan] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢`); continue; }
 
       const edge = confidence - price;
 
@@ -1649,8 +1649,8 @@ async function claudeBroadScan() {
       if (!pd.markets?.length) break;
       for (const m of pd.markets ?? []) {
         if (m.closed || !m.active) continue;
-        // Include moneyline (game-winners) AND futures (Masters, MVP, etc.)
-        if (m.marketType !== 'moneyline' && m.marketType !== 'futures') continue;
+        // Only moneyline (game-winners) — futures lock capital for months
+        if (m.marketType !== 'moneyline') continue;
         const sides = m.marketSides ?? [];
         if (sides.length < 2) continue;
         const s0 = parseFloat(String(sides[0]?.price ?? '0'));
@@ -1725,9 +1725,9 @@ async function claudeBroadScan() {
 
     const polyPrice = polyDecision.side === 'side0' ? polyMkt.s0Price : polyMkt.s1Price;
     const polyConf = polyDecision.confidence ?? polyDecision.probability ?? 0;
-    if (polyPrice <= 0.05 || polyPrice >= 0.85) { console.log(`[poly-scan] BLOCKED: price ${(polyPrice*100).toFixed(0)}¢ outside range`); return; }
-    if (polyConf < 0.65) { console.log(`[poly-scan] Confidence too low: ${(polyConf*100).toFixed(0)}%`); return; }
-    if (polyConf < polyPrice + 0.05) { console.log(`[poly-scan] Not enough margin: conf=${(polyConf*100).toFixed(0)}% vs price=${(polyPrice*100).toFixed(0)}¢`); return; }
+    if (polyPrice <= 0.05 || polyPrice >= MAX_PRICE) { console.log(`[poly-scan] BLOCKED: price ${(polyPrice*100).toFixed(0)}¢ outside range`); return; }
+    if (polyConf < MIN_CONFIDENCE) { console.log(`[poly-scan] Confidence too low: ${(polyConf*100).toFixed(0)}%`); return; }
+    if (polyConf < polyPrice + CONFIDENCE_MARGIN) { console.log(`[poly-scan] Not enough margin: conf=${(polyConf*100).toFixed(0)}% vs price=${(polyPrice*100).toFixed(0)}¢`); return; }
     const polyEdge = polyConf - polyPrice;
 
     if (!canTrade()) return;
