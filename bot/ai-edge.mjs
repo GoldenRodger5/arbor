@@ -774,6 +774,11 @@ function getWinExpectancy(league, lead, period) {
     table = MLB_WIN_EXPECTANCY;
     leadKey = Math.min(lead, 5);
     periodKey = Math.min(Math.max(period, 1), 9);
+  } else if (league === 'mls') {
+    // MLS/Soccer: goal lead by half (1=first half, 2=second half)
+    table = { 1: { 1: 0.68, 2: 0.82 }, 2: { 1: 0.85, 2: 0.94 }, 3: { 1: 0.95, 2: 0.99 } };
+    leadKey = Math.min(lead, 3);
+    periodKey = Math.min(Math.max(period, 1), 2);
   } else if (league === 'nba') {
     table = NBA_WIN_EXPECTANCY;
     // Round to nearest bracket
@@ -910,6 +915,7 @@ async function checkLiveScoreEdges() {
     { league: 'mlb', path: 'baseball/mlb', series: 'KXMLBGAME' },
     { league: 'nba', path: 'basketball/nba', series: 'KXNBAGAME' },
     { league: 'nhl', path: 'hockey/nhl', series: 'KXNHLGAME' },
+    { league: 'mls', path: 'soccer/usa.1', series: 'KXMLSGAME' },
   ];
 
   // === PHASE 1: Collect all games with leads (parallel ESPN fetch) ===
@@ -976,7 +982,7 @@ async function checkLiveScoreEdges() {
     const idx = (pick.index ?? 1) - 1;
     if (idx < 0 || idx >= liveGames.length) continue;
     const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail } = liveGames[idx];
-    const series = league === 'mlb' ? 'KXMLBGAME' : league === 'nba' ? 'KXNBAGAME' : 'KXNHLGAME';
+    const series = league === 'mlb' ? 'KXMLBGAME' : league === 'nba' ? 'KXNBAGAME' : league === 'nhl' ? 'KXNHLGAME' : 'KXMLSGAME';
 
     try {
         const homeAbbr = home.team?.abbreviation ?? '';
@@ -1178,9 +1184,9 @@ async function checkLiveScoreEdges() {
           `+ Better team (record, talent) → UP 2-5%\n` +
           `+ Home field → already in baseline (+3% home advantage)\n` +
           `+ Strong pitching/goaltending → UP 2-3%\n` +
-          `+ ${league === 'mlb' ? 'Pitcher with ERA < 3.0 → UP 5-8%' : league === 'nba' ? 'Star player dominating (25+ pts) → UP 3-5%' : 'Goalie with SV% > .925 → UP 3-5%'}\n` +
+          `+ ${league === 'mlb' ? 'Pitcher with ERA < 3.0 → UP 5-8%' : league === 'nba' ? 'Star player dominating (25+ pts) → UP 3-5%' : league === 'mls' ? 'Home team in MLS wins 57% — strong home advantage. Red card = UP 10-15%' : 'Goalie with SV% > .925 → UP 3-5%'}\n` +
           `- Trailing team is much better → DOWN 3-8%\n` +
-          `- ${league === 'mlb' ? 'Weak bullpen (ERA > 5.0) → DOWN 3-5%' : league === 'nba' ? 'MODERN NBA: 15-pt comebacks happen 13% now (3pt era) — be less aggressive on big NBA leads' : 'Empty net situation → DOWN 5-10%'}\n` +
+          `- ${league === 'mlb' ? 'Weak bullpen (ERA > 5.0) → DOWN 3-5%' : league === 'nba' ? 'MODERN NBA: 15-pt comebacks happen 13% now (3pt era) — be less aggressive on big NBA leads' : league === 'mls' ? 'Soccer comebacks are rare — 1-goal leads hold 68-82% of the time. Parking the bus in 2nd half = strong hold.' : 'Empty net situation → DOWN 5-10%'}\n` +
           `- ${league === 'nba' ? 'Star player in foul trouble → DOWN 5-10% for their team' : 'Trailing team has momentum (just scored multiple) → DOWN 2-4%'}\n` +
           `- IMPORTANT: Time remaining matters MORE than period/quarter number. 10pts up with 8min left ≠ 10pts up with 30sec left.\n\n` +
           `Use web search if you need injury/streak info. Then give your FINAL adjusted probability.\n\n` +
@@ -1346,7 +1352,7 @@ async function checkPreGamePredictions() {
   lastPreGameScan = Date.now();
   if (!canTrade()) return;
 
-  const sportsSeries = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME'];
+  const sportsSeries = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME'];
   const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
   const etTmrw = new Date(etNow.getTime() + 24 * 60 * 60 * 1000);
   const toShort = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
@@ -1709,7 +1715,7 @@ async function claudeBroadScan() {
 
   // Fetch markets across categories — sports, crypto, politics, economics
   const categories = [
-    { name: 'Sports', series: ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME'] },
+    { name: 'Sports', series: ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME'] },
     { name: 'Crypto', keywords: ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto'] },
     { name: 'Economics', keywords: ['cpi', 'fed', 'gdp', 'jobs', 'inflation', 'rate'] },
   ];
@@ -2185,7 +2191,7 @@ async function getGameContext(trade) {
   else if (ticker.includes('NHL')) league = 'nhl';
   else return null;
 
-  const pathMap = { mlb: 'baseball/mlb', nba: 'basketball/nba', nhl: 'hockey/nhl' };
+  const pathMap = { mlb: 'baseball/mlb', nba: 'basketball/nba', nhl: 'hockey/nhl', mls: 'soccer/usa.1' };
   try {
     const res = await fetch(`http://site.api.espn.com/apis/site/v2/sports/${pathMap[league]}/scoreboard`,
       { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) });
@@ -2212,6 +2218,7 @@ async function getGameContext(trade) {
       else if (league === 'mlb') stage = period <= 4 ? 'early' : period <= 6 ? 'mid' : 'late';
       else if (league === 'nba') stage = period <= 2 ? 'early' : period === 3 ? 'mid' : 'late';
       else if (league === 'nhl') stage = period === 1 ? 'early' : period === 2 ? 'mid' : 'late';
+      else if (league === 'mls') stage = period === 1 ? 'early' : 'late'; // soccer: 1st half = early, 2nd half = late
 
       const homeScore = parseInt(home?.score ?? '0');
       const awayScore = parseInt(away?.score ?? '0');
