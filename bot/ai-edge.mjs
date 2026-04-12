@@ -34,8 +34,8 @@ const ANTHROPIC_KEY = process.env.VITE_ANTHROPIC_API_KEY ?? process.env.ANTHROPI
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 
-const MIN_EDGE = 0.07;           // 7% edge minimum — consistent across ALL strategies
-const MIN_EDGE_PCT = 7;          // same × 100 for display
+const MIN_EDGE_AFTER_FEES = 0.05; // 5% edge AFTER fees — the real profitability threshold
+const MIN_EDGE_PCT_AFTER_FEES = 5;
 const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — base fraction
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 30 * 60 * 1000; // 30 min cooldown per market (was 15 — too short)
@@ -303,6 +303,47 @@ let lastHaltCheck = 0;
 
 function getBankroll() {
   return kalshiBalance + kalshiPositionValue + polyBalance;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fee-Aware Edge Validation — reject trades that aren't profitable after fees
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Kalshi fee: parabolic 0.07 × P × (1-P) per contract. Peak at 50¢ = 1.75¢
+function kalshiFee(price) {
+  return 0.07 * price * (1 - price);
+}
+
+// Polymarket US fee: ~0.5% flat on premium (simpler than Kalshi)
+function polymarketFee(price) {
+  return price * 0.005;
+}
+
+// Calculate net edge after fees for a given trade
+// Returns { netEdge, fee, profitable }
+function calcNetEdge(exchange, price, claimedEdge) {
+  const fee = exchange === 'polymarket' ? polymarketFee(price) : kalshiFee(price);
+  // Fee is paid on entry. On win, you get $1 per contract.
+  // Net profit per contract = (1 - price) - fee (if you win)
+  // Expected profit = edge - fee (simplified per-dollar basis)
+  const netEdge = claimedEdge - fee;
+  return {
+    netEdge,
+    fee,
+    feePct: (fee * 100).toFixed(2),
+    profitable: netEdge >= MIN_EDGE_AFTER_FEES,
+  };
+}
+
+// Gate function: returns true only if trade is profitable after fees
+function isProfitableAfterFees(exchange, price, claimedEdge, label = '') {
+  const { netEdge, feePct, profitable } = calcNetEdge(exchange, price, claimedEdge);
+  if (!profitable) {
+    console.log(`[fees] BLOCKED ${label}: ${(claimedEdge*100).toFixed(1)}% edge - ${feePct}% fee = ${(netEdge*100).toFixed(1)}% net (need ${MIN_EDGE_PCT_AFTER_FEES}%+)`);
+    return false;
+  }
+  console.log(`[fees] OK ${label}: ${(claimedEdge*100).toFixed(1)}% edge - ${feePct}% fee = ${(netEdge*100).toFixed(1)}% net ✓`);
+  return true;
 }
 
 // Inverse curve: aggressive when small (need growth), conservative when big (protect gains)
@@ -738,10 +779,12 @@ async function executeTrade(market, assessment) {
   if (!price || price <= 0) return;
   if (!canTrade()) return;
   if (!checkSportExposure(market.ticker)) return;
+  if (!isProfitableAfterFees('kalshi', price, edgePct / 100, market.ticker)) return;
 
-  // 1/4 Kelly sizing (conservative for AI-estimated edges)
+  // 1/4 Kelly sizing on NET edge (after fees)
+  const { netEdge } = calcNetEdge('kalshi', price, edgePct / 100);
   const odds = (1 / price) - 1;
-  const edge = edgePct / 100;
+  const edge = netEdge; // use fee-adjusted edge for sizing
   const kellyFraction = odds > 0 ? edge / odds : 0;
   const quarterKelly = 0.25 * kellyFraction;
 
@@ -945,11 +988,10 @@ async function checkLiveScoreEdges() {
         }
 
         const winProb = decision.winProbability ?? 0;
-        const edge = winProb - price;
-        if (edge < MIN_EDGE) {
-          console.log(`[live-edge] Edge too small: ${(edge*100).toFixed(1)}% (${leadingAbbr} YES @${(price*100).toFixed(0)}¢ vs ${(winProb*100).toFixed(0)}%)`);
-          continue;
-        }
+        const rawEdge = winProb - price;
+        if (!isProfitableAfterFees('kalshi', price, rawEdge, ticker)) continue;
+
+        const { netEdge: edge } = calcNetEdge('kalshi', price, rawEdge);
 
         // Size the bet — dynamic + risk-managed
         if (!canTrade()) continue;
@@ -1276,7 +1318,7 @@ async function claudeBroadScan() {
       `- If cash < $3: return {"trade":false}\n` +
       `- Min price: $0.05 (no lottery tickets)\n` +
       `- Markets close within ${MAX_DAYS_OUT} days. Prefer sooner.\n` +
-      `- Fees: ~1.75¢/contract at 50¢.\n\n` +
+      `- FEES MATTER: Kalshi fee = 7% × P × (1-P). At 50¢ = 1.75¢/contract. Your edge AFTER fees must be ≥${MIN_EDGE_PCT_AFTER_FEES}%. Example: 8% raw edge at 50¢ → 8% - 1.75% = 6.25% net → PASSES. 6% raw at 50¢ → 6% - 1.75% = 4.25% → REJECTED.\n\n` +
       `Respond JSON ONLY:\n` +
       `{"trade":false,"reasoning":"why no good trade"}\n` +
       `OR\n` +
@@ -1323,11 +1365,9 @@ async function claudeBroadScan() {
       return;
     }
 
-    const edge = Math.abs((decision.probability ?? 0) - price);
-    if (edge < MIN_EDGE) {
-      console.log(`[broad-scan] BLOCKED: edge ${(edge*100).toFixed(1)}% < ${MIN_EDGE_PCT}% minimum`);
-      return;
-    }
+    const rawEdge = Math.abs((decision.probability ?? 0) - price);
+    if (!isProfitableAfterFees('kalshi', price, rawEdge, decision.ticker)) return;
+    const { netEdge: edge } = calcNetEdge('kalshi', price, rawEdge);
 
     // Block if cash too low
     if (kalshiBalance < 3) {
@@ -1478,7 +1518,7 @@ async function claudeBroadScan() {
     const polyPrice = polyDecision.side === 'side0' ? polyMkt.s0Price : polyMkt.s1Price;
     const polyEdge = Math.abs((polyDecision.probability ?? 0) - polyPrice);
     if (polyPrice <= 0.05) { console.log(`[poly-scan] BLOCKED: price ${(polyPrice*100).toFixed(0)}¢ is a lottery ticket`); return; }
-    if (polyEdge < MIN_EDGE) { console.log(`[poly-scan] Edge too small: ${(polyEdge*100).toFixed(1)}%`); return; }
+    if (!isProfitableAfterFees('polymarket', polyPrice, polyEdge, polyMkt.slug)) return;
 
     if (!canTrade()) return;
     const polyIntent = polyDecision.side === 'side0' ? 'ORDER_INTENT_BUY_LONG' : 'ORDER_INTENT_BUY_SHORT';
@@ -1606,9 +1646,10 @@ async function pollCycle() {
       if (!assessment.side || typeof assessment.edgePct !== 'number' ||
           typeof assessment.fairProbability !== 'number' || !assessment.reasoning) continue;
 
-      // Edge must be >= 10%
-      const expectedEdge = Math.abs(assessment.fairProbability - (assessment.currentPrice ?? 0)) * 100;
-      if (expectedEdge < MIN_EDGE * 100) continue;
+      // Fee-aware edge check
+      const expectedEdge = Math.abs(assessment.fairProbability - (assessment.currentPrice ?? 0));
+      const mPrice = assessment.side === 'yes' ? (market.yesAsk ?? 0.5) : (market.noAsk ?? 0.5);
+      if (!isProfitableAfterFees('kalshi', mPrice, expectedEdge, market.ticker)) continue;
       if (assessment.confidence === 'low') continue;
 
       stats.edgesFound++;
@@ -1875,7 +1916,7 @@ function logStats() {
 
 async function main() {
   console.log('=== Arbor AI Edge Trading Bot ===');
-  console.log(`Config: MIN_EDGE=${MIN_EDGE_PCT}% MAX_TRADE=$${getDynamicMaxTrade().toFixed(2)} POLL=${POLL_INTERVAL_MS / 1000}s`);
+  console.log(`Config: MIN_NET_EDGE=${MIN_EDGE_PCT_AFTER_FEES}% (after fees) MAX_TRADE=$${getDynamicMaxTrade().toFixed(2)} POLL=${POLL_INTERVAL_MS / 1000}s`);
 
   if (!KALSHI_API_KEY || !kalshiPrivateKey) {
     console.error('Missing Kalshi credentials');
