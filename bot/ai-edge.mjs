@@ -423,10 +423,19 @@ function canTrade() {
     return false;
   }
 
-  // Check max positions (dynamic)
+  // Check max positions (dynamic) — only count positions with meaningful cost
   const maxPos = getMaxPositions();
-  if (openPositions.length >= maxPos) {
-    console.log(`[risk] Max positions reached: ${openPositions.length}/${maxPos}`);
+  const meaningfulPositions = openPositions.filter(p => (p.cost ?? 0) >= 1.0).length;
+  if (meaningfulPositions >= maxPos) {
+    console.log(`[risk] Max meaningful positions: ${meaningfulPositions}/${maxPos} (${openPositions.length} total including dust)`);
+    return false;
+  }
+
+  // Also check deployment cap — even if position count is OK, don't over-deploy
+  const deployed = getTotalDeployed();
+  const maxDeploy = getBankroll() * getMaxDeployment();
+  if (deployed >= maxDeploy) {
+    console.log(`[risk] Deployment cap: $${deployed.toFixed(2)}/$${maxDeploy.toFixed(2)} (${(getMaxDeployment()*100).toFixed(0)}%)`);
     return false;
   }
 

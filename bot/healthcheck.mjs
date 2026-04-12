@@ -67,21 +67,23 @@ async function run() {
   try {
     const pm2Out = execSync('pm2 jlist 2>/dev/null', { encoding: 'utf-8' });
     const procs = JSON.parse(pm2Out);
+    // Only check arbor-ai (arb-bot intentionally stopped, health is cron)
+    const criticalProcs = procs.filter(p => p.name === 'arbor-ai');
     let allOnline = true;
     for (const p of procs) {
       const status = p.pm2_env?.status ?? 'unknown';
       const uptime = p.pm2_env?.pm_uptime ? Math.round((Date.now() - p.pm2_env.pm_uptime) / 3600000) : 0;
       const restarts = p.pm2_env?.restart_time ?? 0;
-      const icon = status === 'online' ? '✅' : '❌';
-      if (status !== 'online') allOnline = false;
+      const icon = status === 'online' ? '✅' : (p.name === 'arbor-arb' ? '⏸️' : '❌');
+      if (status !== 'online' && p.name === 'arbor-ai') allOnline = false;
       lines.push(`${icon} <b>${p.name}</b> — ${status} (${uptime}h uptime, ${restarts} restarts)`);
     }
-    if (procs.length === 0) {
-      lines.push('❌ No pm2 processes found');
+    if (criticalProcs.length === 0) {
+      lines.push('❌ arbor-ai not found!');
       allOnline = false;
     }
     lines.push('');
-    lines.push(allOnline ? '🟢 All systems operational' : '🔴 Some systems DOWN');
+    lines.push(allOnline ? '🟢 All systems operational' : '🔴 arbor-ai is DOWN');
   } catch {
     lines.push('⚠️ Could not check pm2 status');
   }
