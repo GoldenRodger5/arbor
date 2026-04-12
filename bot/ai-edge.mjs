@@ -1030,16 +1030,13 @@ async function checkLiveScoreEdges() {
         const leadingName = leading.team?.displayName ?? '';
         const gameDetail = comp.status?.type?.shortDetail ?? '';
 
-        // Trigger early — let Claude decide if the lead is real
-        // The edge exists in the GAP between score change and market repricing
-        let highCertainty = false;
-        if (league === 'mlb' && period >= 2 && diff >= 2) highCertainty = true;      // 2nd+ with 2+ run lead
-        else if (league === 'mlb' && diff >= 4) highCertainty = true;                 // any inning, 4+ blowout
-        else if (league === 'nba' && period >= 2 && diff >= 6) highCertainty = true;  // 2nd quarter+, 6+ lead
-        else if (league === 'nba' && diff >= 15) highCertainty = true;                // any time, 15+ blowout
-        else if (league === 'nhl' && period >= 2 && diff >= 1) highCertainty = true;  // 2nd+, any lead
-        else if (league === 'nhl' && diff >= 2) highCertainty = true;                 // any period, 2+ goals
-        if (!highCertainty) continue;
+        // Trigger on ANY meaningful lead — Claude's job is to PREDICT the winner
+        // Lower price = better entry. We want to buy at 55-75¢, not 90¢+.
+        let worthChecking = false;
+        if (league === 'mlb' && diff >= 1 && period >= 1) worthChecking = true;       // any lead, game started
+        else if (league === 'nba' && diff >= 4) worthChecking = true;                  // 4+ point lead
+        else if (league === 'nhl' && diff >= 1) worthChecking = true;                  // any goal lead
+        if (!worthChecking) continue;
 
         const homeAbbr = home.team?.abbreviation ?? '';
         const awayAbbr = away.team?.abbreviation ?? '';
@@ -1093,22 +1090,22 @@ async function checkLiveScoreEdges() {
         // Use Claude to assess win probability based on live score + research
         const portfolioInfo = getPortfolioSummary();
         const livePrompt =
-          `You are a live sports bettor looking for FAST edges. The market lags behind score changes — that's where we profit.\n\n` +
+          `You are a sports analyst. Your job: predict who wins this game and whether the current market price is a good buy.\n\n` +
           `LIVE ${league.toUpperCase()} GAME:\n` +
           `${away.team?.displayName} ${awayScore} at ${home.team?.displayName} ${homeScore}\n` +
           `Status: ${gameDetail}\n` +
           `${leading.team?.displayName} leads by ${diff}\n\n` +
-          `MARKET: ${leadingAbbr} YES @ $${price.toFixed(2)} (implied ${(price*100).toFixed(0)}%)\n\n` +
-          `RESEARCH: Search for both teams' current season records.\n\n` +
-          `KEY QUESTION: Is the market price LOWER than the actual win probability given this score?\n` +
-          `- Use baseball/basketball/hockey win expectancy for this score+inning/quarter/period\n` +
-          `- A team up 3-0 in the 4th inning wins ~85% of the time. If market is at 70¢, that's 15% edge.\n` +
-          `- A team up 3-0 in the 4th at 85¢ — no edge, market is correct.\n` +
-          `- ONLY trade if market price is BELOW your win probability by 5%+ AFTER Kalshi fees.\n\n` +
+          `MARKET: ${leadingAbbr} YES @ $${price.toFixed(2)} (you'd pay ${(price*100).toFixed(0)}¢ to win $1 if ${leadingAbbr} wins)\n\n` +
+          `RESEARCH: Look up both teams' records this season.\n\n` +
+          `DECIDE: Will ${leading.team?.displayName} win this game? Consider:\n` +
+          `1. Current score and game situation (inning/quarter/period)\n` +
+          `2. Team quality (season record, home/away)\n` +
+          `3. ${league === 'mlb' ? 'Starting pitching, bullpen depth' : league === 'nba' ? 'Key players, pace of play' : 'Goaltending, special teams'}\n\n` +
+          `The LOWER the price, the BETTER the buy. At ${(price*100).toFixed(0)}¢ you need ${leading.team?.displayName} to win ${Math.ceil(price * 100 + 5)}%+ of the time for this to be profitable after fees.\n\n` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
           `JSON ONLY:\n` +
-          `{"trade": false, "reasoning": "why — include your win probability estimate"}\n` +
-          `OR {"trade": true, "side": "yes", "winProbability": 0.XX, "betAmount": N, "reasoning": "win expectancy calc"}`;
+          `{"trade": false, "winProbability": 0.XX, "reasoning": "why not worth it at this price"}\n` +
+          `OR {"trade": true, "side": "yes", "winProbability": 0.XX, "betAmount": N, "reasoning": "why ${leadingAbbr} wins and why ${(price*100).toFixed(0)}¢ is a good price"}`;
         // Block if we already have a position on this game
         const ticker = targetMarket.ticker;
         const lastH = ticker.lastIndexOf('-');
@@ -1123,9 +1120,9 @@ async function checkLiveScoreEdges() {
         if (Date.now() - (tradeCooldowns.get(ticker) ?? 0) < COOLDOWN_MS) continue;
         if (Date.now() - (tradeCooldowns.get(gameBase) ?? 0) < COOLDOWN_MS) continue;
 
-        // Price sanity
-        if (price <= 0.05 || price >= 0.98) {
-          console.log(`[live-edge] Market already priced in: ${leadingAbbr} YES @${(price*100).toFixed(0)}¢`);
+        // Price sanity — skip if already decided (97¢+) or too cheap (lottery)
+        if (price <= 0.05 || price >= 0.97) {
+          console.log(`[live-edge] Skipping: ${leadingAbbr} @${(price*100).toFixed(0)}¢ (${price >= 0.97 ? 'already decided' : 'lottery'})`);
           continue;
         }
 
