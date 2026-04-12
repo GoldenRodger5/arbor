@@ -34,8 +34,9 @@ const ANTHROPIC_KEY = process.env.VITE_ANTHROPIC_API_KEY ?? process.env.ANTHROPI
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 
-const MIN_EDGE_AFTER_FEES = 0.05; // 5% edge AFTER fees — the real profitability threshold
-const MIN_EDGE_PCT_AFTER_FEES = 5;
+const MIN_CONFIDENCE = 0.65;      // Claude must be ≥65% confident to trade
+const CONFIDENCE_MARGIN = 0.05;   // Confidence must exceed price by 5%+
+const MAX_PRICE = 0.85;           // Don't buy contracts above 85¢
 const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — base fraction
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 15 * 60 * 1000; // 15 min — allows scaling into winners
@@ -314,11 +315,10 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
 // ─────────────────────────────────────────────────────────────────────────────
 
 const tradeCooldowns = new Map(); // ticker → lastTradedMs
-const seenNewsIds = new Map();    // id → timestamp (pruned every cycle)
 let kalshiBalance = 0;
 let kalshiPositionValue = 0;
 let openPositions = [];  // fetched each cycle
-let stats = { newsChecked: 0, claudeCalls: 0, edgesFound: 0, tradesPlaced: 0 };
+let stats = { claudeCalls: 0, tradesPlaced: 0 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Risk Management State
@@ -334,46 +334,7 @@ function getBankroll() {
   return kalshiBalance + kalshiPositionValue + polyBalance;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Fee-Aware Edge Validation — reject trades that aren't profitable after fees
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Kalshi fee: parabolic 0.07 × P × (1-P) per contract. Peak at 50¢ = 1.75¢
-function kalshiFee(price) {
-  return 0.07 * price * (1 - price);
-}
-
-// Polymarket US fee: ~0.5% flat on premium (simpler than Kalshi)
-function polymarketFee(price) {
-  return price * 0.005;
-}
-
-// Calculate net edge after fees for a given trade
-// Returns { netEdge, fee, profitable }
-function calcNetEdge(exchange, price, claimedEdge) {
-  const fee = exchange === 'polymarket' ? polymarketFee(price) : kalshiFee(price);
-  // Fee is paid on entry. On win, you get $1 per contract.
-  // Net profit per contract = (1 - price) - fee (if you win)
-  // Expected profit = edge - fee (simplified per-dollar basis)
-  const netEdge = claimedEdge - fee;
-  return {
-    netEdge,
-    fee,
-    feePct: (fee * 100).toFixed(2),
-    profitable: netEdge >= MIN_EDGE_AFTER_FEES,
-  };
-}
-
-// Gate function: returns true only if trade is profitable after fees
-function isProfitableAfterFees(exchange, price, claimedEdge, label = '') {
-  const { netEdge, feePct, profitable } = calcNetEdge(exchange, price, claimedEdge);
-  if (!profitable) {
-    console.log(`[fees] BLOCKED ${label}: ${(claimedEdge*100).toFixed(1)}% edge - ${feePct}% fee = ${(netEdge*100).toFixed(1)}% net (need ${MIN_EDGE_PCT_AFTER_FEES}%+)`);
-    return false;
-  }
-  console.log(`[fees] OK ${label}: ${(claimedEdge*100).toFixed(1)}% edge - ${feePct}% fee = ${(netEdge*100).toFixed(1)}% net ✓`);
-  return true;
-}
+// [REMOVED: Fee-gating functions — replaced by confidence-based prediction engine]
 
 // Inverse curve: aggressive when small (need growth), conservative when big (protect gains)
 // $200 → 85% deployed, $1K → 75%, $5K → 50%, $20K → 30%, $50K+ → 20%
@@ -720,277 +681,11 @@ function getPortfolioSummary() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step 1: Fetch ESPN News & Injuries
+// Live Predictions + Market Scanning
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function fetchESPNNews() {
-  const items = [];
-  const sports = [
-    { league: 'mlb', path: 'baseball/mlb' },
-    { league: 'nba', path: 'basketball/nba' },
-    { league: 'nhl', path: 'hockey/nhl' },
-  ];
-
-  for (const { league, path } of sports) {
-    // News headlines
-    try {
-      const res = await fetch(
-        `http://site.api.espn.com/apis/site/v2/sports/${path}/news?limit=10`,
-        { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) },
-      );
-      if (res.ok) {
-        const data = await res.json();
-        for (const article of data.articles ?? []) {
-          const id = article.id ?? article.headline;
-          if (seenNewsIds.has(id)) continue;
-          // Only care about recent articles (last 30 minutes)
-          const published = Date.parse(article.published ?? '');
-          if (!Number.isFinite(published) || Date.now() - published > 30 * 60 * 1000) continue;
-          seenNewsIds.set(id, Date.now());
-          items.push({
-            league,
-            type: 'news',
-            headline: article.headline ?? '',
-            description: article.description ?? '',
-            published: article.published ?? '',
-            teams: extractTeamNames(article.headline + ' ' + (article.description ?? '')),
-          });
-        }
-      }
-    } catch { /* silent */ }
-
-    // Injury updates from scoreboard (today's games)
-    try {
-      const res = await fetch(
-        `http://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard`,
-        { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) },
-      );
-      if (res.ok) {
-        const data = await res.json();
-        for (const ev of data.events ?? []) {
-          const comp = ev.competitions?.[0];
-          if (!comp) continue;
-          // Check for injury/status notes
-          for (const c of comp.competitors ?? []) {
-            const injuries = c.injuries ?? [];
-            for (const inj of injuries) {
-              const id = `inj-${c.team?.abbreviation}-${inj.id ?? inj.athlete?.id}`;
-              if (seenNewsIds.has(id)) continue;
-              seenNewsIds.set(id, Date.now());
-              const status = inj.status ?? inj.type?.name ?? '';
-              if (status === 'Active') continue; // not newsworthy
-              items.push({
-                league,
-                type: 'injury',
-                headline: `${inj.athlete?.displayName ?? 'Player'} (${c.team?.displayName ?? ''}) — ${status}`,
-                description: `${inj.details?.detail ?? ''} ${inj.details?.side ?? ''} ${inj.details?.type ?? ''}`.trim(),
-                published: new Date().toISOString(),
-                teams: [c.team?.displayName?.toLowerCase() ?? ''],
-              });
-            }
-          }
-        }
-      }
-    } catch { /* silent */ }
-  }
-
-  return items;
-}
-
-function extractTeamNames(text) {
-  const lower = text.toLowerCase();
-  const teams = [];
-  // Common team names — just check if they appear
-  const knownTeams = [
-    'yankees', 'mets', 'dodgers', 'braves', 'astros', 'cubs', 'red sox',
-    'phillies', 'padres', 'mariners', 'guardians', 'orioles', 'rays',
-    'twins', 'tigers', 'royals', 'athletics', 'angels', 'reds', 'cardinals',
-    'pirates', 'brewers', 'nationals', 'marlins', 'rockies', 'giants',
-    'diamondbacks', 'rangers', 'blue jays', 'white sox',
-    'celtics', 'knicks', 'lakers', 'warriors', 'nuggets', 'bucks', 'heat',
-    'suns', 'cavaliers', 'thunder', 'mavericks', 'rockets', 'clippers',
-    'hawks', 'bulls', 'nets', 'pacers', 'kings', 'pelicans', 'grizzlies',
-    'spurs', 'timberwolves', 'blazers', 'jazz', 'hornets', 'pistons',
-    'wizards', 'raptors', 'magic', 'sixers',
-    'bruins', 'lightning', 'panthers', 'hurricanes', 'rangers', 'islanders',
-    'penguins', 'capitals', 'senators', 'maple leafs', 'canadiens',
-    'jets', 'stars', 'avalanche', 'wild', 'blues', 'predators',
-    'golden knights', 'oilers', 'flames', 'canucks', 'kraken', 'ducks',
-    'sharks', 'blackhawks', 'red wings', 'sabres', 'devils', 'flyers',
-  ];
-  for (const t of knownTeams) {
-    if (lower.includes(t)) teams.push(t);
-  }
-  return teams;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Step 2: Find matching Kalshi markets
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function findMatchingMarkets(newsItem) {
-  const series = newsItem.league === 'mlb' ? 'KXMLBGAME'
-               : newsItem.league === 'nba' ? 'KXNBAGAME'
-               : 'KXNHLGAME';
-  try {
-    const params = new URLSearchParams({ series_ticker: series, status: 'open', limit: '100' });
-    const data = await kalshiGet(`/markets?${params}`);
-    const matches = [];
-    for (const m of data.markets ?? []) {
-      const title = (m.title ?? '').toLowerCase();
-      // Check if any team from the news appears in the market title
-      for (const team of newsItem.teams) {
-        if (title.includes(team) || team.split(' ').some(w => w.length > 3 && title.includes(w))) {
-          matches.push({
-            ticker: m.ticker,
-            title: m.title,
-            yesAsk: m.yes_ask_dollars ? parseFloat(m.yes_ask_dollars) : null,
-            noAsk: m.no_ask_dollars ? parseFloat(m.no_ask_dollars) : null,
-            yesBid: m.yes_bid_dollars ? parseFloat(m.yes_bid_dollars) : null,
-          });
-          break;
-        }
-      }
-    }
-    return matches;
-  } catch {
-    return [];
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Step 3: Ask Claude for edge assessment
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function assessEdge(newsItem, market) {
-  if (!ANTHROPIC_KEY) return null;
-
-  const prompt = `You are a sports prediction market trader managing a real portfolio.
-
-MY PORTFOLIO:
-${getPortfolioSummary()}
-
-NEWS:
-Type: ${newsItem.type}
-League: ${newsItem.league.toUpperCase()}
-Headline: ${newsItem.headline}
-Details: ${newsItem.description}
-
-MARKET:
-Title: ${market.title}
-Current YES price: $${market.yesAsk?.toFixed(2) ?? 'unknown'}
-Current NO price: $${market.noAsk?.toFixed(2) ?? 'unknown'}
-
-RESEARCH FIRST: Use web search to look up CURRENT information before deciding:
-- Both teams' current win-loss records and standings
-- Recent form (last 5-10 games)
-- Key injuries or lineup changes
-- Head-to-head record this season
-Your probability MUST be grounded in real data you find, not assumptions.
-
-QUESTION: Does this news materially change the probability of this game's outcome? If so:
-1. Which side benefits (YES or NO)?
-2. What should the fair probability be after this news?
-3. What is the edge (difference between fair prob and current market price)?
-
-IMPORTANT: Do NOT bet on heavy underdogs (market price below $0.25) unless your research reveals a SPECIFIC concrete reason (e.g., star player injury on favorite, confirmed rest day). "Upset potential" alone is NOT an edge.
-
-Respond in JSON only:
-{
-  "hasEdge": true/false,
-  "side": "yes" or "no",
-  "fairProbability": 0.XX,
-  "currentPrice": 0.XX,
-  "edgePct": X.X,
-  "confidence": "high"/"medium"/"low",
-  "reasoning": "one sentence citing specific facts from your research"
-}
-
-If the news doesn't meaningfully change the probability (e.g. minor roster move, already priced in, not relevant to this game), return {"hasEdge": false}.`;
-
-  try {
-    const text = await claudeWithSearch(prompt);
-    if (!text) return null;
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return null;
-    return JSON.parse(jsonMatch[0]);
-  } catch (e) {
-    console.error('[claude] error:', e.message);
-    return null;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Step 4: Execute trade
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function executeTrade(market, assessment) {
-  const { side, edgePct, fairProbability, reasoning } = assessment;
-  const price = side === 'yes' ? market.yesAsk : market.noAsk;
-  if (!price || price <= 0) return;
-  if (!canTrade()) return;
-  if (!checkSportExposure(market.ticker)) return;
-  if (!isProfitableAfterFees('kalshi', price, edgePct / 100, market.ticker)) return;
-
-  // 1/4 Kelly sizing on NET edge (after fees)
-  const { netEdge } = calcNetEdge('kalshi', price, edgePct / 100);
-  const odds = (1 / price) - 1;
-  const edge = netEdge; // use fee-adjusted edge for sizing
-  const kellyFraction = odds > 0 ? edge / odds : 0;
-  const quarterKelly = 0.25 * kellyFraction;
-
-  // Dynamic cap based on bankroll + consecutive loss adjustment
-  const maxTrade = getPositionSize('kalshi');
-  const budget = Math.min(maxTrade, getBankroll() * quarterKelly);
-  const qty = Math.max(1, Math.floor(budget / price));
-  const deployed = qty * price;
-  const priceInCents = Math.round(price * 100);
-
-  console.log(`[ai-trade] ${market.ticker} BUY ${side.toUpperCase()} @${priceInCents}¢ × ${qty} edge=${edgePct.toFixed(1)}%`);
-  if (!canDeployMore(deployed)) return;
-
-  const result = await kalshiPost('/portfolio/orders', {
-    ticker: market.ticker,
-    action: 'buy',
-    side,
-    count: qty,
-    yes_price: side === 'yes' ? priceInCents : 100 - priceInCents,
-  });
-
-  if (result.ok) {
-    stats.tradesPlaced++;
-    tradeCooldowns.set(market.ticker, Date.now());
-    const order = result.data.order ?? result.data;
-    const filled = order.quantity_filled ?? order.fill_count_fp ?? 0;
-
-    logTrade({
-      exchange: 'kalshi', strategy: 'news-edge',
-      ticker: market.ticker, title: market.title,
-      side, quantity: qty, entryPrice: price,
-      deployCost: deployed, filled,
-      orderId: order.order_id ?? null,
-      edge: edgePct, fairProb: fairProbability,
-      reasoning,
-    });
-
-    await tg(
-      `🧠 <b>AI EDGE TRADE — KALSHI</b>\n\n` +
-      `<b>${market.title}</b>\n\n` +
-      `BUY ${side.toUpperCase()} @ $${price.toFixed(2)} × ${qty}\n` +
-      `Deployed: <b>$${deployed.toFixed(2)}</b>\n` +
-      `Edge: <b>${edgePct.toFixed(1)}%</b> (${assessment.confidence})\n` +
-      `Fair prob: ${(fairProbability * 100).toFixed(0)}% vs market ${(price * 100).toFixed(0)}%\n\n` +
-      `📰 <i>${reasoning}</i>\n\n` +
-      `Filled: ${filled} | Order: ${order.order_id ?? 'pending'}`
-    );
-
-    console.log(`[ai-trade] placed: filled=${filled} orderId=${order.order_id ?? 'unknown'}`);
-  } else {
-    console.error(`[ai-trade] order failed: ${result.status}`, JSON.stringify(result.data));
-    await tg(`❌ <b>AI Trade FAILED</b>\n${market.title}\n${side.toUpperCase()} @ $${price.toFixed(2)}\nHTTP ${result.status}`);
-  }
-}
-
+// [Dead news-edge pipeline removed — 270 lines of fetchESPNNews, extractTeamNames,
+//  findMatchingMarkets, assessEdge, executeTrade. Replaced by prediction engine.]
 // ─────────────────────────────────────────────────────────────────────────────
 // Live Score Edge — buy winning sides in late games at discount
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1002,30 +697,35 @@ async function checkLiveScoreEdges() {
     { league: 'nhl', path: 'hockey/nhl', series: 'KXNHLGAME' },
   ];
 
-  // === PHASE 1: Collect all games with leads ===
+  // === PHASE 1: Collect all games with leads (parallel ESPN fetch) ===
   const liveGames = [];
-  for (const { league, path } of sports) {
-    try {
-      const res = await fetch(`http://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard`,
-        { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) });
-      if (!res.ok) continue;
-      const data = await res.json();
-      for (const ev of data.events ?? []) {
-        const comp = ev.competitions?.[0];
-        if (!comp || comp.status?.type?.state !== 'in') continue;
-        const period = parseInt(comp.status?.period ?? '0');
-        const home = comp.competitors?.find(c => c.homeAway === 'home');
-        const away = comp.competitors?.find(c => c.homeAway === 'away');
-        if (!home || !away) continue;
-        const homeScore = parseInt(home.score ?? '0');
-        const awayScore = parseInt(away.score ?? '0');
-        const diff = Math.abs(homeScore - awayScore);
-        if (diff === 0) continue; // tied — skip
-        const leading = homeScore > awayScore ? home : away;
-        const detail = comp.status?.type?.shortDetail ?? '';
-        liveGames.push({ league, comp, ev, home, away, homeScore, awayScore, diff, period, leading, detail });
-      }
-    } catch { /* skip */ }
+  const espnResults = await Promise.allSettled(
+    sports.map(({ league, path }) =>
+      fetch(`http://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard`,
+        { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) })
+        .then(r => r.ok ? r.json() : null)
+        .then(data => ({ league, data }))
+        .catch(() => null)
+    )
+  );
+  for (const result of espnResults) {
+    if (result.status !== 'fulfilled' || !result.value?.data) continue;
+    const { league, data } = result.value;
+    for (const ev of data.events ?? []) {
+      const comp = ev.competitions?.[0];
+      if (!comp || comp.status?.type?.state !== 'in') continue;
+      const period = parseInt(comp.status?.period ?? '0');
+      const home = comp.competitors?.find(c => c.homeAway === 'home');
+      const away = comp.competitors?.find(c => c.homeAway === 'away');
+      if (!home || !away) continue;
+      const homeScore = parseInt(home.score ?? '0');
+      const awayScore = parseInt(away.score ?? '0');
+      const diff = Math.abs(homeScore - awayScore);
+      if (diff === 0) continue;
+      const leading = homeScore > awayScore ? home : away;
+      const detail = comp.status?.type?.shortDetail ?? '';
+      liveGames.push({ league, comp, ev, home, away, homeScore, awayScore, diff, period, leading, detail });
+    }
   }
 
   if (liveGames.length === 0) return;
@@ -2092,89 +1792,21 @@ async function pollCycle() {
   // Risk check — skip everything if halted
   if (!canTrade()) return;
 
-  // Prune news IDs older than 2 hours
-  const pruneThreshold = Date.now() - 2 * 60 * 60 * 1000;
-  for (const [id, ts] of seenNewsIds) {
-    if (ts < pruneThreshold) seenNewsIds.delete(id);
-  }
-
-  // Step 1: Fetch news
-  const newsItems = await fetchESPNNews();
-  stats.newsChecked += newsItems.length;
-
-  if (newsItems.length > 0) {
-    console.log(`[ai-edge] ${newsItems.length} new items:`, newsItems.map(n => n.headline.slice(0, 50)).join(' | '));
-  }
-
-  // Skip all Claude-powered analysis when available cash is too low
+  // Skip if available cash too low
   const availCash = getAvailableCash('kalshi');
   if (availCash < 3) {
     console.log(`[ai-edge] Available cash $${availCash.toFixed(2)} < $3 (reserve protected) — skipping`);
     return;
   }
 
-  // Step 1b: Pre-game predictions on today's games (best entry prices)
+  // Pre-game predictions (best entry prices, runs every 10 min)
   await checkPreGamePredictions();
 
-  // Step 1c: Check live scores for in-game predictions
+  // Live in-game predictions (runs every cycle)
   await checkLiveScoreEdges();
 
-  // Step 1d: Broad market scan — all markets including non-sports
+  // Broad market scan — sports + non-sports (runs every 5 min)
   await claudeBroadScan();
-
-  // Step 2-4: For each news item, find markets and assess edge
-  for (const news of newsItems) {
-    if (news.teams.length === 0) continue;
-
-    const markets = await findMatchingMarkets(news);
-    if (markets.length === 0) continue;
-
-    for (const market of markets.slice(0, 2)) {
-      // Position check — don't trade games we already have positions on
-      const mBase = market.ticker.lastIndexOf('-') > 0
-        ? market.ticker.slice(0, market.ticker.lastIndexOf('-'))
-        : market.ticker;
-      const hasPos = openPositions.some(p => {
-        const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
-        return pBase === mBase;
-      });
-      if (hasPos) continue;
-
-      // Date check — sports game-winners must be today or tonight
-      const isSports = /^KX(MLB|NBA|NFL|NHL)GAME-/i.test(market.ticker);
-      if (isSports) {
-        const etNow2 = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
-        const etTmrw = new Date(etNow2.getTime() + 24 * 60 * 60 * 1000);
-        const toS = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
-        if (!market.ticker.includes(toS(etNow2)) && !market.ticker.includes(toS(etTmrw))) continue;
-      }
-
-      // Cooldown (ticker + base)
-      if (Date.now() - (tradeCooldowns.get(market.ticker) ?? 0) < COOLDOWN_MS) continue;
-      if (Date.now() - (tradeCooldowns.get(mBase) ?? 0) < COOLDOWN_MS) continue;
-
-      // Ask Claude
-      const assessment = await assessEdge(news, market);
-      if (!assessment || !assessment.hasEdge) continue;
-      if (!assessment.side || typeof assessment.edgePct !== 'number' ||
-          typeof assessment.fairProbability !== 'number' || !assessment.reasoning) continue;
-
-      // Fee-aware edge check
-      const expectedEdge = Math.abs(assessment.fairProbability - (assessment.currentPrice ?? 0));
-      const mPrice = assessment.side === 'yes' ? (market.yesAsk ?? 0.5) : (market.noAsk ?? 0.5);
-      if (!isProfitableAfterFees('kalshi', mPrice, expectedEdge, market.ticker)) continue;
-      if (assessment.confidence === 'low') continue;
-
-      stats.edgesFound++;
-      console.log(`[ai-edge] EDGE: ${market.title} — ${assessment.side} ${expectedEdge.toFixed(1)}% (${assessment.confidence})`);
-
-      // Execute + set base cooldown
-      await executeTrade(market, assessment);
-      tradeCooldowns.set(mBase, Date.now());
-
-      await new Promise(r => setTimeout(r, 1000));
-    }
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2521,7 +2153,7 @@ async function main() {
     console.error('[ai-edge] Portfolio check failed:', e.message);
   }
 
-  console.log(`Config: MIN_NET_EDGE=${MIN_EDGE_PCT_AFTER_FEES}% (after fees) MAX_TRADE=$${getDynamicMaxTrade().toFixed(2)} BANKROLL=$${getBankroll().toFixed(2)} POLL=${POLL_INTERVAL_MS / 1000}s`);
+  console.log(`Config: MIN_CONF=${(MIN_CONFIDENCE*100).toFixed(0)}% MARGIN=${(CONFIDENCE_MARGIN*100).toFixed(0)}% MAX_PRICE=${(MAX_PRICE*100).toFixed(0)}¢ MAX_TRADE=$${getDynamicMaxTrade().toFixed(2)} BANKROLL=$${getBankroll().toFixed(2)}`);
 
   // Initial poll, then chain with setTimeout (prevents overlap)
   async function pollLoop() {
@@ -2575,7 +2207,7 @@ async function main() {
     `Reserve: ${(CAPITAL_RESERVE*100).toFixed(0)}% ($${(bankroll*CAPITAL_RESERVE).toFixed(2)}) | Sport cap: $${Math.max(15, bankroll * SPORT_EXPOSURE_PCT).toFixed(2)}\n` +
     `Consecutive loss: ${MAX_CONSECUTIVE_LOSSES}→half size, 8→halt\n\n` +
     `<b>Config:</b>\n` +
-    `Min net edge: ${MIN_EDGE_PCT_AFTER_FEES}% (after fees) | Cooldown: ${COOLDOWN_MS/60000}min\n` +
+    `Min confidence: ${(MIN_CONFIDENCE*100).toFixed(0)}% + ${(CONFIDENCE_MARGIN*100).toFixed(0)}% margin | Cooldown: ${COOLDOWN_MS/60000}min\n` +
     `Model: Haiku screen → Sonnet + web search decide\n` +
     `Broad scan: every ${BROAD_SCAN_INTERVAL/60000}min | Live-edge: every 60s\n\n` +
     `💰 Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions\n` +
