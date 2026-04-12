@@ -20,7 +20,7 @@
  * Run: node ai-edge.mjs
  */
 
-import { readFileSync } from 'fs';
+import { readFileSync, appendFileSync, existsSync, mkdirSync } from 'fs';
 import { createPrivateKey, sign as cryptoSign, constants as cryptoConstants } from 'crypto';
 import 'dotenv/config';
 
@@ -140,11 +140,12 @@ async function initPolySigning() {
   }
 }
 
-async function polySignRequest(method, path, body = '') {
+async function polySignRequest(method, path) {
   if (!polySign) await initPolySigning();
   if (!polySign) return null;
   const ts = String(Date.now());
-  const message = `${ts}${method}${path}${body}`;
+  // Polymarket US signature: timestamp + method + path (NO body)
+  const message = `${ts}${method}${path}`;
   const sigBytes = await polySign(new TextEncoder().encode(message), polyPrivBytes);
   const signature = btoa(String.fromCharCode(...sigBytes));
   return {
@@ -200,16 +201,19 @@ async function polymarketPost(slug, intent, price, quantity) {
       tif: 'TIME_IN_FORCE_IMMEDIATE_OR_CANCEL',
     };
     const bodyStr = JSON.stringify(body);
-    // Signature includes body for POST requests
-    const auth = await polySignRequest('POST', path, bodyStr);
+    const auth = await polySignRequest('POST', path);
     if (!auth) return { ok: false, status: 0, data: {} };
 
     const res = await fetch(`${POLY_US_API}${path}`, {
       method: 'POST',
       headers: auth.headers,
       body: bodyStr,
+      signal: AbortSignal.timeout(10000),
     });
     const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error(`[poly-order] FAILED ${res.status}:`, JSON.stringify(data));
+    }
     console.log('[poly-order]', JSON.stringify({ status: res.status, slug, intent, price, quantity, response: data }));
     return { ok: res.ok, status: res.status, data };
   } catch (e) {
@@ -282,6 +286,31 @@ let kalshiBalance = 0;
 let kalshiPositionValue = 0;
 let openPositions = [];  // fetched each cycle
 let stats = { newsChecked: 0, claudeCalls: 0, edgesFound: 0, tradesPlaced: 0 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P&L Trade Logging — append-only JSONL for every trade placed
+// ─────────────────────────────────────────────────────────────────────────────
+
+const TRADES_LOG = './logs/trades.jsonl';
+if (!existsSync('./logs')) mkdirSync('./logs', { recursive: true });
+
+function logTrade(entry) {
+  const record = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+    ...entry,
+    status: 'open',           // open → settled (updated by checkSettlements)
+    exitPrice: null,
+    realizedPnL: null,
+  };
+  try {
+    appendFileSync(TRADES_LOG, JSON.stringify(record) + '\n');
+    console.log(`[pnl] Logged trade: ${record.exchange} ${record.ticker} ${record.side} $${record.deployCost?.toFixed(2)}`);
+  } catch (e) {
+    console.error('[pnl] Failed to log trade:', e.message);
+  }
+  return record.id;
+}
 
 async function refreshPortfolio() {
   try {
@@ -559,6 +588,16 @@ async function executeTrade(market, assessment) {
     const order = result.data.order ?? result.data;
     const filled = order.quantity_filled ?? order.fill_count_fp ?? 0;
 
+    logTrade({
+      exchange: 'kalshi', strategy: 'news-edge',
+      ticker: market.ticker, title: market.title,
+      side, quantity: qty, entryPrice: price,
+      deployCost: deployed, filled,
+      orderId: order.order_id ?? null,
+      edge: edgePct, fairProb: fairProbability,
+      reasoning,
+    });
+
     await tg(
       `🧠 <b>AI EDGE TRADE — KALSHI</b>\n\n` +
       `<b>${market.title}</b>\n\n` +
@@ -755,6 +794,18 @@ async function checkLiveScoreEdges() {
         if (result.ok) {
           stats.tradesPlaced++;
           const deployed = qty * price;
+
+          logTrade({
+            exchange: 'kalshi', strategy: 'live-score',
+            ticker, title, side: 'yes',
+            quantity: qty, entryPrice: price, deployCost: deployed,
+            filled: (result.data.order ?? result.data).quantity_filled ?? 0,
+            orderId: (result.data.order ?? result.data).order_id ?? null,
+            edge: edge * 100, fairProb: winProb,
+            reasoning: decision.reasoning,
+            liveScore: `${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore} (${gameDetail})`,
+          });
+
           await tg(
             `⚡ <b>LIVE SCORE EDGE — KALSHI</b>\n\n` +
             `<b>${title}</b>\n` +
@@ -1124,10 +1175,23 @@ async function claudeBroadScan() {
 
     if (result.ok) {
       stats.tradesPlaced++;
-      // Extract team from ticker suffix and calculate days to close
       const teamSuffix = decision.ticker.split('-').pop() ?? '';
       const closeMs = Date.parse(market.closeTime);
       const daysOut = Number.isFinite(closeMs) ? Math.ceil((closeMs - Date.now()) / (24*60*60*1000)) : '?';
+
+      logTrade({
+        exchange: 'kalshi', strategy: 'claude-scan',
+        ticker: decision.ticker, title: market.title, category: market.category,
+        side: decision.side, quantity: qty, entryPrice: price,
+        deployCost: qty * price,
+        filled: (result.data.order ?? result.data).quantity_filled ?? 0,
+        orderId: (result.data.order ?? result.data).order_id ?? null,
+        edge: edge * 100, fairProb: decision.probability,
+        reasoning: decision.reasoning,
+        counterArgument: decision.counterArgument ?? null,
+        daysOut,
+      });
+
       await tg(
         `🧠 <b>CLAUDE TRADE — KALSHI</b>\n\n` +
         `<b>${market.title}</b>\n` +
@@ -1238,6 +1302,18 @@ async function claudeBroadScan() {
     if (polyResult.ok) {
       stats.tradesPlaced++;
       tradeCooldowns.set(polyKey, Date.now());
+
+      logTrade({
+        exchange: 'polymarket', strategy: 'claude-scan',
+        ticker: polyMkt.slug, title: polyMkt.title,
+        side: polyDecision.side === 'side0' ? 'long' : 'short',
+        quantity: polyQty, entryPrice: polyPrice,
+        deployCost: polyQty * polyPrice,
+        edge: polyEdge * 100, fairProb: polyDecision.probability,
+        reasoning: polyDecision.reasoning,
+        counterArgument: polyDecision.counterArgument ?? null,
+      });
+
       await tg(
         `🧠 <b>CLAUDE TRADE — POLYMARKET</b>\n\n` +
         `<b>${polyMkt.title}</b>\n` +
@@ -1341,8 +1417,232 @@ async function pollCycle() {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Settlement Reconciliation — update trades.jsonl with P&L on closed markets
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkSettlements() {
+  if (!existsSync(TRADES_LOG)) return;
+  try {
+    const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+    const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const openTrades = trades.filter(t => t.status === 'open' && t.exchange === 'kalshi');
+    if (openTrades.length === 0) return;
+
+    // Fetch closed/settled markets
+    let closedMarkets = [];
+    for (const status of ['closed', 'settled']) {
+      try {
+        const data = await kalshiGet(`/markets?status=${status}&limit=100`);
+        closedMarkets.push(...(data.markets ?? []));
+      } catch { /* skip */ }
+    }
+    if (closedMarkets.length === 0) return;
+
+    const closedMap = new Map();
+    for (const m of closedMarkets) closedMap.set(m.ticker, m);
+
+    let updated = false;
+    for (const trade of trades) {
+      if (trade.status !== 'open' || trade.exchange !== 'kalshi') continue;
+      // Check all market tickers that could match this trade (with team suffixes)
+      const market = closedMap.get(trade.ticker);
+      if (!market || !market.result) continue;
+
+      // Calculate P&L: if we bought YES and result is 'yes', we win $1/contract
+      const won = (trade.side === 'yes' && market.result === 'yes') ||
+                  (trade.side === 'no' && market.result === 'no');
+      const exitPrice = won ? 1.0 : 0.0;
+      const filled = trade.filled ?? trade.quantity ?? 0;
+      const proceeds = filled * exitPrice;
+      const pnl = proceeds - (trade.deployCost ?? 0);
+
+      trade.status = 'settled';
+      trade.exitPrice = exitPrice;
+      trade.realizedPnL = Math.round(pnl * 100) / 100;
+      trade.settledAt = new Date().toISOString();
+      trade.result = market.result;
+      updated = true;
+
+      const icon = pnl >= 0 ? '✅' : '❌';
+      console.log(`[pnl] SETTLED: ${trade.ticker} ${trade.side} → ${market.result} | P&L: ${icon} $${pnl.toFixed(2)}`);
+    }
+
+    if (updated) {
+      // Rewrite the file with updated records
+      const newContent = trades.map(t => JSON.stringify(t)).join('\n') + '\n';
+      const { writeFileSync } = await import('fs');
+      writeFileSync(TRADES_LOG, newContent);
+    }
+  } catch (e) {
+    console.error('[pnl] settlement check error:', e.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Resolution Arbs — buy winning sides of settled markets below $1
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkResolutionArbs() {
+  if (kalshiBalance < 2) return; // need cash to buy
+
+  try {
+    // Fetch recently closed markets where result is known
+    let closedMarkets = [];
+    for (const status of ['closed', 'settled']) {
+      try {
+        const data = await kalshiGet(`/markets?status=${status}&limit=50`);
+        closedMarkets.push(...(data.markets ?? []));
+      } catch { /* skip */ }
+    }
+
+    for (const m of closedMarkets) {
+      if (!m.result || !m.ticker) continue;
+
+      // Determine winning side price
+      const winSide = m.result; // 'yes' or 'no'
+      const winPrice = winSide === 'yes'
+        ? parseFloat(m.yes_ask_dollars ?? '1')
+        : parseFloat(m.no_ask_dollars ?? '1');
+
+      // If winning side is still < $0.95, there's free money
+      if (winPrice >= 0.95 || winPrice <= 0) continue;
+
+      const profit = (1.0 - winPrice);
+      const fee = 0.07 * winPrice * (1 - winPrice); // Kalshi parabolic fee
+      const netProfit = profit - fee;
+      if (netProfit < 0.01) continue; // not worth it after fees
+
+      // Verify with ESPN for sports markets
+      const isSportsGame = /^KX(MLB|NBA|NFL|NHL)GAME-/i.test(m.ticker);
+      if (isSportsGame) {
+        const verified = await verifyESPNResult(m);
+        if (!verified) {
+          console.log(`[resolve] ESPN verification failed for ${m.ticker}, skipping`);
+          continue;
+        }
+      }
+
+      // Cooldown — don't re-buy same market
+      if (Date.now() - (tradeCooldowns.get('res:' + m.ticker) ?? 0) < 60 * 60 * 1000) continue;
+
+      // Size: up to 25% of cash, max $50
+      const maxBet = Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25);
+      const qty = Math.max(1, Math.floor(maxBet / winPrice));
+      const priceInCents = Math.round(winPrice * 100);
+
+      console.log(`[resolve] ARB: ${m.ticker} result=${winSide} winPrice=${priceInCents}¢ netProfit=${(netProfit*100).toFixed(1)}¢/contract × ${qty}`);
+
+      tradeCooldowns.set('res:' + m.ticker, Date.now());
+      const result = await kalshiPost('/portfolio/orders', {
+        ticker: m.ticker, action: 'buy', side: winSide, count: qty,
+        yes_price: winSide === 'yes' ? priceInCents : 100 - priceInCents,
+      });
+
+      if (result.ok) {
+        stats.tradesPlaced++;
+        const deployed = qty * winPrice;
+
+        logTrade({
+          exchange: 'kalshi', strategy: 'resolution-arb',
+          ticker: m.ticker, title: m.title ?? m.ticker,
+          side: winSide, quantity: qty, entryPrice: winPrice,
+          deployCost: deployed,
+          filled: (result.data.order ?? result.data).quantity_filled ?? 0,
+          orderId: (result.data.order ?? result.data).order_id ?? null,
+          edge: netProfit * 100,
+          reasoning: `Post-result arb: ${winSide} won, buying at ${priceInCents}¢ for guaranteed $1 settlement`,
+        });
+
+        await tg(
+          `💰 <b>RESOLUTION ARB — KALSHI</b>\n\n` +
+          `<b>${m.title ?? m.ticker}</b>\n` +
+          `Result: <b>${winSide.toUpperCase()} WON</b>\n\n` +
+          `BUY ${winSide.toUpperCase()} @ $${winPrice.toFixed(2)} × ${qty}\n` +
+          `Deployed: $${deployed.toFixed(2)}\n` +
+          `Guaranteed profit: <b>$${(qty * netProfit).toFixed(2)}</b>\n` +
+          `(${(netProfit*100).toFixed(1)}¢/contract after fees)`
+        );
+      }
+    }
+  } catch (e) {
+    console.error('[resolve] error:', e.message);
+  }
+}
+
+// ESPN verification for resolution arbs
+async function verifyESPNResult(market) {
+  const ticker = market.ticker ?? '';
+  let league = '';
+  if (ticker.includes('MLB')) league = 'baseball/mlb';
+  else if (ticker.includes('NBA')) league = 'basketball/nba';
+  else if (ticker.includes('NHL')) league = 'hockey/nhl';
+  else if (ticker.includes('NFL')) league = 'football/nfl';
+  else return true; // non-sports — skip ESPN check
+
+  try {
+    const res = await fetch(
+      `http://site.api.espn.com/apis/site/v2/sports/${league}/scoreboard`,
+      { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) },
+    );
+    if (!res.ok) return false;
+    const data = await res.json();
+
+    // Extract team abbreviations from ticker
+    const parts = ticker.split('-');
+    const teamSuffix = parts[parts.length - 1]; // e.g., 'NYY' or 'BOS'
+
+    // Look for a completed game with this team
+    for (const ev of data.events ?? []) {
+      const comp = ev.competitions?.[0];
+      if (!comp || comp.status?.type?.state !== 'post') continue;
+      const competitors = comp.competitors ?? [];
+      const matchesTeam = competitors.some(c =>
+        c.team?.abbreviation === teamSuffix
+      );
+      if (!matchesTeam) continue;
+
+      // Found the game — check winner
+      const winner = competitors.find(c => c.winner === true || c.winner === 'true');
+      if (!winner) continue;
+
+      const kalshiSaysWin = market.result === 'yes';
+      const tickerTeamWon = winner.team?.abbreviation === teamSuffix;
+
+      // If Kalshi says YES won, the ticker team should have won
+      if (kalshiSaysWin === tickerTeamWon) return true;
+
+      console.log(`[resolve] ESPN MISMATCH: Kalshi result=${market.result} but ESPN winner=${winner.team?.abbreviation}`);
+      return false;
+    }
+
+    // Game not found on scoreboard — might be too old, allow it
+    return true;
+  } catch {
+    return false; // fail closed — don't trade if ESPN unreachable
+  }
+}
+
 function logStats() {
-  console.log(`[ai-stats] news=${stats.newsChecked} claude=${stats.claudeCalls} edges=${stats.edgesFound} trades=${stats.tradesPlaced} bal=$${kalshiBalance.toFixed(2)}`);
+  // Include P&L summary in stats
+  let totalPnL = 0;
+  let settledCount = 0;
+  if (existsSync(TRADES_LOG)) {
+    try {
+      const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      for (const l of lines) {
+        try {
+          const t = JSON.parse(l);
+          if (t.status === 'settled' && t.realizedPnL != null) {
+            totalPnL += t.realizedPnL;
+            settledCount++;
+          }
+        } catch { /* skip */ }
+      }
+    } catch { /* skip */ }
+  }
+  const pnlStr = totalPnL >= 0 ? `+$${totalPnL.toFixed(2)}` : `-$${Math.abs(totalPnL).toFixed(2)}`;
+  console.log(`[ai-stats] news=${stats.newsChecked} claude=${stats.claudeCalls} edges=${stats.edgesFound} trades=${stats.tradesPlaced} bal=$${kalshiBalance.toFixed(2)} pnl=${pnlStr} (${settledCount} settled)`);
 }
 
 async function main() {
@@ -1378,6 +1678,14 @@ async function main() {
     setTimeout(statsLoop, 5 * 60 * 1000);
   }
   setTimeout(statsLoop, 5 * 60 * 1000);
+
+  // Settlement reconciliation + resolution arbs — every 5 min
+  async function settlementLoop() {
+    try { await checkSettlements(); } catch (e) { console.error('[settlement] error:', e.message); }
+    try { await checkResolutionArbs(); } catch (e) { console.error('[resolve] error:', e.message); }
+    setTimeout(settlementLoop, 5 * 60 * 1000);
+  }
+  setTimeout(settlementLoop, 2 * 60 * 1000); // first run after 2 min
 
   await tg(
     `🧠 <b>AI Edge Bot Started</b>\n\n` +

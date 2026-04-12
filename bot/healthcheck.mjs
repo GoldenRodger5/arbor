@@ -153,6 +153,40 @@ async function run() {
   }
   lines.push('');
 
+  // P&L Summary from trades.jsonl
+  try {
+    const tradesFile = './logs/trades.jsonl';
+    if (existsSync(tradesFile)) {
+      const tradeLines = readFileSync(tradesFile, 'utf-8').split('\n').filter(l => l.trim());
+      let totalPnL = 0, settled = 0, openCount = 0, totalDeployed = 0;
+      const cutoff24h = Date.now() - 24 * 60 * 60 * 1000;
+      let todayPnL = 0, todayTrades = 0;
+      for (const l of tradeLines) {
+        try {
+          const t = JSON.parse(l);
+          if (t.status === 'settled' && t.realizedPnL != null) {
+            totalPnL += t.realizedPnL;
+            settled++;
+            if (t.settledAt && Date.parse(t.settledAt) > cutoff24h) todayPnL += t.realizedPnL;
+          } else if (t.status === 'open') {
+            openCount++;
+            totalDeployed += (t.deployCost ?? 0);
+          }
+          if (t.timestamp && Date.parse(t.timestamp) > cutoff24h) todayTrades++;
+        } catch { /* skip */ }
+      }
+      lines.push(`📈 <b>P&L Summary</b>`);
+      lines.push(`Total: <b>${totalPnL >= 0 ? '+' : ''}$${totalPnL.toFixed(2)}</b> (${settled} settled)`);
+      lines.push(`Today: ${todayPnL >= 0 ? '+' : ''}$${todayPnL.toFixed(2)} | ${todayTrades} trades placed`);
+      lines.push(`Open: ${openCount} trades, $${totalDeployed.toFixed(2)} deployed`);
+    } else {
+      lines.push('📈 No trade history yet');
+    }
+  } catch {
+    lines.push('⚠️ Could not read trade log');
+  }
+  lines.push('');
+
   // Timestamp
   const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
   lines.push(`🕐 ${now} ET`);
