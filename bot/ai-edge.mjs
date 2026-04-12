@@ -1091,7 +1091,7 @@ async function claudeBroadScan() {
   const sportsSeries = [...categories[0].series, 'KXMLSGAME', 'KXNFLGAME'];
   for (const s of sportsSeries) {
     try {
-      const data = await kalshiGet(`/markets?series_ticker=${s}&status=open&limit=10`);
+      const data = await kalshiGet(`/markets?series_ticker=${s}&status=open&limit=200`);
       for (const m of data.markets ?? []) {
         if (!m.yes_ask_dollars || !m.no_ask_dollars) continue;
         allMarkets.push({
@@ -1147,7 +1147,7 @@ async function claudeBroadScan() {
   ];
   for (const { series: s, label } of nonSportsSeries) {
     try {
-      const data = await kalshiGet(`/markets?series_ticker=${s}&status=open&limit=10`);
+      const data = await kalshiGet(`/markets?series_ticker=${s}&status=open&limit=50`);
       for (const m of data.markets ?? []) {
         if (!m.yes_ask_dollars || !m.no_ask_dollars) continue;
         const ya = parseFloat(m.yes_ask_dollars);
@@ -1277,12 +1277,25 @@ async function claudeBroadScan() {
 
   if (tradeable.length === 0) { console.log('[broad-scan] No tradeable markets (all have positions)'); return; }
 
-  // Put non-sports first so Claude sees crypto/economics/politics before the cap
-  const nonSports = tradeable.filter(m => m.category !== 'Sports');
-  const sports = tradeable.filter(m => m.category === 'Sports');
-  const ordered = [...nonSports, ...sports];
+  // Dedup sports — same game has 2 tickers (one per team), keep only one
+  const seenGameBases = new Set();
+  const deduped = [];
+  for (const m of tradeable) {
+    if (m.category === 'Sports') {
+      const lastH = m.ticker.lastIndexOf('-');
+      const gameBase = lastH > 0 ? m.ticker.slice(0, lastH) : m.ticker;
+      if (seenGameBases.has(gameBase)) continue;
+      seenGameBases.add(gameBase);
+    }
+    deduped.push(m);
+  }
 
-  // Group tradeable markets by event for bracket-aware presentation
+  // Sports first so Claude sees today's games, then non-sports
+  const sports = deduped.filter(m => m.category === 'Sports');
+  const nonSports = deduped.filter(m => m.category !== 'Sports');
+  const ordered = [...sports, ...nonSports];
+
+  // Group markets by event for bracket-aware presentation
   const tradeEventGroups = new Map();
   for (const m of ordered) {
     const parts = m.ticker.split('-');
@@ -1300,13 +1313,13 @@ async function claudeBroadScan() {
       tradeLines.push(`[${m.category}] ${m.ticker}: "${m.title}" YES=$${m.yesAsk} NO=$${m.noAsk}`);
     } else {
       const cat = markets[0].category;
-      tradeLines.push(`[${cat}] BRACKET EVENT: ${eventKey} (${markets.length} thresholds — these are CUMULATIVE, pick the best one):`);
+      tradeLines.push(`[${cat}] BRACKET EVENT: ${eventKey} (${markets.length} thresholds — CUMULATIVE, pick the best one):`);
       for (const m of markets) {
         tradeLines.push(`  ${m.ticker}: "${m.title}" YES=$${m.yesAsk} NO=$${m.noAsk}`);
       }
     }
   }
-  const marketSummaryFiltered = tradeLines.slice(0, 60).join('\n');
+  const marketSummaryFiltered = tradeLines.slice(0, 80).join('\n');
 
   // Ask Claude with web search — strict rules
   try {
