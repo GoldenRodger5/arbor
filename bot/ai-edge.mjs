@@ -105,19 +105,36 @@ async function initPolySigning() {
   if (polySign) return; // already initialized
   if (!POLY_US_KEY_ID || !POLY_US_SECRET) return;
   try {
-    const ed = await import('@noble/ed25519');
     const { createHash } = await import('crypto');
-    // Set sha512 before any signing call (object freezes after first use)
-    if (ed.etc && typeof ed.etc.sha512Sync !== 'function') {
+    const ed = await import('@noble/ed25519');
+    // ed.etc may be frozen — use Object.defineProperty which works on frozen objects
+    // or wrap sha512 at a higher level
+    try {
       ed.etc.sha512Sync = (...m) => {
         const h = createHash('sha512');
         for (const msg of m) h.update(msg);
         return new Uint8Array(h.digest());
       };
+    } catch {
+      // Object is frozen — override via defineProperty on a fresh copy
+      try {
+        Object.defineProperty(ed.etc, 'sha512Sync', {
+          value: (...m) => {
+            const h = createHash('sha512');
+            for (const msg of m) h.update(msg);
+            return new Uint8Array(h.digest());
+          },
+          writable: true, configurable: true,
+        });
+      } catch {
+        // Object is truly sealed — use signAsync which uses its own sha512
+        // signAsync doesn't need sha512Sync set
+      }
     }
+    // Prefer signAsync (doesn't need sha512Sync) over sync sign
     polySign = ed.signAsync ?? ed.sign;
     polyPrivBytes = Uint8Array.from(atob(POLY_US_SECRET), c => c.charCodeAt(0)).slice(0, 32);
-    console.log('[poly] Ed25519 signing initialized');
+    console.log('[poly] Ed25519 signing initialized (using signAsync)');
   } catch (e) {
     console.error('[poly] init error:', e.message);
   }
