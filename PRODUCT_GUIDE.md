@@ -1,3 +1,4 @@
+
 # Arbor - Autonomous Prediction Market Trading Bot
 
 ## What It Is
@@ -193,11 +194,11 @@ Every trade checks both Kalshi and Polymarket prices before placing the order:
 
 ### Position Sizing (Dynamic)
 
-All limits scale automatically with bankroll every 60 seconds:
+All limits scale automatically with bankroll every 60 seconds.
 
-```javascript
-MAX_TRADE_FRACTION = 0.10  // 10% of bankroll per trade
-```
+**Per-trade size:** `getBankroll() * MAX_TRADE_FRACTION` (10%) capped by `getTradeCapCeiling()`.
+
+**Inverse deployment curve** (`getMaxDeployment()`): Aggressive when small (need growth), conservative when big (protect gains).
 
 | Bankroll | Max Trade | Max Deploy | Positions | Per-Trade Ceiling |
 |----------|-----------|------------|-----------|-------------------|
@@ -207,6 +208,13 @@ MAX_TRADE_FRACTION = 0.10  // 10% of bankroll per trade
 | $5,000 | $50 | $3,000 (60%) | 50 | $500 |
 | $20,000 | $500 | $8,000 (40%) | 50 | $500 |
 | $50,000 | $2,000 | $15,000 (30%) | 60 | $2,000 |
+
+**How sizing works per trade:**
+1. `getDynamicMaxTrade()` calculates: `min(bankroll * 10%, getTradeCapCeiling(), getAvailableCash())`
+2. `getAvailableCash()` subtracts the 5% capital reserve from platform cash
+3. `getPositionSize()` applies consecutive-loss reduction (50% after 7 losses)
+4. Claude's recommended bet amount is capped by the above
+5. Final quantity: `floor(safeBet / price)`
 
 ### Circuit Breakers
 
@@ -544,3 +552,138 @@ As bankroll grows, deployment percentage decreases:
 6. **No backtesting.** Predictions are forward-only. Can't validate strategy against historical data without building a separate backtesting framework.
 
 7. **Poly futures positions.** 2 Hart Trophy bets ($36 total) are locked until June 30, 2026 from before the futures filter was added.
+
+---
+
+## Additional Features (Detail)
+
+### Settlement Reconciliation (`checkSettlements`)
+
+Runs every 5 minutes. Reads `trades.jsonl`, finds open Kalshi trades, fetches closed/settled markets from Kalshi API, and matches them. When a trade's market has settled:
+
+- Calculates P&L: `won = (side matches result)`, exit price is $1.00 (win) or $0.00 (loss)
+- Updates trade status in `trades.jsonl` from `open` to `settled`
+- Updates `consecutiveLosses` counter
+- Runs per-strategy performance check (see below)
+- Logs result to console: `[pnl] SETTLED: KXMLB... yes -> no | P&L: -$11.78`
+
+### Strategy Auto-Disable Alerts
+
+After each settlement batch, the system calculates per-strategy win rates. If ANY strategy has 10+ settled trades AND win rate drops below 40%, a Telegram alert is sent:
+
+```
+Strategy Alert
+
+"live-prediction" has 35% win rate over 12 trades.
+P&L: -$18.40
+
+Consider disabling this strategy.
+```
+
+This doesn't auto-disable (human decision required) but ensures you know when a strategy is bleeding money.
+
+### Underdog Betting Logic
+
+In live games, the bot evaluates BOTH the leading AND trailing team:
+
+**Default:** Buy the leading team's contract (they're winning, likely to hold)
+
+**Underdog trigger (all must be true):**
+- Trailing team's contract price is between 15-40 cents (cheap)
+- Game is early (period/inning <= 4)
+- Score deficit is small (3 or fewer runs/points)
+- Trailing team has a BETTER season record than the leading team
+
+When triggered, Claude evaluates the trailing team's comeback potential instead. The prompt explicitly notes this is an underdog bet and asks Claude to assess whether the better team can come back.
+
+**Example:** Yankees (8-3) trailing Rays (5-6) by 2 runs in the 3rd inning. NYY at 35 cents. Bot evaluates NYY comeback because they're the better team down early.
+
+### Bracket Market Grouping
+
+Non-sports markets like CPI, GDP, Fed rates are cumulative threshold brackets:
+- "GDP > 2.0%?" YES=$0.53
+- "GDP > 2.5%?" YES=$0.33
+- "GDP > 3.0%?" YES=$0.16
+
+The bot groups these by event and presents them to Claude as a single bracket with all thresholds visible. Claude picks the single best threshold to trade, understanding that the implied probability of "GDP between 2.0-2.5%" = 0.53 - 0.33 = 20%.
+
+### ESPN Data Extraction
+
+For live games, the bot extracts rich context from ESPN's scoreboard API (no additional API calls needed):
+
+| Data Point | Source | Used In |
+|-----------|--------|---------|
+| Team records (overall) | `competitor.records[0].summary` | Live-edge + pre-game prompts |
+| Home/away records | `competitor.records[type=home/road]` | Live-edge prompt |
+| Current pitcher stats | `competition.situation.pitcher.summary` | Live MLB prompt |
+| Starting pitcher ERA | `competitor.probables[].statistics[ERA]` | Live MLB prompt |
+| Starting pitcher W-L | `competitor.probables[].statistics[W/L]` | Live MLB prompt |
+| Team batting average | `competitor.statistics[AVG]` | Live MLB prompt |
+| Inning-by-inning scores | `competitor.linescores[]` | Live prompt |
+| Runners on base | `competition.situation.onFirst/Second/Third` | Live prompt |
+| Outs | `competition.situation.outs` | Live prompt |
+| Game status detail | `competition.status.type.shortDetail` | All prompts |
+
+### Poll Cycle Flow
+
+Every 60 seconds, `pollCycle()` runs this sequence:
+
+```
+1. refreshPortfolio()
+   ├── Fetch Kalshi balance + positions
+   ├── Read trades.jsonl for open Poly positions
+   └── Refresh Poly balance via Ed25519 signed request
+
+2. Daily reset check (midnight ET)
+   └── Reset daily loss tracking, update consecutive losses
+
+3. canTrade() gate
+   └── Check: not halted, daily loss OK, positions under limit, deployment under cap
+
+4. checkPreGamePredictions() [every 5 min]
+   ├── Fetch today's Kalshi sports markets (25-90 cent range)
+   ├── Haiku screens for 3 most predictable games
+   ├── Sonnet + web search predicts each
+   ├── Cross-platform price check (Kalshi vs Poly)
+   └── Buy on cheaper platform if confidence passes
+
+5. checkUFCPredictions() [every 30 min]
+   ├── Fetch Poly UFC moneylines
+   ├── Haiku picks 2 most predictable fights
+   ├── Sonnet researches fighters
+   └── Buy on Poly if confidence passes
+
+6. checkLiveScoreEdges() [every cycle]
+   ├── Parallel ESPN fetch (MLB + NBA + NHL)
+   ├── Collect all games with leads
+   ├── Haiku batch-screens: pick 2 best predictions
+   ├── Sonnet analyzes each with full ESPN data
+   ├── Cross-platform price check
+   └── Buy on cheaper platform
+
+7. claudeBroadScan() [every 5 min]
+   ├── Fetch 200+ markets across all categories
+   ├── Filter by date (sports: ticker date, non-sports: close time)
+   ├── Dedup sports (one ticker per game)
+   ├── Haiku screens for 3 candidates
+   └── Sonnet researches each
+```
+
+Every 5 minutes, `settlementLoop()` runs:
+```
+1. checkStopLosses()   — sell Kalshi positions down >30%
+2. checkSettlements()   — reconcile closed markets with trade log
+3. checkResolutionArbs() — buy winning sides below $0.95
+```
+
+### Polymarket Technical Details
+
+**Signing:** Ed25519 via `@noble/ed25519` library. The `sha512Sync` function from Node's crypto module is set once at initialization (the `ed.etc` object freezes after first use). Falls back to `signAsync` which has internal sha512.
+
+**Signature format:** `timestamp + method + path` (NO body included for POST requests — this was a critical fix; including body caused 401 errors).
+
+**Order type:** All orders are `TIME_IN_FORCE_IMMEDIATE_OR_CANCEL` (IOC) limit orders. Price is set 2 cents above market to ensure fill. If not filled immediately, order cancels — no hanging orders.
+
+**Market mapping:** Polymarket slugs use format `aec-{sport}-{team1}-{team2}-{date}`. The mapper requires BOTH team abbreviations AND sport prefix to match, preventing cross-sport confusion (e.g., PIT Pirates MLB vs PIT Penguins NHL).
+
+**Futures blocked:** Only `moneyline` market type allowed (game-winners). The `futures` type (MVP, championships) is blocked because these lock capital for months.
