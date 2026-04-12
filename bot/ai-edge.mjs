@@ -40,7 +40,7 @@ const MAX_TRADE_FRACTION = 0.25; // Use up to 25% of balance per trade
 const MAX_TRADE_CAP = 50;        // Hard cap $50 per trade
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 15 * 60 * 1000; // 15 min cooldown per market
-const MAX_DAYS_OUT = 14;           // Only trade markets closing within 14 days — capital efficiency
+const MAX_DAYS_OUT = 1;            // Same-day only — capital turns over nightly at $200 scale
 const CLAUDE_MODEL = 'claude-sonnet-4-6';  // Sonnet 4.6 for better analysis
 
 // ─────────────────────────────────────────────────────────────────────────────
