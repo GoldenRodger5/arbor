@@ -389,11 +389,11 @@ function getMaxDeployment() {
 
 function getMaxPositions() {
   const b = getBankroll();
-  if (b < 500) return 20;       // small account — deployment cap is the real limiter
-  if (b < 2000) return 25;
-  if (b < 10000) return 30;
-  if (b < 50000) return 40;
-  return 50;
+  if (b < 500) return 30;       // small account — deployment cap is the real limiter
+  if (b < 2000) return 40;
+  if (b < 10000) return 50;
+  if (b < 50000) return 60;
+  return 80;
 }
 
 // Per-trade cap also scales: small accounts need room, big accounts need limits
@@ -1030,12 +1030,15 @@ async function checkLiveScoreEdges() {
         const leadingName = leading.team?.displayName ?? '';
         const gameDetail = comp.status?.type?.shortDetail ?? '';
 
-        // Aggressive thresholds — catch edges early, let Claude filter via research
+        // Trigger early — let Claude decide if the lead is real
+        // The edge exists in the GAP between score change and market repricing
         let highCertainty = false;
-        if (league === 'mlb' && period >= 4 && diff >= 3) highCertainty = true;     // 4th+ with 3+ run lead
-        else if (league === 'mlb' && period >= 3 && diff >= 5) highCertainty = true; // 3rd+ with 5+ blowout
-        else if (league === 'nba' && period >= 2 && diff >= 8) highCertainty = true;  // 2nd half, 8+ lead
-        else if (league === 'nhl' && period >= 2 && diff >= 2) highCertainty = true;  // 2nd period, 2+ goals
+        if (league === 'mlb' && period >= 2 && diff >= 2) highCertainty = true;      // 2nd+ with 2+ run lead
+        else if (league === 'mlb' && diff >= 4) highCertainty = true;                 // any inning, 4+ blowout
+        else if (league === 'nba' && period >= 2 && diff >= 6) highCertainty = true;  // 2nd quarter+, 6+ lead
+        else if (league === 'nba' && diff >= 15) highCertainty = true;                // any time, 15+ blowout
+        else if (league === 'nhl' && period >= 2 && diff >= 1) highCertainty = true;  // 2nd+, any lead
+        else if (league === 'nhl' && diff >= 2) highCertainty = true;                 // any period, 2+ goals
         if (!highCertainty) continue;
 
         const homeAbbr = home.team?.abbreviation ?? '';
@@ -1090,22 +1093,22 @@ async function checkLiveScoreEdges() {
         // Use Claude to assess win probability based on live score + research
         const portfolioInfo = getPortfolioSummary();
         const livePrompt =
-          `You are a sports prediction market analyst. Be skeptical — only trade with high confidence.\n\n` +
-          `LIVE ${league.toUpperCase()} GAME RIGHT NOW:\n` +
+          `You are a live sports bettor looking for FAST edges. The market lags behind score changes — that's where we profit.\n\n` +
+          `LIVE ${league.toUpperCase()} GAME:\n` +
           `${away.team?.displayName} ${awayScore} at ${home.team?.displayName} ${homeScore}\n` +
-          `Game status: ${gameDetail}\n` +
-          `Leading team: ${leading.team?.displayName} by ${diff}\n\n` +
-          `MARKET: ${title}\n` +
-          `Ticker: ${targetMarket.ticker}\n` +
-          `${leadingAbbr} YES price: $${price.toFixed(2)} (implied ${(price*100).toFixed(0)}%)\n\n` +
-          `CASH: $${kalshiBalance.toFixed(2)} | Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
-          `RESEARCH: Use web search to check both teams' records and any relevant context.\n\n` +
-          `QUESTION: Given the live score and game situation, what is the TRUE probability ${leading.team?.displayName} wins?\n` +
-          `- If your probability is > market price by 7%+, recommend the trade\n` +
-          `- If the market has already priced in the lead correctly, pass\n\n` +
-          `Respond JSON ONLY:\n` +
-          `{"trade": false, "reasoning": "why"}\n` +
-          `OR {"trade": true, "side": "yes", "winProbability": 0.XX, "betAmount": N, "reasoning": "facts"}`;
+          `Status: ${gameDetail}\n` +
+          `${leading.team?.displayName} leads by ${diff}\n\n` +
+          `MARKET: ${leadingAbbr} YES @ $${price.toFixed(2)} (implied ${(price*100).toFixed(0)}%)\n\n` +
+          `RESEARCH: Search for both teams' current season records.\n\n` +
+          `KEY QUESTION: Is the market price LOWER than the actual win probability given this score?\n` +
+          `- Use baseball/basketball/hockey win expectancy for this score+inning/quarter/period\n` +
+          `- A team up 3-0 in the 4th inning wins ~85% of the time. If market is at 70¢, that's 15% edge.\n` +
+          `- A team up 3-0 in the 4th at 85¢ — no edge, market is correct.\n` +
+          `- ONLY trade if market price is BELOW your win probability by 5%+ AFTER Kalshi fees.\n\n` +
+          `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
+          `JSON ONLY:\n` +
+          `{"trade": false, "reasoning": "why — include your win probability estimate"}\n` +
+          `OR {"trade": true, "side": "yes", "winProbability": 0.XX, "betAmount": N, "reasoning": "win expectancy calc"}`;
         // Block if we already have a position on this game
         const ticker = targetMarket.ticker;
         const lastH = ticker.lastIndexOf('-');
