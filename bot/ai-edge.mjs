@@ -37,16 +37,16 @@ const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 const MIN_EDGE = 0.07;           // 7% edge minimum — consistent across ALL strategies
 const MIN_EDGE_PCT = 7;          // same × 100 for display
 const MAX_TRADE_FRACTION = 0.03; // 3% of bankroll per trade (was 25% — way too aggressive)
-const MAX_TRADE_CAP = 5;         // Hard cap $5 per trade (scales up as bankroll grows)
+const MAX_TRADE_CAP = 50;        // Absolute ceiling — dynamic cap handles the real limit
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 30 * 60 * 1000; // 30 min cooldown per market (was 15 — too short)
 const MAX_DAYS_OUT = 1;            // Same-day only — capital turns over nightly
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
 const MAX_POSITIONS = 5;           // Max concurrent open positions
-const DAILY_LOSS_LIMIT = 10;       // Stop trading if down $10 in a day
+const DAILY_LOSS_PCT = 0.05;       // Stop trading if down 5% in a day (scales with bankroll)
 const CAPITAL_RESERVE = 0.10;      // Always keep 10% of bankroll untouched
 const MAX_CONSECUTIVE_LOSSES = 3;  // After 3 losses → reduce size + wait
-const MAX_SPORT_EXPOSURE = 15;     // Max $ deployed on same sport per day
+const SPORT_EXPOSURE_PCT = 0.08;   // Max 8% of bankroll deployed on same sport per day
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth
@@ -327,12 +327,13 @@ function canTrade() {
     return false;
   }
 
-  // Check daily loss limit
+  // Check daily loss limit (scales with bankroll)
   const currentBankroll = getBankroll();
+  const dailyLossLimit = Math.max(10, dailyOpenBankroll * DAILY_LOSS_PCT);
   const dailyPnL = currentBankroll - dailyOpenBankroll;
-  if (dailyOpenBankroll > 0 && dailyPnL < -DAILY_LOSS_LIMIT) {
+  if (dailyOpenBankroll > 0 && dailyPnL < -dailyLossLimit) {
     tradingHalted = true;
-    haltReason = `Daily loss limit hit: $${Math.abs(dailyPnL).toFixed(2)} lost today (limit: $${DAILY_LOSS_LIMIT})`;
+    haltReason = `Daily loss limit hit: $${Math.abs(dailyPnL).toFixed(2)} lost today (limit: $${dailyLossLimit.toFixed(2)} = 5% of $${dailyOpenBankroll.toFixed(2)})`;
     tg(`🛑 <b>TRADING HALTED</b>\n\n${haltReason}\n\nBot will resume tomorrow.`);
     console.log(`[risk] ${haltReason}`);
     return false;
@@ -385,8 +386,9 @@ function checkSportExposure(ticker) {
   for (const sport of ['MLB', 'NBA', 'NHL', 'NFL']) {
     if (ticker.includes(sport)) {
       const current = getSportExposure(sport);
-      if (current >= MAX_SPORT_EXPOSURE) {
-        console.log(`[risk] ${sport} exposure $${current.toFixed(2)} >= $${MAX_SPORT_EXPOSURE} cap`);
+      const sportCap = Math.max(15, getBankroll() * SPORT_EXPOSURE_PCT);
+      if (current >= sportCap) {
+        console.log(`[risk] ${sport} exposure $${current.toFixed(2)} >= $${sportCap.toFixed(2)} cap (8% of bankroll)`);
         return false;
       }
       return true;
@@ -1875,9 +1877,9 @@ async function main() {
     `🧠 <b>AI Edge Bot Started</b>\n\n` +
     `<b>Risk Controls Active:</b>\n` +
     `Max trade: $${maxTrade.toFixed(2)} (3% of $${bankroll.toFixed(2)} bankroll)\n` +
-    `Max positions: ${MAX_POSITIONS} | Daily loss limit: $${DAILY_LOSS_LIMIT}\n` +
+    `Max positions: ${MAX_POSITIONS} | Daily loss limit: $${Math.max(10, bankroll * DAILY_LOSS_PCT).toFixed(2)} (5%)\n` +
     `Capital reserve: ${(CAPITAL_RESERVE*100).toFixed(0)}% ($${(bankroll*CAPITAL_RESERVE).toFixed(2)} protected)\n` +
-    `Sport exposure cap: $${MAX_SPORT_EXPOSURE}/sport\n` +
+    `Sport exposure cap: $${Math.max(15, bankroll * SPORT_EXPOSURE_PCT).toFixed(2)}/sport (8%)\n` +
     `Consecutive loss halt: ${MAX_CONSECUTIVE_LOSSES}→reduce, 5→halt\n\n` +
     `<b>Config:</b>\n` +
     `Min edge: ${MIN_EDGE_PCT}% | Cooldown: ${COOLDOWN_MS/60000}min\n` +
