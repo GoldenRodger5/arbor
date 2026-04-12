@@ -877,23 +877,26 @@ async function checkLiveScoreEdges() {
 
         // Get today/tonight Kalshi markets — pre-filter to THIS game's teams + today's date
         const etNowLE = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
-        const etTmrwLE = new Date(etNowLE.getTime() + 24 * 60 * 60 * 1000);
         const toShortLE = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
         const todayStr = toShortLE(etNowLE);
-        const tonightStr = toShortLE(etTmrwLE);
+        // Late night: if it's after 10pm ET, also accept tomorrow's date (game started tonight, ticker is next day UTC)
+        const etHourLE = etNowLE.getHours();
+        const etTmrwLE = new Date(etNowLE.getTime() + 24 * 60 * 60 * 1000);
+        const tonightStr = etHourLE >= 22 ? toShortLE(etTmrwLE) : null;
 
         const params = new URLSearchParams({ series_ticker: series, status: 'open', limit: '100' });
         const mkts = await kalshiGet(`/markets?${params}`);
 
-        // Filter to ONLY markets for THIS game: must contain team abbreviation AND today's date
+        // Filter to ONLY markets for THIS game: must match teams AND TODAY's date
+        // Only accept tomorrow's date after 10pm ET (for games that started tonight)
         const gameMarkets = (mkts.markets ?? []).filter(m => {
           if (!m.yes_ask_dollars || !m.no_ask_dollars) return false;
           const ya = parseFloat(m.yes_ask_dollars);
           const na = parseFloat(m.no_ask_dollars);
           if (ya < 0.01 || ya > 0.99 || na < 0.01 || na > 0.99) return false;
           const ticker = m.ticker ?? '';
-          // Must be today or tonight
-          if (!ticker.includes(todayStr) && !ticker.includes(tonightStr)) return false;
+          // Must be today's date (or tonight's late game after 10pm ET)
+          if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) return false;
           // Must match BOTH playing teams (ticker contains both abbreviations)
           const upperTicker = ticker.toUpperCase();
           const hasHome = upperTicker.includes(homeAbbr);
@@ -902,7 +905,7 @@ async function checkLiveScoreEdges() {
         });
 
         if (gameMarkets.length === 0) {
-          console.log(`[live-edge] No Kalshi market found for ${awayAbbr}@${homeAbbr} on ${todayStr}/${tonightStr}`);
+          console.log(`[live-edge] No Kalshi market found for ${awayAbbr}@${homeAbbr} on ${todayStr}${tonightStr ? '/' + tonightStr : ''}`);
           continue;
         }
 
