@@ -1051,17 +1051,61 @@ async function checkLiveScoreEdges() {
           }
         }
 
-        // Live situation (runners, outs)
+        // Live situation (runners, outs, batter, last play)
         let situationInfo = '';
         const sit = comp.situation;
         if (sit) {
           const runners = [sit.onFirst && '1st', sit.onSecond && '2nd', sit.onThird && '3rd'].filter(Boolean);
           situationInfo = `Outs: ${sit.outs ?? '?'} | Runners: ${runners.length > 0 ? runners.join(', ') : 'none'}`;
+          // Current batter (MLB)
+          if (sit.batter?.athlete?.displayName) {
+            situationInfo += ` | At bat: ${sit.batter.athlete.displayName} (${sit.batter.summary ?? ''})`;
+          }
+          // Last play for momentum context
+          if (sit.lastPlay?.text) {
+            situationInfo += `\nLast play: ${sit.lastPlay.text}`;
+          }
+        }
+
+        // Time remaining (critical for NBA/NHL — "3:21 in 2nd" vs just "2nd quarter")
+        let timeRemaining = '';
+        const statusDetail = comp.status?.type?.shortDetail ?? '';
+        if (league === 'nba' || league === 'nhl') {
+          timeRemaining = statusDetail; // ESPN gives "3:21 - 2nd" which includes time
         }
 
         // Team stats
         const homeAvg = home.statistics?.find(s => s.abbreviation === 'AVG')?.displayValue ?? '';
         const awayAvg = away.statistics?.find(s => s.abbreviation === 'AVG')?.displayValue ?? '';
+
+        // NBA shooting stats
+        let shootingInfo = '';
+        if (league === 'nba') {
+          const homeFGM = home.statistics?.find(s => s.abbreviation === 'FGM')?.displayValue ?? '';
+          const homeFGA = home.statistics?.find(s => s.abbreviation === 'FGA')?.displayValue ?? '';
+          const awayFGM = away.statistics?.find(s => s.abbreviation === 'FGM')?.displayValue ?? '';
+          const awayFGA = away.statistics?.find(s => s.abbreviation === 'FGA')?.displayValue ?? '';
+          const homeReb = home.statistics?.find(s => s.abbreviation === 'REB')?.displayValue ?? '';
+          const awayReb = away.statistics?.find(s => s.abbreviation === 'REB')?.displayValue ?? '';
+          if (homeFGM && homeFGA) {
+            const homePct = ((parseInt(homeFGM) / parseInt(homeFGA)) * 100).toFixed(0);
+            const awayPct = awayFGM && awayFGA ? ((parseInt(awayFGM) / parseInt(awayFGA)) * 100).toFixed(0) : '?';
+            shootingInfo = `Shooting: ${homeAbbr} ${homePct}% (${homeFGM}/${homeFGA}) | ${awayAbbr} ${awayPct}% (${awayFGM}/${awayFGA})`;
+            if (homeReb || awayReb) shootingInfo += ` | Rebounds: ${homeAbbr} ${homeReb} | ${awayAbbr} ${awayReb}`;
+          }
+        }
+
+        // Leading scorers (NBA)
+        let leadersInfo = '';
+        if (league === 'nba') {
+          for (const c of [home, away]) {
+            const pts = c.leaders?.find(l => l.name === 'points');
+            if (pts?.leaders?.[0]) {
+              const p = pts.leaders[0];
+              leadersInfo += `${c.team?.abbreviation} top scorer: ${p.athlete?.displayName} ${p.displayValue}\n`;
+            }
+          }
+        }
 
         // Line score
         const homeLineScore = (home.linescores ?? []).map(l => l.displayValue).join(' ');
@@ -1082,6 +1126,9 @@ async function checkLiveScoreEdges() {
           (situationInfo ? `Situation: ${situationInfo}\n` : '') +
           (pitcherInfo ? `\n${pitcherInfo}` : '') +
           (homeAvg || awayAvg ? `Team batting: ${homeAbbr} ${homeAvg} | ${awayAbbr} ${awayAvg}\n` : '') +
+          (shootingInfo ? `${shootingInfo}\n` : '') +
+          (leadersInfo ? `${leadersInfo}` : '') +
+          (timeRemaining && timeRemaining !== gameDetail ? `Time: ${timeRemaining}\n` : '') +
           `\n═══ ${baselineText} ═══\n\n` +
           `═══ MARKET ═══\n` +
           `${targetAbbr} YES @ ${(price*100).toFixed(0)}¢ (market thinks ${(price*100).toFixed(0)}% chance)\n` +
