@@ -742,33 +742,52 @@ async function getPolyMoneylines() {
   return markets;
 }
 
-// Find the Poly market matching a Kalshi game (by team abbreviations)
-function findPolyMarketForGame(homeAbbr, awayAbbr, polyMarkets) {
+// Find the Poly market matching a Kalshi game (by team abbreviations + sport)
+function findPolyMarketForGame(homeAbbr, awayAbbr, polyMarkets, sport = '') {
   const ha = homeAbbr.toLowerCase();
   const aa = awayAbbr.toLowerCase();
+  // Map Kalshi series to Poly sport prefix to avoid cross-sport matches
+  // (PIT Pirates MLB ≠ PIT Penguins NHL)
+  const sportMap = { mlb: 'mlb', nba: 'nba', nhl: 'nhl', nfl: 'nfl' };
+  const polyPrefix = sportMap[sport.toLowerCase()] ?? '';
+
   return polyMarkets.find(m => {
     const slug = m.slug.toLowerCase();
+    // Must match sport prefix if we know it
+    if (polyPrefix && !slug.includes('-' + polyPrefix + '-')) return false;
     return slug.includes(ha) && slug.includes(aa);
   }) ?? null;
 }
 
 // Compare prices and pick the best platform to buy on
-function pickBestPlatform(side, kalshiPrice, polyMatch) {
+// targetTeamAbbr: which team we want to buy (e.g. 'PIT')
+function pickBestPlatform(side, kalshiPrice, polyMatch, targetTeamAbbr = '') {
   if (!polyMatch) return { platform: 'kalshi', price: kalshiPrice };
 
-  // Map side: 'yes' on Kalshi = the team named in the ticker
-  // On Poly, s0 = first team in slug (away), s1 = second team (home)
-  // This varies — safest to compare by checking which side is cheaper
-  const polyS0 = polyMatch.s0Price;
-  const polyS1 = polyMatch.s1Price;
+  // Find which Poly side matches the team we want to buy
+  const target = targetTeamAbbr.toLowerCase();
+  const s0Name = (polyMatch.s0Name ?? '').toLowerCase();
+  const s1Name = (polyMatch.s1Name ?? '').toLowerCase();
+  const slugParts = (polyMatch.slug ?? '').toLowerCase().split('-');
 
-  // If we're buying the leading team, find which Poly side matches
-  // For now, use the cheaper of the two Poly sides that's < kalshiPrice
-  const polyPrice = Math.min(polyS0, polyS1);
+  // Match by: team name contains abbreviation, or slug position matches
+  let polyPrice = null;
+  let polyIntent = '';
 
-  if (polyPrice < kalshiPrice - 0.02 && polyPrice >= 0.05) {
-    return { platform: 'polymarket', price: polyPrice, slug: polyMatch.slug,
-      intent: polyPrice === polyS0 ? 'ORDER_INTENT_BUY_LONG' : 'ORDER_INTENT_BUY_SHORT' };
+  // Check s0 (first team in slug = LONG)
+  if (s0Name.includes(target) || (slugParts.length >= 4 && slugParts[2] === target)) {
+    polyPrice = polyMatch.s0Price;
+    polyIntent = 'ORDER_INTENT_BUY_LONG';
+  }
+  // Check s1 (second team in slug = SHORT)
+  else if (s1Name.includes(target) || (slugParts.length >= 5 && slugParts[3] === target)) {
+    polyPrice = polyMatch.s1Price;
+    polyIntent = 'ORDER_INTENT_BUY_SHORT';
+  }
+
+  if (polyPrice !== null && polyPrice < kalshiPrice - 0.02 && polyPrice >= 0.05 && polyPrice < MAX_PRICE) {
+    console.log(`[cross-platform] Poly cheaper: ${target} ${(polyPrice*100).toFixed(0)}¢ vs Kalshi ${(kalshiPrice*100).toFixed(0)}¢ (saving ${((kalshiPrice-polyPrice)*100).toFixed(0)}¢)`);
+    return { platform: 'polymarket', price: polyPrice, slug: polyMatch.slug, intent: polyIntent };
   }
   return { platform: 'kalshi', price: kalshiPrice };
 }
@@ -1061,8 +1080,8 @@ async function checkLiveScoreEdges() {
 
         // === CROSS-PLATFORM PRICE CHECK — buy on cheaper platform ===
         const polyMoneylines = await getPolyMoneylines();
-        const polyMatch = findPolyMarketForGame(homeAbbr, awayAbbr, polyMoneylines);
-        const best = pickBestPlatform('yes', price, polyMatch);
+        const polyMatch = findPolyMarketForGame(homeAbbr, awayAbbr, polyMoneylines, league);
+        const best = pickBestPlatform('yes', price, polyMatch, targetAbbr);
 
         // Use the better price for sizing
         const bestPrice = best.price;
@@ -1274,12 +1293,15 @@ async function checkPreGamePredictions() {
     // Cross-platform price check — extract team abbreviations from ticker
     const tickerParts = market.ticker.split('-');
     const teamBlock = tickerParts.length >= 3 ? tickerParts[tickerParts.length - 2] : '';
-    // teamBlock is like "26APR121340ATHNYM" — last 6 chars are team codes
     const team1 = teamBlock.slice(-6, -3);
     const team2 = teamBlock.slice(-3);
+    // Extract sport from Kalshi series ticker (KXMLBGAME → mlb, KXNBAGAME → nba)
+    const pgSport = market.ticker.includes('MLB') ? 'mlb' : market.ticker.includes('NBA') ? 'nba' : market.ticker.includes('NHL') ? 'nhl' : '';
     const pgPolyMarkets = await getPolyMoneylines();
-    const pgPolyMatch = findPolyMarketForGame(team1, team2, pgPolyMarkets);
-    const pgBest = pickBestPlatform(pick.side, price, pgPolyMatch);
+    const pgPolyMatch = findPolyMarketForGame(team1, team2, pgPolyMarkets, pgSport);
+    // The team we want is in the ticker suffix (e.g., -PIT or -CHC)
+    const pgTargetTeam = market.ticker.split('-').pop() ?? '';
+    const pgBest = pickBestPlatform(pick.side, price, pgPolyMatch, pgTargetTeam);
 
     const bestPrice = pgBest.price;
     const edge = confidence - bestPrice;
