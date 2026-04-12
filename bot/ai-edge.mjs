@@ -966,7 +966,7 @@ async function checkLiveScoreEdges() {
   }).join('\n');
 
   const screenText = await claudeScreen(
-    `Pick up to 2 live games where you're most confident predicting the winner. Consider: score, inning/period, team records, home advantage.\n\n` +
+    `Pick up to 3 live games where you're most confident predicting the winner. Consider: score, inning/period, team records, home advantage.\n\n` +
     `LIVE GAMES:\n${gameSummaries}\n\n` +
     `Pick games where the leading team's price might be ≤ 80¢ (early leads, close games, not blowouts already priced at 95¢+).\n\n` +
     `JSON array: [{"index":N,"team":"ABR","reason":"one line"}] or []`
@@ -985,7 +985,7 @@ async function checkLiveScoreEdges() {
   console.log(`[live-edge] Haiku picked ${haikuPicks.length} from ${liveGames.length} live games: ${haikuPicks.map(p => p.team).join(', ')}`);
 
   // === PHASE 3: Only analyze Haiku's picks with Sonnet (saves 80%+ API cost) ===
-  for (const pick of haikuPicks.slice(0, 2)) {
+  for (const pick of haikuPicks.slice(0, 3)) {
     const idx = (pick.index ?? 1) - 1;
     if (idx < 0 || idx >= liveGames.length) continue;
     const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail } = liveGames[idx];
@@ -1411,7 +1411,7 @@ async function checkPreGamePredictions() {
   ).join('\n');
 
   const screenText = await claudeScreen(
-    `You are a sports handicapper. Pick up to 3 games where you have a strong opinion on who wins.\n\n` +
+    `You are a sports handicapper. Pick up to 5 games where you have a strong opinion on who wins.\n\n` +
     `TODAY'S GAMES (pre-game, not started yet):\n${marketList}\n\n` +
     `For each pick, say which side (YES = first team listed in title, NO = second team) and why.\n` +
     `Only pick games where you're genuinely confident (≥65%). Skip coin-flip games.\n\n` +
@@ -1432,7 +1432,7 @@ async function checkPreGamePredictions() {
   console.log(`[pre-game] Haiku picked ${picks.length}: ${picks.map(p => p.ticker).join(', ')}`);
 
   // Sonnet deep dive on each pick
-  for (const pick of picks.slice(0, 3)) {
+  for (const pick of picks.slice(0, 5)) {
     const market = preGameMarkets.find(m => m.ticker === pick.ticker);
     if (!market) continue;
 
@@ -2001,7 +2001,7 @@ async function claudeBroadScan() {
       `\n${marketSummaryFiltered}\n\n` +
       `FOCUS on prices in the $0.30-$0.70 range — that's where real edges exist. A team at 55¢ that should be 65¢ is more actionable than a favorite at 93¢.\n` +
       `SKIP: $0.01-$0.05 (lottery tickets), $0.90+ (heavy favorites — usually correct), BTC ranges far from spot, YES+NO≈$1 (bid-ask spread).\n\n` +
-      `Return JSON array (max 3): [{"ticker":"exact","reason":"why the price seems wrong"}] or []`;
+      `Return JSON array (max 5): [{"ticker":"exact","reason":"why the price seems wrong"}] or []`;
 
     const screenText = await claudeScreen(screenPrompt);
     if (!screenText) return;
@@ -2020,8 +2020,8 @@ async function claudeBroadScan() {
     console.log(`[broad-scan] Haiku found ${candidates.length} candidates: ${candidates.map(c => c.ticker).join(', ')}`);
     logScreen({ stage: 'haiku', result: 'found', candidates, marketCount: deduped.length });
 
-    // === STAGE 2: Sonnet + web search on each candidate ($0.08/call, max 3) ===
-    for (const candidate of candidates.slice(0, 3)) {
+    // === STAGE 2: Sonnet + web search on each candidate ($0.08/call, max 5) ===
+    for (const candidate of candidates.slice(0, 5)) {
       const market = deduped.find(m => m.ticker === candidate.ticker);
       if (!market) continue;
 
