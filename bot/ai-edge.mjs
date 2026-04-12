@@ -36,13 +36,12 @@ const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 
 const MIN_EDGE = 0.07;           // 7% edge minimum — consistent across ALL strategies
 const MIN_EDGE_PCT = 7;          // same × 100 for display
-const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — must generate enough to cover API costs + grow
-const MAX_TRADE_CAP = 50;        // Absolute ceiling — dynamic cap handles the real limit
+const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — base fraction
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 30 * 60 * 1000; // 30 min cooldown per market (was 15 — too short)
 const MAX_DAYS_OUT = 1;            // Same-day only — capital turns over nightly
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
-const MAX_POSITIONS = 5;           // Max concurrent open positions
+// MAX_POSITIONS and deployment limits are DYNAMIC — see getMaxPositions() and getMaxDeployment()
 const DAILY_LOSS_PCT = 0.05;       // Stop trading if down 5% in a day (scales with bankroll)
 const CAPITAL_RESERVE = 0.10;      // Always keep 10% of bankroll untouched
 const MAX_CONSECUTIVE_LOSSES = 3;  // After 3 losses → reduce size + wait
@@ -306,6 +305,37 @@ function getBankroll() {
   return kalshiBalance + kalshiPositionValue + polyBalance;
 }
 
+// Inverse curve: aggressive when small (need growth), conservative when big (protect gains)
+// $200 → 85% deployed, $1K → 75%, $5K → 50%, $20K → 30%, $50K+ → 20%
+function getMaxDeployment() {
+  const b = getBankroll();
+  if (b < 500) return 0.85;
+  if (b < 2000) return 0.75;
+  if (b < 5000) return 0.60;
+  if (b < 20000) return 0.40;
+  if (b < 50000) return 0.30;
+  return 0.20;
+}
+
+function getMaxPositions() {
+  const b = getBankroll();
+  if (b < 500) return 8;
+  if (b < 2000) return 12;
+  if (b < 10000) return 15;
+  if (b < 50000) return 20;
+  return 25;
+}
+
+// Per-trade cap also scales: small accounts need room, big accounts need limits
+function getTradeCapCeiling() {
+  const b = getBankroll();
+  if (b < 500) return 50;        // $200 → max $20 per trade (10% wins)
+  if (b < 2000) return 150;      // $1K → max $100
+  if (b < 10000) return 500;     // $5K → max $500
+  if (b < 50000) return 2000;    // $20K → max $2000
+  return 5000;                    // $50K+ → max $5000
+}
+
 function getAvailableCash(exchange = 'kalshi') {
   const bal = exchange === 'polymarket' ? polyBalance : kalshiBalance;
   const reserve = getBankroll() * CAPITAL_RESERVE;
@@ -314,11 +344,24 @@ function getAvailableCash(exchange = 'kalshi') {
 
 function getDynamicMaxTrade(exchange = 'kalshi') {
   const bankroll = getBankroll();
-  // Scale position size with bankroll: 3% of total, capped
-  // At $200: max $6. At $1000: max $30. At $5000: max $50 (hard cap)
-  const dynamicCap = Math.min(50, bankroll * MAX_TRADE_FRACTION);
+  const pctCap = bankroll * MAX_TRADE_FRACTION; // 10% of bankroll
+  const ceiling = getTradeCapCeiling();
   const available = getAvailableCash(exchange);
-  return Math.min(dynamicCap, available * 0.25, MAX_TRADE_CAP);
+  return Math.min(pctCap, ceiling, available);
+}
+
+function getTotalDeployed() {
+  return openPositions.reduce((sum, p) => sum + (p.cost ?? 0), 0);
+}
+
+function canDeployMore(tradeAmount) {
+  const maxDeploy = getBankroll() * getMaxDeployment();
+  const currentlyDeployed = getTotalDeployed();
+  if (currentlyDeployed + tradeAmount > maxDeploy) {
+    console.log(`[risk] Deployment cap: $${currentlyDeployed.toFixed(2)} + $${tradeAmount.toFixed(2)} > $${maxDeploy.toFixed(2)} (${(getMaxDeployment()*100).toFixed(0)}% of $${getBankroll().toFixed(2)})`);
+    return false;
+  }
+  return true;
 }
 
 function canTrade() {
@@ -339,9 +382,10 @@ function canTrade() {
     return false;
   }
 
-  // Check max positions
-  if (openPositions.length >= MAX_POSITIONS) {
-    console.log(`[risk] Max positions reached: ${openPositions.length}/${MAX_POSITIONS}`);
+  // Check max positions (dynamic)
+  const maxPos = getMaxPositions();
+  if (openPositions.length >= maxPos) {
+    console.log(`[risk] Max positions reached: ${openPositions.length}/${maxPos}`);
     return false;
   }
 
@@ -709,6 +753,7 @@ async function executeTrade(market, assessment) {
   const priceInCents = Math.round(price * 100);
 
   console.log(`[ai-trade] ${market.ticker} BUY ${side.toUpperCase()} @${priceInCents}¢ × ${qty} edge=${edgePct.toFixed(1)}%`);
+  if (!canDeployMore(deployed)) return;
 
   const result = await kalshiPost('/portfolio/orders', {
     ticker: market.ticker,
@@ -922,6 +967,7 @@ async function checkLiveScoreEdges() {
         console.log(`[live-edge] TRADE: ${ticker} ${leadingAbbr} YES @${priceInCents}¢ × ${qty} edge=${(edge*100).toFixed(1)}%`);
         console.log(`  Score: ${awayAbbr} ${awayScore} @ ${homeAbbr} ${homeScore} (${gameDetail})`);
         console.log(`  Reason: ${decision.reasoning}`);
+        if (!canDeployMore(qty * price)) continue;
 
         tradeCooldowns.set(ticker, Date.now());
         tradeCooldowns.set(gameBase, Date.now());
@@ -1306,9 +1352,9 @@ async function claudeBroadScan() {
 
     console.log(`[broad-scan] TRADE: ${market.title} ${decision.side} @${priceInCents}¢ × ${qty} edge=${(edge*100).toFixed(1)}%`);
     console.log(`  Reason: ${decision.reasoning}`);
+    if (!canDeployMore(safeBet)) return;
 
     tradeCooldowns.set(decision.ticker, Date.now());
-    // Also cooldown the base ticker to prevent opposite-side trades
     tradeCooldowns.set(base, Date.now());
 
     const result = await kalshiPost('/portfolio/orders', {
@@ -1707,8 +1753,9 @@ async function checkResolutionArbs() {
       // Cooldown — don't re-buy same market
       if (Date.now() - (tradeCooldowns.get('res:' + m.ticker) ?? 0) < 60 * 60 * 1000) continue;
 
-      // Size: up to 25% of cash, max $50
-      const maxBet = Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25);
+      // Resolution arbs are RISK-FREE — size aggressively (up to 50% of cash)
+      const resolveCeiling = getTradeCapCeiling();
+      const maxBet = Math.min(resolveCeiling, kalshiBalance * 0.50);
       const qty = Math.max(1, Math.floor(maxBet / winPrice));
       const priceInCents = Math.round(winPrice * 100);
 
@@ -1876,10 +1923,10 @@ async function main() {
   await tg(
     `🧠 <b>AI Edge Bot Started</b>\n\n` +
     `<b>Risk Controls Active:</b>\n` +
-    `Max trade: $${maxTrade.toFixed(2)} (3% of $${bankroll.toFixed(2)} bankroll)\n` +
-    `Max positions: ${MAX_POSITIONS} | Daily loss limit: $${Math.max(10, bankroll * DAILY_LOSS_PCT).toFixed(2)} (5%)\n` +
-    `Capital reserve: ${(CAPITAL_RESERVE*100).toFixed(0)}% ($${(bankroll*CAPITAL_RESERVE).toFixed(2)} protected)\n` +
-    `Sport exposure cap: $${Math.max(15, bankroll * SPORT_EXPOSURE_PCT).toFixed(2)}/sport (8%)\n` +
+    `Max trade: $${maxTrade.toFixed(2)} (10% of bankroll, ceiling $${getTradeCapCeiling()})\n` +
+    `Max deploy: ${(getMaxDeployment()*100).toFixed(0)}% ($${(bankroll*getMaxDeployment()).toFixed(2)}) | Positions: ${getMaxPositions()}\n` +
+    `Daily loss halt: $${Math.max(10, bankroll * DAILY_LOSS_PCT).toFixed(2)} (5%)\n` +
+    `Reserve: ${(CAPITAL_RESERVE*100).toFixed(0)}% ($${(bankroll*CAPITAL_RESERVE).toFixed(2)}) | Sport cap: $${Math.max(15, bankroll * SPORT_EXPOSURE_PCT).toFixed(2)}\n` +
     `Consecutive loss halt: ${MAX_CONSECUTIVE_LOSSES}→reduce, 5→halt\n\n` +
     `<b>Config:</b>\n` +
     `Min edge: ${MIN_EDGE_PCT}% | Cooldown: ${COOLDOWN_MS/60000}min\n` +
