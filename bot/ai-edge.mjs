@@ -774,9 +774,12 @@ function getWinExpectancy(league, lead, period) {
     table = MLB_WIN_EXPECTANCY;
     leadKey = Math.min(lead, 5);
     periodKey = Math.min(Math.max(period, 1), 9);
-  } else if (league === 'mls') {
-    // MLS/Soccer: goal lead by half (1=first half, 2=second half)
-    table = { 1: { 1: 0.68, 2: 0.82 }, 2: { 1: 0.85, 2: 0.94 }, 3: { 1: 0.95, 2: 0.99 } };
+  } else if (league === 'mls' || league === 'epl' || league === 'laliga') {
+    // Soccer: goal lead by half (1=first half, 2=second half)
+    // Source: brendansudol.github.io, EPL/MLS data
+    // Home leading 1-0 at HT: ~70% win. Away 1-0: reaches 70% at 68th min
+    // 2-0 in 2nd half: >90% win. Draws: EPL 28%, MLS 24%
+    table = { 1: { 1: 0.65, 2: 0.78 }, 2: { 1: 0.82, 2: 0.92 }, 3: { 1: 0.94, 2: 0.98 } };
     leadKey = Math.min(lead, 3);
     periodKey = Math.min(Math.max(period, 1), 2);
   } else if (league === 'nba') {
@@ -1189,9 +1192,9 @@ async function checkLiveScoreEdges() {
           `+ Better team (record, talent) → UP 2-5%\n` +
           `+ Home field → already in baseline (+3% home advantage)\n` +
           `+ Strong pitching/goaltending → UP 2-3%\n` +
-          `+ ${league === 'mlb' ? 'Pitcher with ERA < 3.0 → UP 5-8%' : league === 'nba' ? 'Star player dominating (25+ pts) → UP 3-5%' : league === 'mls' ? 'Home team in MLS wins 57% — strong home advantage. Red card = UP 10-15%' : 'Goalie with SV% > .925 → UP 3-5%'}\n` +
+          `+ ${league === 'mlb' ? 'Pitcher with ERA < 3.0 → UP 5-8%' : league === 'nba' ? 'Star player dominating (25+ pts) → UP 3-5%' : (league === 'mls' || league === 'epl' || league === 'laliga') ? 'Home advantage: EPL 45% home wins, MLS 49%. Red card on opponent = UP 25-30% (win prob 47%→18% for red-carded home team). First goal is critical momentum shift.' : 'Goalie with SV% > .925 → UP 3-5%'}\n` +
           `- Trailing team is much better → DOWN 3-8%\n` +
-          `- ${league === 'mlb' ? 'Weak bullpen (ERA > 5.0) → DOWN 3-5%' : league === 'nba' ? 'MODERN NBA: 15-pt comebacks happen 13% now (3pt era) — be less aggressive on big NBA leads' : league === 'mls' ? 'Soccer comebacks are rare — 1-goal leads hold 68-82% of the time. Parking the bus in 2nd half = strong hold.' : 'Empty net situation → DOWN 5-10%'}\n` +
+          `- ${league === 'mlb' ? 'Weak bullpen (ERA > 5.0) → DOWN 3-5%' : league === 'nba' ? 'MODERN NBA: 15-pt comebacks happen 13% now (3pt era) — be less aggressive on big NBA leads' : (league === 'mls' || league === 'epl' || league === 'laliga') ? 'DRAWS happen 24-30% of games (EPL 28%). 1-goal leads hold ~65-78%. Minutes 55-70 = best comeback window. Red card on YOUR team = DOWN 25-30%.' : 'Empty net situation → DOWN 5-10%'}\n` +
           `- ${league === 'nba' ? 'Star player in foul trouble → DOWN 5-10% for their team' : 'Trailing team has momentum (just scored multiple) → DOWN 2-4%'}\n` +
           `- IMPORTANT: Time remaining matters MORE than period/quarter number. 10pts up with 8min left ≠ 10pts up with 30sec left.\n\n` +
           `Use web search if you need injury/streak info. Then give your FINAL adjusted probability.\n\n` +
@@ -1446,6 +1449,8 @@ async function checkPreGamePredictions() {
       `- MLB home team wins 54% | Top pitcher (ERA<3.0) adds +10-15% | FIP is better predictor than ERA\n` +
       `- NBA home team wins 63% | Star player out = -10% | Back-to-back team = -3-5%\n` +
       `- NHL home team wins 59% | Scoring first = 70% win rate | Goalie SV% is key factor\n` +
+      `- EPL home 45%, draw 28%, away 27% | MLS home 49%, draw 24% | REMEMBER: draw = your contract LOSES\n` +
+      `- Soccer: Red card = massive swing (47%→18%). Recent form (last 5) matters. First goal is critical.\n` +
       `Start from the home/away baseline, then adjust.\n\n` +
       `RESEARCH: Look up both teams' records, starting pitchers (MLB), key injuries, recent form (last 5 games), head-to-head this season.\n\n` +
       `ADJUST the baseline based on:\n` +
