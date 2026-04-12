@@ -553,6 +553,8 @@ function resetDailyTracking() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const TRADES_LOG = './logs/trades.jsonl';
+const DAILY_LOG = './logs/daily-snapshots.jsonl';
+const SCREENS_LOG = './logs/screens.jsonl';
 if (!existsSync('./logs')) mkdirSync('./logs', { recursive: true });
 
 function logTrade(entry) {
@@ -571,6 +573,117 @@ function logTrade(entry) {
     console.error('[pnl] Failed to log trade:', e.message);
   }
   return record.id;
+}
+
+// Log screening decisions for analysis: what Haiku flagged, what Sonnet decided
+function logScreen(entry) {
+  try {
+    const record = {
+      timestamp: new Date().toISOString(),
+      ...entry,
+    };
+    appendFileSync(SCREENS_LOG, JSON.stringify(record) + '\n');
+  } catch { /* silent */ }
+}
+
+// Daily analytics snapshot — called at midnight ET
+function saveDailySnapshot() {
+  try {
+    // Read trade history for stats
+    let totalTrades = 0, settledTrades = 0, wins = 0, losses = 0;
+    let totalPnL = 0, todayPnL = 0, todayTrades = 0;
+    const strategyStats = {};
+    const cutoff24h = Date.now() - 24 * 60 * 60 * 1000;
+
+    if (existsSync(TRADES_LOG)) {
+      const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      for (const l of lines) {
+        try {
+          const t = JSON.parse(l);
+          totalTrades++;
+          if (t.status === 'settled') {
+            settledTrades++;
+            const pnl = t.realizedPnL ?? 0;
+            totalPnL += pnl;
+            if (pnl >= 0) wins++; else losses++;
+            if (t.settledAt && Date.parse(t.settledAt) > cutoff24h) todayPnL += pnl;
+          }
+          if (t.timestamp && Date.parse(t.timestamp) > cutoff24h) todayTrades++;
+          // Per-strategy
+          const strat = t.strategy ?? 'unknown';
+          if (!strategyStats[strat]) strategyStats[strat] = { trades: 0, settled: 0, wins: 0, losses: 0, pnl: 0 };
+          strategyStats[strat].trades++;
+          if (t.status === 'settled') {
+            strategyStats[strat].settled++;
+            if ((t.realizedPnL ?? 0) >= 0) strategyStats[strat].wins++;
+            else strategyStats[strat].losses++;
+            strategyStats[strat].pnl += (t.realizedPnL ?? 0);
+          }
+        } catch { /* skip */ }
+      }
+    }
+
+    const snapshot = {
+      date: new Date().toISOString().slice(0, 10),
+      timestamp: new Date().toISOString(),
+      bankroll: getBankroll(),
+      kalshiCash: kalshiBalance,
+      kalshiPositions: kalshiPositionValue,
+      polyBalance,
+      openPositionCount: openPositions.length,
+      totalDeployed: getTotalDeployed(),
+      totalTrades,
+      settledTrades,
+      wins,
+      losses,
+      winRate: settledTrades > 0 ? Math.round((wins / settledTrades) * 100) : null,
+      totalPnL: Math.round(totalPnL * 100) / 100,
+      todayPnL: Math.round(todayPnL * 100) / 100,
+      todayTrades,
+      consecutiveLosses,
+      strategyStats,
+    };
+
+    appendFileSync(DAILY_LOG, JSON.stringify(snapshot) + '\n');
+    console.log(`[analytics] Daily snapshot saved: bankroll=$${snapshot.bankroll.toFixed(2)} pnl=$${snapshot.totalPnL.toFixed(2)} winRate=${snapshot.winRate ?? 'n/a'}%`);
+    return snapshot;
+  } catch (e) {
+    console.error('[analytics] snapshot error:', e.message);
+    return null;
+  }
+}
+
+// Send daily P&L report to Telegram
+async function sendDailyReport() {
+  const snap = saveDailySnapshot();
+  if (!snap) return;
+
+  const stratLines = Object.entries(snap.strategyStats).map(([name, s]) => {
+    const wr = s.settled > 0 ? `${Math.round((s.wins / s.settled) * 100)}%` : 'n/a';
+    const pnlStr = s.pnl >= 0 ? `+$${s.pnl.toFixed(2)}` : `-$${Math.abs(s.pnl).toFixed(2)}`;
+    return `  ${name}: ${s.trades} trades, ${wr} win rate, ${pnlStr}`;
+  }).join('\n');
+
+  const pnlIcon = snap.totalPnL >= 0 ? '📈' : '📉';
+  const todayIcon = snap.todayPnL >= 0 ? '+' : '';
+
+  await tg(
+    `${pnlIcon} <b>DAILY REPORT — ${snap.date}</b>\n\n` +
+    `<b>Portfolio:</b>\n` +
+    `Kalshi: $${snap.kalshiCash.toFixed(2)} cash + $${snap.kalshiPositions.toFixed(2)} positions\n` +
+    `Polymarket: $${snap.polyBalance.toFixed(2)}\n` +
+    `Total: <b>$${snap.bankroll.toFixed(2)}</b>\n\n` +
+    `<b>Trading:</b>\n` +
+    `Today: ${snap.todayTrades} trades, ${todayIcon}$${snap.todayPnL.toFixed(2)}\n` +
+    `All time: ${snap.totalTrades} trades, ${snap.settledTrades} settled\n` +
+    `Won: ${snap.wins} | Lost: ${snap.losses} | Win rate: ${snap.winRate ?? 'n/a'}%\n` +
+    `Total P&L: <b>${snap.totalPnL >= 0 ? '+' : ''}$${snap.totalPnL.toFixed(2)}</b>\n\n` +
+    `<b>By Strategy:</b>\n` +
+    (stratLines || '  No trades yet') + '\n\n' +
+    `Open: ${snap.openPositionCount} positions, $${snap.totalDeployed.toFixed(2)} deployed\n` +
+    `Consecutive losses: ${snap.consecutiveLosses}\n` +
+    `🕐 ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })} ET`
+  );
 }
 
 async function refreshPortfolio() {
@@ -1382,9 +1495,11 @@ async function claudeBroadScan() {
 
     if (!Array.isArray(candidates) || candidates.length === 0) {
       console.log('[broad-scan] Haiku screen: no candidates');
+      logScreen({ stage: 'haiku', result: 'none', marketCount: deduped.length });
       return;
     }
     console.log(`[broad-scan] Haiku found ${candidates.length} candidates: ${candidates.map(c => c.ticker).join(', ')}`);
+    logScreen({ stage: 'haiku', result: 'found', candidates, marketCount: deduped.length });
 
     // === STAGE 2: Sonnet + web search on each candidate ($0.08/call, max 3) ===
     for (const candidate of candidates.slice(0, 3)) {
@@ -1412,6 +1527,7 @@ async function claudeBroadScan() {
 
       if (!decision.trade) {
         console.log(`[broad-scan] Sonnet rejected ${candidate.ticker}: ${decision.reasoning?.slice(0, 100)}`);
+        logScreen({ stage: 'sonnet', ticker: candidate.ticker, result: 'rejected', reasoning: decision.reasoning });
         continue;
       }
 
@@ -2024,6 +2140,21 @@ async function main() {
     setTimeout(settlementLoop, 5 * 60 * 1000);
   }
   setTimeout(settlementLoop, 2 * 60 * 1000); // first run after 2 min
+
+  // Daily report — checks every hour, sends at midnight ET
+  let lastDailyReport = '';
+  async function dailyReportLoop() {
+    const etDate = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const today = etDate.toISOString().slice(0, 10);
+    const etHour = etDate.getHours();
+    // Send at midnight ET (hour 0) and also at 8pm ET (end of trading day recap)
+    if ((etHour === 0 || etHour === 20) && lastDailyReport !== `${today}-${etHour}`) {
+      lastDailyReport = `${today}-${etHour}`;
+      try { await sendDailyReport(); } catch (e) { console.error('[daily-report] error:', e.message); }
+    }
+    setTimeout(dailyReportLoop, 30 * 60 * 1000); // check every 30 min
+  }
+  setTimeout(dailyReportLoop, 5 * 60 * 1000); // first check after 5 min
 
   // Initialize risk tracking
   resetDailyTracking();
