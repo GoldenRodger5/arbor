@@ -623,47 +623,92 @@ async function checkLiveScoreEdges() {
         else if (league === 'nhl' && period >= 3 && diff >= 2) highCertainty = true;
         if (!highCertainty) continue;
 
-        console.log(`[live-edge] Checking: ${away.team?.displayName} ${awayScore} @ ${home.team?.displayName} ${homeScore} (${gameDetail})`);
+        const homeAbbr = home.team?.abbreviation ?? '';
+        const awayAbbr = away.team?.abbreviation ?? '';
+        console.log(`[live-edge] Checking: ${away.team?.displayName} (${awayAbbr}) ${awayScore} @ ${home.team?.displayName} (${homeAbbr}) ${homeScore} (${gameDetail})`);
 
-        // Get today's Kalshi markets for this sport
+        // Get today/tonight Kalshi markets — pre-filter to THIS game's teams + today's date
+        const etNowLE = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+        const etTmrwLE = new Date(etNowLE.getTime() + 24 * 60 * 60 * 1000);
+        const toShortLE = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
+        const todayStr = toShortLE(etNowLE);
+        const tonightStr = toShortLE(etTmrwLE);
+
         const params = new URLSearchParams({ series_ticker: series, status: 'open', limit: '100' });
         const mkts = await kalshiGet(`/markets?${params}`);
-        const marketList = (mkts.markets ?? [])
-          .filter(m => {
-            if (!m.yes_ask_dollars || !m.no_ask_dollars) return false;
-            // Only include markets that could be today's game
-            const ya = parseFloat(m.yes_ask_dollars);
-            const na = parseFloat(m.no_ask_dollars);
-            return ya > 0.01 && ya < 0.99 && na > 0.01 && na < 0.99;
-          })
-          .slice(0, 20) // limit to avoid huge prompt
-          .map(m => `${m.ticker}: "${m.title}" YES=$${m.yes_ask_dollars} NO=$${m.no_ask_dollars}`);
 
-        if (marketList.length === 0) continue;
+        // Filter to ONLY markets for THIS game: must contain team abbreviation AND today's date
+        const gameMarkets = (mkts.markets ?? []).filter(m => {
+          if (!m.yes_ask_dollars || !m.no_ask_dollars) return false;
+          const ya = parseFloat(m.yes_ask_dollars);
+          const na = parseFloat(m.no_ask_dollars);
+          if (ya < 0.01 || ya > 0.99 || na < 0.01 || na > 0.99) return false;
+          const ticker = m.ticker ?? '';
+          // Must be today or tonight
+          if (!ticker.includes(todayStr) && !ticker.includes(tonightStr)) return false;
+          // Must match one of the playing teams
+          const upperTicker = ticker.toUpperCase();
+          return upperTicker.includes(homeAbbr) || upperTicker.includes(awayAbbr);
+        });
 
-        // Use Claude with web search to research teams and assess
+        if (gameMarkets.length === 0) {
+          console.log(`[live-edge] No Kalshi market found for ${awayAbbr}@${homeAbbr} on ${todayStr}/${tonightStr}`);
+          continue;
+        }
+
+        // Pick the market for the leading team (buy YES on the winner)
+        const leadingAbbr = leading.team?.abbreviation ?? '';
+        const trailingAbbr = (leadingAbbr === homeAbbr) ? awayAbbr : homeAbbr;
+
+        // Find the market ticker for the leading team
+        let targetMarket = gameMarkets.find(m => m.ticker?.toUpperCase().endsWith('-' + leadingAbbr));
+        if (!targetMarket) targetMarket = gameMarkets[0]; // fallback
+
+        const price = parseFloat(targetMarket.yes_ask_dollars);
+        const title = targetMarket.title ?? '';
+
+        console.log(`[live-edge] Found market: ${targetMarket.ticker} "${title}" YES=$${price.toFixed(2)}`);
+
+        // Use Claude to assess win probability based on live score + research
         const portfolioInfo = getPortfolioSummary();
         const livePrompt =
-          `You are a sports prediction market trader managing a real portfolio.\n\n` +
-          `MY PORTFOLIO:\n${portfolioInfo}\n\n` +
-          `LIVE ${league.toUpperCase()} GAME RIGHT NOW (today ${new Date().toISOString().slice(0,10)}):\n` +
+          `You are a sports prediction market analyst. Be skeptical — only trade with high confidence.\n\n` +
+          `LIVE ${league.toUpperCase()} GAME RIGHT NOW:\n` +
           `${away.team?.displayName} ${awayScore} at ${home.team?.displayName} ${homeScore}\n` +
-          `Game status: ${gameDetail}\n\n` +
-          `KALSHI MARKETS (some may be for DIFFERENT DATES):\n` +
-          marketList.join('\n') + '\n\n' +
-          `RESEARCH FIRST: Use web search to look up both teams' current records, standings, and any key context. Your win probability MUST be based on real data.\n\n` +
-          `RULES:\n` +
-          `- Ticker dates use format like 26APR11 = April 11, 26APR12 = April 12.\n` +
-          `- Today is ${new Date().toISOString().slice(0,10)}. ONLY pick a ticker with TODAY's date.\n` +
-          `- If I already have a position on this game, DON'T add more.\n` +
-          `- Never bet more than 25% of my cash balance on one trade.\n` +
-          `- If cash balance is below $5, return {"ticker": null}.\n` +
-          `- Only trade if you're very confident (>80% win probability).\n` +
-          `- Do NOT bet on heavy underdogs (price below 25¢) unless you found specific breaking news.\n\n` +
-          `Respond in JSON ONLY:\n` +
-          `{"ticker": "exact ticker for TODAY or null", "side": "yes"/"no", ` +
-          `"winProbability": 0.XX, "betAmount": dollars to bet (max 25% of cash), ` +
-          `"reasoning": "one sentence citing facts from your research"}`;
+          `Game status: ${gameDetail}\n` +
+          `Leading team: ${leading.team?.displayName} by ${diff}\n\n` +
+          `MARKET: ${title}\n` +
+          `Ticker: ${targetMarket.ticker}\n` +
+          `${leadingAbbr} YES price: $${price.toFixed(2)} (implied ${(price*100).toFixed(0)}%)\n\n` +
+          `CASH: $${kalshiBalance.toFixed(2)} | Max bet: $${Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25).toFixed(2)}\n\n` +
+          `RESEARCH: Use web search to check both teams' records and any relevant context.\n\n` +
+          `QUESTION: Given the live score and game situation, what is the TRUE probability ${leading.team?.displayName} wins?\n` +
+          `- If your probability is > market price by 7%+, recommend the trade\n` +
+          `- If the market has already priced in the lead correctly, pass\n\n` +
+          `Respond JSON ONLY:\n` +
+          `{"trade": false, "reasoning": "why"}\n` +
+          `OR {"trade": true, "side": "yes", "winProbability": 0.XX, "betAmount": N, "reasoning": "facts"}`;
+        // Block if we already have a position on this game
+        const ticker = targetMarket.ticker;
+        const lastH = ticker.lastIndexOf('-');
+        const gameBase = lastH > 0 ? ticker.slice(0, lastH) : ticker;
+        const hasPosition = openPositions.some(p => {
+          const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
+          return pBase === gameBase;
+        });
+        if (hasPosition) { console.log(`[live-edge] BLOCKED: already have position on ${gameBase}`); continue; }
+
+        // Cooldown check
+        if (Date.now() - (tradeCooldowns.get(ticker) ?? 0) < COOLDOWN_MS) continue;
+        if (Date.now() - (tradeCooldowns.get(gameBase) ?? 0) < COOLDOWN_MS) continue;
+
+        // Price sanity
+        if (price <= 0.05 || price >= 0.98) {
+          console.log(`[live-edge] Market already priced in: ${leadingAbbr} YES @${(price*100).toFixed(0)}¢`);
+          continue;
+        }
+
+        // Ask Claude for win probability assessment
         const cText = await claudeWithSearch(livePrompt);
         if (!cText) continue;
         const jsonMatch = cText.match(/\{[\s\S]*\}/);
@@ -671,74 +716,54 @@ async function checkLiveScoreEdges() {
 
         let decision;
         try { decision = JSON.parse(jsonMatch[0]); } catch { continue; }
-        if (!decision.ticker || decision.ticker === 'null') {
-          console.log(`[live-edge] Claude: no matching ticker for today's game`);
+
+        if (!decision.trade) {
+          console.log(`[live-edge] Claude passed: ${decision.reasoning?.slice(0, 100)}`);
           continue;
         }
 
-        // Validate the ticker exists in our market list
-        const market = (mkts.markets ?? []).find(m => m.ticker === decision.ticker);
-        if (!market) { console.log(`[live-edge] Claude picked invalid ticker: ${decision.ticker}`); continue; }
-
-        // Block if we already have a position on this game
-        const lastH = decision.ticker.lastIndexOf('-');
-        const gameBase = lastH > 0 ? decision.ticker.slice(0, lastH) : decision.ticker;
-        const hasPosition = openPositions.some(p => {
-          const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
-          return pBase === gameBase;
-        });
-        if (hasPosition) { console.log(`[live-edge] BLOCKED: already have position on ${gameBase}`); continue; }
-
-        // Check cooldown (also blocks base ticker to prevent opposite-side trades)
-        if (Date.now() - (tradeCooldowns.get(decision.ticker) ?? 0) < COOLDOWN_MS) continue;
-        if (Date.now() - (tradeCooldowns.get(gameBase) ?? 0) < COOLDOWN_MS) continue;
-
-        const winProb = decision.winProbability ?? 0.90;
-        const side = decision.side;
-        const price = side === 'yes'
-          ? parseFloat(market.yes_ask_dollars)
-          : parseFloat(market.no_ask_dollars);
-
+        const winProb = decision.winProbability ?? 0;
         const edge = winProb - price;
         if (edge < MIN_EDGE) {
-          console.log(`[live-edge] Edge too small: ${(edge*100).toFixed(1)}% (${side} @${(price*100).toFixed(0)}¢ vs ${(winProb*100).toFixed(0)}%)`);
+          console.log(`[live-edge] Edge too small: ${(edge*100).toFixed(1)}% (${leadingAbbr} YES @${(price*100).toFixed(0)}¢ vs ${(winProb*100).toFixed(0)}%)`);
           continue;
         }
 
-        // Use Claude's recommended bet amount, capped by actual balance
+        // Size the bet
         const claudeBet = decision.betAmount ?? 0;
         const safeBet = Math.min(claudeBet, kalshiBalance * 0.25, MAX_TRADE_CAP);
         if (safeBet < 1) {
-          console.log(`[live-edge] Not enough cash ($${kalshiBalance.toFixed(2)}) or Claude said $0`);
+          console.log(`[live-edge] Bet too small: Claude=$${claudeBet} cash=$${kalshiBalance.toFixed(2)}`);
           continue;
         }
         const qty = Math.max(1, Math.floor(safeBet / price));
         const priceInCents = Math.round(price * 100);
 
-        console.log(`[live-edge] Claude matched: ${decision.ticker} ${side} @${priceInCents}¢ edge=${(edge*100).toFixed(1)}%`);
+        console.log(`[live-edge] TRADE: ${ticker} ${leadingAbbr} YES @${priceInCents}¢ × ${qty} edge=${(edge*100).toFixed(1)}%`);
+        console.log(`  Score: ${awayAbbr} ${awayScore} @ ${homeAbbr} ${homeScore} (${gameDetail})`);
         console.log(`  Reason: ${decision.reasoning}`);
 
-        tradeCooldowns.set(decision.ticker, Date.now());
-        tradeCooldowns.set(gameBase, Date.now()); // block opposite-side trades
+        tradeCooldowns.set(ticker, Date.now());
+        tradeCooldowns.set(gameBase, Date.now());
         const result = await kalshiPost('/portfolio/orders', {
-          ticker: decision.ticker, action: 'buy', side, count: qty,
-          yes_price: side === 'yes' ? priceInCents : 100 - priceInCents,
-          });
+          ticker, action: 'buy', side: 'yes', count: qty,
+          yes_price: priceInCents,
+        });
 
         if (result.ok) {
           stats.tradesPlaced++;
           const deployed = qty * price;
-          const profit = qty * edge;
           await tg(
             `⚡ <b>LIVE SCORE EDGE — KALSHI</b>\n\n` +
-            `<b>${market.title}</b>\n` +
-            `Ticker: <code>${decision.ticker}</code>\n` +
-            `Score: ${awayScore}-${homeScore} (${gameDetail})\n\n` +
-            `BUY ${side.toUpperCase()} @ $${price.toFixed(2)} × ${qty}\n` +
+            `<b>${title}</b>\n` +
+            `Ticker: <code>${ticker}</code>\n` +
+            `Team: <b>${leadingAbbr}</b>\n` +
+            `Score: ${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore} (${gameDetail})\n\n` +
+            `BUY YES @ $${price.toFixed(2)} × ${qty}\n` +
             `Deployed: <b>$${deployed.toFixed(2)}</b>\n` +
             `Claude prob: ${(winProb*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}%\n` +
             `Edge: <b>${(edge*100).toFixed(1)}%</b>\n\n` +
-            `🧠 <i>${decision.reasoning}</i>`
+            `🔍 <i>${decision.reasoning}</i>`
           );
         } else {
           console.error(`[live-edge] Order failed:`, result.status, JSON.stringify(result.data));
