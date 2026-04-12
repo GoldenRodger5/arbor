@@ -34,7 +34,7 @@ const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 
 const MIN_CONFIDENCE = 0.65;      // Claude must be ≥65% confident to trade
-const CONFIDENCE_MARGIN = 0.05;   // Confidence must exceed price by 5%+
+const CONFIDENCE_MARGIN = 0.03;   // Confidence must exceed price by 3% — prediction mode, not mispricing
 const MAX_PRICE = 0.90;           // Don't buy contracts above 90¢ — allows high-confidence late-game bets
 const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — base fraction
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
@@ -701,7 +701,70 @@ async function refreshPortfolio() {
   console.log(`[portfolio] Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions | Poly: $${polyBalance.toFixed(2)} | Open: ${kalshiCount} Kalshi + ${polyCount} Poly`);
 }
 
-// [getPortfolioSummary removed — was only used by dead news-edge pipeline]
+// ─────────────────────────────────────────────────────────────────────────────
+// Win Expectancy Baselines — historical data for anchoring Claude's predictions
+// ─────────────────────────────────────────────────────────────────────────────
+
+// MLB: probability of leading team winning, by run lead and inning
+// Source: 150 years of MLB data, retrosheet.org
+const MLB_WIN_EXPECTANCY = {
+  // [runLead][inning] → win probability
+  1: { 1: 0.56, 2: 0.58, 3: 0.60, 4: 0.64, 5: 0.67, 6: 0.71, 7: 0.77, 8: 0.84, 9: 0.91 },
+  2: { 1: 0.64, 2: 0.67, 3: 0.70, 4: 0.76, 5: 0.79, 6: 0.83, 7: 0.88, 8: 0.93, 9: 0.96 },
+  3: { 1: 0.72, 2: 0.75, 3: 0.78, 4: 0.85, 5: 0.87, 6: 0.90, 7: 0.93, 8: 0.96, 9: 0.98 },
+  4: { 1: 0.79, 2: 0.82, 3: 0.85, 4: 0.90, 5: 0.92, 6: 0.94, 7: 0.96, 8: 0.98, 9: 0.99 },
+  5: { 1: 0.85, 2: 0.87, 3: 0.90, 4: 0.93, 5: 0.95, 6: 0.97, 7: 0.98, 8: 0.99, 9: 0.99 },
+};
+
+// NBA: probability of leading team winning, by point lead and quarter
+const NBA_WIN_EXPECTANCY = {
+  5:  { 1: 0.58, 2: 0.62, 3: 0.68, 4: 0.78 },
+  10: { 1: 0.65, 2: 0.72, 3: 0.80, 4: 0.89 },
+  15: { 1: 0.74, 2: 0.82, 3: 0.88, 4: 0.95 },
+  20: { 1: 0.82, 2: 0.88, 3: 0.93, 4: 0.98 },
+  25: { 1: 0.88, 2: 0.93, 3: 0.96, 4: 0.99 },
+};
+
+// NHL: probability of leading team winning, by goal lead and period
+const NHL_WIN_EXPECTANCY = {
+  1: { 1: 0.62, 2: 0.68, 3: 0.79 },
+  2: { 1: 0.80, 2: 0.86, 3: 0.93 },
+  3: { 1: 0.92, 2: 0.95, 3: 0.99 },
+};
+
+function getWinExpectancy(league, lead, period) {
+  let table, leadKey, periodKey;
+
+  if (league === 'mlb') {
+    table = MLB_WIN_EXPECTANCY;
+    leadKey = Math.min(lead, 5);
+    periodKey = Math.min(Math.max(period, 1), 9);
+  } else if (league === 'nba') {
+    table = NBA_WIN_EXPECTANCY;
+    // Round to nearest bracket
+    leadKey = lead >= 25 ? 25 : lead >= 20 ? 20 : lead >= 15 ? 15 : lead >= 10 ? 10 : 5;
+    periodKey = Math.min(Math.max(period, 1), 4);
+  } else if (league === 'nhl') {
+    table = NHL_WIN_EXPECTANCY;
+    leadKey = Math.min(lead, 3);
+    periodKey = Math.min(Math.max(period, 1), 3);
+  } else {
+    return null;
+  }
+
+  if (!table[leadKey] || !table[leadKey][periodKey]) return null;
+  return table[leadKey][periodKey];
+}
+
+function getWinExpectancyText(league, lead, period, isHome) {
+  const base = getWinExpectancy(league, lead, period);
+  if (!base) return '';
+  const homeAdj = isHome ? 0.03 : -0.01;
+  const adjusted = Math.min(0.99, base + homeAdj);
+  const sport = league === 'mlb' ? 'MLB' : league === 'nba' ? 'NBA' : 'NHL';
+  const periodName = league === 'mlb' ? `inning ${period}` : league === 'nba' ? `Q${period}` : `period ${period}`;
+  return `HISTORICAL BASELINE: Teams leading by ${lead} ${league === 'nba' ? 'points' : league === 'mlb' ? 'runs' : 'goals'} in ${periodName} ${isHome ? '(home)' : '(away)'} win ${(adjusted * 100).toFixed(0)}% of the time historically. Start from this baseline and adjust up/down.`;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Live Predictions + Market Scanning
@@ -1004,8 +1067,12 @@ async function checkLiveScoreEdges() {
         const homeLineScore = (home.linescores ?? []).map(l => l.displayValue).join(' ');
         const awayLineScore = (away.linescores ?? []).map(l => l.displayValue).join(' ');
 
+        // Get win expectancy baseline for this exact game situation
+        const targetIsHome = targetAbbr === homeAbbr;
+        const baselineText = getWinExpectancyText(league, diff, period, leadingAbbr === homeAbbr);
+
         const livePrompt =
-          `You are a professional sports bettor. Predict who wins this game based on ALL the data below.\n\n` +
+          `You are a professional sports bettor. Your job: predict this game's outcome using the historical baseline below.\n\n` +
           `═══ LIVE ${league.toUpperCase()} GAME ═══\n` +
           `${away.team?.displayName} (${awayRecord}${awayRoadRec ? ', ' + awayRoadRec + ' away' : ''}) ${awayScore}\n` +
           `  at\n` +
@@ -1015,19 +1082,25 @@ async function checkLiveScoreEdges() {
           (situationInfo ? `Situation: ${situationInfo}\n` : '') +
           (pitcherInfo ? `\n${pitcherInfo}` : '') +
           (homeAvg || awayAvg ? `Team batting: ${homeAbbr} ${homeAvg} | ${awayAbbr} ${awayAvg}\n` : '') +
-          `\n═══ MARKET ═══\n` +
-          `${targetAbbr} YES @ ${(price*100).toFixed(0)}¢ → pay ${(price*100).toFixed(0)}¢, win $1.00 if ${targetTeam.team?.displayName} wins\n` +
-          `${targetAbbr === leadingAbbr ? '(LEADING team' : '(TRAILING team — underdog value?'}${targetAbbr === homeAbbr ? ', HOME)' : ', AWAY)'}\n\n` +
+          `\n═══ ${baselineText} ═══\n\n` +
+          `═══ MARKET ═══\n` +
+          `${targetAbbr} YES @ ${(price*100).toFixed(0)}¢ (market thinks ${(price*100).toFixed(0)}% chance)\n` +
+          `${targetAbbr === leadingAbbr ? '(LEADING team' : '(TRAILING team — underdog'}${targetIsHome ? ', HOME)' : ', AWAY)'}\n\n` +
           `═══ YOUR JOB ═══\n` +
-          `Use web search ONLY if you need additional context (recent injuries, streaks).\n\n` +
-          `Based on: score, game stage, team records, home/away, pitching — how confident are you ${targetTeam.team?.displayName} wins?\n` +
-          `${targetAbbr !== leadingAbbr ? 'NOTE: This team is BEHIND. Only bet if you believe they come back (early game, better team, weak opposing bullpen).\n' : ''}\n` +
-          `BUY RULE: confidence ≥ 65% AND at least 5 points above price.\n` +
-          `Example: 72% confident + 60¢ price = BUY. 68% confident + 65¢ = PASS.\n\n` +
-          `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
+          `Start from the historical baseline above. Then ADJUST up or down based on:\n` +
+          `+ Better team (record, talent) → adjust UP 2-5%\n` +
+          `+ Home field → already included in baseline\n` +
+          `+ Strong pitching/goaltending holding lead → adjust UP 2-3%\n` +
+          `- Trailing team is much better → adjust DOWN 3-8%\n` +
+          `- Leading team has weak bullpen/bench → adjust DOWN 2-5%\n` +
+          `- Trailing team has momentum (just scored) → adjust DOWN 1-3%\n\n` +
+          `Use web search if you need injury/streak info. Then give your FINAL adjusted probability.\n\n` +
+          `BUY if: your probability ≥ 65% AND at least 3 points above price.\n` +
+          `${targetAbbr !== leadingAbbr ? 'NOTE: This is an UNDERDOG bet. The baseline says they LOSE. Only bet if specific factors override the baseline.\n' : ''}` +
+          `Max bet: $${getDynamicMaxTrade().toFixed(2)} (bet MORE if confidence is much higher than price)\n\n` +
           `JSON ONLY:\n` +
-          `{"trade": false, "confidence": 0.XX, "reasoning": "who wins and why not buying"}\n` +
-          `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "why ${leadingAbbr} wins"}`;
+          `{"trade": false, "confidence": 0.XX, "reasoning": "baseline X%, adjusted to Y% because [reasons]. Price is Z¢ so [pass/buy]."}\n` +
+          `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "baseline X%, adjusted to Y% because [reasons]. Price Z¢ = good buy."}`;
         // Block if we already have a position on this game (check BOTH platforms)
         const ticker = targetMarket.ticker;
         const lastH = ticker.lastIndexOf('-');
@@ -1263,23 +1336,27 @@ async function checkPreGamePredictions() {
     const price = pick.side === 'yes' ? market.yesAsk : market.noAsk;
     if (price > MAX_PRICE || price < 0.05) continue;
 
+    const pregamePrice = pick.side === 'yes' ? market.yesAsk : market.noAsk;
     const decideText = await claudeWithSearch(
-      `You are a professional sports bettor. Make a prediction on this game.\n\n` +
+      `You are a professional sports bettor. Predict who wins this pre-game matchup.\n\n` +
       `GAME: ${market.title}\n` +
-      `Ticker: ${market.ticker}\n` +
       `YES price: ${(market.yesAsk*100).toFixed(0)}¢ | NO price: ${(market.noAsk*100).toFixed(0)}¢\n` +
       `Haiku's pick: ${pick.side.toUpperCase()} — "${pick.reason}"\n\n` +
-      `RESEARCH: Look up both teams' records, starting pitchers (MLB), injury reports, recent form.\n\n` +
-      `PREDICT: How confident are you in ${pick.side.toUpperCase()}? Consider:\n` +
-      `- Team records and quality\n` +
-      `- Home/away advantage\n` +
-      `- Starting pitchers / key players\n` +
-      `- Recent form (last 5 games)\n\n` +
-      `BUY if confidence ≥ 65% AND at least 5 points above price.\n` +
-      `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
+      `PRE-GAME BASELINE: Home teams win ~54% in MLB, ~58% in NBA, ~55% in NHL. Adjust from there.\n\n` +
+      `RESEARCH: Look up both teams' records, starting pitchers (MLB), key injuries, recent form (last 5 games), head-to-head this season.\n\n` +
+      `ADJUST the baseline based on:\n` +
+      `+ Much better record → UP 5-10%\n` +
+      `+ Ace pitcher starting (ERA < 3.0) → UP 5-8%\n` +
+      `+ Home team with strong home record → UP 3-5%\n` +
+      `+ Hot streak (won 5+ in a row) → UP 3-5%\n` +
+      `- Key player injured/resting → DOWN 5-10%\n` +
+      `- Bad recent form (lost 4+ in a row) → DOWN 3-5%\n` +
+      `- Poor starter pitching (ERA > 5.0) → DOWN 5-8%\n\n` +
+      `BUY if confidence ≥ 65% AND at least 3 points above price.\n` +
+      `Max bet: $${getDynamicMaxTrade().toFixed(2)} (bet MORE if confidence is much higher than price)\n\n` +
       `JSON ONLY:\n` +
-      `{"trade":false,"confidence":0.XX,"reasoning":"prediction"}\n` +
-      `OR {"trade":true,"side":"${pick.side}","confidence":0.XX,"betAmount":N,"reasoning":"who wins and why"}`,
+      `{"trade":false,"confidence":0.XX,"reasoning":"baseline X%, adjusted to Y% because [reasons]"}\n` +
+      `OR {"trade":true,"side":"${pick.side}","confidence":0.XX,"betAmount":N,"reasoning":"baseline X%, adjusted to Y% because [reasons]. Price ${(pregamePrice*100).toFixed(0)}¢ = good buy."}`,
       { maxTokens: 800, maxSearches: 3 }
     );
     if (!decideText) continue;
@@ -1455,7 +1532,7 @@ async function checkUFCPredictions() {
       `- Fighting style matchup (striker vs grappler, etc.)\n` +
       `- Physical advantages (reach, size, cardio)\n` +
       `- Level of competition faced\n\n` +
-      `BUY if confidence ≥ 65% AND at least 5 points above price.\n` +
+      `BUY if confidence ≥ 65% AND at least 3 points above price.\n` +
       `Max bet: $${getPositionSize('polymarket').toFixed(2)}\n\n` +
       `JSON ONLY:\n` +
       `{"trade":false,"confidence":0.XX,"reasoning":"prediction"}\n` +
