@@ -1087,25 +1087,31 @@ async function checkLiveScoreEdges() {
 
         console.log(`[live-edge] Found market: ${targetMarket.ticker} "${title}" YES=$${price.toFixed(2)}`);
 
-        // Use Claude to assess win probability based on live score + research
-        const portfolioInfo = getPortfolioSummary();
+        // Extract team records from ESPN data
+        const homeRecord = home.records?.[0]?.summary ?? home.record ?? '';
+        const awayRecord = away.records?.[0]?.summary ?? away.record ?? '';
+        const homeIsLeading = leadingAbbr === homeAbbr;
+
+        // Prediction-focused prompt — "who wins?" not "is this mispriced?"
         const livePrompt =
-          `You are a sports analyst. Your job: predict who wins this game and whether the current market price is a good buy.\n\n` +
+          `You are a sports prediction analyst. Predict who wins this game.\n\n` +
           `LIVE ${league.toUpperCase()} GAME:\n` +
-          `${away.team?.displayName} ${awayScore} at ${home.team?.displayName} ${homeScore}\n` +
-          `Status: ${gameDetail}\n` +
-          `${leading.team?.displayName} leads by ${diff}\n\n` +
-          `MARKET: ${leadingAbbr} YES @ $${price.toFixed(2)} (you'd pay ${(price*100).toFixed(0)}¢ to win $1 if ${leadingAbbr} wins)\n\n` +
-          `RESEARCH: Look up both teams' records this season.\n\n` +
-          `DECIDE: Will ${leading.team?.displayName} win this game? Consider:\n` +
-          `1. Current score and game situation (inning/quarter/period)\n` +
-          `2. Team quality (season record, home/away)\n` +
-          `3. ${league === 'mlb' ? 'Starting pitching, bullpen depth' : league === 'nba' ? 'Key players, pace of play' : 'Goaltending, special teams'}\n\n` +
-          `The LOWER the price, the BETTER the buy. At ${(price*100).toFixed(0)}¢ you need ${leading.team?.displayName} to win ${Math.ceil(price * 100 + 5)}%+ of the time for this to be profitable after fees.\n\n` +
+          `${away.team?.displayName} (${awayRecord}) ${awayScore}\n` +
+          `  at\n` +
+          `${home.team?.displayName} (${homeRecord}) ${homeScore}\n` +
+          `Status: ${gameDetail} | ${leading.team?.displayName} leads by ${diff}\n` +
+          `Home/Away: ${homeIsLeading ? leading.team?.displayName + ' is HOME (advantage)' : leading.team?.displayName + ' is AWAY'}\n\n` +
+          `MARKET: ${leadingAbbr} YES @ ${(price*100).toFixed(0)}¢ (pay ${(price*100).toFixed(0)}¢, win $1.00 if ${leadingAbbr} wins)\n\n` +
+          `RESEARCH: Look up both teams — records, recent form, any injuries.\n\n` +
+          `PREDICT: How confident are you that ${leading.team?.displayName} wins?\n` +
+          `- Consider: score, game stage, team quality, home/away, ${league === 'mlb' ? 'pitching matchup' : league === 'nba' ? 'star players, rest days' : 'goaltending'}\n` +
+          `- If confidence ≥ 65% AND price is ≤ 75¢, this is a BUY\n` +
+          `- If confidence ≥ 70% AND price is ≤ 80¢, also a BUY\n` +
+          `- If price is already above your confidence, PASS\n\n` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
           `JSON ONLY:\n` +
-          `{"trade": false, "winProbability": 0.XX, "reasoning": "why not worth it at this price"}\n` +
-          `OR {"trade": true, "side": "yes", "winProbability": 0.XX, "betAmount": N, "reasoning": "why ${leadingAbbr} wins and why ${(price*100).toFixed(0)}¢ is a good price"}`;
+          `{"trade": false, "confidence": 0.XX, "reasoning": "prediction + why not buying"}\n` +
+          `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "why ${leadingAbbr} wins this game"}`;
         // Block if we already have a position on this game
         const ticker = targetMarket.ticker;
         const lastH = ticker.lastIndexOf('-');
@@ -1120,13 +1126,17 @@ async function checkLiveScoreEdges() {
         if (Date.now() - (tradeCooldowns.get(ticker) ?? 0) < COOLDOWN_MS) continue;
         if (Date.now() - (tradeCooldowns.get(gameBase) ?? 0) < COOLDOWN_MS) continue;
 
-        // Price sanity — skip if already decided (97¢+) or too cheap (lottery)
-        if (price <= 0.05 || price >= 0.97) {
-          console.log(`[live-edge] Skipping: ${leadingAbbr} @${(price*100).toFixed(0)}¢ (${price >= 0.97 ? 'already decided' : 'lottery'})`);
+        // Price filter — skip if already decided (80¢+ = not enough upside) or lottery
+        if (price <= 0.05) {
+          console.log(`[live-edge] Skipping: ${leadingAbbr} @${(price*100).toFixed(0)}¢ (lottery ticket)`);
+          continue;
+        }
+        if (price >= 0.80) {
+          console.log(`[live-edge] Skipping: ${leadingAbbr} @${(price*100).toFixed(0)}¢ (too expensive, not enough upside)`);
           continue;
         }
 
-        // Ask Claude for win probability assessment
+        // Ask Claude to PREDICT the winner
         const cText = await claudeWithSearch(livePrompt);
         if (!cText) continue;
         const jsonMatch = cText.match(/\{[\s\S]*\}/);
@@ -1136,17 +1146,26 @@ async function checkLiveScoreEdges() {
         try { decision = JSON.parse(jsonMatch[0]); } catch { continue; }
 
         if (!decision.trade) {
-          console.log(`[live-edge] Claude passed: ${decision.reasoning?.slice(0, 100)}`);
+          console.log(`[live-edge] Claude says NO: conf=${((decision.confidence ?? 0)*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ | ${decision.reasoning?.slice(0, 80)}`);
+          logScreen({ stage: 'live-edge', ticker, result: 'pass', confidence: decision.confidence, price, reasoning: decision.reasoning });
           continue;
         }
 
-        const winProb = decision.winProbability ?? 0;
-        const rawEdge = winProb - price;
-        if (!isProfitableAfterFees('kalshi', price, rawEdge, ticker)) continue;
+        // Confidence-based gate — simple and clear
+        const confidence = decision.confidence ?? 0;
+        if (confidence < 0.65) {
+          console.log(`[live-edge] Confidence too low: ${(confidence*100).toFixed(0)}% < 65%`);
+          continue;
+        }
+        // Confidence must exceed price for the bet to be +EV
+        if (confidence < price + 0.03) {
+          console.log(`[live-edge] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢ (need 3%+ gap)`);
+          continue;
+        }
 
-        const { netEdge: edge } = calcNetEdge('kalshi', price, rawEdge);
+        const edge = confidence - price; // simple: how much we think we're ahead
 
-        // Size the bet — dynamic + risk-managed
+        // Risk checks
         if (!canTrade()) continue;
         if (!checkSportExposure(ticker)) continue;
         const maxBetLE = getPositionSize('kalshi');
@@ -1159,9 +1178,10 @@ async function checkLiveScoreEdges() {
         const qty = Math.max(1, Math.floor(safeBet / price));
         const priceInCents = Math.round(price * 100);
 
-        console.log(`[live-edge] TRADE: ${ticker} ${leadingAbbr} YES @${priceInCents}¢ × ${qty} edge=${(edge*100).toFixed(1)}%`);
+        console.log(`[live-edge] 🎯 TRADE: ${ticker} ${leadingAbbr} YES @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
         console.log(`  Score: ${awayAbbr} ${awayScore} @ ${homeAbbr} ${homeScore} (${gameDetail})`);
         console.log(`  Reason: ${decision.reasoning}`);
+        logScreen({ stage: 'live-edge', ticker, result: 'TRADE', confidence, price, reasoning: decision.reasoning });
         if (!canDeployMore(qty * price)) continue;
 
         tradeCooldowns.set(ticker, Date.now());
@@ -1176,27 +1196,25 @@ async function checkLiveScoreEdges() {
           const deployed = qty * price;
 
           logTrade({
-            exchange: 'kalshi', strategy: 'live-score',
+            exchange: 'kalshi', strategy: 'live-prediction',
             ticker, title, side: 'yes',
             quantity: qty, entryPrice: price, deployCost: deployed,
             filled: (result.data.order ?? result.data).quantity_filled ?? 0,
             orderId: (result.data.order ?? result.data).order_id ?? null,
-            edge: edge * 100, fairProb: winProb,
+            edge: edge * 100, confidence,
             reasoning: decision.reasoning,
             liveScore: `${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore} (${gameDetail})`,
           });
 
           await tg(
-            `⚡ <b>LIVE SCORE EDGE — KALSHI</b>\n\n` +
+            `🎯 <b>PREDICTION BET — KALSHI</b>\n\n` +
             `<b>${title}</b>\n` +
-            `Ticker: <code>${ticker}</code>\n` +
-            `Team: <b>${leadingAbbr}</b>\n` +
-            `Score: ${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore} (${gameDetail})\n\n` +
-            `BUY YES @ $${price.toFixed(2)} × ${qty}\n` +
-            `Deployed: <b>$${deployed.toFixed(2)}</b>\n` +
-            `Claude prob: ${(winProb*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}%\n` +
-            `Edge: <b>${(edge*100).toFixed(1)}%</b>\n\n` +
-            `🔍 <i>${decision.reasoning}</i>`
+            `Team: <b>${leadingAbbr}</b> | Score: ${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore}\n` +
+            `Status: ${gameDetail}\n\n` +
+            `BUY YES @ ${(price*100).toFixed(0)}¢ × ${qty} = <b>$${deployed.toFixed(2)}</b>\n` +
+            `Confidence: <b>${(confidence*100).toFixed(0)}%</b> vs price ${(price*100).toFixed(0)}¢\n` +
+            `Potential profit: <b>$${(qty * (1 - price)).toFixed(2)}</b> if ${leadingAbbr} wins\n\n` +
+            `🧠 <i>${decision.reasoning}</i>`
           );
         } else {
           console.error(`[live-edge] Order failed:`, result.status, JSON.stringify(result.data));
@@ -1508,16 +1526,32 @@ async function claudeBroadScan() {
       const market = deduped.find(m => m.ticker === candidate.ticker);
       if (!market) continue;
 
-      const decidePrompt =
-        `You are a skeptical prediction market analyst. DEFAULT: {"trade":false}.\n\n` +
-        `CANDIDATE: ${market.ticker}: "${market.title}" YES=$${market.yesAsk} NO=$${market.noAsk}\n` +
-        `Category: ${market.category}\n` +
-        `Screening note: "${candidate.reason}"\n\n` +
-        `CASH: $${kalshiBalance.toFixed(2)} | Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
-        `RESEARCH: Use web search to verify the screening note. Look up current facts.\n\n` +
-        `CHALLENGE: Why would thousands of traders have this wrong? You need SPECIFIC facts, not vibes.\n\n` +
-        `FEES: Kalshi fee = 7% × P × (1-P). Your edge AFTER fees must be ≥${MIN_EDGE_PCT_AFTER_FEES}%.\n\n` +
-        `JSON ONLY:\n{"trade":false,"reasoning":"why"}\nOR\n{"trade":true,"ticker":"exact","side":"yes"/"no","betAmount":N,"probability":0.XX,"counterArgument":"why this could fail","reasoning":"specific facts"}`;
+      const isSportsMarket = market.category === 'Sports';
+      const yesPrice = parseFloat(market.yesAsk);
+      const noPrice = parseFloat(market.noAsk);
+
+      const decidePrompt = isSportsMarket
+        ? `You are a sports prediction analyst. Predict the outcome of this game.\n\n` +
+          `MARKET: ${market.ticker}: "${market.title}"\n` +
+          `YES price: ${(yesPrice*100).toFixed(0)}¢ | NO price: ${(noPrice*100).toFixed(0)}¢\n` +
+          `Screening note: "${candidate.reason}"\n\n` +
+          `RESEARCH: Look up both teams' current records, recent form, injuries.\n\n` +
+          `PREDICT: Who wins? How confident are you (0-100%)?\n` +
+          `- If confidence ≥ 65% and the side you pick costs ≤ 75¢, BUY\n` +
+          `- Pick YES (home team/first team) or NO (away team/second team)\n\n` +
+          `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
+          `JSON ONLY:\n{"trade":false,"confidence":0.XX,"reasoning":"prediction"}\n` +
+          `OR {"trade":true,"ticker":"${market.ticker}","side":"yes"/"no","confidence":0.XX,"betAmount":N,"reasoning":"who wins and why"}`
+        : `You are a prediction analyst. Evaluate this market.\n\n` +
+          `MARKET: ${market.ticker}: "${market.title}"\n` +
+          `YES: ${(yesPrice*100).toFixed(0)}¢ | NO: ${(noPrice*100).toFixed(0)}¢\n` +
+          `Category: ${market.category}\n` +
+          `Screening note: "${candidate.reason}"\n\n` +
+          `RESEARCH: Look up current real-world data relevant to this market.\n\n` +
+          `PREDICT: What's the true probability? If your confidence differs from the market by 5%+, trade it.\n\n` +
+          `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
+          `JSON ONLY:\n{"trade":false,"confidence":0.XX,"reasoning":"analysis"}\n` +
+          `OR {"trade":true,"ticker":"${market.ticker}","side":"yes"/"no","confidence":0.XX,"betAmount":N,"reasoning":"why market is wrong"}`;
 
       const cText = await claudeWithSearch(decidePrompt, { maxTokens: 800, maxSearches: 3 });
       if (!cText) continue;
@@ -1553,27 +1587,32 @@ async function claudeBroadScan() {
       if (positionBases.has(base)) { console.log(`[broad-scan] BLOCKED: position on ${base}`); continue; }
 
       const price = decision.side === 'yes' ? parseFloat(mktValid.yesAsk) : parseFloat(mktValid.noAsk);
-      if (price <= 0.03) { console.log(`[broad-scan] BLOCKED: lottery ticket ${(price*100).toFixed(0)}¢`); continue; }
+      if (price <= 0.05 || price >= 0.80) {
+        console.log(`[broad-scan] BLOCKED: price ${(price*100).toFixed(0)}¢ outside 5-80¢ range`); continue;
+      }
 
-      const rawEdge = Math.abs((decision.probability ?? 0) - price);
-      if (!isProfitableAfterFees('kalshi', price, rawEdge, decision.ticker)) continue;
-      const { netEdge: edge } = calcNetEdge('kalshi', price, rawEdge);
+      // Confidence-based gate
+      const confidence = decision.confidence ?? decision.probability ?? 0;
+      if (confidence < 0.65) { console.log(`[broad-scan] Confidence too low: ${(confidence*100).toFixed(0)}%`); continue; }
+      if (confidence < price + 0.03) { console.log(`[broad-scan] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢`); continue; }
+
+      const edge = confidence - price;
 
       if (kalshiBalance < 3) continue;
       if (Date.now() - (tradeCooldowns.get(decision.ticker) ?? 0) < COOLDOWN_MS) continue;
       if (!canTrade()) continue;
       if (!checkSportExposure(decision.ticker)) continue;
 
-    // Dynamic sizing — scales with bankroll, reduces after losses
-    const maxBet = getPositionSize('kalshi');
-    const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
-    if (safeBet < 1 || price <= 0) return;
+      const maxBet = getPositionSize('kalshi');
+      const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
+      if (safeBet < 1 || price <= 0) continue;
 
-    const qty = Math.max(1, Math.floor(safeBet / price));
-    const priceInCents = Math.round(price * 100);
+      const qty = Math.max(1, Math.floor(safeBet / price));
+      const priceInCents = Math.round(price * 100);
 
-      console.log(`[broad-scan] TRADE: ${mktValid.title} ${decision.side} @${priceInCents}¢ × ${qty} edge=${(edge*100).toFixed(1)}%`);
+      console.log(`[broad-scan] 🎯 TRADE: ${mktValid.title} ${decision.side} @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
       console.log(`  Reason: ${decision.reasoning}`);
+      logScreen({ stage: 'sonnet', ticker: decision.ticker, result: 'TRADE', confidence, price, reasoning: decision.reasoning });
       if (!canDeployMore(safeBet)) continue;
 
       tradeCooldowns.set(decision.ticker, Date.now());
@@ -1591,28 +1630,27 @@ async function claudeBroadScan() {
         const daysOut = Number.isFinite(closeMs) ? Math.ceil((closeMs - Date.now()) / (24*60*60*1000)) : '?';
 
         logTrade({
-          exchange: 'kalshi', strategy: 'claude-scan',
+          exchange: 'kalshi', strategy: 'claude-prediction',
           ticker: decision.ticker, title: mktValid.title, category: mktValid.category,
-        side: decision.side, quantity: qty, entryPrice: price,
-        deployCost: qty * price,
-        filled: (result.data.order ?? result.data).quantity_filled ?? 0,
-        orderId: (result.data.order ?? result.data).order_id ?? null,
-        edge: edge * 100, fairProb: decision.probability,
-        reasoning: decision.reasoning,
-        counterArgument: decision.counterArgument ?? null,
-        daysOut,
-      });
+          side: decision.side, quantity: qty, entryPrice: price,
+          deployCost: qty * price,
+          filled: (result.data.order ?? result.data).quantity_filled ?? 0,
+          orderId: (result.data.order ?? result.data).order_id ?? null,
+          edge: edge * 100, confidence,
+          reasoning: decision.reasoning,
+          daysOut,
+        });
 
         await tg(
-          `🧠 <b>CLAUDE TRADE — KALSHI</b>\n\n` +
+          `🎯 <b>PREDICTION BET — KALSHI</b>\n\n` +
           `<b>${mktValid.title}</b>\n` +
           `Category: ${mktValid.category}\n` +
           `Ticker: <code>${decision.ticker}</code>\n` +
-          `Team: <b>${teamSuffix}</b> | Closes in <b>${daysOut}d</b>\n\n` +
-          `BUY ${decision.side.toUpperCase()} @ $${price.toFixed(2)} × ${qty}\n` +
-          `Deployed: <b>$${(qty * price).toFixed(2)}</b>\n` +
-          `Edge: <b>${(edge*100).toFixed(0)}%</b> (Claude ${((decision.probability ?? 0)*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}%)\n\n` +
-          `🔍 <i>${decision.reasoning}</i>`
+          `Team: <b>${teamSuffix}</b>\n\n` +
+          `BUY ${decision.side.toUpperCase()} @ ${(price*100).toFixed(0)}¢ × ${qty} = <b>$${(qty * price).toFixed(2)}</b>\n` +
+          `Confidence: <b>${(confidence*100).toFixed(0)}%</b> vs price ${(price*100).toFixed(0)}¢\n` +
+          `Potential profit: <b>$${(qty * (1 - price)).toFixed(2)}</b>\n\n` +
+          `🧠 <i>${decision.reasoning}</i>`
         );
       }
       break; // placed a trade — don't check more candidates this cycle
