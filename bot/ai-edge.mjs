@@ -646,9 +646,11 @@ async function checkLiveScoreEdges() {
           const ticker = m.ticker ?? '';
           // Must be today or tonight
           if (!ticker.includes(todayStr) && !ticker.includes(tonightStr)) return false;
-          // Must match one of the playing teams
+          // Must match BOTH playing teams (ticker contains both abbreviations)
           const upperTicker = ticker.toUpperCase();
-          return upperTicker.includes(homeAbbr) || upperTicker.includes(awayAbbr);
+          const hasHome = upperTicker.includes(homeAbbr);
+          const hasAway = upperTicker.includes(awayAbbr);
+          return hasHome && hasAway;
         });
 
         if (gameMarkets.length === 0) {
