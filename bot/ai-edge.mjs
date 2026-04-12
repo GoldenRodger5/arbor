@@ -917,36 +917,35 @@ async function claudeBroadScan() {
     const today = etNow.toISOString().slice(0, 10);
 
     const broadPrompt =
-      `You are a professional prediction market trader. Find ONE trade with a real edge across sports, crypto, economics, or politics.\n\n` +
-      `AVAILABLE CASH: $${kalshiBalance.toFixed(2)} (this is ALL I can bet with — positions value is LOCKED)\n\n` +
+      `You are a skeptical prediction market analyst. Your DEFAULT answer is {"trade":false}. Most markets are efficiently priced — finding a real edge is rare. Your job is to check if any of these markets have a GENUINE mispricing, not to force a trade.\n\n` +
+      `AVAILABLE CASH: $${kalshiBalance.toFixed(2)} (positions value is LOCKED, not available)\n\n` +
       `MY EXISTING POSITIONS (DO NOT trade these again):\n` +
       (openPositions.length > 0 ? openPositions.map(p => `  ${p.ticker}`).join('\n') : '  None') + '\n\n' +
-      `TODAY: ${today} (sports tickers use ${todayShort} for today, ${tomorrowShort} for tonight's late games)\n` +
+      `TODAY: ${today} (sports tickers: ${todayShort} = today, ${tomorrowShort} = tonight's late games)\n` +
       (cryptoPrices ? `LIVE CRYPTO PRICES: ${cryptoPrices}\n` : '') +
-      `\nMARKETS I CAN TRADE:\n${marketSummaryFiltered}\n\n` +
-      `RESEARCH FIRST: You have web search. BEFORE picking any trade, SEARCH for current real-world data:\n` +
-      `- Sports: search both teams' current records/standings, injuries, recent form. A 20-win team at 25¢ is correctly priced, NOT an edge.\n` +
-      `- Crypto: search current price action, major news, on-chain data\n` +
-      `- Economics: search latest CPI/jobs data, Fed commentary, consensus forecasts\n` +
-      `- Politics: search latest polls, expert predictions, recent developments\n` +
-      `- Golf/Masters: search leaderboard, player form, course history\n` +
-      `Your probability MUST come from facts you researched. If you can't find data supporting an edge, return {"trade":false}.\n\n` +
-      `STRICT RULES — violating ANY means return {"trade":false}:\n` +
-      `1. Your probability MUST differ from market price by at least 7 percentage points\n` +
-      `2. YES price + NO price on Kalshi always sums to ~$1.00-1.03. This is NOT mispricing — it's the bid-ask spread. Do NOT trade based on YES+NO sum.\n` +
-      `3. For SPORTS game-winner tickers: ONLY trade if ticker contains "${todayShort}" (today) or "${tomorrowShort}" (tonight's late games). Non-sports tickers don't have dates — trade those anytime.\n` +
-      `4. Max bet: $${Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25).toFixed(2)} (25% of $${kalshiBalance.toFixed(2)} cash)\n` +
-      `5. If cash < $3, return {"trade":false}\n` +
-      `6. You need a REAL reason the market is wrong — not just "asymmetric pricing" or "bid-ask spread"\n` +
-      `7. Fees eat ~1.75¢ per contract at 50¢. Account for this.\n` +
-      `8. Do NOT bet on heavy underdogs (price below $0.25) unless your research found SPECIFIC breaking news (injury, rest day, etc). General "upset potential" is NOT an edge.\n` +
-      `9. All markets shown close within ${MAX_DAYS_OUT} days. Prefer markets closing SOONER for faster capital turnover.\n` +
-      `10. KXBTC/KXETH markets are NARROW RANGE bets (e.g. $80,750-$80,999.99). The asset must land in that EXACT $250 window. A 1¢ YES price means ~1% probability — this is usually CORRECT for narrow ranges requiring large moves. Do NOT confuse range bets with above/below bets.\n` +
-      `11. Never buy YES at $0.01-$0.03 on narrow-range or extreme tail markets. These are lottery tickets, not edges. A "14% edge" on a 1¢ contract is meaningless noise.\n\n` +
+      `\nMARKETS:\n${marketSummaryFiltered}\n\n` +
+      `PROCESS — follow this EXACTLY:\n` +
+      `1. RESEARCH: Use web search to look up current facts for any market that catches your eye\n` +
+      `2. ASSESS: Based on your research, estimate the true probability\n` +
+      `3. COMPARE: Is your probability at least 7 percentage points different from the market price?\n` +
+      `4. CHALLENGE YOURSELF: Ask "Why would the market be wrong here? Thousands of traders are pricing this — what do I know that they don't?" If your answer is vague (e.g. "undervalued", "upset potential", "seems mispriced"), you do NOT have an edge.\n` +
+      `5. DECIDE: Only trade if you have a SPECIFIC, CONCRETE reason backed by facts from your research.\n\n` +
+      `MARKET STRUCTURE — understand before trading:\n` +
+      `- YES + NO sums to ~$1.00-1.03. This is bid-ask spread, NOT mispricing.\n` +
+      `- KXBTC/KXETH are NARROW $250 RANGE bets. BTC must land in that exact window. A 1¢ price on a range far from current price is CORRECTLY priced.\n` +
+      `- Sports underdogs at 15-25¢ are usually correctly priced. Bad teams lose a lot.\n` +
+      `- Contracts at $0.01-$0.05 are lottery tickets. The market knows they're unlikely.\n\n` +
+      `HARD CONSTRAINTS:\n` +
+      `- Sports game tickers: ONLY "${todayShort}" or "${tomorrowShort}"\n` +
+      `- Max bet: $${Math.min(MAX_TRADE_CAP, kalshiBalance * 0.25).toFixed(2)}\n` +
+      `- If cash < $3: return {"trade":false}\n` +
+      `- Min price: $0.05 (no lottery tickets)\n` +
+      `- Markets close within ${MAX_DAYS_OUT} days. Prefer sooner.\n` +
+      `- Fees: ~1.75¢/contract at 50¢.\n\n` +
       `Respond JSON ONLY:\n` +
       `{"trade":false,"reasoning":"why no good trade"}\n` +
       `OR\n` +
-      `{"trade":true,"ticker":"exact","side":"yes"/"no","betAmount":N,"probability":0.XX,"reasoning":"specific facts from research proving market is wrong"}`;
+      `{"trade":true,"ticker":"exact","side":"yes"/"no","betAmount":N,"probability":0.XX,"counterArgument":"strongest reason this trade could be WRONG","reasoning":"specific facts proving market is mispriced DESPITE the counter-argument"}`;
 
     const cText = await claudeWithSearch(broadPrompt, { maxTokens: 1024, maxSearches: 5 });
     if (!cText) return;
@@ -1085,23 +1084,22 @@ async function claudeBroadScan() {
     ).join('\n');
 
     const polyPrompt =
-      `You are a prediction market trader. Find ONE trade on Polymarket US with a real edge.\n\n` +
+      `You are a skeptical prediction market analyst. Your DEFAULT answer is {"trade":false}. Most markets are efficiently priced.\n\n` +
       `POLYMARKET CASH: $${polyBalance.toFixed(2)}\n\n` +
       `MARKETS:\n${polyList}\n\n` +
-      `RESEARCH FIRST: Use web search to look up current facts before deciding:\n` +
-      `- Sports: team records, standings, injuries, recent form\n` +
-      `- Futures (MVP, awards, tournament winners): current favorites, recent performance, expert analysis\n` +
-      `- Any other market type: search for the latest relevant data\n` +
-      `Your probability MUST be based on researched facts, not assumptions.\n\n` +
-      `RULES:\n` +
-      `- Need 10%+ edge (your researched probability vs market price)\n` +
+      `PROCESS:\n` +
+      `1. Research any interesting market with web search (team records, standings, player stats, expert analysis)\n` +
+      `2. Estimate true probability from your research\n` +
+      `3. Ask yourself: "Why would thousands of other traders have this wrong?"\n` +
+      `4. Only trade if you have a SPECIFIC answer to that question backed by concrete facts\n\n` +
+      `CONSTRAINTS:\n` +
+      `- Need 10%+ edge (researched probability vs market price)\n` +
       `- Max bet: $${Math.min(50, polyBalance * 0.25).toFixed(2)}\n` +
-      `- Need a REAL reason backed by specific facts from your research\n` +
-      `- Do NOT bet on heavy underdogs without specific breaking news\n` +
+      `- Min price: $0.05 (no lottery tickets)\n` +
       `- side0 = ORDER_INTENT_BUY_LONG, side1 = ORDER_INTENT_BUY_SHORT\n\n` +
       `JSON ONLY:\n` +
       `{"trade":false,"reasoning":"why"}\n` +
-      `OR {"trade":true,"slug":"exact slug","side":"side0"/"side1","betAmount":N,"probability":0.XX,"reasoning":"specific facts proving market is wrong"}`;
+      `OR {"trade":true,"slug":"exact slug","side":"side0"/"side1","betAmount":N,"probability":0.XX,"counterArgument":"why this trade could be wrong","reasoning":"specific facts proving market is wrong despite counter-argument"}`;
 
     const pcText = await claudeWithSearch(polyPrompt, { maxTokens: 1024, maxSearches: 3 });
     if (!pcText) return;
@@ -1127,6 +1125,7 @@ async function claudeBroadScan() {
 
     const polyPrice = polyDecision.side === 'side0' ? polyMkt.s0Price : polyMkt.s1Price;
     const polyEdge = Math.abs((polyDecision.probability ?? 0) - polyPrice);
+    if (polyPrice <= 0.05) { console.log(`[poly-scan] BLOCKED: price ${(polyPrice*100).toFixed(0)}¢ is a lottery ticket`); return; }
     if (polyEdge < MIN_EDGE) { console.log(`[poly-scan] Edge too small: ${(polyEdge*100).toFixed(1)}%`); return; }
 
     const polyIntent = polyDecision.side === 'side0' ? 'ORDER_INTENT_BUY_LONG' : 'ORDER_INTENT_BUY_SHORT';
