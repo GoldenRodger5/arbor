@@ -1105,9 +1105,9 @@ async function checkLiveScoreEdges() {
           `RESEARCH: Look up both teams — records, recent form, any injuries.\n\n` +
           `PREDICT: How confident are you that ${leading.team?.displayName} wins?\n` +
           `- Consider: score, game stage, team quality, home/away, ${league === 'mlb' ? 'pitching matchup' : league === 'nba' ? 'star players, rest days' : 'goaltending'}\n` +
-          `- If confidence ≥ 65% AND price is ≤ 75¢, this is a BUY\n` +
-          `- If confidence ≥ 70% AND price is ≤ 80¢, also a BUY\n` +
-          `- If price is already above your confidence, PASS\n\n` +
+          `- BUY if: your confidence is at least 5 points ABOVE the price (e.g. 70% confident, price 65¢ or less)\n` +
+          `- PASS if: price is within 5 points of your confidence or above it\n` +
+          `- Max price: 80¢ (above that, not enough profit margin)\n\n` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
           `JSON ONLY:\n` +
           `{"trade": false, "confidence": 0.XX, "reasoning": "prediction + why not buying"}\n` +
@@ -1158,8 +1158,8 @@ async function checkLiveScoreEdges() {
           continue;
         }
         // Confidence must exceed price for the bet to be +EV
-        if (confidence < price + 0.03) {
-          console.log(`[live-edge] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢ (need 3%+ gap)`);
+        if (confidence < price + 0.05) {
+          console.log(`[live-edge] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢ (need 5%+ gap)`);
           continue;
         }
 
@@ -1594,7 +1594,7 @@ async function claudeBroadScan() {
       // Confidence-based gate
       const confidence = decision.confidence ?? decision.probability ?? 0;
       if (confidence < 0.65) { console.log(`[broad-scan] Confidence too low: ${(confidence*100).toFixed(0)}%`); continue; }
-      if (confidence < price + 0.03) { console.log(`[broad-scan] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢`); continue; }
+      if (confidence < price + 0.05) { console.log(`[broad-scan] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢`); continue; }
 
       const edge = confidence - price;
 
