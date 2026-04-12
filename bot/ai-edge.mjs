@@ -1087,31 +1087,71 @@ async function checkLiveScoreEdges() {
 
         console.log(`[live-edge] Found market: ${targetMarket.ticker} "${title}" YES=$${price.toFixed(2)}`);
 
-        // Extract team records from ESPN data
-        const homeRecord = home.records?.[0]?.summary ?? home.record ?? '';
-        const awayRecord = away.records?.[0]?.summary ?? away.record ?? '';
+        // === BUILD RICH CONTEXT FROM ESPN DATA ===
+        const homeRecord = home.records?.[0]?.summary ?? '';
+        const awayRecord = away.records?.[0]?.summary ?? '';
+        const homeHomeRec = home.records?.find(r => r.type === 'home')?.summary ?? '';
+        const awayRoadRec = away.records?.find(r => r.type === 'road')?.summary ?? '';
         const homeIsLeading = leadingAbbr === homeAbbr;
 
-        // Prediction-focused prompt — "who wins?" not "is this mispriced?"
+        // Pitcher info (MLB)
+        let pitcherInfo = '';
+        if (league === 'mlb') {
+          const situation = comp.situation ?? {};
+          const pitcher = situation.pitcher;
+          if (pitcher?.summary) {
+            pitcherInfo = `Current pitcher: ${pitcher.athlete?.displayName ?? '?'} (${pitcher.summary})\n`;
+          }
+          // Probable/starting pitchers
+          for (const c of [home, away]) {
+            for (const p of c.probables ?? []) {
+              const era = p.statistics?.find(s => s.abbreviation === 'ERA')?.displayValue ?? '?';
+              const w = p.statistics?.find(s => s.abbreviation === 'W')?.displayValue ?? '?';
+              const l = p.statistics?.find(s => s.abbreviation === 'L')?.displayValue ?? '?';
+              pitcherInfo += `${c.team?.abbreviation} starter: ${p.athlete?.displayName ?? '?'} (${w}-${l}, ${era} ERA)\n`;
+            }
+          }
+        }
+
+        // Live situation (runners, outs)
+        let situationInfo = '';
+        const sit = comp.situation;
+        if (sit) {
+          const runners = [sit.onFirst && '1st', sit.onSecond && '2nd', sit.onThird && '3rd'].filter(Boolean);
+          situationInfo = `Outs: ${sit.outs ?? '?'} | Runners: ${runners.length > 0 ? runners.join(', ') : 'none'}`;
+        }
+
+        // Team stats
+        const homeAvg = home.statistics?.find(s => s.abbreviation === 'AVG')?.displayValue ?? '';
+        const awayAvg = away.statistics?.find(s => s.abbreviation === 'AVG')?.displayValue ?? '';
+
+        // Line score
+        const homeLineScore = (home.linescores ?? []).map(l => l.displayValue).join(' ');
+        const awayLineScore = (away.linescores ?? []).map(l => l.displayValue).join(' ');
+
         const livePrompt =
-          `You are a sports prediction analyst. Predict who wins this game.\n\n` +
-          `LIVE ${league.toUpperCase()} GAME:\n` +
-          `${away.team?.displayName} (${awayRecord}) ${awayScore}\n` +
+          `You are a professional sports bettor. Predict who wins this game based on ALL the data below.\n\n` +
+          `═══ LIVE ${league.toUpperCase()} GAME ═══\n` +
+          `${away.team?.displayName} (${awayRecord}${awayRoadRec ? ', ' + awayRoadRec + ' away' : ''}) ${awayScore}\n` +
           `  at\n` +
-          `${home.team?.displayName} (${homeRecord}) ${homeScore}\n` +
-          `Status: ${gameDetail} | ${leading.team?.displayName} leads by ${diff}\n` +
-          `Home/Away: ${homeIsLeading ? leading.team?.displayName + ' is HOME (advantage)' : leading.team?.displayName + ' is AWAY'}\n\n` +
-          `MARKET: ${leadingAbbr} YES @ ${(price*100).toFixed(0)}¢ (pay ${(price*100).toFixed(0)}¢, win $1.00 if ${leadingAbbr} wins)\n\n` +
-          `RESEARCH: Look up both teams — records, recent form, any injuries.\n\n` +
-          `PREDICT: How confident are you that ${leading.team?.displayName} wins?\n` +
-          `- Consider: score, game stage, team quality, home/away, ${league === 'mlb' ? 'pitching matchup' : league === 'nba' ? 'star players, rest days' : 'goaltending'}\n` +
-          `- BUY if: your confidence is at least 5 points ABOVE the price (e.g. 70% confident, price 65¢ or less)\n` +
-          `- PASS if: price is within 5 points of your confidence or above it\n` +
-          `- Max price: 80¢ (above that, not enough profit margin)\n\n` +
+          `${home.team?.displayName} (${homeRecord}${homeHomeRec ? ', ' + homeHomeRec + ' home' : ''}) ${homeScore}\n\n` +
+          `Status: ${gameDetail}\n` +
+          `Line score: ${awayAbbr} [${awayLineScore}] | ${homeAbbr} [${homeLineScore}]\n` +
+          (situationInfo ? `Situation: ${situationInfo}\n` : '') +
+          (pitcherInfo ? `\n${pitcherInfo}` : '') +
+          (homeAvg || awayAvg ? `Team batting: ${homeAbbr} ${homeAvg} | ${awayAbbr} ${awayAvg}\n` : '') +
+          `\n═══ MARKET ═══\n` +
+          `${leadingAbbr} YES @ ${(price*100).toFixed(0)}¢ → pay ${(price*100).toFixed(0)}¢, win $1.00 if ${leadingAbbr} wins\n` +
+          `${homeIsLeading ? '(leading team is HOME — advantage)' : '(leading team is AWAY)'}\n\n` +
+          `═══ YOUR JOB ═══\n` +
+          `Use web search ONLY if you need additional context (recent injuries, streaks). The data above should be enough for most predictions.\n\n` +
+          `Based on: score, inning/period, team records, home/away, pitching — how confident are you ${leading.team?.displayName} wins?\n\n` +
+          `BUY RULE: confidence ≥ 65% AND at least 5 points above price.\n` +
+          `Example: 72% confident + 60¢ price = BUY. 68% confident + 65¢ = PASS.\n\n` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
           `JSON ONLY:\n` +
-          `{"trade": false, "confidence": 0.XX, "reasoning": "prediction + why not buying"}\n` +
-          `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "why ${leadingAbbr} wins this game"}`;
+          `{"trade": false, "confidence": 0.XX, "reasoning": "who wins and why not buying"}\n` +
+          `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "why ${leadingAbbr} wins"}`;
         // Block if we already have a position on this game
         const ticker = targetMarket.ticker;
         const lastH = ticker.lastIndexOf('-');
