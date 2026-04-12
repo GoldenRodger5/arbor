@@ -2138,8 +2138,79 @@ async function pollCycle() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
-// Position Management — profit-taking, stop-loss, Claude-assisted exits
+// Position Management — game-stage-aware profit-taking, stop-loss, Claude exits
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Get game stage and live data for a trade's ticker by matching ESPN scoreboard
+async function getGameContext(trade) {
+  const ticker = trade.ticker ?? '';
+  let league = '';
+  if (ticker.includes('MLB')) league = 'mlb';
+  else if (ticker.includes('NBA')) league = 'nba';
+  else if (ticker.includes('NHL')) league = 'nhl';
+  else return null;
+
+  const pathMap = { mlb: 'baseball/mlb', nba: 'basketball/nba', nhl: 'hockey/nhl' };
+  try {
+    const res = await fetch(`http://site.api.espn.com/apis/site/v2/sports/${pathMap[league]}/scoreboard`,
+      { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return null;
+    const data = await res.json();
+
+    // Find the game matching this ticker's teams
+    const teamSuffix = ticker.split('-').pop()?.toUpperCase() ?? '';
+    for (const ev of data.events ?? []) {
+      const comp = ev.competitions?.[0];
+      if (!comp) continue;
+      const teams = (comp.competitors ?? []).map(c => c.team?.abbreviation ?? '');
+      if (!teams.some(t => t === teamSuffix)) continue;
+
+      const period = parseInt(comp.status?.period ?? '0');
+      const state = comp.status?.type?.state ?? '';
+      const detail = comp.status?.type?.shortDetail ?? '';
+      const home = comp.competitors?.find(c => c.homeAway === 'home');
+      const away = comp.competitors?.find(c => c.homeAway === 'away');
+
+      // Determine game stage: early, mid, late, finished
+      let stage = 'unknown';
+      if (state === 'post') stage = 'finished';
+      else if (league === 'mlb') stage = period <= 4 ? 'early' : period <= 6 ? 'mid' : 'late';
+      else if (league === 'nba') stage = period <= 2 ? 'early' : period === 3 ? 'mid' : 'late';
+      else if (league === 'nhl') stage = period === 1 ? 'early' : period === 2 ? 'mid' : 'late';
+
+      const homeScore = parseInt(home?.score ?? '0');
+      const awayScore = parseInt(away?.score ?? '0');
+      const diff = Math.abs(homeScore - awayScore);
+      const leading = homeScore > awayScore ? home : away;
+
+      // Get win expectancy for current situation
+      const baselineWE = getWinExpectancy(league, diff, period, leading?.team?.abbreviation === (home?.team?.abbreviation));
+
+      // Build context string for Claude
+      const sit = comp.situation;
+      let situationStr = `${away?.team?.abbreviation} ${awayScore} @ ${home?.team?.abbreviation} ${homeScore} | ${detail}`;
+      if (sit?.lastPlay?.text) situationStr += ` | Last: ${sit.lastPlay.text}`;
+      if (league === 'mlb' && sit) {
+        const runners = [sit.onFirst && '1st', sit.onSecond && '2nd', sit.onThird && '3rd'].filter(Boolean);
+        if (runners.length > 0 || sit.outs > 0) situationStr += ` | ${sit.outs} outs, runners: ${runners.join(',') || 'none'}`;
+        if (sit.pitcher?.athlete?.displayName) situationStr += ` | Pitching: ${sit.pitcher.athlete.displayName} (${sit.pitcher.summary ?? ''})`;
+      }
+
+      return { league, stage, period, state, detail: situationStr, homeScore, awayScore, diff, baselineWE, leading: leading?.team?.abbreviation };
+    }
+  } catch { /* skip */ }
+  return null;
+}
+
+// Get game-stage-aware thresholds
+function getExitThresholds(stage) {
+  switch (stage) {
+    case 'early':  return { stopLoss: -0.50, claudeStop: -0.30, profitTake: 0.40, scaleOut: 0.40, claudeProfit: [0.15, 0.39] };
+    case 'mid':    return { stopLoss: -0.40, claudeStop: -0.25, profitTake: 0.30, scaleOut: 0.30, claudeProfit: [0.10, 0.29] };
+    case 'late':   return { stopLoss: -0.30, claudeStop: -0.20, profitTake: 0.20, scaleOut: 0.25, claudeProfit: [0.08, 0.19] };
+    default:       return { stopLoss: -0.30, claudeStop: -0.20, profitTake: 0.25, scaleOut: 0.30, claudeProfit: [0.10, 0.24] };
+  }
+}
 
 async function managePositions() {
   if (!existsSync(TRADES_LOG)) return;
@@ -2180,7 +2251,6 @@ async function managePositions() {
         if (!prices) continue;
 
         const currentPrice = trade.side === 'yes' ? prices.yes : prices.no;
-        const bidPrice = trade.side === 'yes' ? prices.yesBid : (1 - prices.yesBid); // what we'd get selling
         const entryPrice = trade.entryPrice ?? 0;
         if (entryPrice <= 0 || currentPrice <= 0) continue;
 
@@ -2190,76 +2260,112 @@ async function managePositions() {
         const profitPerContract = currentPrice - entryPrice;
         const pctChange = profitPerContract / entryPrice;
 
-        // === TIER 1: Rule-based auto-exits (no Claude needed) ===
+        // Fetch game context (stage, score, ESPN data)
+        const ctx = await getGameContext(trade);
+        const stage = ctx?.stage ?? 'unknown';
+        const thresholds = getExitThresholds(stage);
 
-        // STOP-LOSS: Down 30%+ → sell immediately
-        if (pctChange < -0.30) {
-          console.log(`[exit] 🛑 STOP-LOSS: ${trade.ticker} down ${(pctChange*100).toFixed(0)}% (${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢)`);
+        // === TIER 1: Rule-based auto-exits (game-stage-aware) ===
+
+        // STOP-LOSS: Dynamic by game stage
+        if (pctChange < thresholds.stopLoss) {
+          console.log(`[exit] 🛑 STOP-LOSS (${stage}): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% (threshold: ${(thresholds.stopLoss*100).toFixed(0)}%)`);
           const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
           if (result) anyUpdated = true;
           continue;
         }
 
-        // PROFIT-TAKE: Up 25¢+ AND price is 90¢+ (game nearly decided) → sell all
-        if (profitPerContract >= 0.25 && currentPrice >= 0.90) {
-          console.log(`[exit] 💰 PROFIT-TAKE: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ at ${(currentPrice*100).toFixed(0)}¢ (nearly decided)`);
+        // PROFIT-TAKE: Up enough AND price 90¢+ → sell all (game nearly decided)
+        if (profitPerContract >= thresholds.profitTake && currentPrice >= 0.90) {
+          console.log(`[exit] 💰 PROFIT-TAKE (${stage}): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ at ${(currentPrice*100).toFixed(0)}¢`);
           const result = await executeSell(trade, qty, currentPrice, 'profit-take');
           if (result) anyUpdated = true;
           continue;
         }
 
-        // PROFIT-TAKE: Up 30¢+ at any price → sell half, lock in profit
-        if (profitPerContract >= 0.30 && qty >= 2) {
+        // SCALE-OUT: Up enough → sell half
+        if (profitPerContract >= thresholds.scaleOut && qty >= 2 && currentPrice < 0.90) {
           const halfQty = Math.floor(qty / 2);
-          console.log(`[exit] 💰 SCALE-OUT: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ — selling ${halfQty}/${qty} contracts`);
+          console.log(`[exit] 💰 SCALE-OUT (${stage}): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ — selling ${halfQty}/${qty}`);
           const result = await executeSell(trade, halfQty, currentPrice, 'scale-out');
           if (result) anyUpdated = true;
           continue;
         }
 
-        // === TIER 2: Claude-assisted exit for ambiguous situations ===
-        // Up 10-24¢ mid-game — should we take profit or hold?
-        if (profitPerContract >= 0.10 && profitPerContract < 0.25 && currentPrice < 0.90) {
-          // Only ask Claude once per position per 15 minutes
-          const exitCooldownKey = 'exit:' + trade.ticker;
+        // === TIER 2: Claude-assisted exit with game context ===
+
+        // LOSING: Claude evaluates positions in the stop-loss danger zone
+        if (pctChange < thresholds.claudeStop && pctChange >= thresholds.stopLoss) {
+          const exitCooldownKey = 'exit-loss:' + trade.ticker;
+          if (Date.now() - (tradeCooldowns.get(exitCooldownKey) ?? 0) < 15 * 60 * 1000) continue;
+          tradeCooldowns.set(exitCooldownKey, Date.now());
+
+          const lossPrompt =
+            `You manage a live sports bet that's LOSING. Should you SELL or HOLD?\n\n` +
+            `POSITION: Bought ${trade.side?.toUpperCase()} at ${(entryPrice*100).toFixed(0)}¢. Now ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}% loss).\n` +
+            `Game: ${trade.title}\n` +
+            `${ctx ? `LIVE: ${ctx.detail}\nGame stage: ${stage.toUpperCase()} | Win expectancy: ${ctx.baselineWE ? (ctx.baselineWE*100).toFixed(0) + '%' : 'unknown'}` : 'No live data available'}\n\n` +
+            `A) SELL NOW: Lock in loss of $${Math.abs(qty * profitPerContract).toFixed(2)}. Free capital.\n` +
+            `B) HOLD: ${ctx?.baselineWE ? `Win expectancy says ${(ctx.baselineWE*100).toFixed(0)}% — team ${ctx.baselineWE > 0.45 ? 'still has a shot' : 'is in trouble'}.` : 'Unknown situation.'} Risk: could lose full $${(qty * entryPrice).toFixed(2)}.\n\n` +
+            `KEY: Is this a normal sports swing (hold) or is the game getting away (sell)?\n\n` +
+            `JSON ONLY: {"action": "sell"/"hold", "reasoning": "why"}`;
+
+          const lossText = await claudeScreen(lossPrompt, { maxTokens: 200, timeout: 8000 });
+          if (lossText) {
+            try {
+              const match = lossText.match(/\{[\s\S]*\}/);
+              if (match) {
+                const d = JSON.parse(match[0]);
+                if (d.action === 'sell') {
+                  console.log(`[exit] 🧠 CLAUDE STOP: ${trade.ticker} ${(pctChange*100).toFixed(0)}% (${stage}) | ${d.reasoning?.slice(0, 60)}`);
+                  const result = await executeSell(trade, qty, currentPrice, 'claude-stop');
+                  if (result) anyUpdated = true;
+                } else {
+                  console.log(`[exit] 🧠 CLAUDE HOLD (losing): ${trade.ticker} ${(pctChange*100).toFixed(0)}% (${stage}) | ${d.reasoning?.slice(0, 60)}`);
+                }
+              }
+            } catch { /* skip */ }
+          }
+          continue;
+        }
+
+        // WINNING: Claude evaluates ambiguous profit-taking
+        const [minProfit, maxProfit] = thresholds.claudeProfit;
+        if (profitPerContract >= minProfit && profitPerContract < maxProfit && currentPrice < 0.90) {
+          const exitCooldownKey = 'exit-profit:' + trade.ticker;
           if (Date.now() - (tradeCooldowns.get(exitCooldownKey) ?? 0) < 15 * 60 * 1000) continue;
           tradeCooldowns.set(exitCooldownKey, Date.now());
 
           const exitPrompt =
-            `You manage a live sports bet. Should you SELL now or HOLD?\n\n` +
-            `POSITION: Bought ${trade.side?.toUpperCase()} at ${(entryPrice*100).toFixed(0)}¢. Now worth ${(currentPrice*100).toFixed(0)}¢. Profit: +${(profitPerContract*100).toFixed(0)}¢/contract.\n` +
+            `You manage a live sports bet that's WINNING. Take profit now or hold for more?\n\n` +
+            `POSITION: Bought ${trade.side?.toUpperCase()} at ${(entryPrice*100).toFixed(0)}¢. Now ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢ profit).\n` +
             `Game: ${trade.title}\n` +
-            `${trade.liveScore ? 'Score: ' + trade.liveScore + '\n' : ''}` +
-            `Contracts: ${qty}\n\n` +
-            `OPTIONS:\n` +
-            `A) SELL ALL NOW: Lock in $${(qty * profitPerContract).toFixed(2)} guaranteed. Capital freed for next trade.\n` +
-            `B) SELL HALF: Lock in $${(Math.floor(qty/2) * profitPerContract).toFixed(2)}, ride rest to settlement.\n` +
-            `C) HOLD: If team wins → $${(qty * (1 - entryPrice)).toFixed(2)} total profit. If loses → -$${(qty * entryPrice).toFixed(2)} loss.\n\n` +
-            `Consider: Is the game nearly decided? Is the profit good enough? Is capital better used elsewhere?\n\n` +
+            `${ctx ? `LIVE: ${ctx.detail}\nGame stage: ${stage.toUpperCase()} | Win expectancy: ${ctx.baselineWE ? (ctx.baselineWE*100).toFixed(0) + '%' : 'unknown'}` : 'No live data available'}\n\n` +
+            `A) SELL ALL: Lock in $${(qty * profitPerContract).toFixed(2)} guaranteed. Capital freed.\n` +
+            `B) SELL HALF: Lock in $${(Math.floor(qty/2) * profitPerContract).toFixed(2)}, ride rest.\n` +
+            `C) HOLD: If team wins → $${(qty * (1 - entryPrice)).toFixed(2)} max profit. If loses → -$${(qty * entryPrice).toFixed(2)}.\n\n` +
+            `${ctx?.baselineWE ? `Win expectancy: ${(ctx.baselineWE*100).toFixed(0)}%. ${ctx.baselineWE > 0.85 ? 'Game is nearly decided — lock profit.' : ctx.baselineWE > 0.65 ? 'Good position but game still competitive.' : 'Game is close — consider holding.'}` : ''}\n\n` +
             `JSON ONLY: {"action": "sell_all"/"sell_half"/"hold", "reasoning": "why"}`;
 
           const exitText = await claudeScreen(exitPrompt, { maxTokens: 200, timeout: 8000 });
-          if (!exitText) continue;
-
-          let exitDecision;
-          try {
-            const match = exitText.match(/\{[\s\S]*\}/);
-            if (match) exitDecision = JSON.parse(match[0]);
-          } catch { continue; }
-
-          if (!exitDecision) continue;
-
-          if (exitDecision.action === 'sell_all') {
-            console.log(`[exit] 🧠 CLAUDE SELL ALL: ${trade.ticker} +${(profitPerContract*100).toFixed(0)}¢ | ${exitDecision.reasoning?.slice(0, 60)}`);
-            const result = await executeSell(trade, qty, currentPrice, 'claude-sell');
-            if (result) anyUpdated = true;
-          } else if (exitDecision.action === 'sell_half' && qty >= 2) {
-            const halfQty = Math.floor(qty / 2);
-            console.log(`[exit] 🧠 CLAUDE SELL HALF: ${trade.ticker} +${(profitPerContract*100).toFixed(0)}¢ selling ${halfQty}/${qty} | ${exitDecision.reasoning?.slice(0, 60)}`);
-            const result = await executeSell(trade, halfQty, currentPrice, 'claude-scale');
-            if (result) anyUpdated = true;
-          } else {
-            console.log(`[exit] 🧠 CLAUDE HOLD: ${trade.ticker} +${(profitPerContract*100).toFixed(0)}¢ | ${exitDecision.reasoning?.slice(0, 60)}`);
+          if (exitText) {
+            try {
+              const match = exitText.match(/\{[\s\S]*\}/);
+              if (match) {
+                const d = JSON.parse(match[0]);
+                if (d.action === 'sell_all') {
+                  console.log(`[exit] 🧠 CLAUDE SELL (${stage}): ${trade.ticker} +${(profitPerContract*100).toFixed(0)}¢ | ${d.reasoning?.slice(0, 60)}`);
+                  const result = await executeSell(trade, qty, currentPrice, 'claude-sell');
+                  if (result) anyUpdated = true;
+                } else if (d.action === 'sell_half' && qty >= 2) {
+                  console.log(`[exit] 🧠 CLAUDE HALF (${stage}): ${trade.ticker} +${(profitPerContract*100).toFixed(0)}¢ | ${d.reasoning?.slice(0, 60)}`);
+                  const result = await executeSell(trade, Math.floor(qty / 2), currentPrice, 'claude-scale');
+                  if (result) anyUpdated = true;
+                } else {
+                  console.log(`[exit] 🧠 CLAUDE HOLD (${stage}): ${trade.ticker} +${(profitPerContract*100).toFixed(0)}¢ | ${d.reasoning?.slice(0, 60)}`);
+                }
+              }
+            } catch { /* skip */ }
           }
         }
 
