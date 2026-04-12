@@ -46,7 +46,7 @@ const CLAUDE_DECIDER = 'claude-sonnet-4-6';            // Expensive analysis —
 const DAILY_LOSS_PCT = 0.15;       // Stop trading if down 15% in a day (room for 2-3 bad trades)
 const CAPITAL_RESERVE = 0.05;      // Keep 5% of bankroll untouched (more capital working)
 const MAX_CONSECUTIVE_LOSSES = 5;  // After 5 losses → reduce size (3 was too tight)
-const SPORT_EXPOSURE_PCT = 0.08;   // Max 8% of bankroll deployed on same sport per day
+const SPORT_EXPOSURE_PCT = 0.25;   // Max 25% of bankroll per sport — sports are the main edge source
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth
