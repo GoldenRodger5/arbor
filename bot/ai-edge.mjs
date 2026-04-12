@@ -1002,46 +1002,72 @@ async function checkLiveScoreEdges() {
     { league: 'nhl', path: 'hockey/nhl', series: 'KXNHLGAME' },
   ];
 
-  for (const { league, path, series } of sports) {
+  // === PHASE 1: Collect all games with leads ===
+  const liveGames = [];
+  for (const { league, path } of sports) {
     try {
-      const res = await fetch(
-        `http://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard`,
-        { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) },
-      );
+      const res = await fetch(`http://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard`,
+        { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) });
       if (!res.ok) continue;
       const data = await res.json();
-
       for (const ev of data.events ?? []) {
         const comp = ev.competitions?.[0];
         if (!comp || comp.status?.type?.state !== 'in') continue;
-
         const period = parseInt(comp.status?.period ?? '0');
-        const competitors = comp.competitors ?? [];
-        if (competitors.length < 2) continue;
-
-        const home = competitors.find(c => c.homeAway === 'home');
-        const away = competitors.find(c => c.homeAway === 'away');
+        const home = comp.competitors?.find(c => c.homeAway === 'home');
+        const away = comp.competitors?.find(c => c.homeAway === 'away');
         if (!home || !away) continue;
-
         const homeScore = parseInt(home.score ?? '0');
         const awayScore = parseInt(away.score ?? '0');
         const diff = Math.abs(homeScore - awayScore);
+        if (diff === 0) continue; // tied — skip
         const leading = homeScore > awayScore ? home : away;
-        const leadingName = leading.team?.displayName ?? '';
-        const gameDetail = comp.status?.type?.shortDetail ?? '';
+        const detail = comp.status?.type?.shortDetail ?? '';
+        liveGames.push({ league, comp, ev, home, away, homeScore, awayScore, diff, period, leading, detail });
+      }
+    } catch { /* skip */ }
+  }
 
-        // Trigger on ANY meaningful lead — Claude's job is to PREDICT the winner
-        // Lower price = better entry. We want to buy at 55-75¢, not 90¢+.
-        let worthChecking = false;
-        if (league === 'mlb' && diff >= 1 && period >= 1) worthChecking = true;       // any lead, game started
-        else if (league === 'nba' && diff >= 4) worthChecking = true;                  // 4+ point lead
-        else if (league === 'nhl' && diff >= 1) worthChecking = true;                  // any goal lead
-        if (!worthChecking) continue;
+  if (liveGames.length === 0) return;
 
+  // === PHASE 2: Haiku batch screen — pick best 2 games to analyze ===
+  const gameSummaries = liveGames.slice(0, 15).map((g, i) => {
+    const homeRec = g.home.records?.[0]?.summary ?? '?';
+    const awayRec = g.away.records?.[0]?.summary ?? '?';
+    return `${i+1}. [${g.league.toUpperCase()}] ${g.away.team?.abbreviation}(${awayRec}) ${g.awayScore} @ ${g.home.team?.abbreviation}(${homeRec}) ${g.homeScore} | ${g.detail}`;
+  }).join('\n');
+
+  const screenText = await claudeScreen(
+    `Pick up to 2 live games where you're most confident predicting the winner. Consider: score, inning/period, team records, home advantage.\n\n` +
+    `LIVE GAMES:\n${gameSummaries}\n\n` +
+    `Pick games where the leading team's price might be ≤ 80¢ (early leads, close games, not blowouts already priced at 95¢+).\n\n` +
+    `JSON array: [{"index":N,"team":"ABR","reason":"one line"}] or []`
+  );
+
+  let haikuPicks = [];
+  try {
+    const arr = screenText?.match(/\[[\s\S]*\]/);
+    if (arr) haikuPicks = JSON.parse(arr[0]);
+  } catch { /* bad json */ }
+
+  if (!Array.isArray(haikuPicks) || haikuPicks.length === 0) {
+    console.log(`[live-edge] Haiku: no picks from ${liveGames.length} live games`);
+    return;
+  }
+  console.log(`[live-edge] Haiku picked ${haikuPicks.length} from ${liveGames.length} live games: ${haikuPicks.map(p => p.team).join(', ')}`);
+
+  // === PHASE 3: Only analyze Haiku's picks with Sonnet (saves 80%+ API cost) ===
+  for (const pick of haikuPicks.slice(0, 2)) {
+    const idx = (pick.index ?? 1) - 1;
+    if (idx < 0 || idx >= liveGames.length) continue;
+    const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail } = liveGames[idx];
+    const series = league === 'mlb' ? 'KXMLBGAME' : league === 'nba' ? 'KXNBAGAME' : 'KXNHLGAME';
+
+    try {
         const homeAbbr = home.team?.abbreviation ?? '';
         const awayAbbr = away.team?.abbreviation ?? '';
-        if (!homeAbbr || !awayAbbr) continue; // skip if ESPN missing team data
-        console.log(`[live-edge] Checking: ${away.team?.displayName} (${awayAbbr}) ${awayScore} @ ${home.team?.displayName} (${homeAbbr}) ${homeScore} (${gameDetail})`);
+        if (!homeAbbr || !awayAbbr) continue;
+        console.log(`[live-edge] Sonnet analyzing: ${away.team?.displayName} (${awayAbbr}) ${awayScore} @ ${home.team?.displayName} (${homeAbbr}) ${homeScore} (${gameDetail})`);
 
         // Get today/tonight Kalshi markets — pre-filter to THIS game's teams + today's date
         const etNowLE = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
@@ -1093,14 +1119,22 @@ async function checkLiveScoreEdges() {
         let targetTeam = leading;
         let price = leadPrice;
 
-        // Underdog check: if trailing team is very cheap AND it's early in the game, consider them
-        if (trailMarket && trailPrice >= 0.15 && trailPrice <= 0.40 && period <= 4) {
-          // Early game + small deficit + cheap price = potential underdog value
-          targetMarket = trailMarket;
-          targetAbbr = trailingAbbr;
-          targetTeam = trailing;
-          price = trailPrice;
-          console.log(`[live-edge] 🐕 Underdog check: ${trailingAbbr} trailing by ${diff} at ${(trailPrice*100).toFixed(0)}¢ (early game)`);
+        // Underdog check: only if trailing team has a BETTER record than the leader
+        if (trailMarket && trailPrice >= 0.15 && trailPrice <= 0.40 && period <= 4 && diff <= 3) {
+          // Parse win counts from records to compare team quality
+          const trailRec = trailing.records?.[0]?.summary ?? '';
+          const leadRec = leading.records?.[0]?.summary ?? '';
+          const parseWins = (rec) => parseInt(rec.split('-')[0]) || 0;
+          const trailWins = parseWins(trailRec);
+          const leadWins = parseWins(leadRec);
+          // Only bet underdog if they have MORE wins (better team down early)
+          if (trailWins > leadWins) {
+            targetMarket = trailMarket;
+            targetAbbr = trailingAbbr;
+            targetTeam = trailing;
+            price = trailPrice;
+            console.log(`[live-edge] 🐕 Underdog value: ${trailingAbbr} (${trailRec}) trailing ${leadingAbbr} (${leadRec}) by ${diff} at ${(trailPrice*100).toFixed(0)}¢`);
+          }
         }
 
         if (!targetMarket) continue;
@@ -1281,9 +1315,8 @@ async function checkLiveScoreEdges() {
         } else {
           console.error(`[live-edge] Order failed:`, result.status, JSON.stringify(result.data));
         }
-      }
     } catch (e) {
-      console.error(`[live-edge] ${league} error:`, e.message);
+      console.error(`[live-edge] error:`, e.message);
     }
   }
 }
@@ -1319,8 +1352,8 @@ async function checkPreGamePredictions() {
         const ticker = m.ticker ?? '';
         if (!ticker.includes(todayStr) && !ticker.includes(tonightStr)) continue;
         const ya = parseFloat(m.yes_ask_dollars);
-        // Only pre-game range: 30-70¢ is the sweet spot for pre-game value
-        if (ya < 0.30 || ya > 0.70) continue;
+        // Pre-game: 25-85¢ range for value entries
+        if (ya < 0.25 || ya > 0.85) continue;
         // Dedup by game base
         const lastH = ticker.lastIndexOf('-');
         const base = lastH > 0 ? ticker.slice(0, lastH) : ticker;
@@ -2145,6 +2178,80 @@ async function pollCycle() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Stop-Loss — sell positions that have dropped >30% from entry
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkStopLosses() {
+  if (!existsSync(TRADES_LOG)) return;
+  try {
+    const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+    const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const openTrades = trades.filter(t => t.status === 'open' && t.exchange === 'kalshi');
+    if (openTrades.length === 0) return;
+
+    for (const trade of openTrades) {
+      try {
+        // Fetch current market price for this ticker
+        const data = await kalshiGet(`/markets/${trade.ticker}`);
+        const market = data.market ?? data;
+        if (!market.yes_ask_dollars) continue;
+
+        const currentPrice = trade.side === 'yes'
+          ? parseFloat(market.yes_ask_dollars)
+          : parseFloat(market.no_ask_dollars);
+
+        const entryPrice = trade.entryPrice ?? 0;
+        if (entryPrice <= 0) continue;
+
+        const pctChange = (currentPrice - entryPrice) / entryPrice;
+
+        // Stop-loss: if position dropped >30% from entry, sell
+        if (pctChange < -0.30) {
+          const qty = trade.filled ?? trade.quantity ?? 0;
+          if (qty <= 0) continue;
+
+          console.log(`[stop-loss] 🛑 ${trade.ticker} dropped ${(pctChange*100).toFixed(0)}% (${entryPrice.toFixed(2)}→${currentPrice.toFixed(2)}). Selling.`);
+
+          const priceInCents = Math.round(currentPrice * 100);
+          const result = await kalshiPost('/portfolio/orders', {
+            ticker: trade.ticker,
+            action: 'sell',
+            side: trade.side ?? 'yes',
+            count: qty,
+            yes_price: trade.side === 'yes' ? Math.max(1, priceInCents - 2) : 100 - Math.max(1, priceInCents - 2),
+          });
+
+          if (result.ok) {
+            const loss = (currentPrice - entryPrice) * qty;
+            trade.status = 'sold-stoploss';
+            trade.exitPrice = currentPrice;
+            trade.realizedPnL = Math.round(loss * 100) / 100;
+            trade.settledAt = new Date().toISOString();
+
+            await tg(
+              `🛑 <b>STOP-LOSS TRIGGERED</b>\n\n` +
+              `<b>${trade.title}</b>\n` +
+              `Sold ${trade.side?.toUpperCase()} @ ${(currentPrice*100).toFixed(0)}¢ × ${qty}\n` +
+              `Entry: ${(entryPrice*100).toFixed(0)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢\n` +
+              `Loss: <b>$${Math.abs(loss).toFixed(2)}</b> (${(pctChange*100).toFixed(0)}%)`
+            );
+          }
+        }
+      } catch { /* skip individual ticker check failures */ }
+    }
+
+    // Rewrite trades log if any were updated
+    const updated = trades.some(t => t.status === 'sold-stoploss' && !t._saved);
+    if (updated) {
+      writeFileSync(TRADES_LOG, trades.map(t => JSON.stringify(t)).join('\n') + '\n');
+    }
+  } catch (e) {
+    console.error('[stop-loss] error:', e.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Settlement Reconciliation — update trades.jsonl with P&L on closed markets
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2432,6 +2539,7 @@ async function main() {
 
   // Settlement reconciliation + resolution arbs — every 5 min
   async function settlementLoop() {
+    try { await checkStopLosses(); } catch (e) { console.error('[stop-loss] error:', e.message); }
     try { await checkSettlements(); } catch (e) { console.error('[settlement] error:', e.message); }
     try { await checkResolutionArbs(); } catch (e) { console.error('[resolve] error:', e.message); }
     setTimeout(settlementLoop, 5 * 60 * 1000);
