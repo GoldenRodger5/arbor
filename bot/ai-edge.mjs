@@ -706,9 +706,9 @@ async function refreshPortfolio() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // MLB: probability of leading team winning, by run lead and inning
-// Source: 150 years of MLB data, retrosheet.org
+// Source: Tom Tango (tangotiger.net/we.html), FanGraphs, 1903-2024 data
+// Note: 3-run lead value differs by scoring environment (~4.3 R/G in 2020s)
 const MLB_WIN_EXPECTANCY = {
-  // [runLead][inning] → win probability
   1: { 1: 0.56, 2: 0.58, 3: 0.60, 4: 0.64, 5: 0.67, 6: 0.71, 7: 0.77, 8: 0.84, 9: 0.91 },
   2: { 1: 0.64, 2: 0.67, 3: 0.70, 4: 0.76, 5: 0.79, 6: 0.83, 7: 0.88, 8: 0.93, 9: 0.96 },
   3: { 1: 0.72, 2: 0.75, 3: 0.78, 4: 0.85, 5: 0.87, 6: 0.90, 7: 0.93, 8: 0.96, 9: 0.98 },
@@ -717,15 +717,20 @@ const MLB_WIN_EXPECTANCY = {
 };
 
 // NBA: probability of leading team winning, by point lead and quarter
+// Source: Professor MJ, inpredictable.com, Albert's Blog — MODERN era (2015+)
+// Key: 15-point comebacks now happen 13% of time (was 6% pre-2002) due to 3-point shooting
+// Home court: 62.7% overall (much stronger than MLB/NHL)
 const NBA_WIN_EXPECTANCY = {
-  5:  { 1: 0.58, 2: 0.62, 3: 0.68, 4: 0.78 },
-  10: { 1: 0.65, 2: 0.72, 3: 0.80, 4: 0.89 },
-  15: { 1: 0.74, 2: 0.82, 3: 0.88, 4: 0.95 },
-  20: { 1: 0.82, 2: 0.88, 3: 0.93, 4: 0.98 },
-  25: { 1: 0.88, 2: 0.93, 3: 0.96, 4: 0.99 },
+  5:  { 1: 0.57, 2: 0.60, 3: 0.65, 4: 0.75 },
+  10: { 1: 0.63, 2: 0.69, 3: 0.77, 4: 0.86 },
+  15: { 1: 0.70, 2: 0.78, 3: 0.85, 4: 0.92 },
+  20: { 1: 0.78, 2: 0.85, 3: 0.91, 4: 0.96 },
+  25: { 1: 0.85, 2: 0.90, 3: 0.95, 4: 0.98 },
 };
 
 // NHL: probability of leading team winning, by goal lead and period
+// Source: Hockey Graphs, MoneyPuck — scoring first jumps to 70% win prob
+// Home ice: 59% overall
 const NHL_WIN_EXPECTANCY = {
   1: { 1: 0.62, 2: 0.68, 3: 0.79 },
   2: { 1: 0.80, 2: 0.86, 3: 0.93 },
@@ -1134,13 +1139,15 @@ async function checkLiveScoreEdges() {
           `${targetAbbr} YES @ ${(price*100).toFixed(0)}¢ (market thinks ${(price*100).toFixed(0)}% chance)\n` +
           `${targetAbbr === leadingAbbr ? '(LEADING team' : '(TRAILING team — underdog'}${targetIsHome ? ', HOME)' : ', AWAY)'}\n\n` +
           `═══ YOUR JOB ═══\n` +
-          `Start from the historical baseline above. Then ADJUST up or down based on:\n` +
-          `+ Better team (record, talent) → adjust UP 2-5%\n` +
-          `+ Home field → already included in baseline\n` +
-          `+ Strong pitching/goaltending holding lead → adjust UP 2-3%\n` +
-          `- Trailing team is much better → adjust DOWN 3-8%\n` +
-          `- Leading team has weak bullpen/bench → adjust DOWN 2-5%\n` +
-          `- Trailing team has momentum (just scored) → adjust DOWN 1-3%\n\n` +
+          `Start from the historical baseline above. Then ADJUST up or down:\n` +
+          `+ Better team (record, talent) → UP 2-5%\n` +
+          `+ Home field → already in baseline (+3% home advantage)\n` +
+          `+ Strong pitching/goaltending → UP 2-3%\n` +
+          `+ ${league === 'mlb' ? 'Pitcher with ERA < 3.0 → UP 5-8%' : league === 'nba' ? 'Star player dominating (25+ pts) → UP 3-5%' : 'Goalie with SV% > .925 → UP 3-5%'}\n` +
+          `- Trailing team is much better → DOWN 3-8%\n` +
+          `- ${league === 'mlb' ? 'Weak bullpen (ERA > 5.0) → DOWN 3-5%' : league === 'nba' ? 'MODERN NBA: 15-pt comebacks happen 13% now (3pt era) — be less aggressive on big NBA leads' : 'Empty net situation → DOWN 5-10%'}\n` +
+          `- ${league === 'nba' ? 'Star player in foul trouble → DOWN 5-10% for their team' : 'Trailing team has momentum (just scored multiple) → DOWN 2-4%'}\n` +
+          `- IMPORTANT: Time remaining matters MORE than period/quarter number. 10pts up with 8min left ≠ 10pts up with 30sec left.\n\n` +
           `Use web search if you need injury/streak info. Then give your FINAL adjusted probability.\n\n` +
           `BUY if: your probability ≥ 65% AND at least 3 points above price.\n` +
           `${targetAbbr !== leadingAbbr ? 'NOTE: This is an UNDERDOG bet. The baseline says they LOSE. Only bet if specific factors override the baseline.\n' : ''}` +
@@ -1389,7 +1396,11 @@ async function checkPreGamePredictions() {
       `GAME: ${market.title}\n` +
       `YES price: ${(market.yesAsk*100).toFixed(0)}¢ | NO price: ${(market.noAsk*100).toFixed(0)}¢\n` +
       `Haiku's pick: ${pick.side.toUpperCase()} — "${pick.reason}"\n\n` +
-      `PRE-GAME BASELINE: Home teams win ~54% in MLB, ~58% in NBA, ~55% in NHL. Adjust from there.\n\n` +
+      `PRE-GAME BASELINES (verified historical data):\n` +
+      `- MLB home team wins 54% | Top pitcher (ERA<3.0) adds +10-15% | FIP is better predictor than ERA\n` +
+      `- NBA home team wins 63% | Star player out = -10% | Back-to-back team = -3-5%\n` +
+      `- NHL home team wins 59% | Scoring first = 70% win rate | Goalie SV% is key factor\n` +
+      `Start from the home/away baseline, then adjust.\n\n` +
       `RESEARCH: Look up both teams' records, starting pitchers (MLB), key injuries, recent form (last 5 games), head-to-head this season.\n\n` +
       `ADJUST the baseline based on:\n` +
       `+ Much better record → UP 5-10%\n` +
