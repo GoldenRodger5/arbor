@@ -940,7 +940,9 @@ async function claudeBroadScan() {
       `6. You need a REAL reason the market is wrong — not just "asymmetric pricing" or "bid-ask spread"\n` +
       `7. Fees eat ~1.75¢ per contract at 50¢. Account for this.\n` +
       `8. Do NOT bet on heavy underdogs (price below $0.25) unless your research found SPECIFIC breaking news (injury, rest day, etc). General "upset potential" is NOT an edge.\n` +
-      `9. All markets shown close within ${MAX_DAYS_OUT} days. Prefer markets closing SOONER for faster capital turnover.\n\n` +
+      `9. All markets shown close within ${MAX_DAYS_OUT} days. Prefer markets closing SOONER for faster capital turnover.\n` +
+      `10. KXBTC/KXETH markets are NARROW RANGE bets (e.g. $80,750-$80,999.99). The asset must land in that EXACT $250 window. A 1¢ YES price means ~1% probability — this is usually CORRECT for narrow ranges requiring large moves. Do NOT confuse range bets with above/below bets.\n` +
+      `11. Never buy YES at $0.01-$0.03 on narrow-range or extreme tail markets. These are lottery tickets, not edges. A "14% edge" on a 1¢ contract is meaningless noise.\n\n` +
       `Respond JSON ONLY:\n` +
       `{"trade":false,"reasoning":"why no good trade"}\n` +
       `OR\n` +
@@ -980,6 +982,13 @@ async function claudeBroadScan() {
 
     // Block if edge < 10%
     const price = decision.side === 'yes' ? parseFloat(market.yesAsk) : parseFloat(market.noAsk);
+
+    // Block lottery tickets — contracts at 1-3¢ are tail bets, not edges
+    if (price <= 0.03) {
+      console.log(`[broad-scan] BLOCKED: price ${(price*100).toFixed(0)}¢ is a lottery ticket, not an edge`);
+      return;
+    }
+
     const edge = Math.abs((decision.probability ?? 0) - price);
     if (edge < MIN_EDGE) {
       console.log(`[broad-scan] BLOCKED: edge ${(edge*100).toFixed(1)}% < ${MIN_EDGE_PCT}% minimum`);
