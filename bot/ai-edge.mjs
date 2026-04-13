@@ -2478,12 +2478,19 @@ async function getGameContext(trade) {
 }
 
 // Get game-stage-aware thresholds
+// Philosophy: RIDE WINNERS TO COMPLETION, only stop-loss when game is truly lost
+// At small bankrolls, full $1 payouts on winners matter more than cutting losers early
 function getExitThresholds(stage) {
   switch (stage) {
-    case 'early':  return { stopLoss: -0.50, claudeStop: -0.30, profitTake: 0.40, scaleOut: 0.40, claudeProfit: [0.15, 0.39] };
-    case 'mid':    return { stopLoss: -0.40, claudeStop: -0.25, profitTake: 0.30, scaleOut: 0.30, claudeProfit: [0.10, 0.29] };
-    case 'late':   return { stopLoss: -0.30, claudeStop: -0.20, profitTake: 0.20, scaleOut: 0.25, claudeProfit: [0.08, 0.19] };
-    default:       return { stopLoss: -0.30, claudeStop: -0.20, profitTake: 0.25, scaleOut: 0.30, claudeProfit: [0.10, 0.24] };
+    //                    stopLoss  claudeStop  profitTake  scaleOut  claudeProfit range
+    // Early: game just started, huge variance — very wide stop, NO profit-taking
+    case 'early':  return { stopLoss: -0.70, claudeStop: -0.50, profitTake: 0.60, scaleOut: 0.60, claudeProfit: [0.40, 0.59] };
+    // Mid: game developing — still wide stop, only take profit at 95¢+
+    case 'mid':    return { stopLoss: -0.60, claudeStop: -0.40, profitTake: 0.45, scaleOut: 0.50, claudeProfit: [0.30, 0.44] };
+    // Late: game nearly over — tighter stop OK, take profit at 93¢+
+    case 'late':   return { stopLoss: -0.50, claudeStop: -0.35, profitTake: 0.30, scaleOut: 0.40, claudeProfit: [0.20, 0.29] };
+    // Unknown stage: moderate
+    default:       return { stopLoss: -0.50, claudeStop: -0.35, profitTake: 0.35, scaleOut: 0.45, claudeProfit: [0.25, 0.34] };
   }
 }
 
@@ -2550,16 +2557,18 @@ async function managePositions() {
           continue;
         }
 
-        // PROFIT-TAKE: Up enough AND price 90¢+ → sell all (game nearly decided)
-        if (profitPerContract >= thresholds.profitTake && currentPrice >= 0.90) {
+        // PROFIT-TAKE: Only at 95¢+ — game is essentially decided, lock in the win
+        // At small bankrolls, we need full $1 payouts. Don't sell at 83¢ when it'll be 97¢ soon.
+        if (profitPerContract >= thresholds.profitTake && currentPrice >= 0.95) {
           console.log(`[exit] 💰 PROFIT-TAKE (${stage}): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ at ${(currentPrice*100).toFixed(0)}¢`);
           const result = await executeSell(trade, qty, currentPrice, 'profit-take');
           if (result) anyUpdated = true;
           continue;
         }
 
-        // SCALE-OUT: Up enough → sell half
-        if (profitPerContract >= thresholds.scaleOut && qty >= 2 && currentPrice < 0.90) {
+        // SCALE-OUT: Only sell half at 93¢+ (game very likely decided, protect some profit)
+        // Below 93¢, just hold — our prediction was confident, let it ride
+        if (profitPerContract >= thresholds.scaleOut && qty >= 2 && currentPrice >= 0.93 && currentPrice < 0.95) {
           const halfQty = Math.floor(qty / 2);
           console.log(`[exit] 💰 SCALE-OUT (${stage}): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ — selling ${halfQty}/${qty}`);
           const result = await executeSell(trade, halfQty, currentPrice, 'scale-out');
@@ -2576,13 +2585,19 @@ async function managePositions() {
           tradeCooldowns.set(exitCooldownKey, Date.now());
 
           const lossPrompt =
-            `You manage a live sports bet that's LOSING. Should you SELL or HOLD?\n\n` +
+            `You manage a live sports bet that's DOWN. Should you SELL or HOLD?\n\n` +
             `POSITION: Bought ${trade.side?.toUpperCase()} at ${(entryPrice*100).toFixed(0)}¢. Now ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}% loss).\n` +
             `Game: ${trade.title}\n` +
             `${ctx ? `LIVE: ${ctx.detail}\nGame stage: ${stage.toUpperCase()} | Win expectancy: ${ctx.baselineWE ? (ctx.baselineWE*100).toFixed(0) + '%' : 'unknown'}` : 'No live data available'}\n\n` +
-            `A) SELL NOW: Lock in loss of $${Math.abs(qty * profitPerContract).toFixed(2)}. Free capital.\n` +
-            `B) HOLD: ${ctx?.baselineWE ? `Win expectancy says ${(ctx.baselineWE*100).toFixed(0)}% — team ${ctx.baselineWE > 0.45 ? 'still has a shot' : 'is in trouble'}.` : 'Unknown situation.'} Risk: could lose full $${(qty * entryPrice).toFixed(2)}.\n\n` +
-            `KEY: Is this a normal sports swing (hold) or is the game getting away (sell)?\n\n` +
+            `IMPORTANT: Sports games swing constantly. Comebacks are NORMAL:\n` +
+            `- NBA: 15-point comebacks happen 13% of the time in the 3-point era\n` +
+            `- MLB: 3-run comebacks happen 20%+ through 6 innings\n` +
+            `- NHL: 2-goal comebacks happen ~15% of the time\n` +
+            `- Soccer: Late equalizers happen in ~20% of 1-goal games\n\n` +
+            `We predicted this team would win. The DEFAULT is HOLD unless the game is truly out of reach.\n` +
+            `Only sell if: blowout score (5+ goal/run lead late), key player ejected/injured, or mathematically eliminated.\n\n` +
+            `A) SELL: Lock in loss of $${Math.abs(qty * profitPerContract).toFixed(2)}. Guaranteed loss.\n` +
+            `B) HOLD: If team comes back and wins → +$${(qty * (1 - entryPrice)).toFixed(2)}. If loses → -$${(qty * entryPrice).toFixed(2)}.\n\n` +
             `JSON ONLY: {"action": "sell"/"hold", "reasoning": "why"}`;
 
           const lossText = await claudeScreen(lossPrompt, { maxTokens: 200, timeout: 8000 });
@@ -2604,23 +2619,28 @@ async function managePositions() {
           continue;
         }
 
-        // WINNING: Claude evaluates ambiguous profit-taking
+        // WINNING: Claude evaluates — but STRONGLY biased toward holding
+        // We're growing a small bankroll. Full $1 payouts > locking small profits.
         const [minProfit, maxProfit] = thresholds.claudeProfit;
-        if (profitPerContract >= minProfit && profitPerContract < maxProfit && currentPrice < 0.90) {
+        if (profitPerContract >= minProfit && profitPerContract < maxProfit && currentPrice < 0.93) {
           const exitCooldownKey = 'exit-profit:' + trade.ticker;
           if (Date.now() - (tradeCooldowns.get(exitCooldownKey) ?? 0) < 15 * 60 * 1000) continue;
           tradeCooldowns.set(exitCooldownKey, Date.now());
 
           const exitPrompt =
-            `You manage a live sports bet that's WINNING. Take profit now or hold for more?\n\n` +
+            `You manage a live sports bet that's WINNING. Should you sell or hold?\n\n` +
             `POSITION: Bought ${trade.side?.toUpperCase()} at ${(entryPrice*100).toFixed(0)}¢. Now ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢ profit).\n` +
             `Game: ${trade.title}\n` +
             `${ctx ? `LIVE: ${ctx.detail}\nGame stage: ${stage.toUpperCase()} | Win expectancy: ${ctx.baselineWE ? (ctx.baselineWE*100).toFixed(0) + '%' : 'unknown'}` : 'No live data available'}\n\n` +
-            `A) SELL ALL: Lock in $${(qty * profitPerContract).toFixed(2)} guaranteed. Capital freed.\n` +
-            `B) SELL HALF: Lock in $${(Math.floor(qty/2) * profitPerContract).toFixed(2)}, ride rest.\n` +
-            `C) HOLD: If team wins → $${(qty * (1 - entryPrice)).toFixed(2)} max profit. If loses → -$${(qty * entryPrice).toFixed(2)}.\n\n` +
-            `${ctx?.baselineWE ? `Win expectancy: ${(ctx.baselineWE*100).toFixed(0)}%. ${ctx.baselineWE > 0.85 ? 'Game is nearly decided — lock profit.' : ctx.baselineWE > 0.65 ? 'Good position but game still competitive.' : 'Game is close — consider holding.'}` : ''}\n\n` +
-            `JSON ONLY: {"action": "sell_all"/"sell_half"/"hold", "reasoning": "why"}`;
+            `IMPORTANT CONTEXT: We are growing a small bankroll. We predicted this team would win and they ARE winning. ` +
+            `Selling now at ${(currentPrice*100).toFixed(0)}¢ means leaving ${((1-currentPrice)*100).toFixed(0)}¢/contract on the table. ` +
+            `The DEFAULT should be HOLD unless there is a SPECIFIC reason the game is turning against us.\n\n` +
+            `Only sell if: momentum has clearly shifted, key player injured, or game situation has fundamentally changed.\n` +
+            `If our team is still winning or the game is competitive — HOLD.\n\n` +
+            `A) SELL ALL: Lock in $${(qty * profitPerContract).toFixed(2)} now but give up $${(qty * (1 - currentPrice)).toFixed(2)} potential.\n` +
+            `B) HOLD: Max profit $${(qty * (1 - entryPrice)).toFixed(2)} if they win. Risk: -$${(qty * entryPrice).toFixed(2)} if they lose.\n\n` +
+            `${ctx?.baselineWE ? `Win expectancy: ${(ctx.baselineWE*100).toFixed(0)}%. ${ctx.baselineWE > 0.70 ? 'Team is in strong position — HOLD.' : ctx.baselineWE > 0.50 ? 'Competitive game — default to HOLD.' : 'Team losing ground — consider selling.'}` : ''}\n\n` +
+            `JSON ONLY: {"action": "sell_all"/"hold", "reasoning": "why"}`;
 
           const exitText = await claudeScreen(exitPrompt, { maxTokens: 200, timeout: 8000 });
           if (exitText) {
@@ -2631,10 +2651,6 @@ async function managePositions() {
                 if (d.action === 'sell_all') {
                   console.log(`[exit] 🧠 CLAUDE SELL (${stage}): ${trade.ticker} +${(profitPerContract*100).toFixed(0)}¢ | ${d.reasoning?.slice(0, 60)}`);
                   const result = await executeSell(trade, qty, currentPrice, 'claude-sell');
-                  if (result) anyUpdated = true;
-                } else if (d.action === 'sell_half' && qty >= 2) {
-                  console.log(`[exit] 🧠 CLAUDE HALF (${stage}): ${trade.ticker} +${(profitPerContract*100).toFixed(0)}¢ | ${d.reasoning?.slice(0, 60)}`);
-                  const result = await executeSell(trade, Math.floor(qty / 2), currentPrice, 'claude-scale');
                   if (result) anyUpdated = true;
                 } else {
                   console.log(`[exit] 🧠 CLAUDE HOLD (${stage}): ${trade.ticker} +${(profitPerContract*100).toFixed(0)}¢ | ${d.reasoning?.slice(0, 60)}`);
