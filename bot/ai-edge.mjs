@@ -2067,14 +2067,56 @@ async function checkPreGamePredictions() {
         continue;
       }
 
-      // ALWAYS buy YES on the chosen team's ticker — this is the only correct way
+      // Validate: cross-check team in JSON against reasoning text
+      // Claude sometimes picks the wrong abbreviation (says "BUF wins" but outputs team:"CHI")
+      const reasoning = (decision.reasoning ?? '').toLowerCase();
+      const otherSide = matchedSide === market.team1 ? market.team2 : market.team1;
+      const otherTeamLower = otherSide.teamName.toLowerCase();
+      const chosenTeamLower = matchedSide.teamName.toLowerCase();
+
+      // Validate: cross-check Claude's team pick against its own reasoning
+      // Claude sometimes picks the WRONG abbreviation (says "Buffalo wins" but outputs team:"CHI")
+      // Simple check: count how many times each team is mentioned positively vs negatively
+      const otherTeamNames = [otherSide.team.toLowerCase(), otherTeamLower.split(' ')[0]];
+      const chosenTeamNames = [matchedSide.team.toLowerCase(), chosenTeamLower.split(' ')[0]];
+
+      // Positive signals in reasoning
+      const positiveWords = ['favorite', 'favored', 'better', 'stronger', 'dominant', 'elite', 'superior', 'advantage', 'win streak', 'hot'];
+      const negativeWords = ['eliminated', 'last place', 'worst', 'losing streak', 'struggling', 'injury', 'injured', 'depleted', 'poor', 'weak'];
+
+      let otherPositive = 0, chosenPositive = 0, otherNegative = 0, chosenNegative = 0;
+
+      // Split reasoning into sentences and check context
+      const sentences = reasoning.split(/[.;]/);
+      for (const sentence of sentences) {
+        const mentionsOther = otherTeamNames.some(n => n.length >= 3 && sentence.includes(n));
+        const mentionsChosen = chosenTeamNames.some(n => n.length >= 3 && sentence.includes(n));
+        const hasPositive = positiveWords.some(w => sentence.includes(w));
+        const hasNegative = negativeWords.some(w => sentence.includes(w));
+
+        if (mentionsOther && hasPositive) otherPositive++;
+        if (mentionsOther && hasNegative) otherNegative++;
+        if (mentionsChosen && hasPositive) chosenPositive++;
+        if (mentionsChosen && hasNegative) chosenNegative++;
+      }
+
+      // If the other team has more positive mentions AND our chosen team has more negative mentions → confused
+      if (otherPositive > chosenPositive && otherNegative < chosenNegative) {
+        console.log(`[pre-game] BLOCKED: Claude picked ${chosenTeam} but reasoning favors ${otherSide.team} (other: +${otherPositive}/-${otherNegative}, chosen: +${chosenPositive}/-${chosenNegative}). Likely abbreviation confusion.`);
+        continue;
+      }
+
+      // Also block if other team has 3+ more positive mentions than chosen (strong signal)
+      if (otherPositive >= chosenPositive + 3) {
+        console.log(`[pre-game] BLOCKED: Claude picked ${chosenTeam} but reasoning overwhelmingly favors ${otherSide.team} (+${otherPositive} vs +${chosenPositive}). Likely abbreviation confusion.`);
+        continue;
+      }
+
+      // ALWAYS buy YES on the chosen team's ticker
       const pick = { ticker: matchedSide.ticker, side: 'yes' };
       const price = matchedSide.price;
       const bettingOnTeam = matchedSide.teamName;
       const expectedSport = batchItems[i].sport;
-
-      // Validate: reject if Claude confused the sport
-      const reasoning = (decision.reasoning ?? '').toLowerCase();
       const wrongSport =
         (expectedSport === 'MLB' && (reasoning.includes('nba') || reasoning.includes('nhl') || reasoning.includes('playoff series') || reasoning.includes('world series winner'))) ||
         (expectedSport === 'NBA' && (reasoning.includes('mlb') || reasoning.includes('pitcher') || reasoning.includes('era ') || reasoning.includes('inning'))) ||
