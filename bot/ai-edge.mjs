@@ -34,9 +34,12 @@ const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 
 // DRY RUN MODE: Run full pipeline but don't place real orders.
-// Set DRY_RUN=true in .env or pass --dry-run flag
 const DRY_RUN = process.env.DRY_RUN === 'true' || process.argv.includes('--dry-run');
 if (DRY_RUN) console.log('🧪 DRY RUN MODE — no real orders will be placed');
+
+// KALSHI ONLY MODE: Skip all Polymarket trading. Capital consolidating to Kalshi.
+const KALSHI_ONLY = process.env.KALSHI_ONLY !== 'false'; // default: true
+if (KALSHI_ONLY) console.log('📊 KALSHI ONLY — Polymarket trading disabled');
 
 const MIN_CONFIDENCE = 0.65;      // Claude must be ≥65% confident to trade
 const CONFIDENCE_MARGIN = 0.03;   // LEGACY flat margin — only used for draw bets + fallback
@@ -1089,7 +1092,7 @@ function findPolyMarketForGame(homeAbbr, awayAbbr, polyMarkets, sport = '') {
 // Compare prices and pick the best platform to buy on
 // targetTeamAbbr: which team we want to buy (e.g. 'PIT')
 function pickBestPlatform(side, kalshiPrice, polyMatch, targetTeamAbbr = '') {
-  if (!polyMatch) return { platform: 'kalshi', price: kalshiPrice };
+  if (KALSHI_ONLY || !polyMatch) return { platform: 'kalshi', price: kalshiPrice };
 
   // Find which Poly side matches the team we want to buy
   const target = targetTeamAbbr.toLowerCase();
@@ -2158,6 +2161,7 @@ let lastUFCScan = 0;
 const UFC_SCAN_INTERVAL = 30 * 60 * 1000; // every 30 min (fights don't change fast)
 
 async function checkUFCPredictions() {
+  if (KALSHI_ONLY) return; // UFC is Poly-only
   if (Date.now() - lastUFCScan < UFC_SCAN_INTERVAL) return;
   lastUFCScan = Date.now();
   if (!canTrade()) return;
