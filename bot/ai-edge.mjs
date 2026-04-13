@@ -1882,34 +1882,45 @@ async function checkPreGamePredictions() {
   const pgSlice = preGameMarkets.slice(0, 8);
   const maxBetDisplay = getDynamicMaxTrade().toFixed(2);
 
-  const pgPrompts = pgSlice.map(market => ({
-    market,
-    prompt: `You are a professional sports bettor. Predict who wins this pre-game matchup.\n\n` +
-      `GAME: ${market.title}\n` +
-      `YES price: ${(market.yesAsk*100).toFixed(0)}¢ | NO price: ${(market.noAsk*100).toFixed(0)}¢\n\n` +
-      `PRE-GAME BASELINES (verified historical data):\n` +
-      `- MLB home team wins 54% | Top pitcher (ERA<3.0) adds +10-15% | FIP is better predictor than ERA\n` +
-      `- NBA home team wins 63% | Star player out = -10% | Back-to-back team = -3-5%\n` +
-      `- NHL home team wins 59% | Scoring first = 70% win rate | Goalie SV% is key factor\n` +
-      `- EPL home 45%, draw 28%, away 27% | MLS home 49%, draw 24% | REMEMBER: draw = your contract LOSES\n` +
-      `- Soccer: Red card = massive swing (47%→18%). Recent form (last 5) matters. First goal is critical.\n` +
-      `Start from the home/away baseline, then adjust.\n\n` +
-      `RESEARCH: Look up both teams' records, starting pitchers (MLB), key injuries, recent form (last 5 games), head-to-head this season.\n\n` +
-      `ADJUST the baseline based on:\n` +
-      `+ Much better record → UP 5-10%\n` +
-      `+ Ace pitcher starting (ERA < 3.0) → UP 5-8%\n` +
-      `+ Home team with strong home record → UP 3-5%\n` +
-      `+ Hot streak (won 5+ in a row) → UP 3-5%\n` +
-      `- Key player injured/resting → DOWN 5-10%\n` +
-      `- Bad recent form (lost 4+ in a row) → DOWN 3-5%\n` +
-      `- Poor starter pitching (ERA > 5.0) → DOWN 5-8%\n\n` +
-      `BUY if confidence ≥ 65% AND at least 3 points above the price of the side you pick.\n` +
-      `Pick YES (first team) or NO (second team) — whichever you're more confident in.\n` +
-      `Max bet: $${maxBetDisplay} (bet MORE if confidence is much higher than price)\n\n` +
-      `CRITICAL: You MUST respond with ONLY a JSON object. No analysis text before or after. Just the JSON.\n` +
-      `{"trade":false,"confidence":0.XX,"reasoning":"one sentence: baseline X% adjusted to Y% because Z"}\n` +
-      `OR {"trade":true,"side":"yes"/"no","confidence":0.XX,"betAmount":N,"reasoning":"one sentence: baseline X% adjusted to Y% because Z"}`,
-  }));
+  // Detect sport from ticker and build sport-specific prompts
+  const todayDate = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'long', day: 'numeric' });
+
+  const pgPrompts = pgSlice.map(market => {
+    const tk = market.ticker ?? '';
+    const sport = tk.includes('MLB') ? 'MLB' : tk.includes('NBA') ? 'NBA' : tk.includes('NHL') ? 'NHL' :
+      tk.includes('MLS') ? 'MLS' : tk.includes('EPL') ? 'EPL' : tk.includes('LALIGA') ? 'La Liga' : 'Sport';
+
+    // Sport-specific baseline and research instructions
+    const sportBaseline = {
+      MLB: 'MLB home team wins 54%. Top pitcher (ERA<3.0) adds +10-15%. FIP is better predictor than ERA. Look up starting pitchers, recent form, bullpen ERA.',
+      NBA: 'NBA home team wins 63%. Star player out = -10%. Back-to-back team = -3-5%. Look up injuries, recent form, playoff seeding.',
+      NHL: 'NHL home team wins 59%. Scoring first = 70% win rate. Goalie SV% is key factor. Look up goalie matchup, recent form, special teams.',
+      MLS: 'MLS home team wins 49%, draw 24%, away 27%. DRAW = contract LOSES. Look up form, key injuries. Only bet if confident in WIN not draw.',
+      EPL: 'EPL home 45%, draw 28%, away 27%. DRAW = contract LOSES. Look up league position, form, injuries.',
+      'La Liga': 'La Liga home ~47%, draw ~26%, away ~27%. DRAW = contract LOSES. Look up form table, injuries.',
+    }[sport] ?? 'Home team wins ~55%. Look up records, injuries, recent form.';
+
+    return {
+      market,
+      sport,
+      prompt: `You are a professional ${sport} bettor. Predict who wins this REGULAR SEASON game being played TODAY, ${todayDate}.\n\n` +
+        `THIS IS A ${sport} GAME. Not a futures market, not a playoff series — a single regular season ${sport} game TODAY.\n\n` +
+        `GAME: ${market.title}\n` +
+        `Sport: ${sport}\n` +
+        `Ticker: ${market.ticker}\n` +
+        `YES price: ${(market.yesAsk*100).toFixed(0)}¢ (YES = first team listed wins)\n` +
+        `NO price: ${(market.noAsk*100).toFixed(0)}¢ (NO = second team listed wins)\n\n` +
+        `BASELINE: ${sportBaseline}\n` +
+        `Start from the home/away baseline, then adjust based on your research.\n\n` +
+        `RESEARCH: Look up both teams' 2026 records, starting pitchers/goalies, key injuries TODAY, recent form (last 5 games), head-to-head this season.\n\n` +
+        `BUY if confidence ≥ 65% AND at least 3 points above the price of the side you pick.\n` +
+        `Pick YES (first team wins) or NO (second team wins).\n` +
+        `Max bet: $${maxBetDisplay}\n\n` +
+        `CRITICAL: Respond with ONLY a JSON object. No other text.\n` +
+        `{"trade":false,"confidence":0.XX,"reasoning":"${sport} baseline X%, adjusted to Y% because Z"}\n` +
+        `OR {"trade":true,"side":"yes"/"no","confidence":0.XX,"betAmount":N,"reasoning":"${sport} baseline X%, adjusted to Y% because Z"}`,
+    };
+  });
 
   // Fire in parallel batches of 3
   for (let batch = 0; batch < pgPrompts.length; batch += 3) {
@@ -1940,6 +1951,18 @@ async function checkPreGamePredictions() {
 
       const pick = { ticker: market.ticker, side: decision.side ?? 'yes' };
       const price = pick.side === 'yes' ? market.yesAsk : market.noAsk;
+      const expectedSport = batchItems[i].sport;
+
+      // Validate: reject if Claude confused the sport
+      const reasoning = (decision.reasoning ?? '').toLowerCase();
+      const wrongSport =
+        (expectedSport === 'MLB' && (reasoning.includes('nba') || reasoning.includes('nhl') || reasoning.includes('playoff series') || reasoning.includes('world series winner'))) ||
+        (expectedSport === 'NBA' && (reasoning.includes('mlb') || reasoning.includes('pitcher') || reasoning.includes('era ') || reasoning.includes('inning'))) ||
+        (expectedSport === 'NHL' && (reasoning.includes('nba') || reasoning.includes('mlb') || reasoning.includes('pitcher')));
+      if (wrongSport) {
+        console.log(`[pre-game] BLOCKED: Claude confused sport for ${market.ticker}. Expected ${expectedSport}, reasoning mentions wrong sport.`);
+        continue;
+      }
 
       if (!decision.trade) {
         console.log(`[pre-game] Sonnet rejected ${market.ticker}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
@@ -1952,9 +1975,7 @@ async function checkPreGamePredictions() {
     // HARD CAP: Pre-game confidence capped at baseline + 15%
     // Home team baseline: MLB 54%, NBA 63%, NHL 59%, Soccer 45-49%
     // Without a live score to anchor, Claude can hallucinate 90%+ confidence
-    const pgSportKey = market.ticker.includes('MLB') ? 'mlb' : market.ticker.includes('NBA') ? 'nba' :
-      market.ticker.includes('NHL') ? 'nhl' : market.ticker.includes('MLS') ? 'mls' :
-      market.ticker.includes('EPL') ? 'epl' : market.ticker.includes('LALIGA') ? 'laliga' : '';
+    const pgSportKey = expectedSport.toLowerCase();
     const preGameBaselines = { mlb: 0.54, nba: 0.63, nhl: 0.59, mls: 0.49, epl: 0.45, laliga: 0.45 };
     const pgBaseline = preGameBaselines[pgSportKey] ?? 0.55;
     // For pre-game, the "baseline" is the home team win rate. Adjust: if betting YES (home), use baseline.
