@@ -382,7 +382,9 @@ function getDynamicMaxTrade(exchange = 'kalshi') {
 }
 
 function getTotalDeployed() {
-  return openPositions.reduce((sum, p) => sum + (p.cost ?? 0), 0);
+  // Use Kalshi's portfolio_value (current market value) not original cost
+  // Original cost is misleading — a $50 position that's now worth $10 isn't $50 of deployment
+  return kalshiPositionValue + openPositions.filter(p => p.exchange === 'polymarket').reduce((sum, p) => sum + (p.cost ?? 0), 0);
 }
 
 function canDeployMore(tradeAmount) {
