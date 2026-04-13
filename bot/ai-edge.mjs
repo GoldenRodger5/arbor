@@ -880,6 +880,30 @@ async function refreshPortfolio() {
   // Also refresh Poly balance
   await refreshPolyBalance();
 
+  // Sync: auto-close JSONL entries that Kalshi no longer reports (manual cashouts)
+  try {
+    if (existsSync(TRADES_LOG)) {
+      const kalshiTickers = new Set(openPositions.filter(p => p.exchange === 'kalshi').map(p => p.ticker));
+      const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      let synced = false;
+      for (const t of trades) {
+        if (t.status !== 'open' || t.exchange !== 'kalshi') continue;
+        if (!kalshiTickers.has(t.ticker)) {
+          // Kalshi no longer has this position — manually cashed out
+          t.status = 'closed-manual';
+          t.settledAt = new Date().toISOString();
+          t.realizedPnL = t.realizedPnL ?? 0; // unknown P&L from manual close
+          synced = true;
+          console.log(`[sync] Auto-closed ${t.ticker} — no longer in Kalshi portfolio (manual cashout)`);
+        }
+      }
+      if (synced) {
+        writeFileSync(TRADES_LOG, trades.map(t => JSON.stringify(t)).join('\n') + '\n');
+      }
+    }
+  } catch (e) { console.error('[sync] error:', e.message); }
+
   const kalshiCount = openPositions.filter(p => p.exchange === 'kalshi').length;
   const polyCount = openPositions.filter(p => p.exchange === 'polymarket').length;
   console.log(`[portfolio] Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions | Poly: $${polyBalance.toFixed(2)} | Open: ${kalshiCount} Kalshi + ${polyCount} Poly`);
@@ -1863,6 +1887,7 @@ const MAX_PREGAME_PER_CYCLE = 2;   // Max trades per scan — be surgical, not s
 const MAX_PREGAME_PER_DAY = 4;     // Max pre-game trades per day — force selectivity
 let preGameTradesToday = 0;
 let preGameTradesDate = '';         // reset counter on new day
+const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
 
 async function checkPreGamePredictions() {
   if (Date.now() - lastPreGameScan < PREGAME_SCAN_INTERVAL) return;
@@ -1875,6 +1900,7 @@ async function checkPreGamePredictions() {
   if (preGameTradesDate !== todayDateStr) {
     preGameTradesToday = 0;
     preGameTradesDate = todayDateStr;
+    preGameBetGames.clear();
   }
   if (preGameTradesToday >= MAX_PREGAME_PER_DAY) {
     console.log(`[pre-game] Daily limit reached (${MAX_PREGAME_PER_DAY} trades). Skipping until tomorrow.`);
@@ -2071,6 +2097,7 @@ async function checkPreGamePredictions() {
 
     if (!canDeployMore(qty * bestPrice)) continue;
     if (preGameTradesToday >= MAX_PREGAME_PER_DAY) { console.log(`[pre-game] Daily limit reached`); continue; }
+    if (preGameBetGames.has(market.base)) { console.log(`[pre-game] Already bet on ${market.base} today`); continue; }
 
     const pgPlatformLabel = pgBest.platform === 'polymarket' ? `POLY (saved ${((price-bestPrice)*100).toFixed(0)}¢ vs Kalshi)` : 'KALSHI';
     console.log(`[pre-game] 🎯 TRADE on ${pgPlatformLabel}: ${market.ticker} ${pick.side.toUpperCase()} @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}% (${preGameTradesToday+1}/${MAX_PREGAME_PER_DAY} today)`);
@@ -2095,6 +2122,7 @@ async function checkPreGamePredictions() {
       stats.tradesPlaced++;
       preGameTradesToday++;
       preGameTradesThisCycle++;
+      preGameBetGames.add(market.base);
       logTrade({
         exchange: pgBest.platform, strategy: 'pre-game-prediction',
         ticker: pgBest.platform === 'polymarket' ? pgBest.slug : market.ticker,
@@ -3294,20 +3322,19 @@ async function checkSettlements() {
 // Stop-Loss Outcome Review — check if stop-losses were correct after games end
 // ─────────────────────────────────────────────────────────────────────────────
 
-const reviewedStopLosses = new Set(); // prevent duplicate reviews
-
+// Stop-loss review uses trade's own `stopReviewed` field to persist across restarts
 async function reviewStopLossOutcomes() {
   if (!existsSync(TRADES_LOG)) return;
   try {
     const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
     const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
 
-    // Find trades that were stopped out in last 24h
+    // Find trades that were stopped out in last 24h AND haven't been reviewed yet
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     const stoppedTrades = trades.filter(t =>
       (t.status === 'sold-stop-loss' || t.status === 'sold-claude-stop') &&
       t.settledAt && Date.parse(t.settledAt) > cutoff &&
-      !reviewedStopLosses.has(t.ticker)
+      !t.stopReviewed // persisted in JSONL, survives restarts
     );
     if (stoppedTrades.length === 0) return;
 
@@ -3329,7 +3356,7 @@ async function reviewStopLossOutcomes() {
         const market = mktData?.market;
         if (!market || !market.result) continue; // game not over yet
 
-        reviewedStopLosses.add(ticker);
+        trade.stopReviewed = true; // persist in JSONL so we don't re-review after restart
 
         const wouldHaveWon = (trade.side === 'yes' && market.result === 'yes') ||
                             (trade.side === 'no' && market.result === 'no');
@@ -3361,6 +3388,11 @@ async function reviewStopLossOutcomes() {
       } catch (e) {
         console.error(`[stop-review] error checking ${ticker}:`, e.message);
       }
+    }
+
+    // Save updated trades (with stopReviewed flags)
+    if (stoppedTrades.length > 0) {
+      writeFileSync(TRADES_LOG, trades.map(t => JSON.stringify(t)).join('\n') + '\n');
     }
   } catch (e) {
     console.error('[stop-review] error:', e.message);
