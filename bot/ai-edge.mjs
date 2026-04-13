@@ -1477,6 +1477,32 @@ async function checkLiveScoreEdges() {
         const targetIsHome = targetAbbr === homeAbbr;
         const baselineText = getWinExpectancyText(league, diff, period, leadingAbbr === homeAbbr);
 
+        // Soccer: extract team-specific draw rates from records (W-D-L format)
+        let soccerDrawWarning = '';
+        if (isSoccer) {
+          const parseDrawRate = (record) => {
+            const parts = record.split('-').map(Number);
+            if (parts.length >= 3) {
+              const [w, d, l] = parts;
+              const total = w + d + l;
+              if (total > 0) return { draws: d, total, rate: d / total };
+            }
+            return null;
+          };
+          const targetRecord = targetAbbr === homeAbbr ? homeRecord : awayRecord;
+          const drawData = parseDrawRate(targetRecord);
+          if (drawData && drawData.rate > 0.30) {
+            soccerDrawWarning = `\n═══ CRITICAL DRAW WARNING ═══\n` +
+              `${targetAbbr} has drawn ${drawData.draws} of ${drawData.total} games this season (${(drawData.rate*100).toFixed(0)}% draw rate).\n` +
+              `This is MUCH higher than average (25-28%). A DRAW means this contract LOSES.\n` +
+              `You MUST reduce your WIN probability significantly — if this team draws ${(drawData.rate*100).toFixed(0)}% of games,\n` +
+              `even a 1-goal lead at 70' is probably only 35-45% WIN (not the 65-78% baseline).\n` +
+              `DO NOT bet if your adjusted WIN probability is below 65%.\n`;
+          } else if (drawData) {
+            soccerDrawWarning = `\n${targetAbbr} draw rate: ${drawData.draws}/${drawData.total} games (${(drawData.rate*100).toFixed(0)}%). Remember: draw = contract LOSES.\n`;
+          }
+        }
+
         const livePrompt =
           `You are a professional sports bettor. Your job: predict this game's outcome using the historical baseline below.\n\n` +
           `═══ LIVE ${league.toUpperCase()} GAME ═══\n` +
@@ -1491,8 +1517,9 @@ async function checkLiveScoreEdges() {
           (shootingInfo ? `${shootingInfo}\n` : '') +
           (leadersInfo ? `${leadersInfo}` : '') +
           (timeRemaining && timeRemaining !== gameDetail ? `Time: ${timeRemaining}\n` : '') +
-          `\n═══ ${baselineText} ═══\n\n` +
-          `═══ MARKET ═══\n` +
+          `\n═══ ${baselineText} ═══\n` +
+          soccerDrawWarning +
+          `\n═══ MARKET ═══\n` +
           `${targetAbbr} YES @ ${(price*100).toFixed(0)}¢ (market thinks ${(price*100).toFixed(0)}% chance)\n` +
           `${targetAbbr === leadingAbbr ? '(LEADING team' : '(TRAILING team — underdog'}${targetIsHome ? ', HOME)' : ', AWAY)'}\n\n` +
           `═══ YOUR JOB ═══\n` +
@@ -1623,9 +1650,11 @@ async function checkLiveScoreEdges() {
         }
 
         // Dynamic margin — sport-aware, price-aware, situation-aware
+        // Entry gate uses RAW edge (confidence - price). Fees affect profit, not prediction quality.
         const reqMargin = getRequiredMargin(price, { sport: league, live: true, scoreChanged: !!item._scoreChanged, lineMove: !!item._lineMove });
-        if (netEdge(confidence, price) < reqMargin) {
-          console.log(`[live-edge] Not enough margin: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ need=${(reqMargin*100).toFixed(0)}% (${league})`);
+        const rawEdge = confidence - price;
+        if (rawEdge < reqMargin) {
+          console.log(`[live-edge] Not enough margin: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(rawEdge*100).toFixed(1)}% need=${(reqMargin*100).toFixed(0)}% (${league})`);
           continue;
         }
 
@@ -1643,7 +1672,7 @@ async function checkLiveScoreEdges() {
         // Use the better price for sizing
         const bestPrice = best.price;
         const bestEdge = confidence - bestPrice;
-        if (netEdge(confidence, bestPrice) < reqMargin) continue; // recheck with best price + fees
+        if (confidence - bestPrice < reqMargin) continue; // recheck with best price (raw edge)
 
         const maxBetLE = getPositionSize(best.platform, bestEdge);
         const claudeBet = decision.betAmount ?? 0;
@@ -1863,8 +1892,8 @@ async function checkPreGamePredictions() {
     }
 
     const pgReqMargin = getRequiredMargin(price, { sport: pgSportKey, live: false });
-    if (confidence < MIN_CONFIDENCE || netEdge(confidence, price) < pgReqMargin) {
-      console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ need=${(pgReqMargin*100).toFixed(0)}% (${pgSportKey})`);
+    if (confidence < MIN_CONFIDENCE || (confidence - price) < pgReqMargin) {
+      console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${((confidence-price)*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% (${pgSportKey})`);
       continue;
     }
 
@@ -1885,7 +1914,7 @@ async function checkPreGamePredictions() {
 
     const bestPrice = pgBest.price;
     const edge = confidence - bestPrice;
-    if (netEdge(confidence, bestPrice) < pgReqMargin) continue;
+    if (confidence - bestPrice < pgReqMargin) continue;
 
     const maxBet = getPositionSize(pgBest.platform, edge);
     const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
@@ -2496,7 +2525,7 @@ async function claudeBroadScan() {
       const bsSport = bsSportKey || (bsCat.includes('crypto') ? 'crypto' : bsCat.includes('econ') ? 'economics' : bsCat.includes('polit') ? 'politics' : '');
       const bsReqMargin = getRequiredMargin(price, { sport: bsSport, live: false });
       if (confidence < MIN_CONFIDENCE) { console.log(`[broad-scan] Confidence too low: ${(confidence*100).toFixed(0)}%`); continue; }
-      if (netEdge(confidence, price) < bsReqMargin) { console.log(`[broad-scan] Not enough margin: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ need=${(bsReqMargin*100).toFixed(0)}% (${bsSport})`); continue; }
+      if ((confidence - price) < bsReqMargin) { console.log(`[broad-scan] Not enough margin: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${((confidence-price)*100).toFixed(1)}% need=${(bsReqMargin*100).toFixed(0)}% (${bsSport})`); continue; }
 
       const edge = confidence - price;
 
