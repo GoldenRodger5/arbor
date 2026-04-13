@@ -57,15 +57,29 @@ export default function CommandCenter() {
   // Streak display
   const streakIcon = s.streakType === 'win' && s.streak >= 3 ? '🔥' : s.streakType === 'win' ? '✅' : s.streakType === 'loss' ? '❌' : '';
 
-  // Motivational projections
-  const dailyAvgPnL = s.settledTrades > 0 ? (s.totalPnL ?? 0) / Math.max(1, snapshots.length) : 0;
-  const daysTo1K = dailyAvgPnL > 0 ? Math.ceil((1000 - bankroll) / dailyAvgPnL) : null;
-  const daysTo4KMonth = dailyAvgPnL > 0 ? Math.ceil((5000 - bankroll) / (dailyAvgPnL + (400 / 14))) : null; // include $400 biweekly
-  const monthlyProjected = dailyAvgPnL * 30;
+  // Motivational projections based on actual performance
+  const totalPnL = s.totalPnL ?? 0;
+  const settledCount = s.settledTrades ?? 0;
+  const winRate = s.winRate ?? 0;
+  const avgWin = settledCount > 0 && s.wins > 0 ? totalPnL / s.wins : 0; // rough avg per win
+
+  // "If every day is like today" projections
+  const todayPnL = s.todayPnL ?? 0;
+  const weeklyIfToday = todayPnL * 7;
+  const monthlyIfToday = todayPnL * 30;
+  const yearlyIfToday = todayPnL * 365;
+
+  // "If every day is like our average" projections
+  const tradingDays = Math.max(1, snapshots.length || 1);
+  const dailyAvgPnL = totalPnL / tradingDays;
+  const weeklyAvg = dailyAvgPnL * 7;
+  const monthlyAvg = dailyAvgPnL * 30;
+  const daysTo1K = dailyAvgPnL > 0 ? Math.ceil((1000 - bankroll) / (dailyAvgPnL + (400 / 14))) : null;
+  const daysTo5K = dailyAvgPnL > 0 ? Math.ceil((5000 - bankroll) / (dailyAvgPnL + (400 / 14))) : null;
 
   // Daily target: 5% of bankroll
   const dailyTarget = bankroll * 0.05;
-  const dailyProgress = Math.max(0, Math.min(1, (s.todayPnL ?? 0) / dailyTarget));
+  const dailyProgress = Math.max(0, Math.min(1, todayPnL / dailyTarget));
 
   return (
     <div>
@@ -147,20 +161,26 @@ export default function CommandCenter() {
         <div style={{
           background: 'var(--bg-surface)', border: '1px solid var(--border)', borderRadius: 12, padding: '16px 20px',
         }}>
-          <div className="label" style={{ marginBottom: 8 }}>PROJECTIONS</div>
-          {dailyAvgPnL > 0 ? (
-            <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.8 }}>
-              <div>Avg daily: <span className="font-mono" style={{ color: 'var(--green)' }}>+${dailyAvgPnL.toFixed(2)}</span></div>
-              <div>Monthly pace: <span className="font-mono" style={{ color: 'var(--green)' }}>+${monthlyProjected.toFixed(0)}</span></div>
+          <div className="label" style={{ marginBottom: 8 }}>IF EVERY DAY IS LIKE TODAY</div>
+          {todayPnL !== 0 ? (
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.9 }}>
+              <div>This week: <span className="font-mono" style={{ color: weeklyIfToday >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>{weeklyIfToday >= 0 ? '+' : ''}${weeklyIfToday.toFixed(0)}/wk</span></div>
+              <div>This month: <span className="font-mono" style={{ color: monthlyIfToday >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>{monthlyIfToday >= 0 ? '+' : ''}${monthlyIfToday.toFixed(0)}/mo</span></div>
+              <div>This year: <span className="font-mono" style={{ color: yearlyIfToday >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>{yearlyIfToday >= 0 ? '+' : ''}${yearlyIfToday.toFixed(0)}/yr</span></div>
+            </div>
+          ) : (
+            <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>No P&L today yet</div>
+          )}
+          {dailyAvgPnL > 0 && (
+            <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)', fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.8 }}>
+              <div>Avg daily: <span className="font-mono">${dailyAvgPnL.toFixed(2)}</span> → <span className="font-mono">${weeklyAvg.toFixed(0)}/wk</span></div>
               {daysTo1K != null && daysTo1K > 0 && daysTo1K < 365 && (
                 <div>$1K bankroll in <span className="font-mono" style={{ color: 'var(--accent)' }}>{daysTo1K} days</span></div>
               )}
-              {daysTo4KMonth != null && daysTo4KMonth > 0 && daysTo4KMonth < 365 && (
-                <div>$4K/mo target in <span className="font-mono" style={{ color: 'var(--accent)' }}>{daysTo4KMonth} days</span></div>
+              {daysTo5K != null && daysTo5K > 0 && daysTo5K < 365 && (
+                <div>$5K bankroll in <span className="font-mono" style={{ color: 'var(--accent)' }}>{daysTo5K} days</span></div>
               )}
             </div>
-          ) : (
-            <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>Need more settled trades for projections</div>
           )}
         </div>
       </div>

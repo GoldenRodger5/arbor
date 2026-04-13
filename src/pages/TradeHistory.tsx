@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { useArbor } from '@/context/ArborContext';
 
 function PnlBadge({ value }: { value: number | null }) {
@@ -31,8 +31,9 @@ export default function TradeHistory() {
   const [filterSport, setFilterSport] = useState('all');
   const [filterResult, setFilterResult] = useState('all');
   const [filterStrategy, setFilterStrategy] = useState('all');
+  const [filterDate, setFilterDate] = useState('all');
 
-  const sortedTrades = [...trades].reverse();
+  const sortedTrades = useMemo(() => [...trades].reverse(), [trades]);
 
   const sportOf = (t: any) => {
     const tk = (t.ticker ?? '').toUpperCase();
@@ -51,20 +52,29 @@ export default function TradeHistory() {
     return 'even';
   };
 
+  const dateOf = (t: any) => new Date(t.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+  // Unique values for filters
+  const sports = useMemo(() => ['all', ...new Set(sortedTrades.map(sportOf))], [sortedTrades]);
+  const strategies = useMemo(() => ['all', ...new Set(sortedTrades.map(t => t.strategy).filter(Boolean))], [sortedTrades]);
+  const dates = useMemo(() => {
+    const d = new Set(sortedTrades.map(dateOf));
+    return ['all', ...d];
+  }, [sortedTrades]);
+
   const filtered = sortedTrades.filter(t => {
     if (filterSport !== 'all' && sportOf(t) !== filterSport) return false;
     if (filterResult !== 'all' && resultOf(t) !== filterResult) return false;
     if (filterStrategy !== 'all' && t.strategy !== filterStrategy) return false;
+    if (filterDate !== 'all' && dateOf(t) !== filterDate) return false;
     return true;
   });
-
-  const sports = ['all', ...new Set(sortedTrades.map(sportOf))];
-  const strategies = ['all', ...new Set(sortedTrades.map(t => t.strategy).filter(Boolean))];
 
   // Summary
   const settled = filtered.filter(t => t.status !== 'open');
   const wins = settled.filter(t => (t.realizedPnL ?? 0) > 0).length;
   const totalPnL = settled.reduce((s, t) => s + (t.realizedPnL ?? 0), 0);
+  const avgPnL = settled.length > 0 ? totalPnL / settled.length : 0;
 
   return (
     <div>
@@ -82,10 +92,14 @@ export default function TradeHistory() {
         <span style={{ color: 'var(--red)' }}>{settled.length - wins}L</span>
         <span>Win rate: {settled.length > 0 ? Math.round((wins / settled.length) * 100) : 0}%</span>
         <span>P&L: <PnlBadge value={Math.round(totalPnL * 100) / 100} /></span>
+        <span>Avg: <PnlBadge value={Math.round(avgPnL * 100) / 100} /></span>
       </div>
 
       {/* Filters */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+        <select value={filterDate} onChange={e => setFilterDate(e.target.value)} style={selectStyle}>
+          {dates.map(d => <option key={d} value={d}>{d === 'all' ? 'All Dates' : d}</option>)}
+        </select>
         <select value={filterSport} onChange={e => setFilterSport(e.target.value)} style={selectStyle}>
           {sports.map(s => <option key={s} value={s}>{s === 'all' ? 'All Sports' : s}</option>)}
         </select>
@@ -98,6 +112,10 @@ export default function TradeHistory() {
         <select value={filterStrategy} onChange={e => setFilterStrategy(e.target.value)} style={selectStyle}>
           {strategies.map(s => <option key={s} value={s}>{s === 'all' ? 'All Strategies' : s}</option>)}
         </select>
+        {(filterDate !== 'all' || filterSport !== 'all' || filterResult !== 'all' || filterStrategy !== 'all') && (
+          <button onClick={() => { setFilterDate('all'); setFilterSport('all'); setFilterResult('all'); setFilterStrategy('all'); }}
+            style={{ ...selectStyle, color: 'var(--red)', cursor: 'pointer' }}>Clear filters</button>
+        )}
       </div>
 
       {/* Trade List */}
@@ -107,11 +125,12 @@ export default function TradeHistory() {
           const date = new Date(t.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
           const time = new Date(t.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
           const sport = sportOf(t);
+          const isHC = t.highConviction || t.strategy === 'high-conviction';
 
           return (
             <div key={t.id} onClick={() => setExpanded(isExpanded ? null : t.id)} style={{
-              background: 'var(--bg-surface)', border: '1px solid var(--border)', borderRadius: 10,
-              padding: '12px 16px', cursor: 'pointer',
+              background: 'var(--bg-surface)', border: `1px solid ${isHC ? 'rgba(245, 158, 11, 0.3)' : 'var(--border)'}`,
+              borderRadius: 10, padding: '12px 16px', cursor: 'pointer',
             }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, minWidth: 0 }}>
@@ -122,6 +141,7 @@ export default function TradeHistory() {
                     background: 'var(--bg-elevated)', padding: '2px 6px', borderRadius: 4,
                     fontSize: 10, fontWeight: 600, color: 'var(--accent)', flexShrink: 0,
                   }}>{sport}</span>
+                  {isHC && <span style={{ fontSize: 12 }}>🔥</span>}
                   <span style={{ fontSize: 13, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {t.title}
                   </span>
@@ -139,9 +159,7 @@ export default function TradeHistory() {
               </div>
 
               {isExpanded && (
-                <div style={{
-                  marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--border)',
-                }}>
+                <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
                   <div className="label" style={{ marginBottom: 6 }}>CLAUDE'S REASONING</div>
                   <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.5, fontStyle: 'italic' }}>
                     {t.reasoning}
@@ -160,6 +178,10 @@ export default function TradeHistory() {
           );
         })}
       </div>
+
+      {filtered.length === 0 && (
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>No trades match filters</div>
+      )}
     </div>
   );
 }

@@ -560,11 +560,13 @@ function getPositionSize(exchange = 'kalshi', confidenceMargin = 0, highConvTier
   const bankroll = getBankroll();
 
   // High-conviction tier: 25-30% of bankroll instead of 10%
+  // HC tier bypasses the normal trade ceiling — the ceiling is for normal bets,
+  // HC bets are rare (1/hour max) and near-certain. Own ceiling: 50% of bankroll.
   if (highConvTier > 0) {
     const hcSize = bankroll * highConvTier;
     const available = getAvailableCash(exchange);
-    const ceiling = getTradeCapCeiling();
-    const size = Math.min(hcSize, available, ceiling);
+    const hcCeiling = bankroll * 0.50; // HC can go up to 50% bankroll
+    const size = Math.min(hcSize, available, hcCeiling);
     console.log(`[sizing] 🔥 HIGH CONVICTION: ${(highConvTier*100).toFixed(0)}% of $${bankroll.toFixed(0)} → $${size.toFixed(2)}`);
     return Math.max(1, size);
   }

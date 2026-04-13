@@ -61,16 +61,24 @@ function handleRequest(req, res) {
   try {
     if (path === '/api/trades') {
       const trades = readJsonl(TRADES_LOG);
-      json(res, trades);
+      const exchangeFilter = url.searchParams.get('exchange') ?? 'kalshi';
+      const filtered = exchangeFilter === 'all' ? trades : trades.filter(t => t.exchange === exchangeFilter);
+      json(res, filtered);
 
     } else if (path === '/api/positions') {
       const trades = readJsonl(TRADES_LOG);
-      const open = trades.filter(t => t.status === 'open');
+      const exchangeFilter = url.searchParams.get('exchange') ?? 'kalshi';
+      const open = trades.filter(t => t.status === 'open' && (exchangeFilter === 'all' || t.exchange === exchangeFilter));
       json(res, open);
 
     } else if (path === '/api/stats') {
-      const trades = readJsonl(TRADES_LOG);
+      const allTrades = readJsonl(TRADES_LOG);
       const snapshots = readJsonl(DAILY_LOG);
+
+      // Filter: Kalshi-only for P&L (Poly excluded from stats)
+      const exchangeFilter = url.searchParams.get('exchange') ?? 'kalshi';
+      const trades = exchangeFilter === 'all' ? allTrades : allTrades.filter(t => t.exchange === exchangeFilter);
+
       const settled = trades.filter(t => t.status === 'settled' || t.status?.startsWith('sold-'));
       const open = trades.filter(t => t.status === 'open');
       const wins = settled.filter(t => (t.realizedPnL ?? 0) > 0);
