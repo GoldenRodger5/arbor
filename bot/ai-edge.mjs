@@ -2677,21 +2677,35 @@ async function getGameContext(trade) {
   return null;
 }
 
-// Get game-stage-aware thresholds
-// Philosophy: RIDE WINNERS TO COMPLETION, only stop-loss when game is truly lost
-// At small bankrolls, full $1 payouts on winners matter more than cutting losers early
-function getExitThresholds(stage) {
-  switch (stage) {
-    //                    stopLoss  claudeStop  profitTake  scaleOut  claudeProfit range
-    // Early: game just started, huge variance — very wide stop, NO profit-taking
-    case 'early':  return { stopLoss: -0.70, claudeStop: -0.50, profitTake: 0.60, scaleOut: 0.60, claudeProfit: [0.40, 0.59] };
-    // Mid: game developing — still wide stop, only take profit at 95¢+
-    case 'mid':    return { stopLoss: -0.60, claudeStop: -0.40, profitTake: 0.45, scaleOut: 0.50, claudeProfit: [0.30, 0.44] };
-    // Late: game nearly over — tighter stop OK, take profit at 93¢+
-    case 'late':   return { stopLoss: -0.50, claudeStop: -0.35, profitTake: 0.30, scaleOut: 0.40, claudeProfit: [0.20, 0.29] };
-    // Unknown stage: moderate
-    default:       return { stopLoss: -0.50, claudeStop: -0.35, profitTake: 0.35, scaleOut: 0.45, claudeProfit: [0.25, 0.34] };
-  }
+// Get exit thresholds — price-aware AND stage-aware
+// Expensive entries (70¢+) need tighter stops: losing $13 on a $25 position is brutal
+// Cheap entries (under 50¢) can be looser: risk/reward justifies patience
+function getExitThresholds(stage, entryPrice = 0.50) {
+  // Price tier: expensive (70¢+), mid (50-70¢), cheap (under 50¢)
+  const tier = entryPrice >= 0.70 ? 'expensive' : entryPrice >= 0.50 ? 'mid' : 'cheap';
+
+  const thresholds = {
+    expensive: {
+      early:   { stopLoss: -0.40, claudeStop: -0.25 },
+      mid:     { stopLoss: -0.35, claudeStop: -0.20 },
+      late:    { stopLoss: -0.30, claudeStop: -0.18 },
+      unknown: { stopLoss: -0.35, claudeStop: -0.20 },
+    },
+    mid: {
+      early:   { stopLoss: -0.55, claudeStop: -0.35 },
+      mid:     { stopLoss: -0.45, claudeStop: -0.30 },
+      late:    { stopLoss: -0.40, claudeStop: -0.25 },
+      unknown: { stopLoss: -0.45, claudeStop: -0.30 },
+    },
+    cheap: {
+      early:   { stopLoss: -0.70, claudeStop: -0.50 },
+      mid:     { stopLoss: -0.60, claudeStop: -0.40 },
+      late:    { stopLoss: -0.50, claudeStop: -0.35 },
+      unknown: { stopLoss: -0.50, claudeStop: -0.35 },
+    },
+  };
+
+  return thresholds[tier][stage] ?? thresholds[tier].unknown;
 }
 
 async function managePositions() {
@@ -2745,28 +2759,39 @@ async function managePositions() {
         // Fetch game context (stage, score, ESPN data)
         const ctx = await getGameContext(trade);
         const stage = ctx?.stage ?? 'unknown';
-        const thresholds = getExitThresholds(stage);
+        const thresholds = getExitThresholds(stage, entryPrice);
 
-        // === TIER 1: Rule-based auto-exits (game-stage-aware) ===
+        // === TIER 1: Rule-based auto-exits ===
 
-        // STOP-LOSS: Dynamic by game stage
+        // STOP-LOSS: Price-aware + stage-aware
+        // Expensive entries (70¢+) stop tighter — losing $13 on $25 is brutal
+        // Cheap entries (under 50¢) stop looser — risk/reward justifies patience
         if (pctChange < thresholds.stopLoss) {
-          console.log(`[exit] 🛑 STOP-LOSS (${stage}): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% (threshold: ${(thresholds.stopLoss*100).toFixed(0)}%)`);
+          console.log(`[exit] 🛑 STOP-LOSS (${stage}, entry ${(entryPrice*100).toFixed(0)}¢): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% (threshold: ${(thresholds.stopLoss*100).toFixed(0)}%)`);
           const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
           if (result) anyUpdated = true;
           continue;
         }
 
-        // NO PROFIT-TAKING — let every winner ride to settlement at $1.00
-        // At 95¢ we'd only save 5¢/contract by selling early. Not worth it.
-        // The whole point is: we predicted the winner, they're winning, collect the full $1.
+        // LATE-GAME PROFIT-TAKE at 97¢+ — risking $0.97 to gain $0.03 is 32:1 against us
+        // Buzzer-beaters, walk-offs, empty-net answers can turn $0.97 into $0.00
+        // Only in final moments: late stage AND price 97¢+
+        if (stage === 'late' && currentPrice >= 0.97 && profitPerContract > 0) {
+          console.log(`[exit] 💰 LATE-GAME LOCK (${stage}): ${trade.ticker} at ${(currentPrice*100).toFixed(0)}¢ — locking profit, not worth risking for 3¢`);
+          const result = await executeSell(trade, qty, currentPrice, 'profit-take');
+          if (result) anyUpdated = true;
+          continue;
+        }
 
         // === TIER 2: Claude-assisted exit with game context ===
 
         // LOSING: Claude evaluates positions in the stop-loss danger zone
         if (pctChange < thresholds.claudeStop && pctChange >= thresholds.stopLoss) {
           const exitCooldownKey = 'exit-loss:' + trade.ticker;
-          if (Date.now() - (tradeCooldowns.get(exitCooldownKey) ?? 0) < 15 * 60 * 1000) continue;
+          // NBA moves fast — reevaluate every 8 min. Others every 15 min.
+          const isNBA = trade.ticker?.includes('NBA');
+          const evalCooldownMs = isNBA ? 8 * 60 * 1000 : 15 * 60 * 1000;
+          if (Date.now() - (tradeCooldowns.get(exitCooldownKey) ?? 0) < evalCooldownMs) continue;
           tradeCooldowns.set(exitCooldownKey, Date.now());
 
           const lossPrompt =
