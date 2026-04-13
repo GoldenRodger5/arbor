@@ -84,7 +84,7 @@ const MAX_DAYS_OUT = 1;            // Same-day only — capital turns over night
 const CLAUDE_SCREENER = 'claude-haiku-4-5-20251001';  // Cheap screening — $0.002/call
 const CLAUDE_DECIDER = 'claude-sonnet-4-6';            // Expensive analysis — only on candidates
 // MAX_POSITIONS and deployment limits are DYNAMIC — see getMaxPositions() and getMaxDeployment()
-const DAILY_LOSS_PCT = 0.15;       // Stop trading if down 15% in a day (room for 2-3 bad trades)
+const DAILY_LOSS_PCT = 0.25;       // Stop trading if down 25% in a day — room for bad streaks at small bankroll
 const CAPITAL_RESERVE = 0.05;      // Keep 5% of bankroll untouched (more capital working)
 const MAX_CONSECUTIVE_LOSSES = 7;  // After 7 losses → reduce size (5 in a row happens naturally every 2-3 weeks)
 const SPORT_EXPOSURE_PCT = 0.25;   // Max 25% of bankroll per sport — sports are the main edge source
@@ -1869,7 +1869,6 @@ async function checkPreGamePredictions() {
     }
 
     if (!canTrade()) break;
-    if (!checkSportExposure(market.ticker)) continue;
 
     // Cross-platform price check — extract team abbreviations from ticker
     const tickerParts = market.ticker.split('-');
