@@ -302,7 +302,11 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
     if (searches > 0) console.log(`[claude-search] Used ${searches} web searches`);
 
     // Return last text block (Claude's final answer after research)
-    return textBlocks.length > 0 ? textBlocks[textBlocks.length - 1].text : '';
+    const finalText = textBlocks.length > 0 ? textBlocks[textBlocks.length - 1].text : '';
+    if (!finalText && textBlocks.length === 0) {
+      console.log(`[claude-search] WARNING: No text blocks in response. Content types: ${(data.content ?? []).map(b => b.type).join(', ')}`);
+    }
+    return finalText;
   } catch (e) {
     console.error('[claude-search] error:', e.message);
     return null;
@@ -1404,7 +1408,7 @@ async function checkLiveScoreEdges() {
 
         // Risk checks
         if (!canTrade()) continue;
-        if (!checkSportExposure(ticker)) continue;
+        // Sport exposure cap removed — sports are our main revenue driver
 
         // === CROSS-PLATFORM PRICE CHECK — buy on cheaper platform ===
         const polyMoneylines = await getPolyMoneylines();
@@ -2238,7 +2242,7 @@ async function claudeBroadScan() {
       if (kalshiBalance < 3) continue;
       if (Date.now() - (tradeCooldowns.get(decision.ticker) ?? 0) < COOLDOWN_MS) continue;
       if (!canTrade()) continue;
-      if (!checkSportExposure(decision.ticker)) continue;
+      // Sport exposure cap removed — sports are our main revenue driver
 
       const maxBet = getPositionSize('kalshi');
       const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
