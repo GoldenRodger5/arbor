@@ -2141,7 +2141,11 @@ async function checkPreGamePredictions() {
     const preGameBaselines = { mlb: 0.54, nba: 0.63, nhl: 0.59, mls: 0.49, epl: 0.45, laliga: 0.45 };
     const pgBaseline = preGameBaselines[pgSportKey] ?? 0.55;
     // Sport-specific cap: MLB is random (max +12%), NBA allows more (+20%), NHL mid (+15%)
-    const sportCapBonus = { mlb: 0.12, nba: 0.20, nhl: 0.15, mls: 0.12, epl: 0.12, laliga: 0.12 }[pgSportKey] ?? 0.15;
+    // MLB: +8% cap (54% home + 8% = 62%, fails 68% min → MLB pre-game blocked)
+    // NBA: +20% (can reach 83% → passes easily)
+    // NHL: +15% (can reach 74% → passes)
+    // Soccer: +8% (blocks pre-game soccer too — draws make it too risky)
+    const sportCapBonus = { mlb: 0.08, nba: 0.20, nhl: 0.15, mls: 0.08, epl: 0.08, laliga: 0.08 }[pgSportKey] ?? 0.15;
     const pgTargetBaseline = pick.side === 'yes' ? pgBaseline : (1 - pgBaseline);
     const pgMaxAllowed = Math.min(0.85, pgTargetBaseline + sportCapBonus);
     if (confidence > pgMaxAllowed) {
@@ -2150,8 +2154,10 @@ async function checkPreGamePredictions() {
     }
 
     const pgReqMargin = getRequiredMargin(price, { sport: pgSportKey, live: false });
-    if (confidence < MIN_CONFIDENCE || (confidence - price) < pgReqMargin) {
-      console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${((confidence-price)*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% (${pgSportKey})`);
+    // Pre-game needs 68% minimum (higher than live's 65% — market has had time to settle)
+    const PRE_GAME_MIN_CONF = 0.68;
+    if (confidence < PRE_GAME_MIN_CONF || (confidence - price) < pgReqMargin) {
+      console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${((confidence-price)*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% min=${(PRE_GAME_MIN_CONF*100).toFixed(0)}% (${pgSportKey})`);
       continue;
     }
 
@@ -2183,7 +2189,26 @@ async function checkPreGamePredictions() {
 
     if (!canDeployMore(qty * bestPrice)) continue;
     if (preGameTradesToday >= MAX_PREGAME_PER_DAY) { console.log(`[pre-game] Daily limit reached`); continue; }
-    if (preGameBetGames.has(market.base)) { console.log(`[pre-game] Already bet on ${market.base} today`); continue; }
+    if (preGameBetGames.has(market.base)) { console.log(`[pre-game] Already bet on ${market.base} today (memory)`); continue; }
+
+    // REAL duplicate check — survives restarts. Check Kalshi API positions + JSONL.
+    const alreadyHasPosition = openPositions.some(p => {
+      const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
+      return pBase === market.base;
+    });
+    if (alreadyHasPosition) { console.log(`[pre-game] Already have Kalshi position on ${market.base}`); continue; }
+
+    // Also check JSONL for today's trades on this game (catches trades from earlier restarts)
+    if (existsSync(TRADES_LOG)) {
+      const todayTrades = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      const hasTodayTrade = todayTrades.some(l => {
+        try {
+          const t = JSON.parse(l);
+          return t.status === 'open' && t.ticker?.includes(market.base);
+        } catch { return false; }
+      });
+      if (hasTodayTrade) { console.log(`[pre-game] Already have JSONL position on ${market.base}`); continue; }
+    }
 
     const pgPlatformLabel = pgBest.platform === 'polymarket' ? `POLY (saved ${((price-bestPrice)*100).toFixed(0)}¢ vs Kalshi)` : 'KALSHI';
     console.log(`[pre-game] 🎯 TRADE on ${pgPlatformLabel}: ${market.base} ${pick.side.toUpperCase()} @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}% (${preGameTradesToday+1}/${MAX_PREGAME_PER_DAY} today)`);
