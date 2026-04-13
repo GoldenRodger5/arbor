@@ -1889,7 +1889,7 @@ async function checkLiveScoreEdges() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 let lastPreGameScan = 0;
-const PREGAME_SCAN_INTERVAL = 5 * 60 * 1000;
+const PREGAME_SCAN_INTERVAL = 15 * 60 * 1000; // every 15 min — only NBA/NHL qualify, no need to scan constantly
 const MAX_PREGAME_PER_CYCLE = 2;   // Max trades per scan — be surgical, not spray-and-pray
 const MAX_PREGAME_PER_DAY = 4;     // Max pre-game trades per day — force selectivity
 let preGameTradesToday = 0;
@@ -1975,18 +1975,31 @@ async function checkPreGamePredictions() {
   if (preGameMarkets.length === 0) { console.log('[pre-game] No pre-game markets in range'); return; }
   console.log(`[pre-game] Found ${preGameMarkets.length} pre-game markets in sweet spot`);
 
-  // Send games to Sonnet in parallel batches of 3 — no Haiku gating
-  // ~10-15 games/day × $0.08/call = $0.80-1.20/day. Worth it if even one becomes a winner.
-  const pgSlice = preGameMarkets.slice(0, 8);
+  // Filter: only send sports that CAN pass the confidence cap to Sonnet.
+  // MLB max 62%, Soccer max 57% — both fail 68% min. Don't waste $0.25/call.
+  // Only NBA (max 83%) and NHL (max 74%) can pass pre-game.
+  const PRE_GAME_ELIGIBLE_SPORTS = ['NBA', 'NHL'];
+  const eligibleMarkets = preGameMarkets.filter(m => {
+    const tk = m.base ?? '';
+    const sport = tk.includes('NBA') ? 'NBA' : tk.includes('NHL') ? 'NHL' :
+      tk.includes('MLB') ? 'MLB' : tk.includes('MLS') ? 'MLS' : tk.includes('EPL') ? 'EPL' : 'other';
+    return PRE_GAME_ELIGIBLE_SPORTS.includes(sport);
+  });
+
+  if (eligibleMarkets.length === 0) {
+    if (preGameMarkets.length > 0) console.log(`[pre-game] ${preGameMarkets.length} markets found but none are NBA/NHL (only eligible pre-game sports)`);
+    return;
+  }
+  console.log(`[pre-game] ${eligibleMarkets.length} eligible (NBA/NHL) out of ${preGameMarkets.length} total`);
+
+  const pgSlice = eligibleMarkets.slice(0, 8);
   const maxBetDisplay = getDynamicMaxTrade().toFixed(2);
 
-  // Detect sport from ticker and build sport-specific prompts
   const todayDate = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'long', day: 'numeric' });
 
   const pgPrompts = pgSlice.map(market => {
     const tk = market.base ?? '';
-    const sport = tk.includes('MLB') ? 'MLB' : tk.includes('NBA') ? 'NBA' : tk.includes('NHL') ? 'NHL' :
-      tk.includes('MLS') ? 'MLS' : tk.includes('EPL') ? 'EPL' : tk.includes('LALIGA') ? 'La Liga' : 'Sport';
+    const sport = tk.includes('NBA') ? 'NBA' : tk.includes('NHL') ? 'NHL' : 'Sport';
 
     const sportBaseline = {
       MLB: 'MLB home team wins 54%. Top pitcher (ERA<3.0) adds +10-15%. FIP is better predictor than ERA. Look up starting pitchers, recent form, bullpen ERA.',
@@ -2417,7 +2430,7 @@ async function checkUFCPredictions() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 let lastBroadScan = 0;
-const BROAD_SCAN_INTERVAL = 5 * 60 * 1000; // every 5 min — markets don't reprice faster
+const BROAD_SCAN_INTERVAL = 30 * 60 * 1000; // every 30 min — sports blocked, only non-sports remain
 
 async function claudeBroadScan() {
   if (Date.now() - lastBroadScan < BROAD_SCAN_INTERVAL) return;
