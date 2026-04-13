@@ -1913,7 +1913,9 @@ async function checkPreGamePredictions() {
   const etTmrw = new Date(etNow.getTime() + 24 * 60 * 60 * 1000);
   const toShort = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
   const todayStr = toShort(etNow);
-  const tonightStr = toShort(etTmrw);
+  // Only include tomorrow's date after 10pm ET (late games that cross midnight)
+  const etHour = etNow.getHours();
+  const tonightStr = etHour >= 22 ? toShort(etTmrw) : null;
 
   // Collect today's pre-game markets
   const preGameMarkets = [];
@@ -1924,7 +1926,7 @@ async function checkPreGamePredictions() {
       for (const m of data.markets ?? []) {
         if (!m.yes_ask_dollars || !m.no_ask_dollars) continue;
         const ticker = m.ticker ?? '';
-        if (!ticker.includes(todayStr) && !ticker.includes(tonightStr)) continue;
+        if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) continue;
         const ya = parseFloat(m.yes_ask_dollars);
         // Pre-game: 15-90¢ range — includes underdog value at 15-25¢
         if (ya < 0.15 || ya > MAX_PRICE) continue;
