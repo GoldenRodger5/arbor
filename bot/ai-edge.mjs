@@ -990,9 +990,22 @@ async function checkLiveScoreEdges() {
     return;
   }
 
-  console.log(`[live-edge] ${changed.length} games changed out of ${liveGames.length} live (${changed.map(g => g.away.team?.abbreviation + '@' + g.home.team?.abbreviation).join(', ')})`);
+  // === PHASE 2.5: Sort by opportunity — biggest baseline-vs-price gap first ===
+  // This ensures the best opportunity gets Sonnet analysis before prices move
+  for (const g of changed) {
+    const isHome = g.leading === g.home;
+    const we = getWinExpectancy(g.league, g.diff, g.period, isHome) ?? 0.50;
+    g._baselineWE = we;
+    g._estimatedGap = we - 0.50; // rough gap estimate (real gap needs market price)
+  }
+  changed.sort((a, b) => b._estimatedGap - a._estimatedGap);
 
-  // === PHASE 3: Sonnet analyzes EVERY changed game + draw check for tied soccer ===
+  console.log(`[live-edge] ${changed.length} games changed out of ${liveGames.length} live (${changed.map(g => g.away.team?.abbreviation + '@' + g.home.team?.abbreviation + '(' + (g._baselineWE*100).toFixed(0) + '%)').join(', ')})`);
+
+  // === PHASE 3: Analyze changed games in priority order — best opportunity first ===
+  let sonnetCallsThisCycle = 0;
+  const MAX_SONNET_PER_CYCLE = 3; // Cap to avoid stale prices on later games
+
   for (const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail, isSoccer } of changed) {
     const seriesMap = { mlb: 'KXMLBGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME', mls: 'KXMLSGAME', epl: 'KXEPLGAME', laliga: 'KXLALIGAGAME' };
     const series = seriesMap[league] ?? 'KXMLBGAME';
@@ -1098,6 +1111,12 @@ async function checkLiveScoreEdges() {
 
       // If game is tied, skip the normal team-win analysis (no leader to bet on)
       if (diff === 0) continue;
+    }
+
+    // Cap Sonnet calls per cycle to avoid stale prices on later games
+    if (sonnetCallsThisCycle >= MAX_SONNET_PER_CYCLE) {
+      console.log(`[live-edge] Sonnet cap reached (${MAX_SONNET_PER_CYCLE}), remaining games deferred to next cycle`);
+      break;
     }
 
     try {
@@ -1357,6 +1376,7 @@ async function checkLiveScoreEdges() {
         }
 
         // Ask Claude to PREDICT the winner
+        sonnetCallsThisCycle++;
         const cText = await claudeWithSearch(livePrompt);
         if (!cText) continue;
         const jsonMatch = cText.match(/\{[\s\S]*\}/);
