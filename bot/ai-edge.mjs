@@ -1234,22 +1234,32 @@ async function checkLiveScoreEdges() {
         let targetTeam = leading;
         let price = leadPrice;
 
-        // Underdog check: only if trailing team has a MUCH better record AND deficit is small AND early in game
-        // Being down 2-0 in NHL means ~15-20% comeback chance. Even for a much better team, max ~30%.
-        // Only take underdog if: diff ≤ 1, period ≤ 2, trail team has 10+ more wins
-        if (trailMarket && trailPrice >= 0.15 && trailPrice <= 0.40 && period <= 2 && diff <= 1) {
+        // Sport-specific underdog rules — comebacks vary drastically by sport
+        // NHL: low-scoring, 2-goal deficit is massive (15-20% comeback). Only bet down 1, period 1.
+        // NBA: high-scoring, 15-pt comebacks happen 13%. Underdogs viable if down ≤10 in Q1-Q2.
+        // MLB: mid-variance, 3-run comebacks happen 20% thru 6 innings. Down ≤2 thru inning 5.
+        // Soccer: 1-goal deficits equalize ~20% of the time. Down 1 in 1st half only.
+        let underdogAllowed = false;
+        if (trailMarket && trailPrice >= 0.15 && trailPrice <= 0.40) {
+          if (league === 'nhl' && diff <= 1 && period <= 1) underdogAllowed = true;
+          else if (league === 'nba' && diff <= 10 && period <= 2) underdogAllowed = true;
+          else if (league === 'mlb' && diff <= 2 && period <= 5) underdogAllowed = true;
+          else if ((league === 'mls' || league === 'epl' || league === 'laliga') && diff <= 1 && period <= 1) underdogAllowed = true;
+        }
+
+        if (underdogAllowed) {
           const trailRec = trailing.records?.[0]?.summary ?? '';
           const leadRec = leading.records?.[0]?.summary ?? '';
           const parseWins = (rec) => parseInt(rec.split('-')[0]) || 0;
           const trailWins = parseWins(trailRec);
           const leadWins = parseWins(leadRec);
-          // Only bet underdog if they have SIGNIFICANTLY more wins (10+) — small quality gaps don't overcome deficits
+          // Only bet underdog if they have SIGNIFICANTLY more wins (10+)
           if (trailWins > leadWins + 10) {
             targetMarket = trailMarket;
             targetAbbr = trailingAbbr;
             targetTeam = trailing;
             price = trailPrice;
-            console.log(`[live-edge] 🐕 Underdog value: ${trailingAbbr} (${trailRec}) trailing ${leadingAbbr} (${leadRec}) by ${diff} at ${(trailPrice*100).toFixed(0)}¢`);
+            console.log(`[live-edge] 🐕 Underdog value (${league}): ${trailingAbbr} (${trailRec}) trailing ${leadingAbbr} (${leadRec}) by ${diff} at ${(trailPrice*100).toFixed(0)}¢`);
           }
         }
 
@@ -1411,16 +1421,21 @@ async function checkLiveScoreEdges() {
           if (p.exchange === 'polymarket' && tickerHasTeam(pt, homeAbbr) && tickerHasTeam(pt, awayAbbr)) return true;
           return false;
         });
-        // If we have a position, smart cooldown decides whether to scale in
-        // (removed hard block — canScaleInto handles max entries + price improvement)
+        // Block if we already have a position on this game — prevents duplicate buys after restarts
+        if (hasPosition) {
+          // Only allow scaling in if price dropped significantly (5¢+ cheaper)
+          if (!canScaleInto(`game:${homeAbbr}@${awayAbbr}`, price)) {
+            console.log(`[live-edge] Already have position on ${homeAbbr}@${awayAbbr}, skipping`);
+            continue;
+          }
+          console.log(`[live-edge] 📈 Scale-in: ${homeAbbr}@${awayAbbr} price dropped to ${(price*100).toFixed(0)}¢`);
+        }
 
-        // Smart cooldown: base 5min, but allow scaling if price improved
+        // Smart cooldown: base 5min between new entries
         const matchupKey = `game:${homeAbbr}@${awayAbbr}`;
         const timeSinceLastTrade = Date.now() - (tradeCooldowns.get(matchupKey) ?? 0);
-        if (timeSinceLastTrade < COOLDOWN_MS) {
-          // Within cooldown — only allow if price is better (scaling in)
-          if (!canScaleInto(matchupKey, price)) continue;
-          console.log(`[live-edge] 📈 Scale-in opportunity: ${homeAbbr}@${awayAbbr} price dropped to ${(price*100).toFixed(0)}¢`);
+        if (timeSinceLastTrade < COOLDOWN_MS && !hasPosition) {
+          continue; // within cooldown and no existing position to scale into
         }
 
         // Price filter — skip if already decided (80¢+ = not enough upside) or lottery
