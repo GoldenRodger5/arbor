@@ -564,6 +564,27 @@ const DAILY_LOG = './logs/daily-snapshots.jsonl';
 const SCREENS_LOG = './logs/screens.jsonl';
 if (!existsSync('./logs')) mkdirSync('./logs', { recursive: true });
 
+// Kalshi parabolic fee: 7% × price × (1 - price). Max at 50¢ (1.75¢), zero at 0 or 100¢.
+function kalshiFee(price) {
+  return 0.07 * price * (1 - price);
+}
+
+// Net edge after fees — what we actually keep
+function netEdge(confidence, price) {
+  const fee = kalshiFee(price);
+  return confidence - price - fee;
+}
+
+// Extract actual fill count from order response — Kalshi returns 0 on initial POST, fills async
+function getActualFill(result, requestedQty) {
+  const order = result.data?.order ?? result.data ?? {};
+  const filled = order.quantity_filled ?? order.filled_quantity ?? order.filled ?? 0;
+  // If API says 0 filled (common for limit orders), assume full fill for IOC or check status
+  // For IOC orders: filled = actual. For limit orders: filled may be 0 initially → use requested qty
+  // We'll trust the fill count if > 0, otherwise assume full fill (Kalshi fills most orders)
+  return filled > 0 ? filled : requestedQty;
+}
+
 function logTrade(entry) {
   const record = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1053,7 +1074,10 @@ async function checkLiveScoreEdges() {
 
   // === PHASE 3: Analyze candidates in priority order — best opportunity first ===
   let sonnetCallsThisCycle = 0;
-  const MAX_SONNET_PER_CYCLE = 3; // Cap to keep prices fresh
+  const MAX_SONNET_PER_CYCLE = 6; // Increased from 3 — more games analyzed = more edge found
+
+  // Collect Sonnet work items for parallel execution
+  const sonnetQueue = [];
 
   for (const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail, isSoccer, _scoreChanged } of candidates) {
     const seriesMap = { mlb: 'KXMLBGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME', mls: 'KXMLSGAME', epl: 'KXEPLGAME', laliga: 'KXLALIGAGAME' };
@@ -1448,12 +1472,41 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
-        // Ask Claude to PREDICT the winner
+        // Collect for parallel Sonnet execution instead of calling sequentially
         sonnetCallsThisCycle++;
-        // maxSearches: 1 (we already have rich ESPN data in prompt — one search for team context is enough)
-        // maxTokens: 800 (prompt is rich, need room for JSON response)
-        const cText = await claudeWithSearch(livePrompt, { maxTokens: 1500, maxSearches: 1 });
-        if (!cText) { console.log(`[live-edge] Sonnet returned empty for ${homeAbbr}@${awayAbbr}`); continue; }
+        sonnetQueue.push({
+          prompt: livePrompt, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period,
+          leadingAbbr, gameDetail, price, ticker, gameBase, title, targetAbbr, targetTeam,
+          targetIsHome: targetAbbr === homeAbbr, leading,
+        });
+
+    } catch (e) {
+      console.error(`[live-edge] pre-filter error:`, e.message);
+    }
+  }
+
+  // === PHASE 4: Fire Sonnet calls in parallel (3 at a time) ===
+  if (sonnetQueue.length === 0) return;
+  console.log(`[live-edge] Sending ${sonnetQueue.length} games to Sonnet in parallel...`);
+
+  // Batch in groups of 3 for parallel execution
+  for (let batch = 0; batch < sonnetQueue.length; batch += 3) {
+    const batchItems = sonnetQueue.slice(batch, batch + 3);
+    const batchResults = await Promise.allSettled(
+      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 1 }))
+    );
+
+    for (let i = 0; i < batchItems.length; i++) {
+      const item = batchItems[i];
+      const batchResult = batchResults[i];
+      const cText = batchResult.status === 'fulfilled' ? batchResult.value : null;
+      if (!cText) { console.log(`[live-edge] Sonnet returned empty for ${item.homeAbbr}@${item.awayAbbr}`); continue; }
+
+      // Destructure back the context we need
+      const { league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, leadingAbbr,
+              gameDetail, price, ticker, gameBase, title, targetAbbr } = item;
+
+      try {
         const jsonMatch = cText.match(/\{[\s\S]*\}/);
         if (!jsonMatch) { console.log(`[live-edge] Sonnet response not JSON for ${homeAbbr}@${awayAbbr}: ${cText.slice(0, 100)}`); continue; }
 
@@ -1488,8 +1541,8 @@ async function checkLiveScoreEdges() {
         }
 
         // Confidence must exceed price for the bet to be +EV
-        if (confidence < price + CONFIDENCE_MARGIN) {
-          console.log(`[live-edge] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢ (need ${(CONFIDENCE_MARGIN*100).toFixed(0)}%+ gap)`);
+        if (netEdge(confidence, price) < CONFIDENCE_MARGIN) {
+          console.log(`[live-edge] Not enough margin after fees: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢ fee=${(kalshiFee(price)*100).toFixed(1)}¢`);
           continue;
         }
 
@@ -1507,7 +1560,7 @@ async function checkLiveScoreEdges() {
         // Use the better price for sizing
         const bestPrice = best.price;
         const bestEdge = confidence - bestPrice;
-        if (bestEdge < CONFIDENCE_MARGIN) continue; // recheck with best price
+        if (netEdge(confidence, bestPrice) < CONFIDENCE_MARGIN) continue; // recheck with best price + fees
 
         const maxBetLE = getPositionSize(best.platform, bestEdge);
         const claudeBet = decision.betAmount ?? 0;
@@ -1546,15 +1599,21 @@ async function checkLiveScoreEdges() {
         }
 
         if (result.ok) {
+          const actualFill = getActualFill(result, qty);
+          if (actualFill <= 0) {
+            console.log(`[live-edge] Order accepted but 0 filled for ${ticker} — skipping log`);
+            continue;
+          }
+          const actualDeployed = actualFill * bestPrice;
           stats.tradesPlaced++;
-          recordGameEntry(`game:${homeAbbr}@${awayAbbr}`, bestPrice, deployed);
+          recordGameEntry(`game:${homeAbbr}@${awayAbbr}`, bestPrice, actualDeployed);
 
           logTrade({
             exchange: best.platform, strategy: 'live-prediction',
             ticker: best.platform === 'polymarket' ? best.slug : ticker,
             title, side: 'yes',
-            quantity: qty, entryPrice: bestPrice, deployCost: deployed,
-            filled: (result.data?.order ?? result.data)?.quantity_filled ?? 0,
+            quantity: actualFill, entryPrice: bestPrice, deployCost: actualDeployed,
+            filled: actualFill,
             orderId: (result.data?.order ?? result.data)?.order_id ?? result.data?.id ?? null,
             edge: bestEdge * 100, confidence,
             reasoning: decision.reasoning,
@@ -1568,16 +1627,17 @@ async function checkLiveScoreEdges() {
             `<b>${title}</b>\n` +
             `Team: <b>${targetAbbr}</b> | Score: ${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore}\n` +
             `Status: ${gameDetail}\n\n` +
-            `BUY @ ${priceInCents}¢ × ${qty} = <b>$${deployed.toFixed(2)}</b>\n` +
+            `BUY @ ${priceInCents}¢ × ${actualFill} = <b>$${actualDeployed.toFixed(2)}</b>\n` +
             `Confidence: <b>${(confidence*100).toFixed(0)}%</b> vs price ${priceInCents}¢\n` +
-            `Potential profit: <b>$${(qty * (1 - bestPrice)).toFixed(2)}</b>${savedMsg}\n\n` +
+            `Potential profit: <b>$${(actualFill * (1 - bestPrice)).toFixed(2)}</b>${savedMsg}\n\n` +
             `🧠 <i>${decision.reasoning}</i>`
           );
         } else {
           console.error(`[live-edge] Order failed:`, result.status, JSON.stringify(result.data));
         }
-    } catch (e) {
-      console.error(`[live-edge] error:`, e.message);
+      } catch (e) {
+        console.error(`[live-edge] error processing ${item.homeAbbr}@${item.awayAbbr}:`, e.message);
+      }
     }
   }
 }
@@ -1613,8 +1673,8 @@ async function checkPreGamePredictions() {
         const ticker = m.ticker ?? '';
         if (!ticker.includes(todayStr) && !ticker.includes(tonightStr)) continue;
         const ya = parseFloat(m.yes_ask_dollars);
-        // Pre-game: 25-85¢ range for value entries
-        if (ya < 0.25 || ya > MAX_PRICE) continue;
+        // Pre-game: 15-90¢ range — includes underdog value at 15-25¢
+        if (ya < 0.15 || ya > MAX_PRICE) continue;
         // Dedup by game base
         const lastH = ticker.lastIndexOf('-');
         const base = lastH > 0 ? ticker.slice(0, lastH) : ticker;
@@ -1637,49 +1697,17 @@ async function checkPreGamePredictions() {
     } catch { /* skip */ }
   }
 
-  if (preGameMarkets.length === 0) { console.log('[pre-game] No pre-game markets in 30-70¢ range'); return; }
+  if (preGameMarkets.length === 0) { console.log('[pre-game] No pre-game markets in range'); return; }
   console.log(`[pre-game] Found ${preGameMarkets.length} pre-game markets in sweet spot`);
 
-  // Haiku screen: which games look predictable?
-  const marketList = preGameMarkets.slice(0, 20).map(m =>
-    `${m.ticker}: "${m.title}" YES=${(m.yesAsk*100).toFixed(0)}¢ NO=${(m.noAsk*100).toFixed(0)}¢`
-  ).join('\n');
-
-  const screenText = await claudeScreen(
-    `You are a sports handicapper. Pick up to 5 games where you have a strong opinion on who wins.\n\n` +
-    `TODAY'S GAMES (pre-game, not started yet):\n${marketList}\n\n` +
-    `For each pick, say which side (YES = first team listed in title, NO = second team) and why.\n` +
-    `Only pick games where you're genuinely confident (≥65%). Skip coin-flip games.\n\n` +
-    `JSON array: [{"ticker":"exact","side":"yes"/"no","reason":"who wins and why"}] or []`
-  );
-  if (!screenText) return;
-
-  let picks = [];
-  try {
-    const arrMatch = screenText.match(/\[[\s\S]*\]/);
-    if (arrMatch) picks = JSON.parse(arrMatch[0]);
-  } catch { /* bad JSON */ }
-
-  if (!Array.isArray(picks) || picks.length === 0) {
-    console.log('[pre-game] Haiku: no confident picks');
-    return;
-  }
-  console.log(`[pre-game] Haiku picked ${picks.length}: ${picks.map(p => p.ticker).join(', ')}`);
-
-  // Sonnet deep dive on each pick
-  for (const pick of picks.slice(0, 5)) {
-    const market = preGameMarkets.find(m => m.ticker === pick.ticker);
-    if (!market) continue;
-
-    const price = pick.side === 'yes' ? market.yesAsk : market.noAsk;
-    if (price > MAX_PRICE || price < 0.05) continue;
-
-    const pregamePrice = pick.side === 'yes' ? market.yesAsk : market.noAsk;
+  // Send each game DIRECTLY to Sonnet with web search — no Haiku gating
+  // ~10-15 games/day × $0.08/call = $0.80-1.20/day. Worth it if even one becomes a winner.
+  // Limit to 8 per cycle to control API costs
+  for (const market of preGameMarkets.slice(0, 8)) {
     const decideText = await claudeWithSearch(
       `You are a professional sports bettor. Predict who wins this pre-game matchup.\n\n` +
       `GAME: ${market.title}\n` +
-      `YES price: ${(market.yesAsk*100).toFixed(0)}¢ | NO price: ${(market.noAsk*100).toFixed(0)}¢\n` +
-      `Haiku's pick: ${pick.side.toUpperCase()} — "${pick.reason}"\n\n` +
+      `YES price: ${(market.yesAsk*100).toFixed(0)}¢ | NO price: ${(market.noAsk*100).toFixed(0)}¢\n\n` +
       `PRE-GAME BASELINES (verified historical data):\n` +
       `- MLB home team wins 54% | Top pitcher (ERA<3.0) adds +10-15% | FIP is better predictor than ERA\n` +
       `- NBA home team wins 63% | Star player out = -10% | Back-to-back team = -3-5%\n` +
@@ -1696,12 +1724,13 @@ async function checkPreGamePredictions() {
       `- Key player injured/resting → DOWN 5-10%\n` +
       `- Bad recent form (lost 4+ in a row) → DOWN 3-5%\n` +
       `- Poor starter pitching (ERA > 5.0) → DOWN 5-8%\n\n` +
-      `BUY if confidence ≥ 65% AND at least 3 points above price.\n` +
+      `BUY if confidence ≥ 65% AND at least 3 points above the price of the side you pick.\n` +
+      `Pick YES (first team) or NO (second team) — whichever you're more confident in.\n` +
       `Max bet: $${getDynamicMaxTrade().toFixed(2)} (bet MORE if confidence is much higher than price)\n\n` +
       `JSON ONLY:\n` +
       `{"trade":false,"confidence":0.XX,"reasoning":"baseline X%, adjusted to Y% because [reasons]"}\n` +
-      `OR {"trade":true,"side":"${pick.side}","confidence":0.XX,"betAmount":N,"reasoning":"baseline X%, adjusted to Y% because [reasons]. Price ${(pregamePrice*100).toFixed(0)}¢ = good buy."}`,
-      { maxTokens: 800, maxSearches: 3 }
+      `OR {"trade":true,"side":"yes"/"no","confidence":0.XX,"betAmount":N,"reasoning":"baseline X%, adjusted to Y% because [reasons]"}`,
+      { maxTokens: 800, maxSearches: 2 }
     );
     if (!decideText) continue;
 
@@ -1710,15 +1739,35 @@ async function checkPreGamePredictions() {
     let decision;
     try { decision = JSON.parse(jsonMatch[0]); } catch { continue; }
 
+    const pick = { ticker: market.ticker, side: decision.side ?? 'yes' };
+
     if (!decision.trade) {
-      console.log(`[pre-game] Sonnet rejected ${pick.ticker}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
-      logScreen({ stage: 'pre-game-sonnet', ticker: pick.ticker, result: 'rejected', confidence: decision.confidence, reasoning: decision.reasoning });
+      console.log(`[pre-game] Sonnet rejected ${market.ticker}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
+      logScreen({ stage: 'pre-game-sonnet', ticker: market.ticker, result: 'rejected', confidence: decision.confidence, reasoning: decision.reasoning });
       continue;
     }
 
-    const confidence = decision.confidence ?? 0;
-    if (confidence < MIN_CONFIDENCE || confidence < price + CONFIDENCE_MARGIN) {
-      console.log(`[pre-game] Confidence check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢`);
+    let confidence = decision.confidence ?? 0;
+
+    // HARD CAP: Pre-game confidence capped at baseline + 15%
+    // Home team baseline: MLB 54%, NBA 63%, NHL 59%, Soccer 45-49%
+    // Without a live score to anchor, Claude can hallucinate 90%+ confidence
+    const pgSportKey = market.ticker.includes('MLB') ? 'mlb' : market.ticker.includes('NBA') ? 'nba' :
+      market.ticker.includes('NHL') ? 'nhl' : market.ticker.includes('MLS') ? 'mls' :
+      market.ticker.includes('EPL') ? 'epl' : market.ticker.includes('LALIGA') ? 'laliga' : '';
+    const preGameBaselines = { mlb: 0.54, nba: 0.63, nhl: 0.59, mls: 0.49, epl: 0.45, laliga: 0.45 };
+    const pgBaseline = preGameBaselines[pgSportKey] ?? 0.55;
+    // For pre-game, the "baseline" is the home team win rate. Adjust: if betting YES (home), use baseline.
+    // If betting NO (away), use 1 - baseline. Then cap at baseline + 20% (wider than live since no score).
+    const pgTargetBaseline = pick.side === 'yes' ? pgBaseline : (1 - pgBaseline);
+    const pgMaxAllowed = Math.min(0.90, pgTargetBaseline + 0.20);
+    if (confidence > pgMaxAllowed) {
+      console.log(`[pre-game] Confidence capped: Claude said ${(confidence*100).toFixed(0)}% but pre-game baseline is ${(pgTargetBaseline*100).toFixed(0)}% → capped at ${(pgMaxAllowed*100).toFixed(0)}%`);
+      confidence = pgMaxAllowed;
+    }
+
+    if (confidence < MIN_CONFIDENCE || netEdge(confidence, price) < CONFIDENCE_MARGIN) {
+      console.log(`[pre-game] Confidence check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ fee=${(kalshiFee(price)*100).toFixed(1)}¢`);
       continue;
     }
 
@@ -1897,6 +1946,7 @@ async function checkUFCPredictions() {
     }
 
     const confidence = decision.confidence ?? 0;
+    // Polymarket fees are different (lower), but use same margin check for simplicity
     if (confidence < MIN_CONFIDENCE || confidence < price + CONFIDENCE_MARGIN) {
       console.log(`[ufc] Confidence check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢`);
       continue;
@@ -2326,9 +2376,26 @@ async function claudeBroadScan() {
       }
 
       // Confidence-based gate
-      const confidence = decision.confidence ?? decision.probability ?? 0;
+      let confidence = decision.confidence ?? decision.probability ?? 0;
+
+      // HARD CAP: Sports broad-scan confidence capped at baseline + 20%
+      const bsSportKey = decision.ticker.includes('MLB') ? 'mlb' : decision.ticker.includes('NBA') ? 'nba' :
+        decision.ticker.includes('NHL') ? 'nhl' : decision.ticker.includes('MLS') ? 'mls' :
+        decision.ticker.includes('EPL') ? 'epl' : decision.ticker.includes('LALIGA') ? 'laliga' : '';
+      if (bsSportKey) {
+        const bsBaselines = { mlb: 0.54, nba: 0.63, nhl: 0.59, mls: 0.49, epl: 0.45, laliga: 0.45 };
+        const bsBaseline = bsBaselines[bsSportKey] ?? 0.55;
+        // Approximate: YES = home team, NO = away. Not perfect but good enough for a cap.
+        const bsTargetBaseline = decision.side === 'yes' ? bsBaseline : (1 - bsBaseline);
+        const bsMaxAllowed = Math.min(0.90, bsTargetBaseline + 0.20);
+        if (confidence > bsMaxAllowed) {
+          console.log(`[broad-scan] Confidence capped: ${(confidence*100).toFixed(0)}% → ${(bsMaxAllowed*100).toFixed(0)}% (baseline ${(bsTargetBaseline*100).toFixed(0)}%)`);
+          confidence = bsMaxAllowed;
+        }
+      }
+
       if (confidence < MIN_CONFIDENCE) { console.log(`[broad-scan] Confidence too low: ${(confidence*100).toFixed(0)}%`); continue; }
-      if (confidence < price + CONFIDENCE_MARGIN) { console.log(`[broad-scan] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢`); continue; }
+      if (netEdge(confidence, price) < CONFIDENCE_MARGIN) { console.log(`[broad-scan] Not enough margin after fees: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ fee=${(kalshiFee(price)*100).toFixed(1)}¢`); continue; }
 
       const edge = confidence - price;
 
@@ -2425,14 +2492,14 @@ async function pollCycle() {
     return;
   }
 
-  // Pre-game predictions (best entry prices, runs every 10 min)
+  // Live in-game predictions FIRST — most time-sensitive (scores change every minute)
+  await checkLiveScoreEdges();
+
+  // Pre-game predictions (best entry prices, runs every 5 min)
   await checkPreGamePredictions();
 
   // UFC predictions (Polymarket only, runs every 30 min)
   await checkUFCPredictions();
-
-  // Live in-game predictions (runs every cycle)
-  await checkLiveScoreEdges();
 
   // Broad market scan — sports + non-sports (runs every 5 min)
   await claudeBroadScan();
@@ -2718,8 +2785,93 @@ async function checkSettlements() {
   try {
     const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
     const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    const openTrades = trades.filter(t => t.status === 'open' && t.exchange === 'kalshi');
-    if (openTrades.length === 0) return;
+    const openKalshi = trades.filter(t => t.status === 'open' && t.exchange === 'kalshi');
+    const openPoly = trades.filter(t => t.status === 'open' && t.exchange === 'polymarket');
+    let updated = false;
+
+    // === POLYMARKET SETTLEMENT — check if games/fights are over via ESPN ===
+    for (const trade of openPoly) {
+      if (trade.status !== 'open') continue;
+      try {
+        // Determine sport from strategy or ticker
+        const isUFC = trade.strategy === 'ufc-prediction' || (trade.ticker ?? '').includes('ufc');
+        if (isUFC) {
+          // UFC: check if the fight slug resolves via Poly gateway
+          const slug = trade.ticker ?? '';
+          try {
+            const polyRes = await fetch(`https://gateway.polymarket.us/v1/markets/${slug}`, {
+              headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) });
+            if (polyRes.ok) {
+              const polyMkt = await polyRes.json();
+              if (polyMkt.closed || polyMkt.resolved) {
+                // Determine winner from market sides
+                const winningSide = (polyMkt.marketSides ?? []).find(s => parseFloat(s.price ?? '0') > 0.90);
+                const won = winningSide && (
+                  (trade.side === 'long' && winningSide === polyMkt.marketSides?.[0]) ||
+                  (trade.side === 'short' && winningSide === polyMkt.marketSides?.[1])
+                );
+                const exitPrice = won ? 1.0 : 0.0;
+                const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / (trade.entryPrice || 1));
+                const pnl = (qty * exitPrice) - (trade.deployCost ?? 0);
+                trade.status = 'settled';
+                trade.exitPrice = exitPrice;
+                trade.realizedPnL = Math.round(pnl * 100) / 100;
+                trade.settledAt = new Date().toISOString();
+                updated = true;
+                const icon = pnl >= 0 ? '✅' : '❌';
+                console.log(`[pnl] POLY SETTLED: ${slug} → ${won ? 'WIN' : 'LOSS'} | P&L: ${icon} $${pnl.toFixed(2)}`);
+              }
+            }
+          } catch { /* skip */ }
+        } else {
+          // Sports on Poly: check ESPN for game result
+          const slug = (trade.ticker ?? '').toLowerCase();
+          let espnPath = '';
+          if (slug.includes('-mlb-') || slug.includes('baseball')) espnPath = 'baseball/mlb';
+          else if (slug.includes('-nba-') || slug.includes('basketball')) espnPath = 'basketball/nba';
+          else if (slug.includes('-nhl-') || slug.includes('hockey')) espnPath = 'hockey/nhl';
+          if (!espnPath) continue;
+
+          try {
+            const espnRes = await fetch(`http://site.api.espn.com/apis/site/v2/sports/${espnPath}/scoreboard`,
+              { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) });
+            if (!espnRes.ok) continue;
+            const espnData = await espnRes.json();
+
+            // Try to match by team names in the slug
+            for (const ev of espnData.events ?? []) {
+              const comp = ev.competitions?.[0];
+              if (!comp || comp.status?.type?.state !== 'post') continue; // game not over
+              const teams = (comp.competitors ?? []).map(c => (c.team?.abbreviation ?? '').toLowerCase());
+              // Check if both teams are in the slug
+              const matchesGame = teams.every(t => slug.includes(t) || slug.includes(ABBR_MAP[t.toUpperCase()]?.toLowerCase() ?? '---'));
+              if (!matchesGame) continue;
+
+              // Found the game — determine winner
+              const winner = comp.competitors.find(c => c.winner);
+              if (!winner) continue;
+              const winAbbr = (winner.team?.abbreviation ?? '').toLowerCase();
+              // Did our side win? Check if the slug and side match the winner
+              const won = slug.includes(winAbbr) ? trade.side === 'long' : trade.side === 'short';
+              const exitPrice = won ? 1.0 : 0.0;
+              const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / (trade.entryPrice || 1));
+              const pnl = (qty * exitPrice) - (trade.deployCost ?? 0);
+              trade.status = 'settled';
+              trade.exitPrice = exitPrice;
+              trade.realizedPnL = Math.round(pnl * 100) / 100;
+              trade.settledAt = new Date().toISOString();
+              updated = true;
+              const icon = pnl >= 0 ? '✅' : '❌';
+              console.log(`[pnl] POLY SETTLED: ${trade.ticker} → ${won ? 'WIN' : 'LOSS'} | P&L: ${icon} $${pnl.toFixed(2)}`);
+              break;
+            }
+          } catch { /* skip */ }
+        }
+      } catch { /* skip */ }
+    }
+
+    if (openKalshi.length === 0 && !updated) return;
+    const openTrades = openKalshi;
 
     // Fetch closed/settled markets
     let closedMarkets = [];
@@ -2734,7 +2886,6 @@ async function checkSettlements() {
     const closedMap = new Map();
     for (const m of closedMarkets) closedMap.set(m.ticker, m);
 
-    let updated = false;
     for (const trade of trades) {
       if (trade.status !== 'open' || trade.exchange !== 'kalshi') continue;
       // Check all market tickers that could match this trade (with team suffixes)
