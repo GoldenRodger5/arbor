@@ -1899,7 +1899,7 @@ async function checkLiveScoreEdges() {
       const item = batchItems[i];
       const batchResult = batchResults[i];
       const cText = batchResult.status === 'fulfilled' ? batchResult.value : null;
-      if (!cText) { console.log(`[live-edge] Sonnet returned empty for ${item.homeAbbr}@${item.awayAbbr}`); continue; }
+      if (!cText) { console.log(`[live-edge] Sonnet returned empty for ${item.targetAbbr} (${item.league.toUpperCase()} ${item.awayAbbr}@${item.homeAbbr})`); continue; }
 
       // Destructure back the context we need
       const { league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, leadingAbbr,
@@ -1907,13 +1907,13 @@ async function checkLiveScoreEdges() {
 
       try {
         const jsonMatch = extractJSON(cText);
-        if (!jsonMatch) { console.log(`[live-edge] Sonnet response not JSON for ${homeAbbr}@${awayAbbr}: ${cText.slice(0, 100)}`); continue; }
+        if (!jsonMatch) { console.log(`[live-edge] Sonnet response not JSON for ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${cText.slice(0, 100)}`); continue; }
 
         let decision;
-        try { decision = JSON.parse(jsonMatch); } catch (e) { console.log(`[live-edge] JSON parse failed for ${homeAbbr}@${awayAbbr}: ${e.message}`); continue; }
+        try { decision = JSON.parse(jsonMatch); } catch (e) { console.log(`[live-edge] JSON parse failed for ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${e.message}`); continue; }
 
         if (!decision.trade) {
-          console.log(`[live-edge] Claude says NO: conf=${((decision.confidence ?? 0)*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ | ${decision.reasoning?.slice(0, 80)}`);
+          console.log(`[live-edge] Claude says NO on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): conf=${((decision.confidence ?? 0)*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ | ${decision.reasoning?.slice(0, 80)}`);
           logScreen({ stage: 'live-edge', ticker, result: 'pass', confidence: decision.confidence, price, reasoning: decision.reasoning });
           continue;
         }
@@ -1921,7 +1921,7 @@ async function checkLiveScoreEdges() {
         // Confidence-based gate — simple and clear
         let confidence = decision.confidence ?? 0;
         if (confidence < MIN_CONFIDENCE) {
-          console.log(`[live-edge] Confidence too low: ${(confidence*100).toFixed(0)}% < 65%`);
+          console.log(`[live-edge] Confidence too low on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(confidence*100).toFixed(0)}% < 65%`);
           continue;
         }
 
@@ -1934,7 +1934,7 @@ async function checkLiveScoreEdges() {
           const targetBaseline = targetAbbr === leadingAbbr ? baselineWE : (1 - baselineWE);
           const maxAllowed = Math.min(0.95, targetBaseline + 0.15); // max 15% above baseline
           if (confidence > maxAllowed) {
-            console.log(`[live-edge] Confidence capped: Claude said ${(confidence*100).toFixed(0)}% but baseline is ${(targetBaseline*100).toFixed(0)}% → capped at ${(maxAllowed*100).toFixed(0)}%`);
+            console.log(`[live-edge] Confidence capped on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): Claude said ${(confidence*100).toFixed(0)}% but baseline is ${(targetBaseline*100).toFixed(0)}% → capped at ${(maxAllowed*100).toFixed(0)}%`);
             confidence = maxAllowed;
           }
         }
@@ -1944,7 +1944,7 @@ async function checkLiveScoreEdges() {
         const reqMargin = getRequiredMargin(price, { sport: league, live: true, scoreChanged: !!item._scoreChanged, lineMove: !!item._lineMove });
         const rawEdge = confidence - price;
         if (rawEdge < reqMargin) {
-          console.log(`[live-edge] Not enough margin: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(rawEdge*100).toFixed(1)}% need=${(reqMargin*100).toFixed(0)}% (${league})`);
+          console.log(`[live-edge] Not enough margin on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(rawEdge*100).toFixed(1)}% need=${(reqMargin*100).toFixed(0)}%`);
           continue;
         }
 
