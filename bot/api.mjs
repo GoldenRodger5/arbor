@@ -209,6 +209,41 @@ function handleRequest(req, res) {
       // Return last 100
       json(res, screens.slice(-100));
 
+    } else if (path === '/api/live-feed') {
+      // Tail the last N lines of ai-out.log for real-time feed
+      const LOG_FILE = join(__dirname, 'logs/ai-out.log');
+      const limit = parseInt(url.searchParams.get('limit') ?? '50');
+      if (!existsSync(LOG_FILE)) { json(res, []); return; }
+      try {
+        const content = readFileSync(LOG_FILE, 'utf-8');
+        const lines = content.split('\n').filter(l => l.trim());
+        const tail = lines.slice(-Math.min(limit, 200));
+        const parsed = tail.map(line => {
+          // Parse: "2026-04-13 20:23:15: [live-edge] Found market: ..."
+          const tsMatch = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}): /);
+          const ts = tsMatch ? tsMatch[1] : '';
+          const rest = tsMatch ? line.slice(tsMatch[0].length) : line;
+          const tagMatch = rest.match(/^\[([^\]]+)\] /);
+          const tag = tagMatch ? tagMatch[1] : '';
+          const msg = tagMatch ? rest.slice(tagMatch[0].length) : rest;
+
+          // Categorize for UI coloring
+          let type = 'info';
+          if (msg.includes('TRADE') || msg.includes('🎯') || msg.includes('🔥')) type = 'trade';
+          else if (msg.includes('BLOCKED') || msg.includes('stop-loss') || msg.includes('🛑')) type = 'block';
+          else if (msg.includes('Sonnet analyzing') || msg.includes('Claude says')) type = 'analysis';
+          else if (msg.includes('SETTLED') || msg.includes('✅') || msg.includes('WIN')) type = 'win';
+          else if (msg.includes('❌') || msg.includes('LOSS')) type = 'loss';
+          else if (msg.includes('portfolio')) type = 'portfolio';
+          else if (msg.includes('DRY RUN')) type = 'dryrun';
+
+          return { ts, tag, msg, type, raw: line };
+        });
+        json(res, parsed);
+      } catch (e) {
+        json(res, []);
+      }
+
     } else {
       res.writeHead(404);
       res.end('Not found');

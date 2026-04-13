@@ -6,6 +6,7 @@ import TradeHistory from './pages/TradeHistory';
 import AnalyticsPage from './pages/AnalyticsPage';
 import SettingsPage from './pages/SettingsPage';
 import TradeReview from './pages/TradeReview';
+import LiveFeed from './pages/LiveFeed';
 import { ArborProvider } from './context/ArborContext';
 
 const App = () => (
@@ -18,6 +19,7 @@ const App = () => (
           <Route path="/history" element={<TradeHistory />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
           <Route path="/review" element={<TradeReview />} />
+          <Route path="/live" element={<LiveFeed />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </Layout>
