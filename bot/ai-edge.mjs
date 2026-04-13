@@ -1920,13 +1920,23 @@ async function checkPreGamePredictions() {
 
     for (let i = 0; i < batchItems.length; i++) {
       const { market } = batchItems[i];
-      const decideText = batchResults[i].status === 'fulfilled' ? batchResults[i].value : null;
-      if (!decideText) continue;
+      const batchRes = batchResults[i];
+      const decideText = batchRes.status === 'fulfilled' ? batchRes.value : null;
+      if (!decideText) {
+        console.log(`[pre-game] Sonnet returned empty for ${market.ticker}${batchRes.status === 'rejected' ? ': ' + batchRes.reason?.message : ''}`);
+        continue;
+      }
 
       const jsonMatch = decideText.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) continue;
+      if (!jsonMatch) {
+        console.log(`[pre-game] No JSON in Sonnet response for ${market.ticker}: ${decideText.slice(0, 120)}`);
+        continue;
+      }
       let decision;
-      try { decision = JSON.parse(jsonMatch[0]); } catch { continue; }
+      try { decision = JSON.parse(jsonMatch[0]); } catch (e) {
+        console.log(`[pre-game] JSON parse failed for ${market.ticker}: ${e.message}`);
+        continue;
+      }
 
       const pick = { ticker: market.ticker, side: decision.side ?? 'yes' };
       const price = pick.side === 'yes' ? market.yesAsk : market.noAsk;
