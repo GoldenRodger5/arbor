@@ -681,6 +681,23 @@ function netEdge(confidence, price) {
   return confidence - price - fee;
 }
 
+// Strip markdown code blocks and extract JSON from Claude responses
+// Handles: ```json {...} ```, ```{...}```, or raw {...}
+function extractJSON(text) {
+  if (!text) return null;
+  // Remove markdown code block wrappers
+  const cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
+  const match = cleaned.match(/\{[\s\S]*\}/);
+  return match ? match[0] : null;
+}
+
+function extractJSONArray(text) {
+  if (!text) return null;
+  const cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
+  const match = cleaned.match(/\[[\s\S]*\]/);
+  return match ? match[0] : null;
+}
+
 // Extract actual fill count from order response — Kalshi returns 0 on initial POST, fills async
 function getActualFill(result, requestedQty) {
   const order = result.data?.order ?? result.data ?? {};
@@ -1680,11 +1697,11 @@ async function checkLiveScoreEdges() {
               gameDetail, price, ticker, gameBase, title, targetAbbr } = item;
 
       try {
-        const jsonMatch = cText.match(/\{[\s\S]*\}/);
+        const jsonMatch = extractJSON(cText);
         if (!jsonMatch) { console.log(`[live-edge] Sonnet response not JSON for ${homeAbbr}@${awayAbbr}: ${cText.slice(0, 100)}`); continue; }
 
         let decision;
-        try { decision = JSON.parse(jsonMatch[0]); } catch (e) { console.log(`[live-edge] JSON parse failed for ${homeAbbr}@${awayAbbr}: ${e.message}`); continue; }
+        try { decision = JSON.parse(jsonMatch); } catch (e) { console.log(`[live-edge] JSON parse failed for ${homeAbbr}@${awayAbbr}: ${e.message}`); continue; }
 
         if (!decision.trade) {
           console.log(`[live-edge] Claude says NO: conf=${((decision.confidence ?? 0)*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ | ${decision.reasoning?.slice(0, 80)}`);
@@ -1971,13 +1988,13 @@ async function checkPreGamePredictions() {
         continue;
       }
 
-      const jsonMatch = decideText.match(/\{[\s\S]*\}/);
+      const jsonMatch = extractJSON(decideText);
       if (!jsonMatch) {
         console.log(`[pre-game] No JSON in Sonnet response for ${market.ticker}: ${decideText.slice(0, 120)}`);
         continue;
       }
       let decision;
-      try { decision = JSON.parse(jsonMatch[0]); } catch (e) {
+      try { decision = JSON.parse(jsonMatch); } catch (e) {
         console.log(`[pre-game] JSON parse failed for ${market.ticker}: ${e.message}`);
         continue;
       }
@@ -2154,8 +2171,8 @@ async function checkUFCPredictions() {
 
   let picks = [];
   try {
-    const arr = screenText.match(/\[[\s\S]*\]/);
-    if (arr) picks = JSON.parse(arr[0]);
+    const arr = extractJSONArray(screenText);
+    if (arr) picks = JSON.parse(arr);
   } catch { return; }
 
   if (!Array.isArray(picks) || picks.length === 0) {
@@ -2192,10 +2209,10 @@ async function checkUFCPredictions() {
     );
     if (!decideText) continue;
 
-    const jsonMatch = decideText.match(/\{[\s\S]*\}/);
+    const jsonMatch = extractJSON(decideText);
     if (!jsonMatch) continue;
     let decision;
-    try { decision = JSON.parse(jsonMatch[0]); } catch { continue; }
+    try { decision = JSON.parse(jsonMatch); } catch { continue; }
 
     if (!decision.trade) {
       console.log(`[ufc] Sonnet rejected ${pick.fighter}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
@@ -2552,8 +2569,8 @@ async function claudeBroadScan() {
 
     let candidates = [];
     try {
-      const arrMatch = screenText.match(/\[[\s\S]*\]/);
-      if (arrMatch) candidates = JSON.parse(arrMatch[0]);
+      const arrMatch = extractJSONArray(screenText);
+      if (arrMatch) candidates = JSON.parse(arrMatch);
     } catch { /* not valid JSON */ }
 
     if (!Array.isArray(candidates) || candidates.length === 0) {
@@ -2608,11 +2625,11 @@ async function claudeBroadScan() {
 
       const cText = await claudeWithSearch(decidePrompt, { maxTokens: 800, maxSearches: 3 });
       if (!cText) continue;
-      const jsonMatch = cText.match(/\{[\s\S]*\}/);
+      const jsonMatch = extractJSON(cText);
       if (!jsonMatch) continue;
 
       let decision;
-      try { decision = JSON.parse(jsonMatch[0]); } catch { continue; }
+      try { decision = JSON.parse(jsonMatch); } catch { continue; }
 
       if (!decision.trade) {
         console.log(`[broad-scan] Sonnet rejected ${candidate.ticker}: ${decision.reasoning?.slice(0, 100)}`);
@@ -2623,7 +2640,7 @@ async function claudeBroadScan() {
       // Found a trade — break out to the existing validation logic
       // Inject into the same flow below
       const cTextFinal = JSON.stringify(decision);
-      const jsonMatchFinal = cTextFinal.match(/\{[\s\S]*\}/);
+      const jsonMatchFinal = extractJSON(cTextFinal);
       if (!jsonMatchFinal) continue;
 
       // HARD VALIDATIONS (override Claude)
@@ -3001,9 +3018,9 @@ async function managePositions() {
           const lossText = await claudeScreen(lossPrompt, { maxTokens: 200, timeout: 8000 });
           if (lossText) {
             try {
-              const match = lossText.match(/\{[\s\S]*\}/);
+              const match = extractJSON(lossText);
               if (match) {
-                const d = JSON.parse(match[0]);
+                const d = JSON.parse(match);
                 if (d.action === 'sell') {
                   console.log(`[exit] 🧠 CLAUDE STOP: ${trade.ticker} ${(pctChange*100).toFixed(0)}% (${stage}) | ${d.reasoning?.slice(0, 60)}`);
                   const result = await executeSell(trade, qty, currentPrice, 'claude-stop');
