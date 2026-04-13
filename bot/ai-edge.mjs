@@ -2677,31 +2677,32 @@ async function getGameContext(trade) {
   return null;
 }
 
-// Get exit thresholds — price-aware AND stage-aware
-// Expensive entries (70¢+) need tighter stops: losing $13 on a $25 position is brutal
-// Cheap entries (under 50¢) can be looser: risk/reward justifies patience
+// Get exit thresholds — when Claude starts evaluating a losing position
+// claudeStop = the % drop where Claude is asked sell/hold
+// Nuclear stop (hardcoded in managePositions) handles the absolute floor
 function getExitThresholds(stage, entryPrice = 0.50) {
-  // Price tier: expensive (70¢+), mid (50-70¢), cheap (under 50¢)
   const tier = entryPrice >= 0.70 ? 'expensive' : entryPrice >= 0.50 ? 'mid' : 'cheap';
 
+  // Claude evaluates earlier on expensive entries (can't afford to wait)
+  // and later on cheap entries (risk/reward justifies patience)
   const thresholds = {
     expensive: {
-      early:   { stopLoss: -0.40, claudeStop: -0.25 },
-      mid:     { stopLoss: -0.35, claudeStop: -0.20 },
-      late:    { stopLoss: -0.30, claudeStop: -0.18 },
-      unknown: { stopLoss: -0.35, claudeStop: -0.20 },
+      early:   { claudeStop: -0.15 },  // 75¢ entry → Claude at 64¢ (-15%)
+      mid:     { claudeStop: -0.12 },  // 75¢ entry → Claude at 66¢ (-12%)
+      late:    { claudeStop: -0.10 },  // 75¢ entry → Claude at 67¢ (-10%)
+      unknown: { claudeStop: -0.12 },
     },
     mid: {
-      early:   { stopLoss: -0.55, claudeStop: -0.35 },
-      mid:     { stopLoss: -0.45, claudeStop: -0.30 },
-      late:    { stopLoss: -0.40, claudeStop: -0.25 },
-      unknown: { stopLoss: -0.45, claudeStop: -0.30 },
+      early:   { claudeStop: -0.25 },  // 60¢ entry → Claude at 45¢
+      mid:     { claudeStop: -0.20 },
+      late:    { claudeStop: -0.15 },
+      unknown: { claudeStop: -0.20 },
     },
     cheap: {
-      early:   { stopLoss: -0.70, claudeStop: -0.50 },
-      mid:     { stopLoss: -0.60, claudeStop: -0.40 },
-      late:    { stopLoss: -0.50, claudeStop: -0.35 },
-      unknown: { stopLoss: -0.50, claudeStop: -0.35 },
+      early:   { claudeStop: -0.35 },  // 30¢ entry → Claude at 19¢
+      mid:     { claudeStop: -0.30 },
+      late:    { claudeStop: -0.25 },
+      unknown: { claudeStop: -0.30 },
     },
   };
 
@@ -2763,19 +2764,7 @@ async function managePositions() {
 
         // === TIER 1: Rule-based auto-exits ===
 
-        // STOP-LOSS: Price-aware + stage-aware
-        // Expensive entries (70¢+) stop tighter — losing $13 on $25 is brutal
-        // Cheap entries (under 50¢) stop looser — risk/reward justifies patience
-        if (pctChange < thresholds.stopLoss) {
-          console.log(`[exit] 🛑 STOP-LOSS (${stage}, entry ${(entryPrice*100).toFixed(0)}¢): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% (threshold: ${(thresholds.stopLoss*100).toFixed(0)}%)`);
-          const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
-          if (result) anyUpdated = true;
-          continue;
-        }
-
         // LATE-GAME PROFIT-TAKE at 97¢+ — risking $0.97 to gain $0.03 is 32:1 against us
-        // Buzzer-beaters, walk-offs, empty-net answers can turn $0.97 into $0.00
-        // Only in final moments: late stage AND price 97¢+
         if (stage === 'late' && currentPrice >= 0.97 && profitPerContract > 0) {
           console.log(`[exit] 💰 LATE-GAME LOCK (${stage}): ${trade.ticker} at ${(currentPrice*100).toFixed(0)}¢ — locking profit, not worth risking for 3¢`);
           const result = await executeSell(trade, qty, currentPrice, 'profit-take');
@@ -2783,31 +2772,60 @@ async function managePositions() {
           continue;
         }
 
-        // === TIER 2: Claude-assisted exit with game context ===
+        // NUCLEAR STOP — absolute floor, no Claude, just get out
+        // This is deeper than the old stop-loss. Only fires on true blowouts.
+        // 70¢+ entry: -60%. 50-70¢: -75%. Under 50¢: -85%.
+        const nuclearStop = entryPrice >= 0.70 ? -0.60 : entryPrice >= 0.50 ? -0.75 : -0.85;
+        if (pctChange < nuclearStop) {
+          console.log(`[exit] 🛑 NUCLEAR STOP (${stage}, entry ${(entryPrice*100).toFixed(0)}¢): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% (floor: ${(nuclearStop*100).toFixed(0)}%)`);
+          const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
+          if (result) anyUpdated = true;
+          continue;
+        }
 
-        // LOSING: Claude evaluates positions in the stop-loss danger zone
-        if (pctChange < thresholds.claudeStop && pctChange >= thresholds.stopLoss) {
+        // === TIER 2: Claude evaluates ALL losing positions ===
+        // No more blind stop-loss. Claude sees the live score, sport context,
+        // and comeback stats, then decides sell/hold. This is smarter because:
+        // - NBA down 15 at halftime (45¢ from 75¢) = 13% comeback rate → often HOLD
+        // - NHL down 3 goals in P2 (45¢ from 75¢) = ~5% comeback rate → usually SELL
+        // Same % drop, completely different decision by sport.
+
+        if (pctChange < thresholds.claudeStop) {
           const exitCooldownKey = 'exit-loss:' + trade.ticker;
-          // NBA moves fast — reevaluate every 8 min. Others every 15 min.
+          // Sport-specific cooldowns: NBA 8min (fastest), others 12min
           const isNBA = trade.ticker?.includes('NBA');
-          const evalCooldownMs = isNBA ? 8 * 60 * 1000 : 15 * 60 * 1000;
+          const evalCooldownMs = isNBA ? 8 * 60 * 1000 : 12 * 60 * 1000;
           if (Date.now() - (tradeCooldowns.get(exitCooldownKey) ?? 0) < evalCooldownMs) continue;
           tradeCooldowns.set(exitCooldownKey, Date.now());
 
+          // Detect sport for context-specific prompt
+          const ticker = trade.ticker ?? '';
+          const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB' :
+            ticker.includes('NHL') ? 'NHL' : ticker.includes('MLS') || ticker.includes('EPL') || ticker.includes('LALIGA') ? 'Soccer' : 'Sport';
+
+          // Sport-specific comeback context
+          const comebackContext = {
+            NBA: 'NBA: 15-point comebacks happen 13% in the 3-point era. 20-point comebacks happen 4%. 25+ is essentially over (<1%).',
+            MLB: 'MLB: 3-run comebacks happen 20% through 6 innings, 10% in the 7th+. 5+ run deficit after 6th inning = <3% comeback.',
+            NHL: 'NHL: 1-goal comebacks happen 30%. 2-goal comebacks ~15%. 3-goal comebacks ~5%. Down 3+ in the 3rd = essentially over.',
+            Soccer: 'Soccer: 1-goal deficits equalize ~20% of the time. 2-goal deficit comeback is ~5%. Down 2+ after 75th minute = essentially over.',
+            Sport: 'Comebacks are possible but rare in large deficits late in the game.',
+          }[sport] ?? '';
+
           const lossPrompt =
-            `You manage a live sports bet that's DOWN. Should you SELL or HOLD?\n\n` +
-            `POSITION: Bought ${trade.side?.toUpperCase()} at ${(entryPrice*100).toFixed(0)}¢. Now ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}% loss).\n` +
+            `You manage a live ${sport} bet that's DOWN. Should you SELL or HOLD?\n\n` +
+            `POSITION: Bought ${trade.side?.toUpperCase()} at ${(entryPrice*100).toFixed(0)}¢. Now ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}% loss, -$${Math.abs(qty * profitPerContract).toFixed(2)}).\n` +
             `Game: ${trade.title}\n` +
             `${ctx ? `LIVE: ${ctx.detail}\nGame stage: ${stage.toUpperCase()} | Win expectancy: ${ctx.baselineWE ? (ctx.baselineWE*100).toFixed(0) + '%' : 'unknown'}` : 'No live data available'}\n\n` +
-            `IMPORTANT: Sports games swing constantly. Comebacks are NORMAL:\n` +
-            `- NBA: 15-point comebacks happen 13% of the time in the 3-point era\n` +
-            `- MLB: 3-run comebacks happen 20%+ through 6 innings\n` +
-            `- NHL: 2-goal comebacks happen ~15% of the time\n` +
-            `- Soccer: Late equalizers happen in ~20% of 1-goal games\n\n` +
-            `We predicted this team would win. The DEFAULT is HOLD unless the game is truly out of reach.\n` +
-            `Only sell if: blowout score (5+ goal/run lead late), key player ejected/injured, or mathematically eliminated.\n\n` +
-            `A) SELL: Lock in loss of $${Math.abs(qty * profitPerContract).toFixed(2)}. Guaranteed loss.\n` +
-            `B) HOLD: If team comes back and wins → +$${(qty * (1 - entryPrice)).toFixed(2)}. If loses → -$${(qty * entryPrice).toFixed(2)}.\n\n` +
+            `SPORT-SPECIFIC CONTEXT:\n${comebackContext}\n\n` +
+            `DECISION FRAMEWORK:\n` +
+            `- If win expectancy > 25%: HOLD (team still has a real shot)\n` +
+            `- If win expectancy 10-25%: consider selling if it's late in the game\n` +
+            `- If win expectancy < 10%: SELL (game is over)\n` +
+            `- Key player injury/ejection on OUR team: SELL\n` +
+            `- Score suggests blowout but it's early: HOLD (lots of game left)\n\n` +
+            `A) SELL: Lock in loss of $${Math.abs(qty * profitPerContract).toFixed(2)}. Free up $${currentPrice > 0 ? (qty * currentPrice).toFixed(2) : '0'} capital.\n` +
+            `B) HOLD: If team wins → +$${(qty * (1 - entryPrice)).toFixed(2)}. If loses → -$${(qty * entryPrice).toFixed(2)}.\n\n` +
             `JSON ONLY: {"action": "sell"/"hold", "reasoning": "why"}`;
 
           const lossText = await claudeScreen(lossPrompt, { maxTokens: 200, timeout: 8000 });
