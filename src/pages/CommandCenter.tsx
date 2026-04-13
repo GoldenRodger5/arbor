@@ -1,5 +1,8 @@
+import { useEffect, useRef, useState } from 'react';
 import { useArbor } from '@/context/ArborContext';
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
+import Confetti from '@/components/Confetti';
+import Achievements from '@/components/Achievements';
 
 function PnlColor({ value, prefix = '' }: { value: number; prefix?: string }) {
   const color = value >= 0 ? 'var(--green)' : 'var(--red)';
@@ -19,6 +22,18 @@ function StatCard({ label, value, sub }: { label: string; value: React.ReactNode
 
 export default function CommandCenter() {
   const { stats, positions, snapshots, trades, loading, lastRefresh, refresh } = useArbor();
+
+  // Confetti: trigger when a new win settles
+  const [showConfetti, setShowConfetti] = useState(false);
+  const prevWins = useRef(0);
+  useEffect(() => {
+    const currentWins = stats?.wins ?? 0;
+    if (prevWins.current > 0 && currentWins > prevWins.current) {
+      setShowConfetti(true);
+      setTimeout(() => setShowConfetti(false), 100);
+    }
+    prevWins.current = currentWins;
+  }, [stats?.wins]);
 
   if (loading) return <div style={{ padding: 40, color: 'var(--text-secondary)' }}>Loading...</div>;
 
@@ -53,6 +68,8 @@ export default function CommandCenter() {
 
   return (
     <div>
+      <Confetti active={showConfetti} />
+
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
         <div>
@@ -143,7 +160,11 @@ export default function CommandCenter() {
         <StatCard label="WIN RATE" value={s.winRate != null ? `${s.winRate}%` : 'N/A'} sub={<>{s.wins ?? 0}W / {s.losses ?? 0}L</>} />
         <StatCard
           label="STREAK"
-          value={<>{streakIcon} {s.streak ?? 0} {s.streakType ?? ''}</>}
+          value={
+            <span className={s.streakType === 'win' && (s.streak ?? 0) >= 3 ? 'streak-fire' : ''}>
+              {streakIcon} {s.streak ?? 0} {s.streakType ?? ''}
+            </span>
+          }
         />
         <StatCard label="OPEN" value={s.openTrades ?? 0} sub={<>${(positions.reduce((sum, p) => sum + (p.deployCost ?? 0), 0)).toFixed(2)} deployed</>} />
         <StatCard
@@ -247,6 +268,11 @@ export default function CommandCenter() {
             );
           })}
         </div>
+      </div>
+
+      {/* Achievements */}
+      <div style={{ marginTop: 20 }}>
+        <Achievements stats={s} trades={trades} />
       </div>
     </div>
   );
