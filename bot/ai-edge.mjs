@@ -3740,12 +3740,12 @@ async function main() {
     `Max trade: $${maxTrade.toFixed(2)} (10% of bankroll, ceiling $${getTradeCapCeiling()})\n` +
     `Max deploy: ${(getMaxDeployment()*100).toFixed(0)}% ($${(bankroll*getMaxDeployment()).toFixed(2)}) | Positions: ${getMaxPositions()}\n` +
     `Daily loss halt: $${Math.max(10, bankroll * DAILY_LOSS_PCT).toFixed(2)} (${(DAILY_LOSS_PCT*100).toFixed(0)}%)\n` +
-    `Reserve: ${(CAPITAL_RESERVE*100).toFixed(0)}% ($${(bankroll*CAPITAL_RESERVE).toFixed(2)}) | Sport cap: $${Math.max(15, bankroll * SPORT_EXPOSURE_PCT).toFixed(2)}\n` +
-    `Consecutive loss: ${MAX_CONSECUTIVE_LOSSES}→half size, 8→halt\n\n` +
+    `Reserve: ${(CAPITAL_RESERVE*100).toFixed(0)}% ($${(bankroll*CAPITAL_RESERVE).toFixed(2)}) | Game cap: 15% ($${(bankroll*0.15).toFixed(2)})\n` +
+    `Pre-game: max ${MAX_PREGAME_PER_CYCLE}/cycle, ${MAX_PREGAME_PER_DAY}/day | Consecutive loss: ${MAX_CONSECUTIVE_LOSSES}→half\n\n` +
     `<b>Config:</b>\n` +
-    `Min confidence: ${(MIN_CONFIDENCE*100).toFixed(0)}% + ${(CONFIDENCE_MARGIN*100).toFixed(0)}% margin | Cooldown: ${COOLDOWN_MS/60000}min\n` +
-    `Model: Haiku screen → Sonnet + web search decide\n` +
-    `Broad scan: every ${BROAD_SCAN_INTERVAL/60000}min | Live-edge: every 60s\n\n` +
+    `Min confidence: ${(MIN_CONFIDENCE*100).toFixed(0)}% | Margins: dynamic by sport + price\n` +
+    `Mode: ${KALSHI_ONLY ? 'Kalshi only' : 'Kalshi + Poly'} | ${DRY_RUN ? 'DRY RUN' : 'LIVE TRADING'}\n` +
+    `Sonnet + web search | Live-edge: every 60s\n\n` +
     `💰 Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions\n` +
     `💰 Polymarket: $${polyBalance.toFixed(2)}\n` +
     `💰 Total bankroll: <b>$${bankroll.toFixed(2)}</b>`
