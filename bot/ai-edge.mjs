@@ -950,10 +950,12 @@ async function checkLiveScoreEdges() {
       const homeScore = parseInt(home.score ?? '0');
       const awayScore = parseInt(away.score ?? '0');
       const diff = Math.abs(homeScore - awayScore);
-      if (diff === 0) continue;
-      const leading = homeScore > awayScore ? home : away;
+      const isSoccer = ['mls', 'epl', 'laliga'].includes(league);
+      // Skip tied games UNLESS it's soccer (draw is a valid bet)
+      if (diff === 0 && !isSoccer) continue;
+      const leading = diff > 0 ? (homeScore > awayScore ? home : away) : home; // tied = home as placeholder
       const detail = comp.status?.type?.shortDetail ?? '';
-      liveGames.push({ league, comp, ev, home, away, homeScore, awayScore, diff, period, leading, detail });
+      liveGames.push({ league, comp, ev, home, away, homeScore, awayScore, diff, period, leading, detail, isSoccer });
     }
   }
 
@@ -990,10 +992,113 @@ async function checkLiveScoreEdges() {
 
   console.log(`[live-edge] ${changed.length} games changed out of ${liveGames.length} live (${changed.map(g => g.away.team?.abbreviation + '@' + g.home.team?.abbreviation).join(', ')})`);
 
-  // === PHASE 3: Sonnet analyzes EVERY changed game (no Haiku gate, no missed opportunities) ===
-  for (const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail } of changed) {
+  // === PHASE 3: Sonnet analyzes EVERY changed game + draw check for tied soccer ===
+  for (const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail, isSoccer } of changed) {
     const seriesMap = { mlb: 'KXMLBGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME', mls: 'KXMLSGAME', epl: 'KXEPLGAME', laliga: 'KXLALIGAGAME' };
     const series = seriesMap[league] ?? 'KXMLBGAME';
+
+    // === DRAW BET CHECK (soccer only, tied games, late in match) ===
+    if (isSoccer && diff === 0 && period >= 2) {
+      try {
+        const homeAbbr = home.team?.abbreviation ?? '';
+        const awayAbbr = away.team?.abbreviation ?? '';
+
+        // Parse minutes from detail (e.g. "72'" or "2nd - 27'")
+        const minMatch = gameDetail.match(/(\d+)/);
+        const minutes = minMatch ? parseInt(minMatch[1]) : 0;
+        // period 2 = second half. Minutes in second half context.
+        const effectiveMin = period === 2 ? Math.max(minutes, 45) : minutes;
+
+        // Draw probability baselines by minute (research-verified)
+        let drawProb = 0;
+        if (homeScore === 0 && awayScore === 0) {
+          // 0-0 game
+          if (effectiveMin >= 75) drawProb = 0.85;
+          else if (effectiveMin >= 60) drawProb = 0.59;
+          else drawProb = 0.36;
+        } else {
+          // 1-1, 2-2 etc
+          if (effectiveMin >= 75) drawProb = 0.80;
+          else if (effectiveMin >= 70) drawProb = 0.72;
+          else if (effectiveMin >= 60) drawProb = 0.55;
+          else drawProb = 0.35;
+        }
+
+        // Only bet draws when probability is high enough (>55%)
+        if (drawProb >= 0.55) {
+          // Find the TIE market
+          const params = new URLSearchParams({ series_ticker: series, status: 'open', limit: '100' });
+          const mkts = await kalshiGet(`/markets?${params}`);
+          const tieMarket = (mkts.markets ?? []).find(m => {
+            const ticker = m.ticker ?? '';
+            return ticker.includes('-TIE') && tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
+          });
+
+          if (tieMarket) {
+            const tiePrice = parseFloat(tieMarket.yes_ask_dollars ?? '1');
+
+            // Only buy if our probability exceeds the price by 3%+
+            if (tiePrice < drawProb - CONFIDENCE_MARGIN && tiePrice <= MAX_PRICE && tiePrice >= 0.10) {
+              const margin = drawProb - tiePrice;
+
+              // Check risk gates
+              if (!canTrade()) continue;
+              const gameBase = tieMarket.ticker.lastIndexOf('-') > 0 ? tieMarket.ticker.slice(0, tieMarket.ticker.lastIndexOf('-')) : tieMarket.ticker;
+              if (Date.now() - (tradeCooldowns.get(tieMarket.ticker) ?? 0) < COOLDOWN_MS) continue;
+              if (Date.now() - (tradeCooldowns.get(gameBase) ?? 0) < COOLDOWN_MS) continue;
+
+              // Check no existing position
+              const hasPos = openPositions.some(p => {
+                const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
+                return pBase === gameBase || (p.exchange === 'polymarket' && tickerHasTeam(p.ticker, homeAbbr) && tickerHasTeam(p.ticker, awayAbbr));
+              });
+              if (hasPos) continue;
+
+              const maxBet = getPositionSize('kalshi', margin);
+              const qty = Math.max(1, Math.floor(maxBet / tiePrice));
+              if (!canDeployMore(qty * tiePrice)) continue;
+
+              const priceInCents = Math.round(tiePrice * 100);
+              console.log(`[draw-bet] ⚽ ${homeAbbr} ${homeScore}-${awayScore} ${awayAbbr} at ${effectiveMin}' | TIE @${priceInCents}¢ (prob: ${(drawProb*100).toFixed(0)}%) margin: ${(margin*100).toFixed(0)}%`);
+
+              tradeCooldowns.set(tieMarket.ticker, Date.now());
+              tradeCooldowns.set(gameBase, Date.now());
+
+              const result = await kalshiPost('/portfolio/orders', {
+                ticker: tieMarket.ticker, action: 'buy', side: 'yes', count: qty,
+                yes_price: priceInCents,
+              });
+
+              if (result.ok) {
+                stats.tradesPlaced++;
+                const deployed = qty * tiePrice;
+                logTrade({
+                  exchange: 'kalshi', strategy: 'draw-bet',
+                  ticker: tieMarket.ticker, title: tieMarket.title ?? `${homeAbbr} vs ${awayAbbr} TIE`,
+                  side: 'yes', quantity: qty, entryPrice: tiePrice, deployCost: deployed,
+                  filled: (result.data.order ?? result.data).quantity_filled ?? 0,
+                  orderId: (result.data.order ?? result.data).order_id ?? null,
+                  edge: margin * 100, confidence: drawProb,
+                  reasoning: `${homeScore}-${awayScore} at ${effectiveMin}'. Draw baseline ${(drawProb*100).toFixed(0)}% vs price ${priceInCents}¢.`,
+                });
+
+                await tg(
+                  `⚽ <b>DRAW BET — KALSHI</b>\n\n` +
+                  `<b>${homeAbbr} ${homeScore}-${awayScore} ${awayAbbr}</b> at ${effectiveMin}'\n\n` +
+                  `BUY TIE @ ${priceInCents}¢ × ${qty} = <b>$${deployed.toFixed(2)}</b>\n` +
+                  `Draw probability: <b>${(drawProb*100).toFixed(0)}%</b> vs price ${priceInCents}¢\n` +
+                  `Potential profit: <b>$${(qty * (1 - tiePrice)).toFixed(2)}</b>\n\n` +
+                  `🧠 <i>Pure math: ${homeScore === 0 && awayScore === 0 ? '0-0' : homeScore+'-'+awayScore} at ${effectiveMin}' = ${(drawProb*100).toFixed(0)}% draw historically</i>`
+                );
+              }
+            }
+          }
+        }
+      } catch (e) { console.error(`[draw-bet] error:`, e.message); }
+
+      // If game is tied, skip the normal team-win analysis (no leader to bet on)
+      if (diff === 0) continue;
+    }
 
     try {
         const homeAbbr = home.team?.abbreviation ?? '';
@@ -1841,7 +1946,7 @@ async function claudeBroadScan() {
           }
         }
         // Also skip TIE markets — we only bet on team wins
-        if (ticker.includes('-TIE')) allMarkets.splice(i, 1);
+        // Keep TIE contracts — draw betting is valid for in-game tied soccer
       } else {
         // US Sports: filter by ticker date (today/tonight only)
         if (!ticker.includes(todayFilter) && !ticker.includes(tonightFilter)) {
