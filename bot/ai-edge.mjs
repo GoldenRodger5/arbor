@@ -1891,7 +1891,7 @@ async function checkLiveScoreEdges() {
 let lastPreGameScan = 0;
 const PREGAME_SCAN_INTERVAL = 15 * 60 * 1000; // every 15 min — only NBA/NHL qualify, no need to scan constantly
 const MAX_PREGAME_PER_CYCLE = 2;   // Max trades per scan — be surgical, not spray-and-pray
-const MAX_PREGAME_PER_DAY = 4;     // Max pre-game trades per day — force selectivity
+const MAX_PREGAME_PER_DAY = 2;     // Max 2 pre-game trades — only the absolute strongest
 let preGameTradesToday = 0;
 let preGameTradesDate = '';         // reset counter on new day
 const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
@@ -1901,8 +1901,15 @@ async function checkPreGamePredictions() {
   lastPreGameScan = Date.now();
   if (!canTrade()) return;
 
-  // Daily limit on pre-game trades
+  // Pre-game shuts off at 6pm ET — once live games start, live-edge takes over
   const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const etHourPG = etNow.getHours();
+  if (etHourPG >= 18) {
+    console.log(`[pre-game] After 6pm ET — pre-game disabled, live-edge handles games now`);
+    return;
+  }
+
+  // Daily limit on pre-game trades
   const todayDateStr = etNow.toISOString().slice(0, 10);
   if (preGameTradesDate !== todayDateStr) {
     preGameTradesToday = 0;
@@ -2168,7 +2175,7 @@ async function checkPreGamePredictions() {
 
     const pgReqMargin = getRequiredMargin(price, { sport: pgSportKey, live: false });
     // Pre-game needs 68% minimum (higher than live's 65% — market has had time to settle)
-    const PRE_GAME_MIN_CONF = 0.68;
+    const PRE_GAME_MIN_CONF = 0.70; // Only take strong pre-game bets — 70% minimum
     if (confidence < PRE_GAME_MIN_CONF || (confidence - price) < pgReqMargin) {
       console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${((confidence-price)*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% min=${(PRE_GAME_MIN_CONF*100).toFixed(0)}% (${pgSportKey})`);
       continue;
