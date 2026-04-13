@@ -2793,9 +2793,12 @@ async function claudeBroadScan() {
       const mktValid = deduped.find(m => m.ticker === decision.ticker);
       if (!mktValid) { console.log(`[broad-scan] BLOCKED: invalid ticker ${decision.ticker}`); continue; }
 
-      const isSportsGame = /^KX(MLB|NBA|NFL|NHL)GAME-/i.test(decision.ticker);
-      if (isSportsGame && !decision.ticker.includes(todayShort) && !(tomorrowShort && decision.ticker.includes(tomorrowShort))) {
-        console.log(`[broad-scan] BLOCKED: wrong date ${decision.ticker}`); continue;
+      const isSportsGame = /^KX(MLB|NBA|NFL|NHL|MLS|EPL|LALIGA)GAME-/i.test(decision.ticker);
+      // Block ALL sports games from broad-scan — pre-game and live-edge handle these
+      // with proper side mapping. Broad-scan can't reliably map YES/NO on sports.
+      if (isSportsGame) {
+        console.log(`[broad-scan] BLOCKED: sports game ${decision.ticker} — use pre-game or live-edge instead`);
+        continue;
       }
 
       const lastH = decision.ticker.lastIndexOf('-');
