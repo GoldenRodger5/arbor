@@ -5,6 +5,7 @@ import PositionsPage from './pages/PositionsPage';
 import TradeHistory from './pages/TradeHistory';
 import AnalyticsPage from './pages/AnalyticsPage';
 import SettingsPage from './pages/SettingsPage';
+import TradeReview from './pages/TradeReview';
 import { ArborProvider } from './context/ArborContext';
 
 const App = () => (
@@ -16,6 +17,7 @@ const App = () => (
           <Route path="/positions" element={<PositionsPage />} />
           <Route path="/history" element={<TradeHistory />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
+          <Route path="/review" element={<TradeReview />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </Layout>

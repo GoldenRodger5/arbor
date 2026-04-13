@@ -5,7 +5,7 @@ const tabs = [
   { label: 'Positions', path: '/positions', icon: '📊' },
   { label: 'History', path: '/history', icon: '📋' },
   { label: 'Analytics', path: '/analytics', icon: '📈' },
-  { label: 'Settings', path: '/settings', icon: '⚙️' },
+  { label: 'Review', path: '/review', icon: '🧠' },
 ];
 
 export default function BottomTabs() {

@@ -6,6 +6,7 @@ const navItems = [
   { label: 'Positions', path: '/positions', icon: '📊' },
   { label: 'Trade History', path: '/history', icon: '📋' },
   { label: 'Analytics', path: '/analytics', icon: '📈' },
+  { label: 'Trade Review', path: '/review', icon: '🧠' },
   { label: 'Settings', path: '/settings', icon: '⚙️' },
 ];
 

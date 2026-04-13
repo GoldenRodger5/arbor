@@ -41,6 +41,16 @@ export default function CommandCenter() {
   // Streak display
   const streakIcon = s.streakType === 'win' && s.streak >= 3 ? '🔥' : s.streakType === 'win' ? '✅' : s.streakType === 'loss' ? '❌' : '';
 
+  // Motivational projections
+  const dailyAvgPnL = s.settledTrades > 0 ? (s.totalPnL ?? 0) / Math.max(1, snapshots.length) : 0;
+  const daysTo1K = dailyAvgPnL > 0 ? Math.ceil((1000 - bankroll) / dailyAvgPnL) : null;
+  const daysTo4KMonth = dailyAvgPnL > 0 ? Math.ceil((5000 - bankroll) / (dailyAvgPnL + (400 / 14))) : null; // include $400 biweekly
+  const monthlyProjected = dailyAvgPnL * 30;
+
+  // Daily target: 5% of bankroll
+  const dailyTarget = bankroll * 0.05;
+  const dailyProgress = Math.max(0, Math.min(1, (s.todayPnL ?? 0) / dailyTarget));
+
   return (
     <div>
       {/* Header */}
@@ -76,6 +86,54 @@ export default function CommandCenter() {
         <div style={{ marginTop: 8 }}>
           <span style={{ fontSize: 13, marginRight: 16 }}>Today: <PnlColor value={s.todayPnL ?? 0} /></span>
           <span style={{ fontSize: 13 }}>All time: <PnlColor value={s.totalPnL ?? 0} /></span>
+        </div>
+      </div>
+
+      {/* Daily Challenge + Projections */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 20 }}>
+        {/* Daily Challenge */}
+        <div style={{
+          background: 'var(--bg-surface)', border: '1px solid var(--border)', borderRadius: 12, padding: '16px 20px',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <span className="label">DAILY TARGET</span>
+            <span className="font-mono" style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+              ${(s.todayPnL ?? 0).toFixed(2)} / ${dailyTarget.toFixed(2)}
+            </span>
+          </div>
+          <div style={{ height: 8, background: 'var(--bg-base)', borderRadius: 4, overflow: 'hidden' }}>
+            <div style={{
+              height: '100%', borderRadius: 4, transition: 'width 500ms ease',
+              width: `${Math.min(100, dailyProgress * 100)}%`,
+              background: dailyProgress >= 1 ? 'var(--green)' : dailyProgress >= 0.5 ? 'var(--accent)' : 'var(--amber)',
+            }} />
+          </div>
+          {dailyProgress >= 1 && (
+            <div style={{ marginTop: 8, fontSize: 12, color: 'var(--green)', fontWeight: 600 }}>
+              Target hit! Keep stacking.
+            </div>
+          )}
+        </div>
+
+        {/* Projections */}
+        <div style={{
+          background: 'var(--bg-surface)', border: '1px solid var(--border)', borderRadius: 12, padding: '16px 20px',
+        }}>
+          <div className="label" style={{ marginBottom: 8 }}>PROJECTIONS</div>
+          {dailyAvgPnL > 0 ? (
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.8 }}>
+              <div>Avg daily: <span className="font-mono" style={{ color: 'var(--green)' }}>+${dailyAvgPnL.toFixed(2)}</span></div>
+              <div>Monthly pace: <span className="font-mono" style={{ color: 'var(--green)' }}>+${monthlyProjected.toFixed(0)}</span></div>
+              {daysTo1K != null && daysTo1K > 0 && daysTo1K < 365 && (
+                <div>$1K bankroll in <span className="font-mono" style={{ color: 'var(--accent)' }}>{daysTo1K} days</span></div>
+              )}
+              {daysTo4KMonth != null && daysTo4KMonth > 0 && daysTo4KMonth < 365 && (
+                <div>$4K/mo target in <span className="font-mono" style={{ color: 'var(--accent)' }}>{daysTo4KMonth} days</span></div>
+              )}
+            </div>
+          ) : (
+            <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>Need more settled trades for projections</div>
+          )}
         </div>
       </div>
 

@@ -13,6 +13,7 @@ import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.API_PORT ?? 3456;
+const API_TOKEN = process.env.API_TOKEN ?? 'arbor-2026';
 const TRADES_LOG = join(__dirname, 'logs/trades.jsonl');
 const DAILY_LOG = join(__dirname, 'logs/daily-snapshots.jsonl');
 const SCREENS_LOG = join(__dirname, 'logs/screens.jsonl');
@@ -47,7 +48,14 @@ function handleRequest(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
+  // Simple token auth — pass ?token=xxx or Authorization: Bearer xxx
   const url = new URL(req.url, `http://localhost:${PORT}`);
+  const token = url.searchParams.get('token') ?? req.headers.authorization?.replace('Bearer ', '');
+  if (token !== API_TOKEN) {
+    res.writeHead(401);
+    res.end('Unauthorized');
+    return;
+  }
   const path = url.pathname;
 
   try {
