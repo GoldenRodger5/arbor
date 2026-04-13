@@ -1253,6 +1253,7 @@ async function checkLiveScoreEdges() {
   }
 
   // Boost candidates that had line movement — something happened (injury, weather, lineup)
+  // But ONLY boost mid/late game situations. Early-game line moves are just normal scoring noise.
   if (lineMovers.length > 0) {
     for (const mover of lineMovers) {
       // Find the candidate for this game (ticker contains game base)
@@ -1264,10 +1265,15 @@ async function checkLiveScoreEdges() {
       });
       if (candidate) {
         candidate._lineMove = mover;
-        candidate._baselineWE = Math.max(candidate._baselineWE, 0.90); // boost to top of priority queue
+        // Only boost priority for mid/late game — early-game line moves are scoring noise
+        const isEarlyGame = (candidate.league === 'mlb' && candidate.period <= 3) ||
+                           (candidate.league === 'nba' && candidate.period <= 1);
+        if (!isEarlyGame) {
+          candidate._baselineWE = Math.max(candidate._baselineWE, 0.90); // boost to top of priority queue
+        }
       }
     }
-    // Re-sort with line movers at top
+    // Re-sort with line movers at top (only mid/late game ones are actually boosted)
     candidates.sort((a, b) => b._baselineWE - a._baselineWE);
   }
 
@@ -1397,6 +1403,34 @@ async function checkLiveScoreEdges() {
 
       // If game is tied, skip the normal team-win analysis (no leader to bet on)
       if (diff === 0) continue;
+    }
+
+    // === EARLY-GAME FILTER — don't waste Sonnet on games too early to have edge ===
+    // Pro bettor logic: early-game small leads are noise. The market prices them accurately.
+    // MLB 1-run lead inning 2 = 58% baseline. Claude always says ~55%. Never trades.
+    // Save Sonnet calls for mid/late game where leads are meaningful and edge exists.
+    //
+    // Line movements should NOT override this — a 8¢ swing in inning 2 is just normal
+    // scoring volatility, not actionable edge. Line moves only matter mid-game+.
+    {
+      const earlyGameSkip = (() => {
+        if (league === 'mlb') {
+          // MLB: skip inning 1-3 unless big lead (4+ runs). Inning 4 = marginal. 5+ = go.
+          if (period <= 3 && diff < 4) return `MLB inning ${period} with ${diff}-run lead (need 4+ or inning 4+)`;
+          if (period === 4 && diff < 3) return `MLB inning 4 with ${diff}-run lead (need 3+ or inning 5+)`;
+        } else if (league === 'nba') {
+          // NBA: skip Q1 unless 15+ point lead. Q2+ with any lead is fine (higher scoring, swings happen fast).
+          if (period <= 1 && diff < 15) return `NBA Q1 with ${diff}-pt lead (need 15+ or Q2+)`;
+        }
+        // NHL: any period OK — low-scoring, a 1-goal lead is always meaningful (62%+ WE)
+        // Soccer: any time OK — fewer games, each one matters, draws add complexity worth analyzing
+        return null;
+      })();
+
+      if (earlyGameSkip) {
+        console.log(`[live-edge] Skipping early game: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${earlyGameSkip}`);
+        continue;
+      }
     }
 
     // Cap Sonnet calls per cycle to avoid stale prices on later games
