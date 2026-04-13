@@ -314,6 +314,7 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
 // ─────────────────────────────────────────────────────────────────────────────
 
 const tradeCooldowns = new Map(); // ticker → lastTradedMs
+const lastGameStates = new Map(); // "ATH@NYM" → "1-0-5" (score-period, for change detection)
 let kalshiBalance = 0;
 let kalshiPositionValue = 0;
 let openPositions = [];  // fetched each cycle
@@ -958,37 +959,39 @@ async function checkLiveScoreEdges() {
 
   if (liveGames.length === 0) return;
 
-  // === PHASE 2: Haiku batch screen — pick best 2 games to analyze ===
-  const gameSummaries = liveGames.slice(0, 15).map((g, i) => {
-    const homeRec = g.home.records?.[0]?.summary ?? '?';
-    const awayRec = g.away.records?.[0]?.summary ?? '?';
-    return `${i+1}. [${g.league.toUpperCase()}] ${g.away.team?.abbreviation}(${awayRec}) ${g.awayScore} @ ${g.home.team?.abbreviation}(${homeRec}) ${g.homeScore} | ${g.detail}`;
-  }).join('\n');
+  // === PHASE 2: Change detection — only analyze games where score or period changed ===
+  const changed = [];
+  for (const g of liveGames) {
+    const gameKey = `${g.away.team?.abbreviation}@${g.home.team?.abbreviation}`;
+    const currentState = `${g.awayScore}-${g.homeScore}-${g.period}`;
+    const lastState = lastGameStates.get(gameKey);
 
-  const screenText = await claudeScreen(
-    `Pick up to 3 live games where you're most confident predicting the winner. Consider: score, inning/period, team records, home advantage.\n\n` +
-    `LIVE GAMES:\n${gameSummaries}\n\n` +
-    `Pick games where the leading team's price might be ≤ 80¢ (early leads, close games, not blowouts already priced at 95¢+).\n\n` +
-    `JSON array: [{"index":N,"team":"ABR","reason":"one line"}] or []`
-  );
+    if (lastState !== currentState) {
+      // Score or period changed — worth analyzing
+      lastGameStates.set(gameKey, currentState);
+      if (lastState !== undefined) { // Skip first cycle (everything is "new")
+        changed.push(g);
+      }
+    }
+  }
 
-  let haikuPicks = [];
-  try {
-    const arr = screenText?.match(/\[[\s\S]*\]/);
-    if (arr) haikuPicks = JSON.parse(arr[0]);
-  } catch { /* bad json */ }
-
-  if (!Array.isArray(haikuPicks) || haikuPicks.length === 0) {
-    console.log(`[live-edge] Haiku: no picks from ${liveGames.length} live games`);
+  // First cycle: mark all as seen, don't analyze (no baseline to compare)
+  if (changed.length === 0) {
+    if (liveGames.length > 0 && lastGameStates.size < liveGames.length) {
+      // First time seeing these games — seed the state map
+      for (const g of liveGames) {
+        const gameKey = `${g.away.team?.abbreviation}@${g.home.team?.abbreviation}`;
+        lastGameStates.set(gameKey, `${g.awayScore}-${g.homeScore}-${g.period}`);
+      }
+      console.log(`[live-edge] Seeded ${liveGames.length} game states (first cycle)`);
+    }
     return;
   }
-  console.log(`[live-edge] Haiku picked ${haikuPicks.length} from ${liveGames.length} live games: ${haikuPicks.map(p => p.team).join(', ')}`);
 
-  // === PHASE 3: Only analyze Haiku's picks with Sonnet (saves 80%+ API cost) ===
-  for (const pick of haikuPicks.slice(0, 3)) {
-    const idx = (pick.index ?? 1) - 1;
-    if (idx < 0 || idx >= liveGames.length) continue;
-    const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail } = liveGames[idx];
+  console.log(`[live-edge] ${changed.length} games changed out of ${liveGames.length} live (${changed.map(g => g.away.team?.abbreviation + '@' + g.home.team?.abbreviation).join(', ')})`);
+
+  // === PHASE 3: Sonnet analyzes EVERY changed game (no Haiku gate, no missed opportunities) ===
+  for (const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail } of changed) {
     const seriesMap = { mlb: 'KXMLBGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME', mls: 'KXMLSGAME', epl: 'KXEPLGAME', laliga: 'KXLALIGAGAME' };
     const series = seriesMap[league] ?? 'KXMLBGAME';
 
