@@ -961,52 +961,47 @@ async function checkLiveScoreEdges() {
 
   if (liveGames.length === 0) return;
 
-  // === PHASE 2: Change detection — only analyze games where score or period changed ===
-  const changed = [];
+  // === PHASE 2: Find opportunities — score changed OR baseline-vs-price gap exists ===
+  const candidates = [];
   for (const g of liveGames) {
     const gameKey = `${g.away.team?.abbreviation}@${g.home.team?.abbreviation}`;
     const currentState = `${g.awayScore}-${g.homeScore}-${g.period}`;
     const lastState = lastGameStates.get(gameKey);
+    const scoreChanged = lastState !== undefined && lastState !== currentState;
 
-    if (lastState !== currentState) {
-      // Score or period changed — worth analyzing
-      lastGameStates.set(gameKey, currentState);
-      if (lastState !== undefined) { // Skip first cycle (everything is "new")
-        changed.push(g);
-      }
-    }
-  }
+    // Always update state
+    lastGameStates.set(gameKey, currentState);
 
-  // First cycle: mark all as seen, don't analyze (no baseline to compare)
-  if (changed.length === 0) {
-    if (liveGames.length > 0 && lastGameStates.size < liveGames.length) {
-      // First time seeing these games — seed the state map
-      for (const g of liveGames) {
-        const gameKey = `${g.away.team?.abbreviation}@${g.home.team?.abbreviation}`;
-        lastGameStates.set(gameKey, `${g.awayScore}-${g.homeScore}-${g.period}`);
-      }
-      console.log(`[live-edge] Seeded ${liveGames.length} game states (first cycle)`);
-    }
-    return;
-  }
+    // Skip first time seeing a game (no baseline)
+    if (lastState === undefined) continue;
 
-  // === PHASE 2.5: Sort by opportunity — biggest baseline-vs-price gap first ===
-  // This ensures the best opportunity gets Sonnet analysis before prices move
-  for (const g of changed) {
+    // Calculate baseline win expectancy
     const isHome = g.leading === g.home;
-    const we = getWinExpectancy(g.league, g.diff, g.period, isHome) ?? 0.50;
+    const we = g.diff > 0 ? (getWinExpectancy(g.league, g.diff, g.period, isHome) ?? 0.50) : 0.50;
     g._baselineWE = we;
-    g._estimatedGap = we - 0.50; // rough gap estimate (real gap needs market price)
+    g._scoreChanged = scoreChanged;
+
+    // Include if: score changed, OR baseline suggests opportunity (>60% WE with a lead)
+    if (scoreChanged || (g.diff > 0 && we >= 0.60)) {
+      candidates.push(g);
+    }
   }
-  changed.sort((a, b) => b._estimatedGap - a._estimatedGap);
 
-  console.log(`[live-edge] ${changed.length} games changed out of ${liveGames.length} live (${changed.map(g => g.away.team?.abbreviation + '@' + g.home.team?.abbreviation + '(' + (g._baselineWE*100).toFixed(0) + '%)').join(', ')})`);
+  if (candidates.length === 0) return;
 
-  // === PHASE 3: Analyze changed games in priority order — best opportunity first ===
+  // Sort by baseline WE — highest opportunity first
+  candidates.sort((a, b) => b._baselineWE - a._baselineWE);
+
+  console.log(`[live-edge] ${candidates.length} candidates from ${liveGames.length} live (${candidates.map(g => {
+    const tag = g._scoreChanged ? '⚡' : '📊';
+    return tag + g.away.team?.abbreviation + '@' + g.home.team?.abbreviation + '(' + (g._baselineWE*100).toFixed(0) + '%)';
+  }).join(', ')})`);
+
+  // === PHASE 3: Analyze candidates in priority order — best opportunity first ===
   let sonnetCallsThisCycle = 0;
-  const MAX_SONNET_PER_CYCLE = 3; // Cap to avoid stale prices on later games
+  const MAX_SONNET_PER_CYCLE = 3; // Cap to keep prices fresh
 
-  for (const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail, isSoccer } of changed) {
+  for (const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail, isSoccer, _scoreChanged } of candidates) {
     const seriesMap = { mlb: 'KXMLBGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME', mls: 'KXMLSGAME', epl: 'KXEPLGAME', laliga: 'KXLALIGAGAME' };
     const series = seriesMap[league] ?? 'KXMLBGAME';
 
