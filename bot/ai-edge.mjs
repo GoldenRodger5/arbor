@@ -1922,42 +1922,52 @@ async function checkPreGamePredictions() {
   const etHour = etNow.getHours();
   const tonightStr = etHour >= 22 ? toShort(etTmrw) : null;
 
-  // Collect today's pre-game markets
-  const preGameMarkets = [];
+  // Collect today's pre-game markets — group both tickers per game
+  const gameMap = new Map(); // base → { tickers: [{ticker, team, yesAsk}], title, base, series }
   for (const series of sportsSeries) {
     try {
       const data = await kalshiGet(`/markets?series_ticker=${series}&status=open&limit=200`);
-      const seenBases = new Set();
       for (const m of data.markets ?? []) {
-        if (!m.yes_ask_dollars || !m.no_ask_dollars) continue;
+        if (!m.yes_ask_dollars) continue;
         const ticker = m.ticker ?? '';
         if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) continue;
-        const ya = parseFloat(m.yes_ask_dollars);
-        // Pre-game: 15-90¢ range — includes underdog value at 15-25¢
-        if (ya < 0.15 || ya > MAX_PRICE) continue;
-        // Dedup by game base
         const lastH = ticker.lastIndexOf('-');
         const base = lastH > 0 ? ticker.slice(0, lastH) : ticker;
-        if (seenBases.has(base)) continue;
-        seenBases.add(base);
-        // Skip if we already have a position
-        const hasPos = openPositions.some(p => {
-          const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
-          return pBase === base;
-        });
-        if (hasPos) continue;
-        if (Date.now() - (tradeCooldowns.get(ticker) ?? 0) < COOLDOWN_MS) continue;
-        if (Date.now() - (tradeCooldowns.get(base) ?? 0) < COOLDOWN_MS) continue;
+        const team = ticker.split('-').pop() ?? '';
+        const yesAsk = parseFloat(m.yes_ask_dollars);
+        const yesSubTitle = m.yes_sub_title ?? team; // Kalshi provides the team name
 
-        // Extract YES team from ticker suffix (e.g., KXMLBGAME-26APR131945CLESTL-STL → STL = YES)
-        const yesTeam = ticker.split('-').pop() ?? '';
-
-        preGameMarkets.push({
-          ticker, title: m.title, yesAsk: ya, noAsk: parseFloat(m.no_ask_dollars),
-          base, series, yesTeam,
-        });
+        if (!gameMap.has(base)) gameMap.set(base, { tickers: [], title: m.title, base, series });
+        gameMap.get(base).tickers.push({ ticker, team, teamName: yesSubTitle, yesAsk });
       }
     } catch { /* skip */ }
+  }
+
+  // Build pre-game markets with both sides
+  const preGameMarkets = [];
+  for (const [base, game] of gameMap) {
+    if (game.tickers.length < 2) continue; // need both sides
+    // Skip if already have position
+    const hasPos = openPositions.some(p => {
+      const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
+      return pBase === base;
+    });
+    if (hasPos) continue;
+    if (Date.now() - (tradeCooldowns.get(base) ?? 0) < COOLDOWN_MS) continue;
+
+    // Both teams with prices
+    const team1 = game.tickers[0];
+    const team2 = game.tickers[1];
+
+    // Skip if both prices are outside range
+    if (team1.yesAsk > MAX_PRICE && team2.yesAsk > MAX_PRICE) continue;
+    if (team1.yesAsk < 0.15 && team2.yesAsk < 0.15) continue;
+
+    preGameMarkets.push({
+      title: game.title, base, series: game.series,
+      team1: { ticker: team1.ticker, team: team1.team, teamName: team1.teamName, price: team1.yesAsk },
+      team2: { ticker: team2.ticker, team: team2.team, teamName: team2.teamName, price: team2.yesAsk },
+    });
   }
 
   if (preGameMarkets.length === 0) { console.log('[pre-game] No pre-game markets in range'); return; }
@@ -1972,11 +1982,10 @@ async function checkPreGamePredictions() {
   const todayDate = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'long', day: 'numeric' });
 
   const pgPrompts = pgSlice.map(market => {
-    const tk = market.ticker ?? '';
+    const tk = market.base ?? '';
     const sport = tk.includes('MLB') ? 'MLB' : tk.includes('NBA') ? 'NBA' : tk.includes('NHL') ? 'NHL' :
       tk.includes('MLS') ? 'MLS' : tk.includes('EPL') ? 'EPL' : tk.includes('LALIGA') ? 'La Liga' : 'Sport';
 
-    // Sport-specific baseline and research instructions
     const sportBaseline = {
       MLB: 'MLB home team wins 54%. Top pitcher (ERA<3.0) adds +10-15%. FIP is better predictor than ERA. Look up starting pitchers, recent form, bullpen ERA.',
       NBA: 'NBA home team wins 63%. Star player out = -10%. Back-to-back team = -3-5%. Look up injuries, recent form, playoff seeding.',
@@ -1990,23 +1999,20 @@ async function checkPreGamePredictions() {
       market,
       sport,
       prompt: `You are a professional ${sport} bettor. Predict who wins this REGULAR SEASON game being played TODAY, ${todayDate}.\n\n` +
-        `THIS IS A ${sport} GAME. Not a futures market, not a playoff series — a single regular season ${sport} game TODAY.\n\n` +
+        `THIS IS A ${sport} GAME. Not a futures market, not a playoff series.\n\n` +
         `GAME: ${market.title}\n` +
-        `Sport: ${sport}\n` +
-        `Ticker: ${market.ticker}\n\n` +
-        `CRITICAL SIDE MAPPING:\n` +
-        `  YES = ${market.yesTeam} wins (price: ${(market.yesAsk*100).toFixed(0)}¢)\n` +
-        `  NO = opponent wins (price: ${(market.noAsk*100).toFixed(0)}¢)\n` +
-        `  If you think ${market.yesTeam} wins → pick YES\n` +
-        `  If you think the OTHER team wins → pick NO\n\n` +
-        `BASELINE: ${sportBaseline}\n` +
-        `Start from the home/away baseline, then adjust based on your research.\n\n` +
-        `RESEARCH: Look up both teams' 2026 records, starting pitchers/goalies, key injuries TODAY, recent form (last 5 games), head-to-head this season.\n\n` +
-        `BUY if confidence ≥ 65% AND at least 3 points above the price of the side you pick.\n` +
+        `Sport: ${sport}\n\n` +
+        `The two teams and their prices:\n` +
+        `  ${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
+        `  ${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
+        `BASELINE: ${sportBaseline}\n\n` +
+        `RESEARCH: Look up both teams' 2026 records, starting pitchers/goalies, key injuries TODAY, recent form.\n\n` +
+        `Tell me WHICH TEAM WINS and how confident you are.\n` +
+        `BUY if confidence ≥ 65% AND at least 3 points above that team's price.\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
         `CRITICAL: Respond with ONLY a JSON object. No other text.\n` +
-        `{"trade":false,"confidence":0.XX,"reasoning":"${sport} baseline X%, adjusted to Y% because Z"}\n` +
-        `OR {"trade":true,"side":"yes"/"no","team":"TEAM_ABBR","confidence":0.XX,"betAmount":N,"reasoning":"${sport} baseline X%, adjusted to Y% because Z"}`,
+        `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"reasoning":"one sentence"}`,
     };
   });
 
@@ -2024,25 +2030,45 @@ async function checkPreGamePredictions() {
       const batchRes = batchResults[i];
       const decideText = batchRes.status === 'fulfilled' ? batchRes.value : null;
       if (!decideText) {
-        console.log(`[pre-game] Sonnet returned empty for ${market.ticker}${batchRes.status === 'rejected' ? ': ' + batchRes.reason?.message : ''}`);
+        console.log(`[pre-game] Sonnet returned empty for ${market.base}${batchRes.status === 'rejected' ? ': ' + batchRes.reason?.message : ''}`);
         continue;
       }
 
       const jsonMatch = extractJSON(decideText);
       if (!jsonMatch) {
-        console.log(`[pre-game] No JSON in Sonnet response for ${market.ticker}: ${decideText.slice(0, 120)}`);
+        console.log(`[pre-game] No JSON in Sonnet response for ${market.base}: ${decideText.slice(0, 120)}`);
         continue;
       }
       let decision;
       try { decision = JSON.parse(jsonMatch); } catch (e) {
-        console.log(`[pre-game] JSON parse failed for ${market.ticker}: ${e.message}`);
+        console.log(`[pre-game] JSON parse failed for ${market.base}: ${e.message}`);
         continue;
       }
 
-      const pick = { ticker: market.ticker, side: decision.side ?? 'yes' };
-      const price = pick.side === 'yes' ? market.yesAsk : market.noAsk;
-      // Determine which team we're actually betting on
-      const bettingOnTeam = pick.side === 'yes' ? market.yesTeam : (decision.team ?? 'opponent');
+      // Map Claude's team pick to the correct ticker — ALWAYS buy YES on that team's market
+      const chosenTeam = (decision.team ?? '').toUpperCase();
+      let matchedSide = null;
+      if (chosenTeam === market.team1.team.toUpperCase()) {
+        matchedSide = market.team1;
+      } else if (chosenTeam === market.team2.team.toUpperCase()) {
+        matchedSide = market.team2;
+      } else {
+        // Try fuzzy match (teamName contains abbreviation)
+        if (market.team1.teamName.toUpperCase().includes(chosenTeam) || chosenTeam.includes(market.team1.team.toUpperCase())) {
+          matchedSide = market.team1;
+        } else if (market.team2.teamName.toUpperCase().includes(chosenTeam) || chosenTeam.includes(market.team2.team.toUpperCase())) {
+          matchedSide = market.team2;
+        }
+      }
+      if (!matchedSide) {
+        console.log(`[pre-game] BLOCKED: Claude picked team "${chosenTeam}" but game has ${market.team1.team} vs ${market.team2.team}`);
+        continue;
+      }
+
+      // ALWAYS buy YES on the chosen team's ticker — this is the only correct way
+      const pick = { ticker: matchedSide.ticker, side: 'yes' };
+      const price = matchedSide.price;
+      const bettingOnTeam = matchedSide.teamName;
       const expectedSport = batchItems[i].sport;
 
       // Validate: reject if Claude confused the sport
@@ -2052,13 +2078,13 @@ async function checkPreGamePredictions() {
         (expectedSport === 'NBA' && (reasoning.includes('mlb') || reasoning.includes('pitcher') || reasoning.includes('era ') || reasoning.includes('inning'))) ||
         (expectedSport === 'NHL' && (reasoning.includes('nba') || reasoning.includes('mlb') || reasoning.includes('pitcher')));
       if (wrongSport) {
-        console.log(`[pre-game] BLOCKED: Claude confused sport for ${market.ticker}. Expected ${expectedSport}, reasoning mentions wrong sport.`);
+        console.log(`[pre-game] BLOCKED: Claude confused sport for ${market.base}. Expected ${expectedSport}, reasoning mentions wrong sport.`);
         continue;
       }
 
       if (!decision.trade) {
-        console.log(`[pre-game] Sonnet rejected ${market.ticker}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
-        logScreen({ stage: 'pre-game-sonnet', ticker: market.ticker, result: 'rejected', confidence: decision.confidence, reasoning: decision.reasoning });
+        console.log(`[pre-game] Sonnet rejected ${market.base}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
+        logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'rejected', confidence: decision.confidence, reasoning: decision.reasoning });
         continue;
       }
 
@@ -2088,17 +2114,17 @@ async function checkPreGamePredictions() {
     if (!canTrade()) break;
 
     // Cross-platform price check — extract team abbreviations from ticker
-    const tickerParts = market.ticker.split('-');
+    const tickerParts = market.base.split('-');
     const teamBlock = tickerParts.length >= 3 ? tickerParts[tickerParts.length - 2] : '';
     const team1 = teamBlock.slice(-6, -3);
     const team2 = teamBlock.slice(-3);
     // Extract sport from Kalshi series ticker (KXMLBGAME → mlb, KXNBAGAME → nba)
-    const pgSport = market.ticker.includes('MLB') ? 'mlb' : market.ticker.includes('NBA') ? 'nba' : market.ticker.includes('NHL') ? 'nhl' : market.ticker.includes('MLS') ? 'mls' : market.ticker.includes('EPL') ? 'epl' : market.ticker.includes('LALIGA') ? 'laliga' : '';
+    const pgSport = market.base.includes('MLB') ? 'mlb' : market.base.includes('NBA') ? 'nba' : market.base.includes('NHL') ? 'nhl' : market.base.includes('MLS') ? 'mls' : market.base.includes('EPL') ? 'epl' : market.base.includes('LALIGA') ? 'laliga' : '';
     const pgPolyMarkets = await getPolyMoneylines();
     const pgPolyMatch = findPolyMarketForGame(team1, team2, pgPolyMarkets, pgSport);
-    // The team we want is in the ticker suffix (e.g., -PIT or -CHC)
-    const pgTargetTeam = market.ticker.split('-').pop() ?? '';
-    const pgBest = pickBestPlatform(pick.side, price, pgPolyMatch, pgTargetTeam);
+    // The team we want — from Claude's pick, always buying YES
+    const pgTargetTeam = matchedSide.team;
+    const pgBest = pickBestPlatform('yes', price, pgPolyMatch, pgTargetTeam);
 
     const bestPrice = pgBest.price;
     const edge = confidence - bestPrice;
@@ -2116,10 +2142,10 @@ async function checkPreGamePredictions() {
     if (preGameBetGames.has(market.base)) { console.log(`[pre-game] Already bet on ${market.base} today`); continue; }
 
     const pgPlatformLabel = pgBest.platform === 'polymarket' ? `POLY (saved ${((price-bestPrice)*100).toFixed(0)}¢ vs Kalshi)` : 'KALSHI';
-    console.log(`[pre-game] 🎯 TRADE on ${pgPlatformLabel}: ${market.ticker} ${pick.side.toUpperCase()} @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}% (${preGameTradesToday+1}/${MAX_PREGAME_PER_DAY} today)`);
-    logScreen({ stage: 'pre-game', ticker: market.ticker, result: 'TRADE', confidence, price: bestPrice, platform: pgBest.platform, reasoning: decision.reasoning });
+    console.log(`[pre-game] 🎯 TRADE on ${pgPlatformLabel}: ${market.base} ${pick.side.toUpperCase()} @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}% (${preGameTradesToday+1}/${MAX_PREGAME_PER_DAY} today)`);
+    logScreen({ stage: 'pre-game', ticker: market.base, result: 'TRADE', confidence, price: bestPrice, platform: pgBest.platform, reasoning: decision.reasoning });
 
-    tradeCooldowns.set(market.ticker, Date.now());
+    tradeCooldowns.set(market.base, Date.now());
     tradeCooldowns.set(market.base, Date.now());
 
     let pgResult, deployed;
@@ -2128,8 +2154,8 @@ async function checkPreGamePredictions() {
       deployed = qty * bestPrice;
     } else {
       pgResult = await kalshiPost('/portfolio/orders', {
-        ticker: market.ticker, action: 'buy', side: pick.side, count: qty,
-        yes_price: pick.side === 'yes' ? priceInCents : 100 - priceInCents,
+        ticker: pick.ticker, action: 'buy', side: 'yes', count: qty,
+        yes_price: priceInCents,
       });
       deployed = qty * bestPrice;
     }
@@ -2141,9 +2167,10 @@ async function checkPreGamePredictions() {
       preGameBetGames.add(market.base);
       logTrade({
         exchange: pgBest.platform, strategy: 'pre-game-prediction',
-        ticker: pgBest.platform === 'polymarket' ? pgBest.slug : market.ticker,
+        ticker: pgBest.platform === 'polymarket' ? pgBest.slug : pick.ticker,
         title: market.title,
-        side: pick.side, quantity: qty, entryPrice: bestPrice,
+        side: 'yes', quantity: qty, entryPrice: bestPrice,
+        bettingOn: bettingOnTeam,
         deployCost: deployed,
         filled: (pgResult.data?.order ?? pgResult.data)?.quantity_filled ?? 0,
         orderId: (pgResult.data?.order ?? pgResult.data)?.order_id ?? pgResult.data?.id ?? null,
