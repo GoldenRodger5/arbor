@@ -62,7 +62,11 @@ function handleRequest(req, res) {
     if (path === '/api/trades') {
       const trades = readJsonl(TRADES_LOG);
       const exchangeFilter = url.searchParams.get('exchange') ?? 'kalshi';
-      const filtered = exchangeFilter === 'all' ? trades : trades.filter(t => t.exchange === exchangeFilter);
+      const filtered = trades.filter(t => {
+        if (t.status === 'testing-void') return false;
+        if (exchangeFilter !== 'all' && t.exchange !== exchangeFilter) return false;
+        return true;
+      });
       json(res, filtered);
 
     } else if (path === '/api/positions') {
@@ -75,9 +79,13 @@ function handleRequest(req, res) {
       const allTrades = readJsonl(TRADES_LOG);
       const snapshots = readJsonl(DAILY_LOG);
 
-      // Filter: Kalshi-only for P&L (Poly excluded from stats)
+      // Filter: Kalshi-only, exclude voided testing trades
       const exchangeFilter = url.searchParams.get('exchange') ?? 'kalshi';
-      const trades = exchangeFilter === 'all' ? allTrades : allTrades.filter(t => t.exchange === exchangeFilter);
+      const trades = allTrades.filter(t => {
+        if (t.status === 'testing-void') return false; // exclude testing
+        if (exchangeFilter !== 'all' && t.exchange !== exchangeFilter) return false;
+        return true;
+      });
 
       const settled = trades.filter(t => t.status === 'settled' || t.status?.startsWith('sold-'));
       const open = trades.filter(t => t.status === 'open');

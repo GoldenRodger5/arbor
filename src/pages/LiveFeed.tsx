@@ -42,7 +42,7 @@ export default function LiveFeed() {
         if (isDev) {
           url = `${API_BASE}/api/live-feed?token=${API_TOKEN}&limit=100`;
         } else {
-          url = `/api/proxy?path=${encodeURIComponent('/api/live-feed?limit=100')}`;
+          url = `/api/proxy?path=/api/live-feed&limit=100`;
         }
         const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
         if (res.ok) {

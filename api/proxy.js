@@ -6,10 +6,17 @@ export default async function handler(req, res) {
   const TOKEN = process.env.API_TOKEN || 'arbor-2026';
 
   // Get the path from query param: /api/proxy?path=/api/stats
+  // Forward any extra query params (like limit) to the VPS
   const path = req.query.path || '/api/stats';
+  const extraParams = Object.entries(req.query)
+    .filter(([k]) => k !== 'path')
+    .map(([k, v]) => `${k}=${v}`)
+    .join('&');
 
   try {
-    const response = await fetch(`${VPS_API}${path}?token=${TOKEN}`, {
+    const allParams = `token=${TOKEN}${extraParams ? '&' + extraParams : ''}`;
+    const separator = path.includes('?') ? '&' : '?';
+    const response = await fetch(`${VPS_API}${path}${separator}${allParams}`, {
       signal: AbortSignal.timeout(10000),
     });
 
