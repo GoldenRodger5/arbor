@@ -1955,9 +1955,11 @@ async function checkPreGamePredictions() {
     if (hasPos) continue;
     if (Date.now() - (tradeCooldowns.get(base) ?? 0) < COOLDOWN_MS) continue;
 
-    // Both teams with prices
-    const team1 = game.tickers[0];
-    const team2 = game.tickers[1];
+    // Both teams with prices — filter out TIE tickers (soccer has 3: team1, team2, tie)
+    const realTeams = game.tickers.filter(t => t.team.toUpperCase() !== 'TIE');
+    if (realTeams.length < 2) continue;
+    const team1 = realTeams[0];
+    const team2 = realTeams[1];
 
     // Skip if both prices are outside range
     if (team1.yesAsk > MAX_PRICE && team2.yesAsk > MAX_PRICE) continue;
