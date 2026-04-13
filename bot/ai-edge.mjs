@@ -1372,9 +1372,10 @@ async function checkLiveScoreEdges() {
         });
         if (hasPosition) { console.log(`[live-edge] BLOCKED: already have position on ${gameBase} (cross-platform check)`); continue; }
 
-        // Cooldown check
+        // Cooldown check (includes cross-platform matchup key)
         if (Date.now() - (tradeCooldowns.get(ticker) ?? 0) < COOLDOWN_MS) continue;
         if (Date.now() - (tradeCooldowns.get(gameBase) ?? 0) < COOLDOWN_MS) continue;
+        if (Date.now() - (tradeCooldowns.get(`game:${homeAbbr}@${awayAbbr}`) ?? 0) < COOLDOWN_MS) continue;
 
         // Price filter — skip if already decided (80¢+ = not enough upside) or lottery
         if (price <= 0.05) {
@@ -1452,6 +1453,9 @@ async function checkLiveScoreEdges() {
 
         tradeCooldowns.set(ticker, Date.now());
         tradeCooldowns.set(gameBase, Date.now());
+        // Also set cooldown on team matchup key to prevent cross-platform duplicates
+        tradeCooldowns.set(`game:${homeAbbr}@${awayAbbr}`, Date.now());
+        tradeCooldowns.set(`game:${awayAbbr}@${homeAbbr}`, Date.now());
 
         let result, deployed;
         if (best.platform === 'polymarket' && best.slug) {
