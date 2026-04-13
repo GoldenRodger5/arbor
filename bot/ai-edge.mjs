@@ -1409,10 +1409,9 @@ async function checkLiveScoreEdges() {
       });
       if (candidate) {
         candidate._lineMove = mover;
-        // Only boost priority for mid/late game — early-game line moves are scoring noise
-        const isEarlyGame = (candidate.league === 'mlb' && candidate.period <= 3) ||
-                           (candidate.league === 'nba' && candidate.period <= 1);
-        if (!isEarlyGame) {
+        // Only boost priority if baseline WE is already tradeable (65%+)
+        // Line moves on low-WE games (1-run lead inn 2) are just scoring noise
+        if (candidate._baselineWE >= 0.65) {
           candidate._baselineWE = Math.max(candidate._baselineWE, 0.90); // boost to top of priority queue
         }
       }
@@ -1549,30 +1548,20 @@ async function checkLiveScoreEdges() {
       if (diff === 0) continue;
     }
 
-    // === EARLY-GAME FILTER — don't waste Sonnet on games too early to have edge ===
-    // Pro bettor logic: early-game small leads are noise. The market prices them accurately.
-    // MLB 1-run lead inning 2 = 58% baseline. Claude always says ~55%. Never trades.
-    // Save Sonnet calls for mid/late game where leads are meaningful and edge exists.
-    //
-    // Line movements should NOT override this — a 8¢ swing in inning 2 is just normal
-    // scoring volatility, not actionable edge. Line moves only matter mid-game+.
+    // === WIN EXPECTANCY FLOOR — don't waste Sonnet when baseline WE is too low to trade ===
+    // If baseline WE < 65%, Claude can't reach 65% min confidence (Claude rarely exceeds baseline
+    // in early games). This naturally handles every situation:
+    //   - 1-run lead inn 2 (58% WE) → skip (noise)
+    //   - 3-run lead inn 1 (72% WE) → analyze (real blowout)
+    //   - 5-pt NBA Q1 (57% WE) → skip
+    //   - 15-pt NBA Q1 (70% WE) → analyze
+    // Replaces rigid inning/period filters with one universal number.
     {
-      const earlyGameSkip = (() => {
-        if (league === 'mlb') {
-          // MLB: skip inning 1-3 unless big lead (4+ runs). Inning 4 = marginal. 5+ = go.
-          if (period <= 3 && diff < 4) return `MLB inning ${period} with ${diff}-run lead (need 4+ or inning 4+)`;
-          if (period === 4 && diff < 3) return `MLB inning 4 with ${diff}-run lead (need 3+ or inning 5+)`;
-        } else if (league === 'nba') {
-          // NBA: skip Q1 unless 15+ point lead. Q2+ with any lead is fine (higher scoring, swings happen fast).
-          if (period <= 1 && diff < 15) return `NBA Q1 with ${diff}-pt lead (need 15+ or Q2+)`;
-        }
-        // NHL: any period OK — low-scoring, a 1-goal lead is always meaningful (62%+ WE)
-        // Soccer: any time OK — fewer games, each one matters, draws add complexity worth analyzing
-        return null;
-      })();
-
-      if (earlyGameSkip) {
-        console.log(`[live-edge] Skipping early game: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${earlyGameSkip}`);
+      const isLeading = leading === (diff > 0 ? (homeScore > awayScore ? home : away) : null);
+      const baseWE = getWinExpectancy(league, diff, period) ?? 0.50;
+      const MIN_WE_FOR_SONNET = 0.65;
+      if (baseWE < MIN_WE_FOR_SONNET) {
+        console.log(`[live-edge] Skipping low-WE: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} ${diff}-${league === 'nba' ? 'pt' : league === 'mlb' ? 'run' : 'goal'} lead P${period}, WE=${(baseWE*100).toFixed(0)}% (need ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%+)`);
         continue;
       }
     }
