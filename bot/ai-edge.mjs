@@ -1375,12 +1375,12 @@ async function checkLiveScoreEdges() {
         // Ask Claude to PREDICT the winner
         sonnetCallsThisCycle++;
         const cText = await claudeWithSearch(livePrompt);
-        if (!cText) continue;
+        if (!cText) { console.log(`[live-edge] Sonnet returned empty for ${homeAbbr}@${awayAbbr}`); continue; }
         const jsonMatch = cText.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) continue;
+        if (!jsonMatch) { console.log(`[live-edge] Sonnet response not JSON for ${homeAbbr}@${awayAbbr}: ${cText.slice(0, 100)}`); continue; }
 
         let decision;
-        try { decision = JSON.parse(jsonMatch[0]); } catch { continue; }
+        try { decision = JSON.parse(jsonMatch[0]); } catch (e) { console.log(`[live-edge] JSON parse failed for ${homeAbbr}@${awayAbbr}: ${e.message}`); continue; }
 
         if (!decision.trade) {
           console.log(`[live-edge] Claude says NO: conf=${((decision.confidence ?? 0)*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ | ${decision.reasoning?.slice(0, 80)}`);
@@ -1396,7 +1396,7 @@ async function checkLiveScoreEdges() {
         }
         // Confidence must exceed price for the bet to be +EV
         if (confidence < price + CONFIDENCE_MARGIN) {
-          console.log(`[live-edge] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢ (need 5%+ gap)`);
+          console.log(`[live-edge] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢ (need ${(CONFIDENCE_MARGIN*100).toFixed(0)}%+ gap)`);
           continue;
         }
 
