@@ -1243,17 +1243,30 @@ async function checkLiveScoreEdges() {
         // NBA shooting stats
         let shootingInfo = '';
         if (league === 'nba') {
-          const homeFGM = home.statistics?.find(s => s.abbreviation === 'FGM')?.displayValue ?? '';
-          const homeFGA = home.statistics?.find(s => s.abbreviation === 'FGA')?.displayValue ?? '';
-          const awayFGM = away.statistics?.find(s => s.abbreviation === 'FGM')?.displayValue ?? '';
-          const awayFGA = away.statistics?.find(s => s.abbreviation === 'FGA')?.displayValue ?? '';
-          const homeReb = home.statistics?.find(s => s.abbreviation === 'REB')?.displayValue ?? '';
-          const awayReb = away.statistics?.find(s => s.abbreviation === 'REB')?.displayValue ?? '';
-          if (homeFGM && homeFGA) {
-            const homePct = ((parseInt(homeFGM) / parseInt(homeFGA)) * 100).toFixed(0);
-            const awayPct = awayFGM && awayFGA ? ((parseInt(awayFGM) / parseInt(awayFGA)) * 100).toFixed(0) : '?';
-            shootingInfo = `Shooting: ${homeAbbr} ${homePct}% (${homeFGM}/${homeFGA}) | ${awayAbbr} ${awayPct}% (${awayFGM}/${awayFGA})`;
-            if (homeReb || awayReb) shootingInfo += ` | Rebounds: ${homeAbbr} ${homeReb} | ${awayAbbr} ${awayReb}`;
+          const getStat = (team, abbr) => team.statistics?.find(s => s.abbreviation === abbr)?.displayValue ?? '';
+          const homeFG = getStat(home, 'FG%');
+          const awayFG = getStat(away, 'FG%');
+          const home3P = getStat(home, '3P%');
+          const away3P = getStat(away, '3P%');
+          const homeFTA = getStat(home, 'FTA');
+          const awayFTA = getStat(away, 'FTA');
+          const homeReb = getStat(home, 'REB');
+          const awayReb = getStat(away, 'REB');
+          const homeAST = getStat(home, 'AST');
+          const awayAST = getStat(away, 'AST');
+
+          if (homeFG) {
+            shootingInfo = `FG%: ${homeAbbr} ${homeFG}% | ${awayAbbr} ${awayFG}%`;
+            if (home3P) shootingInfo += ` | 3P%: ${homeAbbr} ${home3P}% | ${awayAbbr} ${away3P}%`;
+            shootingInfo += `\nRebounds: ${homeAbbr} ${homeReb} | ${awayAbbr} ${awayReb} | Assists: ${homeAbbr} ${homeAST} | ${awayAbbr} ${awayAST}`;
+            if (homeFTA) shootingInfo += ` | FTA: ${homeAbbr} ${homeFTA} | ${awayAbbr} ${awayFTA}`;
+            // Flag shooting dominance for Claude
+            const homeFGn = parseFloat(homeFG) || 0;
+            const awayFGn = parseFloat(awayFG) || 0;
+            if (Math.abs(homeFGn - awayFGn) > 10) {
+              const better = homeFGn > awayFGn ? homeAbbr : awayAbbr;
+              shootingInfo += `\n⚠️ ${better} shooting significantly better (${Math.abs(homeFGn - awayFGn).toFixed(0)}% FG gap)`;
+            }
           }
         }
 
