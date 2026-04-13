@@ -2409,7 +2409,9 @@ async function claudeBroadScan() {
   const etTmrwFilter = new Date(etNowFilter.getTime() + 24 * 60 * 60 * 1000);
   const toShortFilter = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
   const todayFilter = toShortFilter(etNowFilter);
-  const tonightFilter = toShortFilter(etTmrwFilter);
+  // Only include tomorrow after 10pm ET (late games crossing midnight)
+  const etHourFilter = etNowFilter.getHours();
+  const tonightFilter = etHourFilter >= 22 ? toShortFilter(etTmrwFilter) : null;
   const maxCloseMs = Date.now() + MAX_DAYS_OUT * 24 * 60 * 60 * 1000;
 
   const beforeFilter = allMarkets.length;
@@ -2435,7 +2437,7 @@ async function claudeBroadScan() {
         // Keep TIE contracts — draw betting is valid for in-game tied soccer
       } else {
         // US Sports: filter by ticker date (today/tonight only)
-        if (!ticker.includes(todayFilter) && !ticker.includes(tonightFilter)) {
+        if (!ticker.includes(todayFilter) && !(tonightFilter && ticker.includes(tonightFilter))) {
           allMarkets.splice(i, 1);
         }
       }
@@ -2584,13 +2586,15 @@ async function claudeBroadScan() {
     const etTomorrow = new Date(etNow.getTime() + 24 * 60 * 60 * 1000);
     const toShort = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
     const todayShort = toShort(etNow);
-    const tomorrowShort = toShort(etTomorrow);
+    // Only include tomorrow after 10pm ET
+    const etHourBS = etNow.getHours();
+    const tomorrowShort = etHourBS >= 22 ? toShort(etTomorrow) : null;
     const today = etNow.toISOString().slice(0, 10);
 
     // === STAGE 1: Cheap Haiku screen — find 0-3 candidates ($0.002/call) ===
     const screenPrompt =
       `Scan these prediction markets for potential mispricings. Most are efficient — return [] if nothing looks off.\n\n` +
-      `TODAY: ${today} | Sports tickers: ${todayShort}/${tomorrowShort} only\n` +
+      `TODAY: ${today} | Sports tickers: ${todayShort}${tomorrowShort ? '/' + tomorrowShort : ''} only\n` +
       (cryptoPrices ? `CRYPTO: ${cryptoPrices}\n` : '') +
       `\n${marketSummaryFiltered}\n\n` +
       `FOCUS on prices in the $0.30-$0.70 range — that's where real edges exist. A team at 55¢ that should be 65¢ is more actionable than a favorite at 93¢.\n` +
@@ -2681,7 +2685,7 @@ async function claudeBroadScan() {
       if (!mktValid) { console.log(`[broad-scan] BLOCKED: invalid ticker ${decision.ticker}`); continue; }
 
       const isSportsGame = /^KX(MLB|NBA|NFL|NHL)GAME-/i.test(decision.ticker);
-      if (isSportsGame && !decision.ticker.includes(todayShort) && !decision.ticker.includes(tomorrowShort)) {
+      if (isSportsGame && !decision.ticker.includes(todayShort) && !(tomorrowShort && decision.ticker.includes(tomorrowShort))) {
         console.log(`[broad-scan] BLOCKED: wrong date ${decision.ticker}`); continue;
       }
 
