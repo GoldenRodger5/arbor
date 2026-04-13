@@ -8,11 +8,14 @@
 
 import { readFileSync, existsSync } from 'fs';
 import { createServer } from 'http';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.API_PORT ?? 3456;
-const TRADES_LOG = './logs/trades.jsonl';
-const DAILY_LOG = './logs/daily-snapshots.jsonl';
-const SCREENS_LOG = './logs/screens.jsonl';
+const TRADES_LOG = join(__dirname, 'logs/trades.jsonl');
+const DAILY_LOG = join(__dirname, 'logs/daily-snapshots.jsonl');
+const SCREENS_LOG = join(__dirname, 'logs/screens.jsonl');
 
 function readJsonl(path) {
   if (!existsSync(path)) return [];
