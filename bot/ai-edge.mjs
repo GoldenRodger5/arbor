@@ -34,7 +34,32 @@ const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 
 const MIN_CONFIDENCE = 0.65;      // Claude must be ≥65% confident to trade
-const CONFIDENCE_MARGIN = 0.03;   // Confidence must exceed price by 3% — prediction mode, not mispricing
+const CONFIDENCE_MARGIN = 0.03;   // LEGACY flat margin — only used for draw bets + fallback
+
+// Dynamic confidence margin — sport-aware, price-aware, situation-aware
+// Goal: aggressive on cheap contracts (great risk/reward), selective on expensive ones
+function getRequiredMargin(price, { sport = '', live = false, scoreChanged = false, lineMove = false } = {}) {
+  // Base margin by sport
+  const sportBase = {
+    nhl: 0.03, nba: 0.04, mlb: 0.05, mls: 0.05, epl: 0.05, laliga: 0.05,
+    ufc: 0.02, crypto: 0.04, economics: 0.04, politics: 0.04,
+  }[sport] ?? 0.04;
+
+  // Price adjustment — cheap contracts need less margin (great risk/reward)
+  let priceAdj = 0;
+  if (price < 0.35) priceAdj = -0.01;       // under 35¢: reduce 1%
+  else if (price >= 0.60 && price < 0.80) priceAdj = 0.02;  // 60-80¢: add 2%
+  else if (price >= 0.80) priceAdj = 0.04;   // 80-90¢: add 4% — expensive, bad risk/reward
+
+  // Situation adjustment
+  let sitAdj = 0;
+  if (live && scoreChanged) sitAdj = -0.01;   // market adjusting to score change
+  if (lineMove) sitAdj -= 0.01;               // line moved, market catching up
+  if (!live) sitAdj += 0.01;                  // pre-game: market settled, need more edge
+
+  const margin = Math.max(0.01, sportBase + priceAdj + sitAdj);
+  return margin;
+}
 const MAX_PRICE = 0.90;           // Don't buy contracts above 90¢ — allows high-confidence late-game bets
 const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — base fraction
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
@@ -1578,13 +1603,14 @@ async function checkLiveScoreEdges() {
           }
         }
 
-        // Confidence must exceed price for the bet to be +EV
-        if (netEdge(confidence, price) < CONFIDENCE_MARGIN) {
-          console.log(`[live-edge] Not enough margin after fees: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢ fee=${(kalshiFee(price)*100).toFixed(1)}¢`);
+        // Dynamic margin — sport-aware, price-aware, situation-aware
+        const reqMargin = getRequiredMargin(price, { sport: league, live: true, scoreChanged: !!item._scoreChanged, lineMove: !!item._lineMove });
+        if (netEdge(confidence, price) < reqMargin) {
+          console.log(`[live-edge] Not enough margin: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ need=${(reqMargin*100).toFixed(0)}% (${league})`);
           continue;
         }
 
-        const edge = confidence - price; // simple: how much we think we're ahead
+        const edge = confidence - price;
 
         // Risk checks
         if (!canTrade()) continue;
@@ -1598,7 +1624,7 @@ async function checkLiveScoreEdges() {
         // Use the better price for sizing
         const bestPrice = best.price;
         const bestEdge = confidence - bestPrice;
-        if (netEdge(confidence, bestPrice) < CONFIDENCE_MARGIN) continue; // recheck with best price + fees
+        if (netEdge(confidence, bestPrice) < reqMargin) continue; // recheck with best price + fees
 
         const maxBetLE = getPositionSize(best.platform, bestEdge);
         const claudeBet = decision.betAmount ?? 0;
@@ -1817,8 +1843,9 @@ async function checkPreGamePredictions() {
       confidence = pgMaxAllowed;
     }
 
-    if (confidence < MIN_CONFIDENCE || netEdge(confidence, price) < CONFIDENCE_MARGIN) {
-      console.log(`[pre-game] Confidence check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ fee=${(kalshiFee(price)*100).toFixed(1)}¢`);
+    const pgReqMargin = getRequiredMargin(price, { sport: pgSportKey, live: false });
+    if (confidence < MIN_CONFIDENCE || netEdge(confidence, price) < pgReqMargin) {
+      console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ need=${(pgReqMargin*100).toFixed(0)}% (${pgSportKey})`);
       continue;
     }
 
@@ -1840,7 +1867,7 @@ async function checkPreGamePredictions() {
 
     const bestPrice = pgBest.price;
     const edge = confidence - bestPrice;
-    if (edge < CONFIDENCE_MARGIN) continue;
+    if (netEdge(confidence, bestPrice) < pgReqMargin) continue;
 
     const maxBet = getPositionSize(pgBest.platform, edge);
     const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
@@ -1998,9 +2025,10 @@ async function checkUFCPredictions() {
     }
 
     const confidence = decision.confidence ?? 0;
-    // Polymarket fees are different (lower), but use same margin check for simplicity
-    if (confidence < MIN_CONFIDENCE || confidence < price + CONFIDENCE_MARGIN) {
-      console.log(`[ufc] Confidence check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢`);
+    // UFC: most inefficient market, smallest margin needed
+    const ufcMargin = getRequiredMargin(price, { sport: 'ufc', live: false });
+    if (confidence < MIN_CONFIDENCE || confidence < price + ufcMargin) {
+      console.log(`[ufc] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ need=${(ufcMargin*100).toFixed(0)}%`);
       continue;
     }
 
@@ -2446,8 +2474,11 @@ async function claudeBroadScan() {
         }
       }
 
+      const bsCat = mktValid.category?.toLowerCase() ?? '';
+      const bsSport = bsSportKey || (bsCat.includes('crypto') ? 'crypto' : bsCat.includes('econ') ? 'economics' : bsCat.includes('polit') ? 'politics' : '');
+      const bsReqMargin = getRequiredMargin(price, { sport: bsSport, live: false });
       if (confidence < MIN_CONFIDENCE) { console.log(`[broad-scan] Confidence too low: ${(confidence*100).toFixed(0)}%`); continue; }
-      if (netEdge(confidence, price) < CONFIDENCE_MARGIN) { console.log(`[broad-scan] Not enough margin after fees: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ fee=${(kalshiFee(price)*100).toFixed(1)}¢`); continue; }
+      if (netEdge(confidence, price) < bsReqMargin) { console.log(`[broad-scan] Not enough margin: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ need=${(bsReqMargin*100).toFixed(0)}% (${bsSport})`); continue; }
 
       const edge = confidence - price;
 
