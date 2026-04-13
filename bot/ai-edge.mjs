@@ -2829,9 +2829,16 @@ async function claudeBroadScan() {
       tradeCooldowns.set(decision.ticker, Date.now());
       tradeCooldowns.set(base, Date.now());
 
+      // For sports games: ALWAYS buy YES. If Claude said NO (other team wins),
+      // we should find the other team's ticker. But since broad-scan rarely trades sports,
+      // just force YES on sports and keep YES/NO for non-sports (crypto, economics).
+      const finalSide = isSportsGame ? 'yes' : decision.side;
+      if (isSportsGame && decision.side === 'no') {
+        console.log(`[broad-scan] WARNING: Claude said NO on sports game ${decision.ticker}. Forcing YES to avoid side confusion. Verify reasoning.`);
+      }
       const result = await kalshiPost('/portfolio/orders', {
-        ticker: decision.ticker, action: 'buy', side: decision.side, count: qty,
-        yes_price: decision.side === 'yes' ? priceInCents : 100 - priceInCents,
+        ticker: decision.ticker, action: 'buy', side: finalSide, count: qty,
+        yes_price: finalSide === 'yes' ? priceInCents : 100 - priceInCents,
       });
 
       if (result.ok) {
