@@ -1059,8 +1059,8 @@ async function checkLiveScoreEdges() {
     const seriesMap = { mlb: 'KXMLBGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME', mls: 'KXMLSGAME', epl: 'KXEPLGAME', laliga: 'KXLALIGAGAME' };
     const series = seriesMap[league] ?? 'KXMLBGAME';
 
-    // === DRAW BET CHECK (soccer only, tied games, late in match) ===
-    if (isSoccer && diff === 0 && period >= 2) {
+    // === DRAW BET CHECK (soccer only, tied games, 2nd half or late 1st half 0-0) ===
+    if (isSoccer && diff === 0 && period >= 1) {
       try {
         const homeAbbr = home.team?.abbreviation ?? '';
         const awayAbbr = away.team?.abbreviation ?? '';
@@ -1072,22 +1072,33 @@ async function checkLiveScoreEdges() {
         const effectiveMin = period === 2 ? Math.max(minutes, 45) : minutes;
 
         // Draw probability baselines by minute (research-verified)
+        // Soccer draws are ~25-28% of all games — most exploitable edge we have
         let drawProb = 0;
         if (homeScore === 0 && awayScore === 0) {
-          // 0-0 game
-          if (effectiveMin >= 75) drawProb = 0.85;
+          // 0-0 game — highest draw rates
+          if (effectiveMin >= 80) drawProb = 0.88;
+          else if (effectiveMin >= 75) drawProb = 0.85;
+          else if (effectiveMin >= 70) drawProb = 0.78;
+          else if (effectiveMin >= 65) drawProb = 0.70;
           else if (effectiveMin >= 60) drawProb = 0.59;
-          else drawProb = 0.36;
+          else if (effectiveMin >= 55) drawProb = 0.50;
+          else if (effectiveMin >= 45) drawProb = 0.42; // start of 2nd half
+          else if (effectiveMin >= 35) drawProb = 0.36; // late 1st half 0-0
+          else drawProb = 0;
         } else {
-          // 1-1, 2-2 etc
-          if (effectiveMin >= 75) drawProb = 0.80;
+          // 1-1, 2-2 etc — slightly lower (both teams showed they can score)
+          if (effectiveMin >= 80) drawProb = 0.84;
+          else if (effectiveMin >= 75) drawProb = 0.80;
           else if (effectiveMin >= 70) drawProb = 0.72;
+          else if (effectiveMin >= 65) drawProb = 0.63;
           else if (effectiveMin >= 60) drawProb = 0.55;
-          else drawProb = 0.35;
+          else if (effectiveMin >= 55) drawProb = 0.47;
+          else drawProb = 0;
         }
 
-        // Only bet draws when probability is high enough (>55%)
-        if (drawProb >= 0.55) {
+        // Bet draws when probability is meaningful (>42% for 0-0 late, >47% for scored ties)
+        // Lower threshold allows earlier entries when market is cheap
+        if (drawProb >= 0.42) {
           // Find the TIE market from cached prices (instant, no API call)
           const tieEntry = [...cachedPrices.entries()].find(([t]) =>
             t.includes('-TIE') && tickerHasTeam(t, homeAbbr) && tickerHasTeam(t, awayAbbr)
@@ -2649,13 +2660,17 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
   const entryPrice = trade.entryPrice ?? 0;
   const priceInCents = Math.round(currentPrice * 100);
 
+  // For stop-loss: sell at 1¢ (market order — get out immediately)
+  // For profit-take: sell at current price - 2¢ (want a good exit)
+  const isStopLoss = reason.includes('stop');
+  const sellPrice = isStopLoss ? 1 : Math.max(1, priceInCents - 2);
+
   const result = await kalshiPost('/portfolio/orders', {
     ticker: trade.ticker,
     action: 'sell',
     side: trade.side ?? 'yes',
     count: sellQty,
-    // Sell 2¢ below current to ensure fill
-    yes_price: trade.side === 'yes' ? Math.max(1, priceInCents - 2) : 100 - Math.max(1, priceInCents - 2),
+    yes_price: trade.side === 'yes' ? sellPrice : 100 - sellPrice,
   });
 
   if (!result.ok) {
@@ -2781,6 +2796,166 @@ async function checkSettlements() {
     }
   } catch (e) {
     console.error('[pnl] settlement check error:', e.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stop-Loss Outcome Review — check if stop-losses were correct after games end
+// ─────────────────────────────────────────────────────────────────────────────
+
+const reviewedStopLosses = new Set(); // prevent duplicate reviews
+
+async function reviewStopLossOutcomes() {
+  if (!existsSync(TRADES_LOG)) return;
+  try {
+    const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+    const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+    // Find trades that were stopped out in last 24h
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const stoppedTrades = trades.filter(t =>
+      (t.status === 'sold-stop-loss' || t.status === 'sold-claude-stop') &&
+      t.settledAt && Date.parse(t.settledAt) > cutoff &&
+      !reviewedStopLosses.has(t.ticker)
+    );
+    if (stoppedTrades.length === 0) return;
+
+    // Check each stopped trade against final game result
+    for (const trade of stoppedTrades) {
+      const ticker = trade.ticker ?? '';
+      let league = '';
+      if (ticker.includes('MLB')) league = 'mlb';
+      else if (ticker.includes('NBA')) league = 'nba';
+      else if (ticker.includes('NHL')) league = 'nhl';
+      else if (ticker.includes('MLS')) league = 'mls';
+      else if (ticker.includes('EPL')) league = 'epl';
+      else if (ticker.includes('LALIGA')) league = 'laliga';
+      else continue;
+
+      // Check if the Kalshi market has settled
+      try {
+        const mktData = await kalshiGet(`/markets/${ticker}`);
+        const market = mktData?.market;
+        if (!market || !market.result) continue; // game not over yet
+
+        reviewedStopLosses.add(ticker);
+
+        const wouldHaveWon = (trade.side === 'yes' && market.result === 'yes') ||
+                            (trade.side === 'no' && market.result === 'no');
+
+        const entryPrice = trade.entryPrice ?? 0;
+        const exitPrice = trade.exitPrice ?? 0;
+        const stopLoss = exitPrice - entryPrice;
+        const ifHeld = wouldHaveWon ? (1 - entryPrice) : (0 - entryPrice);
+        const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / (entryPrice || 1));
+
+        const icon = wouldHaveWon ? '😤' : '✅';
+        const verdict = wouldHaveWon
+          ? `BAD STOP — would have WON $${(ifHeld * qty).toFixed(2)} if held`
+          : `GOOD STOP — saved $${(Math.abs(ifHeld - stopLoss) * qty).toFixed(2)} vs total loss`;
+
+        console.log(`[stop-review] ${icon} ${trade.ticker}: ${verdict}`);
+
+        await tg(
+          `${icon} <b>STOP-LOSS REVIEW</b>\n\n` +
+          `<b>${trade.title ?? trade.ticker}</b>\n` +
+          `Entry: ${(entryPrice*100).toFixed(0)}¢ → Stopped at: ${(exitPrice*100).toFixed(0)}¢\n` +
+          `Game result: <b>${market.result?.toUpperCase()}</b> (we bet ${trade.side})\n\n` +
+          `${wouldHaveWon ? `😤 <b>Premature stop</b> — would have won $${(ifHeld * qty).toFixed(2)}` :
+            `✅ <b>Good stop</b> — avoided losing $${(Math.abs(entryPrice) * qty).toFixed(2)}`}\n` +
+          `Actual loss from stop: $${Math.abs(stopLoss * qty).toFixed(2)}`
+        );
+
+        logScreen({ stage: 'stop-review', ticker: trade.ticker, wouldHaveWon, stopLoss: stopLoss * qty, ifHeld: ifHeld * qty });
+      } catch (e) {
+        console.error(`[stop-review] error checking ${ticker}:`, e.message);
+      }
+    }
+  } catch (e) {
+    console.error('[stop-review] error:', e.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Calibration Engine — adjusts confidence thresholds based on trade history
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CALIBRATION_MIN_TRADES = 50; // Need 50+ settled trades before calibrating
+
+function runCalibration() {
+  if (!existsSync(TRADES_LOG)) return;
+  try {
+    const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+    const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const settled = trades.filter(t => t.status === 'settled' && t.confidence != null);
+
+    if (settled.length < CALIBRATION_MIN_TRADES) {
+      console.log(`[calibrate] ${settled.length}/${CALIBRATION_MIN_TRADES} settled trades — need more data`);
+      return;
+    }
+
+    // Bucket trades by confidence range and check actual win rates
+    const buckets = [
+      { label: '65-70%', min: 0.65, max: 0.70, wins: 0, total: 0 },
+      { label: '70-75%', min: 0.70, max: 0.75, wins: 0, total: 0 },
+      { label: '75-80%', min: 0.75, max: 0.80, wins: 0, total: 0 },
+      { label: '80-85%', min: 0.80, max: 0.85, wins: 0, total: 0 },
+      { label: '85-90%', min: 0.85, max: 0.90, wins: 0, total: 0 },
+      { label: '90%+',   min: 0.90, max: 1.01, wins: 0, total: 0 },
+    ];
+
+    for (const t of settled) {
+      const conf = t.confidence;
+      const won = (t.realizedPnL ?? 0) > 0;
+      for (const b of buckets) {
+        if (conf >= b.min && conf < b.max) {
+          b.total++;
+          if (won) b.wins++;
+          break;
+        }
+      }
+    }
+
+    // Build calibration report
+    const reportLines = [`📊 <b>CALIBRATION REPORT</b> (${settled.length} trades)\n`];
+    let overconfident = false;
+
+    for (const b of buckets) {
+      if (b.total < 3) continue; // not enough data in this bucket
+      const actualWinRate = b.wins / b.total;
+      const midConfidence = (b.min + b.max) / 2;
+      const calibrationError = actualWinRate - midConfidence;
+      const icon = Math.abs(calibrationError) < 0.05 ? '✅' : calibrationError < 0 ? '⚠️' : '💰';
+      reportLines.push(`${icon} ${b.label}: predicted ${(midConfidence*100).toFixed(0)}% → actual ${(actualWinRate*100).toFixed(0)}% (${b.wins}/${b.total})`);
+
+      // Flag if we're significantly overconfident (predicted 75%+ but winning <60%)
+      if (midConfidence >= 0.75 && actualWinRate < 0.60 && b.total >= 5) overconfident = true;
+    }
+
+    // Strategy breakdown
+    const stratWins = {};
+    for (const t of settled) {
+      const s = t.strategy ?? 'unknown';
+      if (!stratWins[s]) stratWins[s] = { wins: 0, total: 0, pnl: 0 };
+      stratWins[s].total++;
+      if ((t.realizedPnL ?? 0) > 0) stratWins[s].wins++;
+      stratWins[s].pnl += t.realizedPnL ?? 0;
+    }
+    reportLines.push('\n<b>By Strategy:</b>');
+    for (const [strat, s] of Object.entries(stratWins)) {
+      reportLines.push(`  ${strat}: ${(s.wins/s.total*100).toFixed(0)}% win (${s.wins}/${s.total}) | P&L: $${s.pnl.toFixed(2)}`);
+    }
+
+    if (overconfident) {
+      reportLines.push('\n⚠️ <b>OVERCONFIDENT</b> — actual wins significantly below predicted. Consider raising MIN_CONFIDENCE.');
+    }
+
+    console.log(`[calibrate] Report: ${settled.length} trades, ${buckets.filter(b => b.total >= 3).length} buckets with data`);
+    tg(reportLines.join('\n'));
+
+    logScreen({ stage: 'calibration', settledCount: settled.length, buckets: buckets.filter(b => b.total > 0) });
+  } catch (e) {
+    console.error('[calibrate] error:', e.message);
   }
 }
 
@@ -2988,14 +3163,29 @@ async function main() {
   }
   setTimeout(statsLoop, 5 * 60 * 1000);
 
-  // Settlement reconciliation + resolution arbs — every 5 min
+  // Settlement reconciliation + resolution arbs + stop-loss review — every 5 min
   async function settlementLoop() {
     try { await managePositions(); } catch (e) { console.error('[exit] error:', e.message); }
     try { await checkSettlements(); } catch (e) { console.error('[settlement] error:', e.message); }
+    try { await reviewStopLossOutcomes(); } catch (e) { console.error('[stop-review] error:', e.message); }
     try { await checkResolutionArbs(); } catch (e) { console.error('[resolve] error:', e.message); }
     setTimeout(settlementLoop, 5 * 60 * 1000);
   }
   setTimeout(settlementLoop, 2 * 60 * 1000); // first run after 2 min
+
+  // Calibration engine — runs once per day at 6am ET (after overnight settlements)
+  let lastCalibration = '';
+  async function calibrationLoop() {
+    const etDate = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const today = etDate.toISOString().slice(0, 10);
+    const etHour = etDate.getHours();
+    if (etHour === 6 && lastCalibration !== today) {
+      lastCalibration = today;
+      try { runCalibration(); } catch (e) { console.error('[calibrate] error:', e.message); }
+    }
+    setTimeout(calibrationLoop, 60 * 60 * 1000); // check every hour
+  }
+  setTimeout(calibrationLoop, 10 * 60 * 1000); // first check after 10 min
 
   // Daily report — checks every hour, sends at midnight ET
   let lastDailyReport = '';
