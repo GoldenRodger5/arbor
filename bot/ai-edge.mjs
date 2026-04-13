@@ -38,7 +38,9 @@ const CONFIDENCE_MARGIN = 0.03;   // Confidence must exceed price by 3% — pred
 const MAX_PRICE = 0.90;           // Don't buy contracts above 90¢ — allows high-confidence late-game bets
 const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — base fraction
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
-const COOLDOWN_MS = 15 * 60 * 1000; // 15 min — allows scaling into winners
+const COOLDOWN_MS = 5 * 60 * 1000;  // 5 min base cooldown (can be bypassed for better prices)
+const MAX_ENTRIES_PER_GAME = 3;     // Max times we can buy into the same game
+const MAX_GAME_EXPOSURE_PCT = 0.15; // Max 15% of bankroll on one game
 const MAX_DAYS_OUT = 1;            // Same-day only — capital turns over nightly
 const CLAUDE_SCREENER = 'claude-haiku-4-5-20251001';  // Cheap screening — $0.002/call
 const CLAUDE_DECIDER = 'claude-sonnet-4-6';            // Expensive analysis — only on candidates
@@ -319,6 +321,33 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
 
 const tradeCooldowns = new Map(); // ticker → lastTradedMs
 const lastGameStates = new Map(); // "ATH@NYM" → "1-0-5" (score-period, for change detection)
+const gameEntries = new Map();    // "game:ATH@NYM" → { count: 2, lastPrice: 0.62, totalDeployed: 24.36 }
+
+// Smart cooldown: allow adding to position IF price improved, block if same/worse
+function canScaleInto(gameKey, currentPrice) {
+  const entry = gameEntries.get(gameKey);
+  if (!entry) return true; // first entry — always allowed
+
+  // Block if max entries reached
+  if (entry.count >= MAX_ENTRIES_PER_GAME) return false;
+
+  // Block if total exposure on this game exceeds 15% of bankroll
+  if (entry.totalDeployed >= getBankroll() * MAX_GAME_EXPOSURE_PCT) return false;
+
+  // Allow if price is BETTER (lower) than last entry — we're averaging down
+  if (currentPrice < entry.lastPrice - 0.02) return true; // at least 2¢ cheaper
+
+  // Block if price is same or worse — nothing changed, don't add
+  return false;
+}
+
+function recordGameEntry(gameKey, price, deployed) {
+  const entry = gameEntries.get(gameKey) ?? { count: 0, lastPrice: 0, totalDeployed: 0 };
+  entry.count++;
+  entry.lastPrice = price;
+  entry.totalDeployed += deployed;
+  gameEntries.set(gameKey, entry);
+}
 let kalshiBalance = 0;
 let kalshiPositionValue = 0;
 let openPositions = [];  // fetched each cycle
@@ -1370,12 +1399,17 @@ async function checkLiveScoreEdges() {
           if (p.exchange === 'polymarket' && tickerHasTeam(pt, homeAbbr) && tickerHasTeam(pt, awayAbbr)) return true;
           return false;
         });
-        if (hasPosition) { console.log(`[live-edge] BLOCKED: already have position on ${gameBase} (cross-platform check)`); continue; }
+        // If we have a position, smart cooldown decides whether to scale in
+        // (removed hard block — canScaleInto handles max entries + price improvement)
 
-        // Cooldown check (includes cross-platform matchup key)
-        if (Date.now() - (tradeCooldowns.get(ticker) ?? 0) < COOLDOWN_MS) continue;
-        if (Date.now() - (tradeCooldowns.get(gameBase) ?? 0) < COOLDOWN_MS) continue;
-        if (Date.now() - (tradeCooldowns.get(`game:${homeAbbr}@${awayAbbr}`) ?? 0) < COOLDOWN_MS) continue;
+        // Smart cooldown: base 5min, but allow scaling if price improved
+        const matchupKey = `game:${homeAbbr}@${awayAbbr}`;
+        const timeSinceLastTrade = Date.now() - (tradeCooldowns.get(matchupKey) ?? 0);
+        if (timeSinceLastTrade < COOLDOWN_MS) {
+          // Within cooldown — only allow if price is better (scaling in)
+          if (!canScaleInto(matchupKey, price)) continue;
+          console.log(`[live-edge] 📈 Scale-in opportunity: ${homeAbbr}@${awayAbbr} price dropped to ${(price*100).toFixed(0)}¢`);
+        }
 
         // Price filter — skip if already decided (80¢+ = not enough upside) or lottery
         if (price <= 0.05) {
@@ -1453,8 +1487,8 @@ async function checkLiveScoreEdges() {
 
         tradeCooldowns.set(ticker, Date.now());
         tradeCooldowns.set(gameBase, Date.now());
-        // Also set cooldown on team matchup key to prevent cross-platform duplicates
-        tradeCooldowns.set(`game:${homeAbbr}@${awayAbbr}`, Date.now());
+        const matchupKeyCooldown = `game:${homeAbbr}@${awayAbbr}`;
+        tradeCooldowns.set(matchupKeyCooldown, Date.now());
         tradeCooldowns.set(`game:${awayAbbr}@${homeAbbr}`, Date.now());
 
         let result, deployed;
@@ -1471,6 +1505,7 @@ async function checkLiveScoreEdges() {
 
         if (result.ok) {
           stats.tradesPlaced++;
+          recordGameEntry(`game:${homeAbbr}@${awayAbbr}`, bestPrice, deployed);
 
           logTrade({
             exchange: best.platform, strategy: 'live-prediction',
