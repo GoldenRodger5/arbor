@@ -1944,9 +1944,12 @@ async function checkPreGamePredictions() {
         if (Date.now() - (tradeCooldowns.get(ticker) ?? 0) < COOLDOWN_MS) continue;
         if (Date.now() - (tradeCooldowns.get(base) ?? 0) < COOLDOWN_MS) continue;
 
+        // Extract YES team from ticker suffix (e.g., KXMLBGAME-26APR131945CLESTL-STL → STL = YES)
+        const yesTeam = ticker.split('-').pop() ?? '';
+
         preGameMarkets.push({
           ticker, title: m.title, yesAsk: ya, noAsk: parseFloat(m.no_ask_dollars),
-          base, series,
+          base, series, yesTeam,
         });
       }
     } catch { /* skip */ }
@@ -1985,18 +1988,20 @@ async function checkPreGamePredictions() {
         `THIS IS A ${sport} GAME. Not a futures market, not a playoff series — a single regular season ${sport} game TODAY.\n\n` +
         `GAME: ${market.title}\n` +
         `Sport: ${sport}\n` +
-        `Ticker: ${market.ticker}\n` +
-        `YES price: ${(market.yesAsk*100).toFixed(0)}¢ (YES = first team listed wins)\n` +
-        `NO price: ${(market.noAsk*100).toFixed(0)}¢ (NO = second team listed wins)\n\n` +
+        `Ticker: ${market.ticker}\n\n` +
+        `CRITICAL SIDE MAPPING:\n` +
+        `  YES = ${market.yesTeam} wins (price: ${(market.yesAsk*100).toFixed(0)}¢)\n` +
+        `  NO = opponent wins (price: ${(market.noAsk*100).toFixed(0)}¢)\n` +
+        `  If you think ${market.yesTeam} wins → pick YES\n` +
+        `  If you think the OTHER team wins → pick NO\n\n` +
         `BASELINE: ${sportBaseline}\n` +
         `Start from the home/away baseline, then adjust based on your research.\n\n` +
         `RESEARCH: Look up both teams' 2026 records, starting pitchers/goalies, key injuries TODAY, recent form (last 5 games), head-to-head this season.\n\n` +
         `BUY if confidence ≥ 65% AND at least 3 points above the price of the side you pick.\n` +
-        `Pick YES (first team wins) or NO (second team wins).\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
         `CRITICAL: Respond with ONLY a JSON object. No other text.\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"${sport} baseline X%, adjusted to Y% because Z"}\n` +
-        `OR {"trade":true,"side":"yes"/"no","confidence":0.XX,"betAmount":N,"reasoning":"${sport} baseline X%, adjusted to Y% because Z"}`,
+        `OR {"trade":true,"side":"yes"/"no","team":"TEAM_ABBR","confidence":0.XX,"betAmount":N,"reasoning":"${sport} baseline X%, adjusted to Y% because Z"}`,
     };
   });
 
@@ -2031,6 +2036,8 @@ async function checkPreGamePredictions() {
 
       const pick = { ticker: market.ticker, side: decision.side ?? 'yes' };
       const price = pick.side === 'yes' ? market.yesAsk : market.noAsk;
+      // Determine which team we're actually betting on
+      const bettingOnTeam = pick.side === 'yes' ? market.yesTeam : (decision.team ?? 'opponent');
       const expectedSport = batchItems[i].sport;
 
       // Validate: reject if Claude confused the sport
@@ -2143,7 +2150,8 @@ async function checkPreGamePredictions() {
       await tg(
         `🎯 <b>PRE-GAME BET — ${pgBest.platform.toUpperCase()}</b>\n\n` +
         `<b>${market.title}</b>\n` +
-        `BUY ${pick.side.toUpperCase()} @ ${priceInCents}¢ × ${qty} = <b>$${deployed.toFixed(2)}</b>\n` +
+        `Betting on: <b>${bettingOnTeam}</b> to win (${pick.side.toUpperCase()} @ ${priceInCents}¢)\n` +
+        `${qty} contracts × ${priceInCents}¢ = <b>$${deployed.toFixed(2)}</b>\n` +
         `Confidence: <b>${(confidence*100).toFixed(0)}%</b> vs price ${priceInCents}¢\n` +
         `Potential profit: <b>$${(qty * (1 - bestPrice)).toFixed(2)}</b>${pgSavedMsg}\n\n` +
         `🧠 <i>${decision.reasoning}</i>`
