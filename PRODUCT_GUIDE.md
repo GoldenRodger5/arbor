@@ -33,10 +33,12 @@ Dashboard (Vercel)
 
 Data flow:
   ESPN Scoreboard API → Live scores, team records, pitcher stats (6 leagues)
-  Kalshi REST API → Market prices, order placement, positions
+  Kalshi REST API → Market prices, order placement, positions, settlement
   Polymarket US API → Market prices, order placement, balance
+  Polymarket Gateway API → Market listings, settlement status
   Anthropic API → Claude Haiku (screening) + Sonnet 4.6 (decisions + web search)
   Telegram Bot API → Trade notifications, daily reports, alerts
+  CoinGecko API → BTC/ETH spot prices for broad scan context
   VPS Data API → bot/api.mjs serves JSONL data over HTTP
   Vercel Proxy → api/proxy.js (HTTPS → HTTP bridge for dashboard)
 ```
@@ -49,12 +51,16 @@ Data flow:
 | `bot/api.mjs` | 284 | Data API server — serves trades, positions, stats, snapshots, live feed to dashboard |
 | `bot/healthcheck.mjs` | 204 | Daily health report via Telegram |
 | `bot/ecosystem.config.cjs` | 47 | pm2 process configuration |
-| `bot/arb-bot.mjs` | 32,795 | Legacy arbitrage bot (stopped) |
-| `bot/market-maker.mjs` | 21,060 | Legacy market maker (disabled — thin sports markets cause one-sided fills) |
+| `bot/arb-bot.mjs` | ~32,800 | Legacy arbitrage bot (stopped) |
+| `bot/market-maker.mjs` | ~21,000 | Legacy market maker (disabled — thin sports markets cause one-sided fills) |
+| `bot/test-poly-order.mjs` | ~6,400 | Polymarket order test script |
+| `bot/deploy-vps.sh` | ~1,000 | VPS deployment script (rsync + pm2 restart) |
 | `api/proxy.js` | 37 | Vercel serverless proxy — HTTPS frontend → HTTP VPS (avoids mixed content) |
 | `src/App.tsx` | 30 | React app with 7 routes |
 | `src/context/ArborContext.tsx` | 91 | Global state provider — polls API every 15 seconds |
 | `src/lib/api.ts` | 31 | Frontend API client — dev hits VPS directly, prod uses Vercel proxy |
+| `src/lib/calculator.ts` | 130 | Reference: orderbook walking + arbitrage calculation (legacy, not imported) |
+| `src/lib/matcher.ts` | 105 | Reference: fuzzy market title matching (legacy, not imported) |
 | `src/pages/CommandCenter.tsx` | 310 | Dashboard home — bankroll, stats, chart, positions, activity, achievements |
 | `src/pages/PositionsPage.tsx` | 119 | Open positions with sport filters and expand-for-reasoning |
 | `src/pages/TradeHistory.tsx` | 193 | All trades with date/sport/result/strategy filters |
@@ -67,8 +73,8 @@ Data flow:
 | `src/components/Layout.tsx` | 24 | Responsive layout — sidebar on desktop, bottom tabs on mobile |
 | `src/components/Sidebar.tsx` | 89 | Desktop sidebar — nav, live/disconnected status, bankroll, positions count |
 | `src/components/BottomTabs.tsx` | 43 | Mobile bottom tab bar (5 tabs) |
-| `bot/logs/trades.jsonl` | grows | Every trade with entry, exit, P&L, reasoning |
-| `bot/logs/screens.jsonl` | grows | Every screening decision for analysis |
+| `bot/logs/trades.jsonl` | grows | Every trade with full entry/exit/P&L/reasoning |
+| `bot/logs/screens.jsonl` | grows | Every screening and decision for analysis |
 | `bot/logs/daily-snapshots.jsonl` | grows | Daily bankroll + strategy stats |
 | `bot/logs/ai-out.log` | grows | Full bot console output (read by live feed) |
 
@@ -85,31 +91,38 @@ Data flow:
 **How it works:**
 
 1. **Phase 1 — Collect:** ESPN scoreboard API fetched in parallel for all 6 leagues. Collects all games with a lead (any score difference), plus tied soccer games.
-2. **Phase 2 — Prioritize:** Score change detection + win expectancy baseline calculation. Candidates sorted by baseline WE — highest opportunity first.
-3. **Line Movement Detection:** Monitors price changes across cycles. 5c+ swings get flagged and boosted to top of analysis queue.
-4. **Batch Price Fetch:** All sports market prices fetched in one parallel call (6 series simultaneously). Cached for instant lookup per game.
-5. **Phase 3 — Analyze:** Sonnet + web search analyzes candidates in priority order (max 6 per cycle, batched 3 at a time in parallel). Rich ESPN context includes:
+2. **Phase 2 — Prioritize:** Score change detection compares current game state to last seen state. Win expectancy baseline calculated for each candidate. Candidates sorted by baseline WE — highest opportunity first. Games seen for the first time are skipped (no baseline to compare).
+3. **Line Movement Detection:** Monitors price changes across cycles. A 5-cent or larger price swing (`LINE_MOVE_THRESHOLD`) gets flagged and boosted to the top of the analysis queue (baseline WE overridden to 90% for priority).
+4. **Batch Price Fetch:** All sports market prices fetched in one parallel call (6 series: KXMLBGAME, KXNBAGAME, KXNHLGAME, KXMLSGAME, KXEPLGAME, KXLALIGAGAME). Prices cached in `cachedPrices` Map for instant lookup per game — no per-market API calls.
+5. **Phase 3 — Analyze:** Sonnet + web search analyzes candidates in priority order (max 6 per cycle, batched 3 at a time in parallel). Each prompt includes rich ESPN context:
    - Team records (overall + home/away splits)
    - Current pitcher stats (IP, ER, K, BB — live from ESPN)
    - Starting/probable pitcher ERA, W-L
    - Inning-by-inning line score
    - Live situation (outs, runners on base, current batter, last play)
    - Team batting averages
-   - NBA shooting stats (FG%, 3P%, rebounds, assists, FTA)
+   - NBA shooting stats (FG%, 3P%, rebounds, assists, FTA) with shooting dominance flags (10%+ FG gap)
    - Leading scorers (NBA)
-   - Time remaining (critical for NBA/NHL)
-   - Historical win expectancy baseline text
-   - Soccer draw rate warnings
-6. **Confidence Hard Cap:** Claude's confidence is capped at baseline + 15%. Prevents insanity like "17% baseline → 68% confidence."
-7. **Dynamic Margin Gate:** Sport-aware margin (see Dynamic Margins section). Raw edge must exceed margin.
-8. **Cross-Platform Price Check:** Compares Kalshi vs Polymarket, buys on cheaper platform.
-9. **Phase 4 — Execute:** Orders placed, trades logged to JSONL, Telegram notification sent.
+   - Time remaining (critical for NBA/NHL — "3:21 - 2nd")
+   - Historical win expectancy baseline text (see Win Expectancy section)
+   - Soccer draw rate warnings (team-specific W-D-L draw rate from record)
+6. **Confidence Hard Cap:** Claude's confidence is capped at historical baseline + 15%. For trailing teams (underdogs), baseline is `1 - winExpectancy`. Prevents hallucinations like "17% baseline → 68% confidence."
+7. **Dynamic Margin Gate:** Sport-aware, price-aware, situation-aware margin (see Dynamic Margins section). Entry gate uses raw edge (confidence - price); fees affect profit, not prediction quality.
+8. **Cross-Platform Price Check:** Compares Kalshi vs Polymarket prices, buys on cheaper platform. Requires at least 2-cent savings to switch.
+9. **Phase 4 — Execute:** Orders placed on best platform, trades logged to JSONL with full context, Telegram notification sent with reasoning.
 
-**Thresholds for checking:**
-- MLB: Any lead, game started
-- NBA: Any lead (previously 4+ points)
-- NHL: 1+ goal lead
-- Soccer: Any lead OR tied (for draw bets)
+**Underdog Logic:**
+
+In live games, the bot evaluates BOTH the leading AND trailing team. Default is the leading team, but the trailing team is evaluated as an underdog if ALL conditions are met:
+
+| Sport | Max Deficit | Max Period | Trail Price Range |
+|-------|-----------|-----------|------------------|
+| NHL | 1 goal | Period 1 | 15-40c |
+| NBA | 10 points | Quarter 2 | 15-40c |
+| MLB | 2 runs | Inning 5 | 15-40c |
+| Soccer | 1 goal | 1st Half | 15-40c |
+
+**Additional underdog requirement:** The trailing team must have **10+ more wins** in their season record than the leading team. Not just a slightly better record — a significantly better team.
 
 ### 2. Soccer Draw Betting
 
@@ -119,18 +132,35 @@ Data flow:
 
 **How it works:**
 
-1. Detects tied soccer games. Calculates draw probability from research-verified baselines by minute:
-   - 0-0 at 80': 88% draw probability
-   - 0-0 at 70': 78%
-   - 0-0 at 60': 59%
-   - 0-0 at 55': 50%
-   - 0-0 at 45' (start of 2nd half): 42%
-   - 1-1/2-2 at 80': 84%
-   - 1-1/2-2 at 70': 72%
-   - 1-1/2-2 at 60': 55%
-2. Finds the TIE market from cached Kalshi prices (instant, no API call)
-3. Buys if draw probability exceeds price by 3%+ (uses CONFIDENCE_MARGIN, not dynamic margin)
-4. Pure math strategy — no Claude AI call needed, uses historical baseline only
+1. Detects tied soccer games during the live-edge cycle. Parses minutes from ESPN status detail (e.g. "72'" or "2nd - 27'").
+2. Calculates draw probability from research-verified historical baselines by minute:
+
+**0-0 games (highest draw rates):**
+| Minute | Draw Probability |
+|--------|-----------------|
+| 80'+ | 88% |
+| 75' | 85% |
+| 70' | 78% |
+| 65' | 70% |
+| 60' | 59% |
+| 55' | 50% |
+| 45' (2nd half start) | 42% |
+| 35' (late 1st half) | 36% |
+
+**Score-matched games (1-1, 2-2, etc.):**
+| Minute | Draw Probability |
+|--------|-----------------|
+| 80'+ | 84% |
+| 75' | 80% |
+| 70' | 72% |
+| 65' | 63% |
+| 60' | 55% |
+| 55' | 47% |
+
+3. Finds the TIE market from `cachedPrices` (instant, no API call needed — prices already fetched in batch)
+4. Buys if draw probability exceeds price by 3%+ (uses flat CONFIDENCE_MARGIN, not dynamic margin) and price is between 10-90c
+5. **Pure math strategy — no Claude AI call, no Haiku screen, no web search.** Uses historical baselines only.
+6. After a draw bet, the game is skipped for normal team-win analysis (no leader to bet on when tied)
 
 **Example:**
 ```
@@ -145,26 +175,32 @@ If draw holds: $15.00 payout = $5.70 profit
 ### 3. Pre-Game Predictions
 
 **Frequency:** Every 15 minutes
-**When:** Before 6pm ET (once live games start, live-edge takes over)
-**Daily limit:** Max 2 trades per day (survives restarts — counted from JSONL)
-**Leagues:** MLB, NBA, NHL, MLS, EPL, La Liga
+**When:** Before 6pm ET only (shuts off automatically — once live games start, live-edge takes over)
+**Daily limit:** Max 2 trades per day (survives restarts — counter restored from JSONL on startup)
+**Max per scan cycle:** 2 trades
+**Eligible sports: NBA and NHL only**
+
+MLB and soccer are explicitly blocked because their sport-specific confidence caps are too low to pass the 70% minimum:
+- MLB baseline 54% + max 8% bonus = 62% max → fails 70% requirement
+- Soccer baseline 45% + max 8% bonus = 53% max → fails (draws make pre-game too risky)
+- NBA baseline 63% + max 20% bonus = 83% max → passes
+- NHL baseline 59% + max 15% bonus = 74% max → passes
 
 **How it works:**
 
-1. Fetches today's Kalshi sports markets across all 6 leagues. Soccer gets a 3-day lookahead (games scheduled in advance, not daily like US sports).
-2. Groups both team tickers per game (e.g., PIT and CHC for Pirates vs Cubs), filters out TIE tickers.
-3. Builds screening prompt with both sides, prices, and records for all games.
-4. Haiku screens for most predictable games.
-5. Sonnet + web search researches each pick with sport-specific prompts. Win expectancy baselines provided for context.
-6. Dynamic pre-game margin applied (sport base + 1% + price penalty for 70c+ favorites — see Dynamic Margins).
-7. Cross-platform price check before execution.
-8. Confidence hard-capped at baseline + 15%.
-
-**Pre-game additions vs live:**
-- +1% base margin (market has had time to settle)
-- +3% penalty for 70c+ favorites (trap protection)
-- Shuts off at 6pm ET automatically
-- Tracks previously bet games to prevent re-buying
+1. Fetches today's Kalshi sports markets across all 6 leagues. Soccer gets a 3-day lookahead (games scheduled in advance, not daily like US sports). Groups both team tickers per game, filters out TIE tickers.
+2. Filters to NBA and NHL only (`PRE_GAME_ELIGIBLE_SPORTS`).
+3. **No Haiku screening step.** All eligible games go directly to Sonnet (max 8 games, batched 3 at a time in parallel). Each game gets its own Sonnet + web search call with a sport-specific prompt including baselines.
+4. Claude responds with a team pick, confidence, bet amount, and reasoning.
+5. **Team pick validation:** Claude's chosen team is matched to the correct ticker (always buying YES on that team's market). If Claude outputs a team abbreviation that doesn't match either game team, the trade is blocked.
+6. **Reasoning cross-validation:** The bot analyzes Claude's reasoning text for sentiment toward each team (positive/negative word matching). If the reasoning overwhelmingly favors the OTHER team (e.g., Claude says "BUF wins" but reasoning praises CHI), the trade is blocked. This prevents abbreviation confusion errors.
+7. **Sport confusion detection:** If Claude's reasoning mentions the wrong sport (e.g., "pitcher" in an NHL game, "ERA" in an NBA game), the trade is blocked.
+8. **Pre-game confidence cap:** Sport-specific, stricter than live:
+   - NBA: capped at baseline + 20% = max 83%
+   - NHL: capped at baseline + 15% = max 74%
+9. **Pre-game minimum confidence: 70%** (higher than live's 65% — market has had time to settle)
+10. Dynamic pre-game margin applied (sport base + 1% + price penalty for 70c+ favorites)
+11. Cross-platform price check, duplicate position checks (Kalshi API + JSONL), and execution
 
 ### 4. UFC Fight Predictions (Polymarket Only)
 
@@ -174,29 +210,32 @@ If draw holds: $15.00 payout = $5.70 profit
 
 1. Fetches UFC moneylines from Polymarket (slug format: `aec-ufc-{fighter1}-{fighter2}-{date}`)
 2. Haiku screens: "Which 2 fights are most predictable?"
-3. Sonnet researches each: fighter records, style matchups, recent form, physical advantages
-4. Same confidence gate as sports
+3. Sonnet + web search researches each: fighter records, style matchups, recent form, physical advantages
+4. Same confidence gate as live sports (65% min, dynamic margin)
 5. Polymarket-only (Kalshi doesn't offer UFC moneylines)
 
 ### 5. Broad Market Scan
 
 **Frequency:** Every 30 minutes
-**When:** Always running
+**When:** Always running (requires at least $5 Kalshi balance)
+
 **How it works:**
 
-1. Fetches ALL open Kalshi markets: sports series (6 leagues + NFL), non-sports series (crypto, economics, finance, politics), plus keyword-based Golf/Masters markets
-2. Sports filtered by ticker date (today/tonight only, soccer gets 3-day window), non-sports by close time (1 day max)
-3. Sports deduped (same game has 2 tickers, one per team — only show once)
-4. Markets grouped by event for bracket markets (CPI, GDP shown as cumulative thresholds)
-5. Fetches contextual data: ESPN news headlines + BTC/ETH spot prices from CoinGecko
-6. Haiku screens 200+ markets for candidates (max 5)
-7. Sonnet + web search researches each candidate with sport-specific or non-sports prompts
-8. Sports games BLOCKED from broad-scan execution — redirected to pre-game/live-edge for proper side mapping
-9. Non-sports use confidence-based gate with dynamic margins
+1. Fetches ALL open Kalshi markets: sports series (6 leagues + NFL), non-sports series (crypto, economics, finance, politics), plus keyword-based Golf/Masters markets (searches for "masters", "rory", "scheffler", etc.)
+2. **Date filtering:** Sports filtered by ticker date (today/tonight only, tomorrow after 10pm ET, soccer gets 3-day window), non-sports by close time (max 1 day out)
+3. Sports deduped (same game has 2 tickers, one per team — only show once per game)
+4. Markets grouped by event for bracket markets (CPI, GDP shown as cumulative thresholds together)
+5. Fetches contextual data in parallel: ESPN MLB news headlines + BTC/ETH spot prices from CoinGecko
+6. Builds position-aware market list (excludes games with existing positions)
+7. **Haiku screens** all tradeable markets (max 80 lines in prompt) for up to 5 candidates
+8. **Sonnet + web search** researches each candidate with sport-specific or non-sports prompts
+9. **Sports games BLOCKED from execution** (lines 2843-2848) — sports side mapping (YES = which team?) is unreliable in broad scan. Pre-game and live-edge handle sports with correct mapping.
+10. **Non-sports: confidence cap** for sports tickers in broad scan uses home-team baselines (MLB 54%, NBA 63%, NHL 59%, Soccer 45-49%) + 20% max deviation
+11. One trade per broad scan cycle (breaks after first successful trade)
 
 **Market categories scanned:**
 - Sports: KXMLBGAME, KXNBAGAME, KXNHLGAME, KXNFLGAME, KXMLSGAME, KXEPLGAME, KXLALIGAGAME
-- Golf: keyword-based (Masters, Rory, Scheffler, etc.)
+- Golf: keyword-based (Masters, Rory, Scheffler, Cameron Young, McIlroy, Scottie)
 - Crypto: KXBTC, KXETH
 - Economics: KXFED, KXCPI, KXGDP
 - Finance: KXSP, KXGOLD
@@ -205,52 +244,58 @@ If draw holds: $15.00 payout = $5.70 profit
 ### 6. Resolution Arbitrage (Kalshi)
 
 **Frequency:** Every 5 minutes
-**When:** After games end
+**When:** After games end (requires at least $2 Kalshi balance + canTrade())
+
 **How it works:**
 
-1. Fetches Kalshi markets with status `closed` and `settled`
-2. Looks for winning sides still trading below 95 cents (guaranteed profit at $1 settlement)
-3. For sports: cross-checks ESPN final scores to verify winner
-4. Auto-buys winning side (risk-free profit)
-5. Sizes aggressively — up to 50% of cash (no risk, guaranteed settlement at $1)
+1. Fetches Kalshi markets with status `closed` and `settled` (up to 50 per status)
+2. For each market with a known result, checks if the winning side is still priced below 95c
+3. Calculates net profit after Kalshi parabolic fee: `(1 - winPrice) - 0.07 * winPrice * (1 - winPrice)`. Skips if net profit < 1c.
+4. **ESPN verification for sports:** For MLB, NBA, NFL, and NHL games (not soccer), cross-checks ESPN scoreboard final scores to confirm the winner matches Kalshi's result. If ESPN disagrees or is unreachable, the arb is skipped (fail-closed).
+5. Sizes aggressively — up to 50% of Kalshi cash, capped by `getTradeCapCeiling()` (risk-free, guaranteed settlement at $1)
 6. 1-hour cooldown per ticker
 
 ### 7. High-Conviction Tier
 
 **Trigger:** Late-game situations where Claude is 90%+ confident
-**Sizing:** 25-30% of bankroll (vs normal 10%)
+**Sizing:** 20-30% of bankroll instead of normal 10%
 
-**Sport-specific qualifiers (all require late stage + 90%+ confidence):**
-- NBA: 20+ point lead in Q4 (<1% comeback), or 15+ in Q4 (~2%)
-- NHL: 2+ goal lead in P3 (~5% comeback), or 1 goal in P3
-- MLB: 4+ runs in 7th+ (~2%), or 3+ runs in 8th+
-- Soccer: 2+ goals at 75'+ (<3% comeback)
+**Sport-specific qualifiers (all require `stage === 'late'` + 90%+ confidence):**
+
+| Sport | Condition | Comeback Rate | Tier |
+|-------|----------|--------------|------|
+| NBA | 20+ pts in Q4 | <1% | 93%+ → 30%, 90%+ → 25% |
+| NBA | 15+ pts in Q4 | ~2% | 93%+ → 30%, 90%+ → 25% |
+| NHL | 2+ goals in P3 | ~5% | 93%+ → 30%, 90%+ → 25% |
+| NHL | 1 goal in P3 | check time | 90%+ → 25%, <93% → 20% |
+| MLB | 4+ runs in 7th+ | ~2% | 93%+ → 30%, 90%+ → 25% |
+| MLB | 3+ runs in 8th+ | ~5% | 93%+ → 30%, 90%+ → 25% |
+| Soccer | 2+ goals at 75'+ | <3% | 93%+ → 30%, 90%+ → 25% |
 
 **Safety rails:**
-- Max 1 high-conviction bet per hour
-- Max 40% of bankroll in active high-conviction positions
-- Own ceiling: 50% of bankroll per trade
+- Max 1 high-conviction bet per hour (`60 * 60 * 1000ms` since last)
+- Max 40% of bankroll in active high-conviction positions (`highConvictionDeployed`)
+- Own ceiling: 50% of bankroll per trade (overrides normal trade ceiling)
+- Bypasses normal `getTradeCapCeiling()` — HC bets are rare and near-certain
 
 ---
 
 ## Two-Model Pipeline
 
-Every prediction (except draw bets) uses a two-stage AI pipeline to minimize API costs:
+Every strategy uses Claude, but in different ways:
 
-```
-Stage 1: Claude Haiku 4.5 ($0.002/call)
-  - Sees all markets/games at once
-  - Fast screen: "Which 2-5 are worth analyzing?"
-  - No web search — uses provided data only
-  - Takes 3-5 seconds
+| Strategy | Haiku Screen? | Sonnet Decision? | Web Search? |
+|----------|--------------|-----------------|-------------|
+| Live in-game | No (uses win expectancy baselines) | Yes (batched 3 parallel) | Yes (1 search/game) |
+| Soccer draw | No | No (pure math) | No |
+| Pre-game | No | Yes (batched 3 parallel) | Yes (2 searches/game) |
+| UFC | Yes | Yes | Yes (3 searches/fight) |
+| Broad scan | Yes | Yes | Yes (3 searches/candidate) |
+| Position management | No | No (Haiku evaluates sell/hold) | No |
 
-Stage 2: Claude Sonnet 4.6 + Web Search ($0.03-0.05/call)
-  - Only called on Haiku's picks
-  - Researches team records, injuries, pitcher stats via web search
-  - Makes the actual confidence prediction
-  - Batched 3 at a time in parallel for live-edge
-  - Takes 15-25 seconds per batch
-```
+**Claude models:**
+- **Haiku 4.5** (`claude-haiku-4-5-20251001`): ~$0.002/call, 300 max tokens, 10s timeout. Used for: broad scan screening, UFC screening, position sell/hold evaluation.
+- **Sonnet 4.6** (`claude-sonnet-4-6`): ~$0.03-0.05/call, 500-1500 max tokens, 45s timeout. Used for: all trade decisions with web search enabled (`web_search_20250305` tool).
 
 **Cost comparison:**
 - Old approach: Sonnet on every market = ~$36/day
@@ -260,18 +305,18 @@ Stage 2: Claude Sonnet 4.6 + Web Search ($0.03-0.05/call)
 
 ## Win Expectancy Baselines
 
-Claude's predictions are anchored to historical baselines, preventing wild confidence swings. The bot provides sport-specific win expectancy tables in every prompt:
+Claude's predictions are anchored to historical baselines, preventing wild confidence swings. The bot provides sport-specific win expectancy tables in every live-edge prompt. A home-court/field adjustment of +3% is added for home teams, -1% for away.
 
-### MLB (Source: Tom Tango, FanGraphs, 1903-2024)
-| Run Lead | Inn 1 | Inn 3 | Inn 5 | Inn 7 | Inn 9 |
-|----------|-------|-------|-------|-------|-------|
-| 1 | 56% | 60% | 67% | 77% | 91% |
-| 2 | 64% | 70% | 79% | 88% | 96% |
-| 3 | 72% | 78% | 87% | 93% | 98% |
-| 4 | 79% | 85% | 92% | 96% | 99% |
-| 5+ | 85% | 90% | 95% | 98% | 99% |
+### MLB (Source: Tom Tango/tangotiger.net, FanGraphs, 1903-2024)
+| Run Lead | Inn 1 | Inn 2 | Inn 3 | Inn 4 | Inn 5 | Inn 6 | Inn 7 | Inn 8 | Inn 9 |
+|----------|-------|-------|-------|-------|-------|-------|-------|-------|-------|
+| 1 | 56% | 58% | 60% | 64% | 67% | 71% | 77% | 84% | 91% |
+| 2 | 64% | 67% | 70% | 76% | 79% | 83% | 88% | 93% | 96% |
+| 3 | 72% | 75% | 78% | 85% | 87% | 90% | 93% | 96% | 98% |
+| 4 | 79% | 82% | 85% | 90% | 92% | 94% | 96% | 98% | 99% |
+| 5+ | 85% | 87% | 90% | 93% | 95% | 97% | 98% | 99% | 99% |
 
-### NBA (Source: Professor MJ, Modern era 2015+)
+### NBA (Source: Professor MJ, inpredictable.com — Modern era 2015+)
 | Point Lead | Q1 | Q2 | Q3 | Q4 |
 |-----------|-----|-----|-----|-----|
 | 5 | 57% | 60% | 65% | 75% |
@@ -280,7 +325,7 @@ Claude's predictions are anchored to historical baselines, preventing wild confi
 | 20 | 78% | 85% | 91% | 96% |
 | 25+ | 85% | 90% | 95% | 98% |
 
-Note: 15-point comebacks now happen 13% of the time (was 6% pre-2002) due to 3-point shooting revolution.
+Note: 15-point comebacks now happen 13% of the time (was 6% pre-2002) due to 3-point shooting revolution. Home court advantage: 62.7% overall.
 
 ### NHL (Source: Hockey Graphs, MoneyPuck)
 | Goal Lead | P1 | P2 | P3 |
@@ -289,22 +334,26 @@ Note: 15-point comebacks now happen 13% of the time (was 6% pre-2002) due to 3-p
 | 2 | 80% | 86% | 93% |
 | 3+ | 92% | 95% | 99% |
 
-### Soccer (Source: brendansudol, EPL/MLS data)
+Scoring first jumps to 70% win probability. Home ice advantage: 59%.
+
+### Soccer (Source: brendansudol.github.io, EPL/MLS data)
 | Goal Lead | 1st Half | 2nd Half |
 |----------|----------|----------|
 | 1 | 65% | 78% |
 | 2 | 82% | 92% |
 | 3+ | 94% | 98% |
 
-Draw rates: EPL 28%, MLS 24%. Home advantage: EPL 45% home wins, MLS 49%.
+Draw rates: EPL 28%, MLS 24%. Home advantage: EPL 45% home wins, MLS 49%. Red card = ~25-30% swing.
 
-**Hard cap:** Claude cannot deviate more than 15% from the historical baseline for the target team. This prevents overconfidence (e.g., "17% baseline → 68% confidence" is capped to 32%).
+**Confidence Hard Cap:** Claude cannot deviate more than 15% above the historical baseline for the target team. For trailing teams (underdogs), the baseline is `1 - winExpectancy`. Maximum cap is 95%.
+
+Example: Team leading 1-0 in NHL P1 has 62% baseline. Claude can predict up to 77% (62% + 15%). If Claude says 85%, it's capped to 77%.
 
 ---
 
 ## Dynamic Confidence Margins
 
-Replaced the old flat 5% margin. Margins are now sport-aware, price-aware, and situation-aware.
+Replaced the old flat 5% margin. Margins are now sport-aware, price-aware, and situation-aware. The function `getRequiredMargin(price, options)` calculates the required edge for each trade.
 
 ### Key Insight
 
@@ -312,23 +361,42 @@ Live and pre-game bets are fundamentally different:
 - **Live:** Price reflects game state. A team up 20 in Q4 at 85c is a BETTER bet than a pre-game toss-up at 50c. Don't penalize high prices.
 - **Pre-game:** Price reflects market consensus. A 75c favorite could easily lose. Be selective, especially on expensive favorites.
 
-### Live Margins (Sport Base Only)
+### Sport Base Margins
+| Sport | Base |
+|-------|------|
+| NHL | 3% |
+| NBA | 4% |
+| MLB | 5% |
+| Soccer (MLS/EPL/La Liga) | 5% |
+| UFC | 2% |
+| Crypto | 4% |
+| Economics | 4% |
+| Politics | 4% |
 
-| Sport | Base Margin | With Score Change | With Line Move |
-|-------|------------|-------------------|---------------|
-| NHL | 3% | 2% | 1% |
-| NBA | 4% | 3% | 2% |
-| MLB | 5% | 4% | 3% |
-| Soccer (MLS/EPL/La Liga) | 5% | 4% | 3% |
-| UFC | 2% | 1% | 0% |
-| Crypto/Economics/Politics | 4% | — | — |
+### Live Margins (Sport Base Only — NO price penalty)
 
-Score change = market is recalculating, act fast. Line move = 5c+ price swing detected, edge window open.
+| Adjustment | Effect |
+|-----------|--------|
+| Score changed since last check | -1% (market recalculating, act fast) |
+| 5c+ line movement detected | -1% (something happened, edge window) |
+| Minimum margin floor | 1% |
+
+Example: NBA base 4%, score just changed → 3% margin required.
 
 ### Pre-Game Margins (Sport Base + 1% + Price Penalty)
 
-| Sport | Under 55c | 55-70c | 70c+ (Trap Zone) |
-|-------|-----------|--------|-----------------|
+| Price Range | Additional Penalty |
+|------------|-------------------|
+| Under 55c | +0% |
+| 55-70c | +1% |
+| 70c+ (Trap Zone) | +3% |
+
+Pre-game always adds +1% over live (market has had time to settle). Minimum 2%.
+
+**Computed pre-game margins by sport:**
+
+| Sport | Under 55c | 55-70c | 70c+ |
+|-------|-----------|--------|------|
 | NHL | 4% | 5% | 7% |
 | NBA | 5% | 6% | 8% |
 | MLB | 6% | 7% | 9% |
@@ -350,38 +418,56 @@ Every trade checks both Kalshi and Polymarket prices before placing the order:
 4. Bot buys on Polymarket (4 cents cheaper = 6% more profit)
 ```
 
-**Kalshi-only mode:** Default `KALSHI_ONLY=true`. When enabled, skips Polymarket trading entirely (capital consolidating to Kalshi).
+**Kalshi-only mode:** Default `KALSHI_ONLY=true`. When enabled, `pickBestPlatform()` immediately returns Kalshi without checking Polymarket. Capital is consolidating to Kalshi.
 
-**Sport-aware matching:** Polymarket slugs contain the sport (`aec-mlb-pit-chc`). The mapper requires both team abbreviations AND the sport prefix to match, preventing cross-sport confusion (PIT Pirates MLB vs PIT Penguins NHL).
+**Polymarket moneyline cache:** The bot caches all active Polymarket moneylines every 3 minutes (`POLY_CACHE_MS`). Fetches up to 1000 markets in batches of 200 from the gateway API. Filters to `marketType === 'moneyline'` only (futures blocked — they lock capital for months).
 
-**Side matching:** `pickBestPlatform()` identifies which Polymarket side corresponds to the team we want by matching team abbreviations to slug positions and team names. First team in slug = LONG, second = SHORT.
+**Sport-aware matching (`findPolyMarketForGame`):** Polymarket slugs use format `aec-{sport}-{team1}-{team2}-{date}`. The mapper requires both team abbreviations AND the sport prefix (e.g., `-mlb-`, `-nba-`) to be present in the slug. This prevents cross-sport confusion (PIT Pirates MLB vs PIT Penguins NHL).
 
-**Team abbreviation mapping:** ESPN and Kalshi use different abbreviations for the same teams. The `ABBR_MAP` translates between them:
+**Side matching (`pickBestPlatform`):** Identifies which Polymarket side corresponds to the team we want by:
+1. Checking if team abbreviation appears in `s0Name` (first side name) → LONG
+2. Checking if team abbreviation appears in `s1Name` (second side name) → SHORT
+3. Checking slug position: index 2 = first team = LONG, index 3 = second team = SHORT
+4. Only switches to Polymarket if price is at least 2c cheaper AND within 5c-90c range
+
+**Team abbreviation mapping (`ABBR_MAP`):** ESPN and Kalshi use different abbreviations for the same teams. The `tickerHasTeam()` function checks both versions:
 - CHW ↔ CWS (White Sox), AZ ↔ ARI (Diamondbacks), ATH ↔ OAK (Athletics)
 - GS ↔ GSW (Warriors), WSH ↔ WAS (Washington), TB ↔ TBL (Lightning)
+- NY ↔ NYK (Knicks), SA ↔ SAS (Spurs), NO ↔ NOP (Pelicans)
+- MON ↔ MTL (Canadiens), LA ↔ LAK (Kings), NJ ↔ NJD (Devils)
+- UTAH ↔ UTA (Jazz/Hockey)
 - MAN ↔ MUN (Manchester United), WOL ↔ WLV (Wolverhampton), VAL ↔ VLL (Valladolid)
 
 ---
 
 ## Position Management
 
-### Smart Exits (Replacing Blind Stop-Loss)
+### Smart Exits (Three-Tier System)
 
-The old system: sell if price drops 30%. The new system: Claude evaluates every losing position with full game context and makes sport-specific sell/hold decisions.
+The old system was a blind 30% stop-loss. The new system uses game-stage-aware, sport-specific, Claude-powered exit decisions.
 
-**Three-tier exit system:**
+**Game stage detection (`getGameContext`):** For every open position, the bot fetches ESPN scoreboard to determine:
+- **Stage:** early/mid/late/finished (sport-specific boundaries)
+  - MLB: innings 1-4 = early, 5-6 = mid, 7+ = late
+  - NBA: Q1-Q2 = early, Q3 = mid, Q4 = late
+  - NHL: P1 = early, P2 = mid, P3 = late
+  - Soccer: 1st half = early, 2nd half = late
+- **Live context:** Score, detail, win expectancy, situation (runners, outs, last play for MLB)
 
-#### Tier 1: Rule-Based Auto-Exits
-- **Late-game profit-take:** Auto-sell at 97c+ in late game. Risking 97c to gain 3c is 32:1 against.
-- **Nuclear stop-loss:** Absolute floor, no Claude evaluation needed. Entry-price-tiered:
-  - 70c+ entry: sell at -60%
-  - 50-70c entry: sell at -75%
-  - Under 50c entry: sell at -85%
+#### Tier 1: Rule-Based Auto-Exits (No Claude)
+
+**Late-game profit-take:** Auto-sell at 97c+ in late game stage. Risking 97c to gain 3c is 32:1 against. Sells at `currentPrice - 2c` (wants good exit, not market order).
+
+**Nuclear stop-loss:** Absolute floor by entry price tier. No Claude evaluation — just get out immediately. Sells at 1c (market order for instant exit).
+- 70c+ entry: sell at -60% loss
+- 50-70c entry: sell at -75% loss
+- Under 50c entry: sell at -85% loss
 
 #### Tier 2: Claude-Powered Sell/Hold Decisions
-When a position hits the Claude evaluation threshold (varies by game stage and entry price), Haiku is asked to sell or hold with full context:
 
-**Claude evaluation thresholds (% drop from entry):**
+When a position hits the Claude evaluation threshold, Haiku is asked to sell or hold with full game context.
+
+**Claude evaluation thresholds (`getExitThresholds`) — % drop from entry that triggers evaluation:**
 
 | Entry Price | Early Game | Mid Game | Late Game |
 |------------|-----------|---------|----------|
@@ -390,52 +476,94 @@ When a position hits the Claude evaluation threshold (varies by game stage and e
 | Under 50c (cheap) | -35% | -30% | -25% |
 
 Claude's prompt includes:
-- Current position P&L and unrealized loss
+- Current position: entry price, current price, % loss, dollar loss
 - Live score and game detail from ESPN
-- Game stage (early/mid/late/finished)
-- Win expectancy percentage
+- Game stage (EARLY/MID/LATE)
+- Win expectancy if available
 - Sport-specific comeback statistics:
-  - NBA: "15-pt comebacks happen 13% in the 3-point era"
-  - MLB: "3-run comebacks happen 20% through 6 innings"
-  - NHL: "2-goal comebacks ~15%"
-  - Soccer: "1-goal deficits equalize ~20%"
+  - NBA: "15-pt comebacks happen 13% in the 3-point era. 20-pt = 4%. 25+ = <1%."
+  - MLB: "3-run comebacks happen 20% through 6 innings, 10% in 7th+. 5+ run deficit after 6th = <3%."
+  - NHL: "1-goal = 30%. 2-goal = ~15%. 3-goal = ~5%. Down 3+ in 3rd = essentially over."
+  - Soccer: "1-goal deficits equalize ~20%. 2-goal = ~5%. Down 2+ after 75' = essentially over."
+- Decision framework: hold if WE > 25%, consider selling if WE 10-25% late, sell if WE < 10%
+- Dollar amounts for sell vs hold scenarios
 
-Claude decides: SELL (lock in loss, free up capital) or HOLD (team still has a real shot).
+**Claude decides:** `{"action": "sell"}` or `{"action": "hold"}` with reasoning.
 
-**Sport-specific evaluation cooldowns:** NBA 8 minutes (fastest game pace), all others 12 minutes.
+**Sport-specific evaluation cooldowns:** NBA gets evaluated every 8 minutes (fastest game pace), all others every 12 minutes.
 
 #### Tier 3: Winners Stay
+
 No Claude evaluation on winning positions. If we're winning, we hold. Let it settle at $1. Every Haiku call on a winner is wasted money.
+
+### Sell Execution (`executeSell`)
+
+Supports both full and partial exits:
+
+- **Stop-loss/Claude-stop:** Sells at 1c (market order — get out immediately)
+- **Profit-take:** Sells at current price - 2c (want a good exit price)
+- **Full exit:** Status set to `sold-{reason}`, P&L calculated, trade closed
+- **Partial exit:** Quantity and deploy cost reduced, trade stays open, partial profit tracked in `partialProfitTaken` field
+- Telegram notification sent with: sell label, title, qty sold, entry → exit price, P&L, remaining contracts if partial
+
+**Sell statuses:** `sold-stop-loss`, `sold-claude-stop`, `sold-profit-take`, `sold-scale-out`, `sold-claude-sell`, `sold-claude-scale`
 
 ### Scale-In Logic
 
-The bot can add to existing positions if the price improves:
+The bot can add to existing positions if the price improves (`canScaleInto`):
 
-- **Max entries per game:** 3
-- **Max game exposure:** 15% of bankroll
-- **Condition:** Price must be at least 2c cheaper than last entry
+- **Max entries per game:** 3 (`MAX_ENTRIES_PER_GAME`)
+- **Max game exposure:** 15% of bankroll (`MAX_GAME_EXPOSURE_PCT`)
+- **Condition:** Price must be at least 2c cheaper than last entry price
 - If price is same or worse — nothing changed, don't add
+- Tracked in `gameEntries` Map: `{count, lastPrice, totalDeployed}`
 
 ### Settlement Reconciliation (`checkSettlements`)
 
-Runs every 5 minutes. Reads `trades.jsonl`, finds open Kalshi trades, fetches closed/settled markets from Kalshi API, and matches them:
+Runs every 5 minutes. Handles BOTH Kalshi and Polymarket settlements:
 
-- Calculates P&L: `won = (side matches result)`, exit price is $1.00 (win) or $0.00 (loss)
-- Updates trade status from `open` to `settled`
-- Updates `consecutiveLosses` counter
-- Runs per-strategy performance check
+**Kalshi settlements:**
+1. Reads all open Kalshi trades from `trades.jsonl`
+2. Fetches `closed` and `settled` markets from Kalshi API (up to 100 per status)
+3. Matches open trades to settled markets by ticker
+4. Calculates P&L: if side matches result → win ($1/contract), else → loss ($0)
+5. Updates trade: status → `settled`, exitPrice, realizedPnL, settledAt, result
+6. Sends Telegram notification for each settlement (WIN or LOSS with P&L)
 
-### Stop-Loss Outcome Review
+**Polymarket sports settlements:**
+1. Reads all open Polymarket trades from `trades.jsonl`
+2. For sports (MLB, NBA, NHL): fetches ESPN scoreboard, finds completed game, determines winner
+3. Matches winner to trade's slug position (first team in slug = LONG side)
+4. Calculates P&L and updates trade
 
-After each settlement cycle, reviews whether previous stop-loss decisions were correct. Tracks:
-- Trades sold early that would have won (missed profit)
-- Trades sold early that would have lost further (saved capital)
+**Polymarket UFC settlements:**
+1. Fetches market status from Polymarket gateway API (`/v1/markets/{slug}`)
+2. If market is closed/resolved, determines winning side by checking which side has price > 90c
+3. Calculates P&L and updates trade
+
+**After all settlements:**
+- Rewrites `trades.jsonl` with updated records
+- Updates consecutive loss tracking (`updateConsecutiveLosses`)
+- Runs strategy performance check: if any strategy has 10+ settled trades AND win rate below 40%, sends a Telegram alert
+
+### Stop-Loss Outcome Review (`reviewStopLossOutcomes`)
+
+Runs every 5 minutes. Reviews stopped-out trades within the last 24 hours that haven't been reviewed yet (tracked by `stopReviewed` flag in JSONL — survives restarts).
+
+For each stopped trade:
+1. Fetches the Kalshi market to check the final result
+2. Determines if the position would have won or lost if held
+3. Calculates: actual loss from stop vs hypothetical P&L if held
+4. **Sends Telegram:** "GOOD STOP — saved $X vs total loss" or "BAD STOP — would have WON $X if held"
+5. Logs to `screens.jsonl` for analysis
+6. Marks trade as reviewed (`stopReviewed = true` in JSONL)
 
 ### Position Sync
 
-On every portfolio refresh, the bot syncs JSONL entries with Kalshi's actual portfolio:
-- If a Kalshi trade is marked `open` in JSONL but no longer appears in Kalshi positions, it's auto-closed as `closed-manual` (manual cashout or settlement the bot missed)
-- Grace period: trades placed in the last 5 minutes are exempt (Kalshi API can be slow to reflect new orders)
+On every portfolio refresh (`refreshPortfolio`), the bot syncs JSONL entries with Kalshi's actual portfolio:
+- If a Kalshi trade is marked `open` in JSONL but no longer appears in Kalshi positions (filtered by `event_exposure > 0`), it's auto-closed as `closed-manual`
+- **Grace period:** Trades placed in the last 5 minutes are exempt (Kalshi API can be slow to reflect new orders)
+- This catches: manual cashouts, settlements the bot missed, and other discrepancies
 
 ---
 
@@ -443,62 +571,91 @@ On every portfolio refresh, the bot syncs JSONL entries with Kalshi's actual por
 
 ### Position Sizing (Dynamic)
 
-All limits scale automatically with bankroll.
+All limits scale automatically with bankroll every 60 seconds.
 
 **Per-trade size:** `getBankroll() * MAX_TRADE_FRACTION` (10%) capped by `getTradeCapCeiling()`.
 
-**Confidence scaling:** Higher confidence = bigger bet. Margin 5% = 1x (base), 10% = 1.5x, 15% = 2x, 20%+ = 2.5x (max).
+**Confidence scaling:** Higher confidence = bigger bet. Applied when edge > 5%:
+- Edge 5% = 1x (base)
+- Edge 10% = 1.5x
+- Edge 15% = 2x
+- Edge 20%+ = 2.5x (max)
+Formula: `min(2.5, 1 + (edge - 0.05) * 10)`
 
 **Inverse deployment curve** (`getMaxDeployment()`): Aggressive when small (need growth), conservative when big (protect gains).
 
-| Bankroll | Max Trade | Max Deploy | Max Positions | Per-Trade Ceiling |
-|----------|-----------|------------|--------------|-------------------|
-| $200 | $20 | $170 (85%) | 12 | $50 |
-| $600 | $50 | $450 (75%) | 12 | $50 |
-| $1,000 | $50 | $750 (75%) | 15 | $150 |
-| $2,000 | $100 | $1,500 (75%) | 18 | $150 |
-| $5,000 | $50 | $3,000 (60%) | 25 | $500 |
-| $10,000 | $100 | $4,000 (40%) | 25 | $500 |
-| $20,000 | $500 | $8,000 (40%) | 35 | $2,000 |
-| $50,000 | $2,000 | $10,000 (20%) | 50 | $5,000 |
+| Bankroll | Max Deploy % | Max Positions | Per-Trade Ceiling |
+|----------|-------------|--------------|-------------------|
+| < $500 | 85% | 12 | $50 |
+| $500-$2K | 75% | 15-18 | $150 |
+| $2K-$5K | 60% | 18-25 | $500 |
+| $5K-$20K | 40% | 25-35 | $500-$2,000 |
+| $20K-$50K | 30% | 35 | $2,000 |
+| $50K+ | 20% | 50 | $5,000 |
 
 **How sizing works per trade:**
 1. `getDynamicMaxTrade()` calculates: `min(bankroll * 10%, getTradeCapCeiling(), getAvailableCash())`
-2. `getAvailableCash()` subtracts the 5% capital reserve from platform cash
-3. `getPositionSize()` applies confidence scaling (higher edge = bigger bet) and consecutive-loss reduction (50% after 7 losses)
+2. `getAvailableCash()` subtracts the 5% capital reserve from platform cash: `max(0, balance - bankroll * 0.05)`
+3. `getPositionSize()` applies:
+   - High-conviction tier override (20-30% of bankroll) if applicable
+   - Confidence scaling multiplier (1x-2.5x based on edge)
+   - Consecutive-loss reduction: 50% after 7 straight losses
 4. Claude's recommended bet amount is capped by the above
-5. Final quantity: `floor(safeBet / price)`
+5. Final quantity: `floor(safeBet / price)`, minimum 1
+
+**Deployment calculation:** `getTotalDeployed()` uses Kalshi's `portfolio_value` (current market value) for Kalshi positions, not original cost. A $50 position now worth $10 counts as $10 deployed, not $50. Polymarket positions use original deploy cost from JSONL.
 
 ### Circuit Breakers
 
 | Control | Threshold | Action |
 |---------|-----------|--------|
-| Daily loss | 25% of bankroll (min $10) | Halt all trading, Telegram alert, auto-resume next day |
+| Daily loss | 25% of bankroll (min $10) | Halt all trading, Telegram alert, auto-resume at midnight ET |
 | Consecutive losses | 7 in a row | Reduce position size to 50% |
 | Consecutive losses | 10 in a row | Full halt, Telegram alert |
-| Available cash | Under $3 | Skip trading cycle (reserve protected) |
-| Midnight ET | Auto | Reset daily limits, update consecutive loss count |
+| Available cash | Under $3 | Skip entire trading cycle |
+| Midnight ET | Auto | Reset dailyOpenBankroll, clear halt, update consecutiveLosses from JSONL |
+
+**Meaningful position filter:** Only positions with cost >= $1.00 count toward the position limit. Dust positions (< $1) are ignored.
 
 ### Trade Gates (every trade passes ALL of these)
 
-1. `canTrade()` — daily loss not exceeded, not halted, positions under dynamic limit, deployment under cap
+1. `canTrade()` — not halted, daily loss OK, meaningful positions under dynamic limit, deployment under cap
 2. `canDeployMore(amount)` — total deployed + new trade within deployment limit
-3. `checkSportExposure(ticker)` — max 25% of bankroll per sport (min $15)
-4. Confidence >= 65% (MIN_CONFIDENCE)
-5. Dynamic margin gate (sport + price + situation aware)
-6. Confidence hard-capped at baseline + 15% (prevents wild predictions)
-7. Price >= 5 cents and <= 90 cents (MAX_PRICE)
-8. Cooldown: 5 minutes between trades on same game (can be bypassed for scale-in at better price)
-9. Position check: no existing position on same game (cross-platform aware) unless scaling in
-10. Max entries per game: 3, max 15% of bankroll per game
+3. Confidence >= 65% (`MIN_CONFIDENCE`) for live, >= 70% (`PRE_GAME_MIN_CONF`) for pre-game
+4. Dynamic margin gate (sport + price + situation aware)
+5. Confidence hard-capped at baseline + 15% (live) or sport-specific cap (pre-game)
+6. Price >= 5c and <= 90c (`MAX_PRICE`)
+7. Cooldown: 5 minutes between trades on same game (bypassed for scale-in at better price)
+8. No existing position on same game (cross-platform aware) unless scaling in
+9. Scale-in rules: max 3 entries/game, max 15% bankroll/game, price must be 2c+ cheaper
+10. Pre-game only: before 6pm ET, max 2/day, NBA/NHL only, no previously bet games
+11. Pre-game only: reasoning validation (anti-confusion), sport confusion detection
 
 ### Cross-Platform Position Tracking
 
 `openPositions` array includes BOTH:
-- Kalshi positions from `/portfolio/positions` API (filtered by active exposure)
-- Polymarket positions from `trades.jsonl` (open status)
+- Kalshi positions from `/portfolio/positions` API (filtered by `event_exposure > 0` — only active positions)
+- Polymarket positions from `trades.jsonl` (open status, matched by exchange field)
 
-This ensures deployment caps, position limits, and same-game checks work across both platforms.
+This ensures deployment caps, position limits, same-game checks, and sport exposure caps work across both platforms.
+
+---
+
+## Calibration Engine (`runCalibration`)
+
+Runs daily at 6am ET (after overnight settlements). Requires 50+ settled trades (`CALIBRATION_MIN_TRADES`).
+
+**What it does:**
+1. Reads all settled trades from JSONL
+2. Buckets trades by confidence range: 65-70%, 70-75%, 75-80%, 80-85%, 85-90%, 90%+
+3. Calculates actual win rate per bucket (needs 3+ trades in a bucket for reporting)
+4. Computes calibration error: `actualWinRate - midConfidence`
+5. **Overconfidence detection:** If any bucket with midConfidence >= 75% has actual win rate < 60% with 5+ trades, flags as overconfident
+6. Generates per-strategy breakdown: win rate and P&L per strategy
+7. **Sends Telegram calibration report** with per-bucket results (icons: checkmark if calibrated within 5%, warning if overconfident, money bag if underconfident), strategy breakdown, and overconfidence alert if applicable
+8. Logs to `screens.jsonl`
+
+The dashboard's Analytics page displays the same calibration data as a scatter chart via the `/api/stats` endpoint.
 
 ---
 
@@ -506,182 +663,228 @@ This ensures deployment caps, position limits, and same-game checks work across 
 
 The dashboard is a React SPA built with Vite, TypeScript, and Recharts, hosted on Vercel. It provides real-time monitoring of all bot activity.
 
-### Global State
+### Global State (`ArborContext`)
 
-`ArborContext` polls 4 API endpoints every 15 seconds using `Promise.allSettled` (graceful partial failures):
-- `/api/trades` — all trades (excludes `testing-void`)
-- `/api/positions` — open positions (includes today's `closed-manual` Kalshi trades that may still be active)
-- `/api/stats` — computed stats (win rate, streaks, sport performance, calibration, strategy breakdown, live bankroll estimate)
-- `/api/snapshots` — daily snapshots for charts
+Polls 4 API endpoints every 15 seconds using `Promise.allSettled` (graceful partial failures — shows data even if some endpoints fail):
+- `/api/trades` — all trades (excludes `testing-void`, default Kalshi-only)
+- `/api/positions` — open trades + today's `closed-manual` Kalshi trades (may still be active on Kalshi due to sync race)
+- `/api/stats` — computed stats (see Data API section)
+- `/api/snapshots` — daily snapshots for bankroll chart
+
+Connection status indicator: green pulsing dot if any endpoint succeeds, red if all fail.
 
 ### Pages
 
 #### Command Center (/)
-- **Bankroll Hero:** Total bankroll with Kalshi cash + positions + Polymarket breakdown. Today and all-time P&L.
-- **Daily Challenge:** Progress bar toward 5% daily bankroll target.
-- **Projections:** "If every day is like today" — weekly/monthly/yearly P&L projections. "If every day is like our average" — daily average, days to $1K/$5K.
-- **Stats Grid:** Today's trades, win rate, streak (with fire animation at 3+), open positions, best/worst trade.
-- **Bankroll Chart:** Recharts AreaChart of bankroll over time.
-- **Active Positions:** Top 12 open positions with sport badge, price, quantity, deploy cost, confidence.
-- **Recent Activity:** Last 10 trades with status icons (open/win/loss/stop-loss).
-- **Achievements:** 14 badges (earned + locked).
-- **Confetti:** Triggers on new win settlement.
+- **Bankroll Hero:** Total bankroll with Kalshi cash + positions + Polymarket breakdown. Today and all-time P&L with color coding (green/red).
+- **Daily Challenge:** Progress bar toward 5% daily bankroll target. Green when hit, accent at 50%+, amber below.
+- **Projections:** Two sections:
+  - "If every day is like today" — weekly/monthly/yearly P&L projections (only shown if todayPnL != 0)
+  - "If every day is like our average" — daily avg P&L, weekly avg, days to $1K/$5K bankroll (only shown if positive average, accounts for biweekly $400 injection)
+- **Stats Grid:** 6 cards — Today's trades (+ settled count), win rate (W/L), streak (fire animation at 3+ wins), open positions (+ deployed $), best trade, worst trade
+- **Bankroll Chart:** Recharts AreaChart with gradient fill, dollar-formatted Y axis, date X axis. Only shown with 2+ snapshots.
+- **Active Positions:** Top 12 open positions with: sport badge (MLB/NBA/NHL/MLS/POLY), title, side/price/qty/cost, confidence percentage. Truncated with ellipsis for long titles.
+- **Recent Activity:** Last 10 trades (newest first) with status icons: open=target, settled-win=checkmark, settled-loss=X, sold=stop-sign, other=clipboard. Shows time, title, side@price, P&L.
+- **Achievements:** Component showing earned (colored) and locked (greyed, 35% opacity) badges.
+- **Confetti:** Triggers when `stats.wins` increases between polls. 40 pieces, 7 colors, 4-second animation.
 
 #### Positions (/positions)
-- Sport filter buttons (All, MLB, NBA, NHL, MLS, EPL, UFC, Other)
-- Cards with: sport badge, exchange badge, title, side/price/qty/cost, potential profit, confidence, edge, hold time, strategy
-- Expand to see Claude's reasoning
-- Live score display if available
+- Sport filter buttons (All + dynamically generated from data: MLB, NBA, NHL, MLS, EPL, UFC, Other)
+- Total deployed dollar amount header
+- Cards with: sport badge, exchange badge (KALSHI/POLYMARKET), title, side/price/qty/cost, potential profit (green), confidence (accent), edge, hold time (computed from timestamp), strategy
+- Click to expand: shows Claude's full reasoning in italic
+- Live score display in amber monospace if available
 
 #### Trade History (/history)
-- **Summary bar:** Total trades, settled count, W/L, win rate, P&L, average P&L
-- **Multi-filter:** Date, sport (MLB/NBA/NHL/Soccer/UFC/Other), result (win/loss/open), strategy
-- **Trade cards:** Date/time, sport badge, high-conviction fire indicator, title, status badge (open/settled/stop-loss/closed-manual), P&L, price/qty details
-- Expand for: Claude's reasoning, live score at entry, strategy, exchange, ticker
+- **Summary bar:** Trade count, settled count, W count (green), L count (red), win rate %, P&L (colored), avg P&L per trade
+- **4 filter dropdowns:** Date (all dates from data), sport (MLB/NBA/NHL/Soccer/UFC/Other), result (Win/Loss/Open), strategy (all strategies from data). Clear filters button when any active.
+- **Trade cards:** Date/time, sport badge, fire indicator for high-conviction trades, title (truncated), status badge (color-coded: open=indigo, settled=green, stop-loss=red, closed-manual=amber), P&L
+- **Details line:** Side @ price x qty = cost → exit price | Conf: X% | Edge: X%
+- Click to expand: Claude's reasoning, live score at entry, strategy, exchange, ticker
 
 #### Analytics (/analytics)
-- **Bankroll Growth:** AreaChart with gradient fill
-- **Performance by Sport:** Dual bar charts (win rate + P&L), plus data table
-- **Confidence Calibration:** ScatterChart — predicted vs actual win rate. Dots on diagonal = perfectly calibrated. Above = underconfident (good). Below = overconfident (bad).
-- **Strategy Breakdown:** PieChart of trades by strategy + table with trades/win rate/P&L per strategy
-- **Performance by Hour (ET):** BarChart showing P&L by hour of day
+- **Bankroll Growth:** AreaChart with CartesianGrid, gradient fill (#6366F1), date axis, dollar axis
+- **Performance by Sport:** Side-by-side bar charts (win rate % with color coding: green >=55%, amber >=45%, red <45%) and (P&L $ with green/red). Plus summary table below.
+- **Confidence Calibration:** ScatterChart with CartesianGrid, predicted % on X axis, actual win % on Y axis. Dots are green if actual >= predicted (underconfident = good), red if below (overconfident = bad). Bucket labels shown below chart.
+- **Strategy Breakdown:** Donut PieChart (7 colors rotating) with legend table: strategy name, trade count, win rate %, P&L (colored)
+- **Performance by Hour (ET):** BarChart with hour on X axis, P&L on Y axis, green/red per bar
 
 #### Trade Review (/review)
-- **Grade Summary:** A/B/C/D grade counts with visual badges
-  - A = Great trade (right reasoning, outcome matched)
-  - B = Solid process (good reasoning, bad luck or vice versa)
-  - C = Weak trade (reasoning gaps)
-  - D = Bad trade (should not have been taken)
-- **Process vs Luck:** Tracks "process wins" (B grades that lost) and "lucky wins" (C grades that won)
-- **Reviews activate** after 50 settled trades when the calibration engine kicks in
-- Each trade shows: original Claude reasoning + AI review text (when available)
+- **Grade Summary:** A/B/C/D grade counts with colored badges (A=green, B=indigo, C=amber, D=red)
+  - A = Great trade — right reasoning, outcome matched prediction
+  - B = Solid process — good reasoning even if outcome was bad luck (or won despite weak reasoning)
+  - C = Weak trade — reasoning had gaps, got lucky or predictably lost
+  - D = Bad trade — should not have been taken, reasoning was flawed
+- **Process vs Luck stats:** "Process wins" (B-grade losses = good reasoning, bad luck) and "Lucky wins" (C-grade wins = weak reasoning, got lucky)
+- **How grading works:** Explainer box with grade descriptions and note that reviews activate at 50 settled trades
+- **Settled trades list:** Win/loss icon, grade badge (if reviewed), title, sport/side/price/date, P&L. Original Claude reasoning in grey box. AI review text in grade-colored box (if available). "Pending AI review" note for unreviewed trades.
 
 #### Live Feed (/live)
-- **Real-time:** Polls `ai-out.log` every 10 seconds via `/api/live-feed`
-- **Controls:** Live/Paused toggle, auto-scroll ON/OFF
+- **Real-time polling:** Fetches `/api/live-feed?limit=100` every 10 seconds (when not paused)
+- **Controls:** LIVE (green) / PAUSED (amber) toggle, auto-scroll ON/OFF toggle
 - **Tag filters:** all, live-edge, pre-game, broad-scan, portfolio, exit, pnl, sync, risk
-- **Type filters:** all types, trade, analysis, block, win, loss
-- **Color coding:** Trades (green), wins (green), losses (red), blocks (red), analysis (accent), portfolio (muted), dry run (amber)
-- Monospace font, timestamp + tag + message format
-- Smart filtering: hides noisy portfolio lines unless specifically filtered
+- **Type filters:** all types, trade (target icon), analysis (brain), block (stop), win (checkmark), loss (X)
+- **Color coding by type:** trade=green bg, win=green bg, loss=red bg, block=red bg, analysis=accent bg, portfolio=transparent, dryrun=amber bg, info=transparent
+- **Display:** JetBrains Mono font, 11px, full viewport height minus header. Each line: timestamp (HH:MM:SS), [tag], colored message.
+- **Smart filtering:** Portfolio lines hidden by default unless specifically filtered (too noisy)
 
 #### Settings (/settings)
-- **System Status:** Bot online indicator, total trades, settled, W/L, win rate, open positions
-- **Trading Configuration:** Read-only display of all config constants
-- **Dynamic Margins (Live):** Sport base margins with score change adjustments
-- **Dynamic Margins (Pre-Game):** Sport margins with price tier adjustments
-- **Sport Status:** Per-sport health indicator (green/amber/red by win rate), trade count, win rate, P&L
+- **System Status:** Green pulsing dot + "Bot Online", total trades, settled (W/L), win rate, open positions
+- **Trading Configuration:** Read-only InfoRow grid showing: min confidence (65%), max price (90c), max trade (10%), max positions (12), deployment cap (85%), daily loss limit (15%), capital reserve (5%), cooldown (5 min), poll interval (60s)
+- **Dynamic Margins (Live):** Per-sport margins with score change adjustments
+- **Dynamic Margins (Pre-Game):** Per-sport margins with price tier breakdowns
+- **Sport Status:** Per-sport row with health dot (green >=55% win rate, amber >=45%, red <45%), trade count, win rate, P&L
 
 ### Design System
 
 - **Dark theme:** `--bg-base: #0A0A0F`, `--bg-surface: #111118`, `--bg-elevated: #1A1A24`
 - **Colors:** `--accent: #6366F1` (indigo), `--green: #22C55E`, `--red: #EF4444`, `--amber: #F59E0B`
-- **Typography:** Inter (body), JetBrains Mono (numbers/data)
-- **Responsive:** Desktop sidebar (220px fixed) + mobile bottom tabs with safe-area inset
-- **Animations:** Pulse (live status dot), shimmer (skeleton loading), confetti (win celebration), fire glow (3+ win streak), badge pop (achievements)
+- **Text:** `--text-primary: #F8F8FF`, `--text-secondary: #8B8B9E`, `--text-tertiary: #4B4B5E`
+- **Typography:** Inter (body, 400/500/600/700), JetBrains Mono (numbers/data, tabular-nums)
+- **Responsive:** Desktop = fixed 220px sidebar + main content. Mobile = full-width content + fixed 60px bottom tab bar with `env(safe-area-inset-bottom)` for notched phones. Breakpoint via `useIsMobile()` hook.
+- **Animations:**
+  - `pulse`: 2s ease-in-out infinite (live status dot)
+  - `shimmer`: 1.5s infinite (skeleton loading — gradient slide)
+  - `confetti-fall`: 3s ease-out forwards (win celebration — falls from top)
+  - `fire-glow`: 1.5s ease-in-out infinite (3+ win streak — amber/red text shadow)
+  - `badge-pop`: 0.4s ease-out (achievement unlock — scale 0→1.2→1)
+- **Scrollbar:** 4px thin, tertiary color track
 
 ### Achievements System
 
-14 badges unlocked based on stats:
+14 badges unlocked based on real-time stats:
 
-| Badge | Name | Condition |
-|-------|------|-----------|
-| First Blood | Placed first trade | 1+ trades |
-| Winner Winner | Won first trade | 1+ wins |
-| High Five | 5 winning trades | 5+ wins |
-| Getting Serious | 10 trades placed | 10+ trades |
-| Quarter Century | 25 trades placed | 25+ trades |
-| Calibration Ready | 50 trades settled | 50+ settled |
-| On Fire | 3-win streak | 3+ consecutive wins |
-| Unstoppable | 5-win streak | 5+ consecutive wins |
-| In The Green | Positive all-time P&L | P&L > $0 |
-| Big Day | $50+ profit in one day | Today P&L >= $50 |
-| Half a Grand | Bankroll hit $500 | Bankroll >= $500 |
-| Comma Club | Bankroll hit $1,000 | Bankroll >= $1,000 |
-| Diversified | Won in 3+ sports | 3+ sports with wins |
-| Sharp | 60%+ win rate (10+ trades) | Win rate >= 60%, 10+ settled |
+| Icon | Name | Condition |
+|------|------|-----------|
+| Target | First Blood | 1+ trades placed |
+| Checkmark | Winner Winner | 1+ wins |
+| Trophy | High Five | 5+ wins |
+| Chart | Getting Serious | 10+ trades placed |
+| Muscle | Quarter Century | 25+ trades placed |
+| Abacus | Calibration Ready | 50+ trades settled |
+| Fire | On Fire | 3+ consecutive wins (current streak) |
+| Explosion | Unstoppable | 5+ consecutive wins (current streak) |
+| Money | In The Green | All-time P&L > $0 |
+| Rich | Big Day | Today P&L >= $50 |
+| Chart Up | Half a Grand | Bankroll >= $500 |
+| Party | Comma Club | Bankroll >= $1,000 |
+| Globe | Diversified | Wins in 3+ different sports |
+| Target | Sharp | 60%+ win rate with 10+ settled trades |
+
+Earned badges: colored with accent background, full opacity. Locked badges: greyscale icon, 35% opacity, base background.
 
 ---
 
-## Data API Server
+## Data API Server (`bot/api.mjs`)
 
-`bot/api.mjs` runs on port 3456, serving bot data to the dashboard over HTTP.
+Runs on port 3456 (configurable via `API_PORT`), serving bot data to the dashboard over HTTP.
 
 ### Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/trades` | GET | All trades from JSONL (excludes `testing-void`) |
-| `/api/positions` | GET | Open trades + today's `closed-manual` Kalshi trades |
-| `/api/stats` | GET | Computed stats: win rate, streaks, sport/strategy performance, calibration, live bankroll |
-| `/api/snapshots` | GET | Daily snapshots from JSONL |
-| `/api/screens` | GET | Last 100 screening decisions |
-| `/api/live-feed` | GET | Parsed tail of `ai-out.log` with type categorization |
+| Endpoint | Method | Returns |
+|----------|--------|---------|
+| `/api/trades` | GET | All trades from JSONL. Excludes `testing-void` status. Default: Kalshi only (`?exchange=kalshi`), pass `?exchange=all` for both platforms. |
+| `/api/positions` | GET | Open trades + today's `closed-manual` Kalshi trades (accounts for Kalshi sync race where manually cashed positions may still be active). Same exchange filter. |
+| `/api/stats` | GET | Comprehensive computed stats object (see below) |
+| `/api/snapshots` | GET | All daily snapshots from JSONL |
+| `/api/screens` | GET | Last 100 screening decisions from JSONL |
+| `/api/live-feed` | GET | Parsed tail of `ai-out.log`. `?limit=N` (default 50, max 200). Each line parsed into `{ts, tag, msg, type}` with type categorization for UI coloring. |
 
 ### Auth
-Simple token auth: `?token=arbor-2026` or `Authorization: Bearer arbor-2026`
+Simple token auth: `?token=arbor-2026` or `Authorization: Bearer arbor-2026`. Returns 401 if wrong.
 
-### Stats Computation (server-side)
-The `/api/stats` endpoint computes everything on each request:
-- Win rate, total P&L, today's P&L, best/worst trade
-- Sport performance: per-sport trades, wins, losses, win rate, P&L
-- Strategy performance: per-strategy trades, settled, wins, losses, win rate, P&L
-- Calibration buckets: 65-70%, 70-75%, 75-80%, 80-85%, 85-90%, 90%+ — actual win rate vs predicted
-- Win/loss streak
-- Live bankroll estimate: last snapshot + P&L settled since snapshot
+### Stats Object (`/api/stats` response)
+```json
+{
+  "totalTrades": 45,
+  "settledTrades": 30,
+  "openTrades": 15,
+  "wins": 18,
+  "losses": 12,
+  "winRate": 60,
+  "totalPnL": 42.50,
+  "todayTrades": 5,
+  "todaySettled": 2,
+  "todayPnL": 8.30,
+  "bestTrade": { "title": "...", "pnl": 15.20, "ticker": "..." },
+  "worstTrade": { "title": "...", "pnl": -12.50, "ticker": "..." },
+  "streak": 3,
+  "streakType": "win",
+  "sportPerformance": [
+    { "sport": "nba", "trades": 10, "wins": 6, "losses": 4, "winRate": 60, "pnl": 25.00 }
+  ],
+  "strategyPerformance": [
+    { "strategy": "live-prediction", "trades": 20, "settled": 15, "wins": 9, "losses": 6, "winRate": 60, "pnl": 30.00 }
+  ],
+  "calibration": [
+    { "label": "65-70%", "min": 0.65, "max": 0.70, "total": 8, "wins": 5, "actualWinRate": 63 }
+  ],
+  "latestSnapshot": { ... },
+  "liveBankroll": 295.50,
+  "openDeployed": 125.00,
+  "serverTime": "2026-04-13T20:00:00.000Z"
+}
+```
 
-### Vercel Proxy
-`api/proxy.js` bridges HTTPS (Vercel) to HTTP (VPS) to avoid mixed-content browser errors. Forwards query params, adds auth token, 10-second timeout, CORS headers, 10-second cache.
+**Live bankroll estimate:** `lastSnapshot.bankroll + pnlSettledSinceSnapshot`. Only counts P&L from trades settled AFTER the snapshot timestamp.
+
+### Vercel Proxy (`api/proxy.js`)
+Bridges HTTPS (Vercel) to HTTP (VPS) for the production dashboard. Forwards all query params (except `path`) to the VPS. Adds auth token. 10-second fetch timeout. CORS headers. Cache: `s-maxage=10, stale-while-revalidate=5`.
 
 ---
 
 ## Configuration
 
-All constants are at the top of `ai-edge.mjs`:
+All constants at the top of `ai-edge.mjs`:
 
 ```javascript
 // Prediction thresholds
-MIN_CONFIDENCE = 0.65       // Claude must be >= 65% confident
-CONFIDENCE_MARGIN = 0.03    // Legacy flat margin — only used for draw bets + fallback
-MAX_PRICE = 0.90            // Won't buy above 90 cents
+MIN_CONFIDENCE = 0.65            // Live: Claude must be >= 65% confident
+PRE_GAME_MIN_CONF = 0.70        // Pre-game: higher bar (market has settled)
+CONFIDENCE_MARGIN = 0.03         // Legacy flat margin — only for draw bets + fallback
+MAX_PRICE = 0.90                 // Won't buy above 90 cents
 
 // Sizing
-MAX_TRADE_FRACTION = 0.10   // 10% of bankroll per trade (base)
-MAX_ENTRIES_PER_GAME = 3    // Max times we can buy into same game
-MAX_GAME_EXPOSURE_PCT = 0.15 // Max 15% of bankroll on one game
+MAX_TRADE_FRACTION = 0.10        // 10% of bankroll per trade (base)
+MAX_ENTRIES_PER_GAME = 3         // Max buys into same game (scale-in)
+MAX_GAME_EXPOSURE_PCT = 0.15     // Max 15% of bankroll on one game
+LINE_MOVE_THRESHOLD = 0.05       // 5c+ price swing = line movement detected
 
 // Timing
-POLL_INTERVAL_MS = 60,000            // Main loop: every 60 seconds
-PREGAME_SCAN_INTERVAL = 900,000      // Pre-game: every 15 minutes
-MAX_PREGAME_PER_DAY = 2              // Max pre-game trades per day
-BROAD_SCAN_INTERVAL = 1,800,000      // Broad scan: every 30 minutes
-UFC_SCAN_INTERVAL = 1,800,000        // UFC: every 30 minutes
-COOLDOWN_MS = 300,000                // 5 min between same-game trades
-MAX_SONNET_PER_CYCLE = 6             // Max Sonnet calls per live-edge cycle
+POLL_INTERVAL_MS = 60,000        // Main loop: every 60 seconds
+PREGAME_SCAN_INTERVAL = 900,000  // Pre-game: every 15 minutes
+MAX_PREGAME_PER_DAY = 2          // Max pre-game trades per day
+MAX_PREGAME_PER_CYCLE = 2        // Max pre-game trades per scan
+BROAD_SCAN_INTERVAL = 1,800,000  // Broad scan: every 30 minutes
+UFC_SCAN_INTERVAL = 1,800,000    // UFC: every 30 minutes
+COOLDOWN_MS = 300,000            // 5 min between same-game trades
+MAX_SONNET_PER_CYCLE = 6         // Max Sonnet calls per live-edge cycle
+POLY_CACHE_MS = 180,000          // Polymarket moneyline cache: 3 min
 
 // Risk
-DAILY_LOSS_PCT = 0.25       // Halt at 25% daily loss (room for bad streaks at small bankroll)
-CAPITAL_RESERVE = 0.05      // Keep 5% untouched
-MAX_CONSECUTIVE_LOSSES = 7  // Half size after 7 straight losses
-SPORT_EXPOSURE_PCT = 0.25   // Max 25% bankroll per sport (min $15)
-MAX_DAYS_OUT = 1            // Same-day markets only (sports by ticker date, soccer 3 days)
+DAILY_LOSS_PCT = 0.25            // Halt at 25% daily loss
+CAPITAL_RESERVE = 0.05           // Keep 5% untouched
+MAX_CONSECUTIVE_LOSSES = 7       // Half size after 7 straight losses (halt at 10)
+SPORT_EXPOSURE_PCT = 0.25        // Max 25% bankroll per sport (min $15)
+MAX_DAYS_OUT = 1                 // Same-day markets only (soccer 3 days)
+CALIBRATION_MIN_TRADES = 50      // Need 50+ settled trades before calibrating
 
 // AI Models
-CLAUDE_SCREENER = 'claude-haiku-4-5-20251001'  // Cheap screening — $0.002/call
-CLAUDE_DECIDER = 'claude-sonnet-4-6'            // Expensive decisions — only on candidates
+CLAUDE_SCREENER = 'claude-haiku-4-5-20251001'
+CLAUDE_DECIDER = 'claude-sonnet-4-6'
 
 // Modes
-DRY_RUN = false              // Set true or --dry-run flag — runs full pipeline, no real orders
-KALSHI_ONLY = true           // Default: skip Polymarket trading
+DRY_RUN = false                  // --dry-run flag: full pipeline, no real orders
+KALSHI_ONLY = true               // Default: skip Polymarket trading
 ```
 
 ---
 
-## Data Collection & Analytics
+## Data Collection & Logging
 
 ### trades.jsonl
 
-Every trade is recorded with full detail:
+Every trade is recorded as a single JSON line with full context:
 
 ```json
 {
@@ -703,37 +906,33 @@ Every trade is recorded with full detail:
   "liveScore": "ATH 1 - NYM 0 (End 5th)",
   "otherPlatformPrice": 0.59,
   "highConviction": false,
+  "bettingOn": "Oakland Athletics",
   "status": "settled",
   "exitPrice": 0.0,
   "realizedPnL": -11.78,
   "settledAt": "2026-04-12T22:30:00.000Z",
-  "result": "no"
+  "result": "no",
+  "stopReviewed": true,
+  "partialProfitTaken": 0
 }
 ```
 
-**Trade statuses:** `open`, `settled`, `sold-stop-loss`, `sold-claude-stop`, `sold-claude-sell`, `closed-manual`, `testing-void`
+**Trade statuses:** `open` → `settled`, `sold-stop-loss`, `sold-claude-stop`, `sold-claude-sell`, `sold-claude-scale`, `sold-profit-take`, `sold-scale-out`, `closed-manual`, `testing-void`
 
-**Strategy types:** `live-prediction`, `pre-game-prediction`, `ufc-prediction`, `claude-prediction` (broad scan), `resolution-arb`, `draw-bet`, `high-conviction`
+**Strategy values:** `live-prediction`, `pre-game-prediction`, `ufc-prediction`, `claude-prediction` (broad scan non-sports), `resolution-arb`, `draw-bet`, `high-conviction`
 
 ### screens.jsonl
 
-Every Haiku screening and Sonnet decision logged:
-
-```json
-{
-  "timestamp": "2026-04-12T18:24:52.606Z",
-  "stage": "haiku",
-  "result": "found",
-  "candidates": [
-    {"ticker": "KXMLBGAME-...", "reason": "LAA YES=$0.93 seems high..."}
-  ],
-  "marketCount": 144
-}
-```
+Every screening, decision, exit, calibration, and stop-loss review logged with timestamp and stage:
+- `stage: 'haiku'` — broad scan/UFC screening results
+- `stage: 'sonnet'` or `stage: 'live-edge'` or `stage: 'pre-game'` or `stage: 'pre-game-sonnet'` — trade decisions
+- `stage: 'exit'` — sell executions with pricing
+- `stage: 'stop-review'` — stop-loss outcome reviews
+- `stage: 'calibration'` — daily calibration results
 
 ### daily-snapshots.jsonl
 
-End-of-day snapshots at 8pm ET and midnight ET:
+Snapshots saved at 8pm ET and midnight ET via `sendDailyReport()`:
 
 ```json
 {
@@ -755,294 +954,109 @@ End-of-day snapshots at 8pm ET and midnight ET:
   "todayTrades": 6,
   "consecutiveLosses": 2,
   "strategyStats": {
-    "live-prediction": {"trades": 2, "settled": 2, "wins": 0, "losses": 2, "pnl": -36.14}
+    "live-prediction": { "trades": 2, "settled": 2, "wins": 0, "losses": 2, "pnl": -36.14 }
   }
 }
 ```
-
-### Calibration Engine
-
-Runs daily at 6am ET (after overnight settlements). Analyzes all settled trades to measure how well Claude's confidence predictions match actual outcomes. Results are served via `/api/stats` and displayed on the Analytics page as a scatter chart.
-
-Buckets: 65-70%, 70-75%, 75-80%, 80-85%, 85-90%, 90%+
-
-### Strategy Auto-Disable Alerts
-
-After each settlement batch, the system calculates per-strategy win rates. If ANY strategy has 10+ settled trades AND win rate drops below 40%, a Telegram alert is sent. This doesn't auto-disable (human decision required) but ensures you know when a strategy is bleeding money.
 
 ---
 
 ## Telegram Notifications
 
-### Trade Placed
-```
-PREDICTION BET - KALSHI
+Every significant event produces a Telegram notification (HTML parse mode):
 
-Pittsburgh vs Chicago C Winner?
-Team: PIT | Score: PIT 6 - CHC 3
-Status: Bot 7th
-
-BUY YES @ 69 cents x 36 = $24.84
-Confidence: 74% vs price 69 cents
-Potential profit: $11.16 if PIT wins
-Bought on Poly (69c Kalshi -> 65c Poly)
-
-[Claude's reasoning with specific facts]
-```
-
-### High-Conviction Trade
-```
-HIGH CONVICTION BET - KALSHI
-
-[NBA team] up 22 in Q4
-
-BUY @ 87c x 80 = $69.60
-Confidence: 93% vs price 87c
-
-HIGH CONVICTION — NBA Q4 up 22 pts — <1% comeback
-```
-
-### Draw Bet
-```
-DRAW BET - KALSHI
-
-ATL 0-0 NSH at 72'
-
-BUY TIE @ 62c x 15 = $9.30
-Draw probability: 78% vs price 62c
-Potential profit: $5.70
-
-Pure math: 0-0 at 72' = 78% draw historically
-```
-
-### Resolution Arb
-```
-RESOLUTION ARB - KALSHI
-
-[Game Title]
-Result: YES WON
-
-BUY YES @ $0.93 x 50
-Deployed: $46.50
-Guaranteed profit: $3.50 (7c/contract after fees)
-```
-
-### Daily Report (8pm ET + Midnight ET)
-```
-DAILY REPORT - April 12
-
-Portfolio:
-Kalshi: $94.02 cash + $96.65 positions
-Polymarket: $60.67
-Total: $251.34
-
-Trading:
-Today: 6 trades, -$36.14
-All time: 6 trades, 2 settled
-Won: 0 | Lost: 2 | Win rate: 0%
-Total P&L: -$36.14
-
-By Strategy:
-  live-prediction: 2 trades, 0% win rate, -$36.14
-
-Open: 16 positions, $159.36 deployed
-Consecutive losses: 2
-API spend today: ~$0.85 (12 calls)
-```
-
-### Health Check (8am ET daily)
-```
-ARBOR DAILY HEALTH CHECK
-
-arbor-ai — online (9h uptime, 0 restarts)
-arbor-arb — stopped (intentional)
-arbor-health — online (0h uptime)
-
-All systems operational
-
-Kalshi Balance:
-Cash: $94.02
-Positions: $96.65
-Total: $190.67
-
-Open Positions: 16
-
-P&L Summary:
-Total: -$36.14 (2 settled)
-Today: +$0.00 | 0 trades placed
-Open: 16 trades, $159.36 deployed
-```
-
-### Trading Halt
-```
-TRADING HALTED
-
-Daily loss limit hit: $38.50 lost today (limit: $62.84 = 25% of $251.34)
-Bot will resume tomorrow.
-```
-
-### Bot Startup
-```
-AI Edge Bot Started
-
-Risk Controls Active:
-Max trade: $25.13 (10% of bankroll, ceiling $50)
-Max deploy: 85% ($213.64) | Positions: 12
-Daily loss halt: $62.84 (25%)
-Reserve: 5% ($12.57) | Game cap: 15% ($37.70)
-Pre-game: max 2/cycle, 2/day | Consecutive loss: 7->half
-
-Config:
-Min confidence: 65% | Margins: dynamic by sport + price
-Mode: Kalshi only | LIVE TRADING
-Sonnet + web search | Live-edge: every 60s
-
-Kalshi: $94.02 cash + $96.65 positions
-Polymarket: $60.67
-Total bankroll: $251.34
-```
+| Event | Icon | Key Info |
+|-------|------|---------|
+| Live prediction trade | Target | Team, score, status, price x qty = cost, confidence vs price, potential profit, reasoning |
+| Pre-game trade | Target | Game title, betting on team, price x qty = cost, confidence, potential profit, reasoning |
+| High-conviction trade | Fire | Same as live + "HIGH CONVICTION — [sport reason]" |
+| Draw bet | Soccer ball | Teams, score, minute, draw probability vs price, potential profit |
+| Underdog bet | Dog | Same as live + "UNDERDOG" label |
+| Resolution arb | Money | Title, result, price x qty, guaranteed profit |
+| Settlement (win) | Checkmark | Title, bought side @ price x qty, result, P&L |
+| Settlement (loss) | X | Same as win with negative P&L |
+| Stop-loss sell | Stop sign | Title, qty sold, entry → exit price, P&L |
+| Claude smart exit | Brain | Title, qty sold, entry → exit price, P&L, reasoning |
+| Profit lock | Money | Title, qty sold, entry → exit price, P&L |
+| Stop-loss review | Angry/Check | Title, entry → stop price, game result, "BAD STOP"/"GOOD STOP" verdict, $ comparison |
+| Daily report (8pm + midnight) | Chart | Portfolio breakdown, today's trades + P&L, all-time stats, strategy breakdown, open positions, consecutive losses, API spend |
+| Health check (8am) | Chart | pm2 process statuses, Kalshi balance, open positions, error count, P&L summary |
+| Strategy alert | Warning | Strategy name, win rate, P&L, "Consider disabling" |
+| Trading halt | Stop | Reason (daily loss / 10 consecutive losses), resume info |
+| Bot start | Brain | All risk control settings, config summary, full balance breakdown |
+| Bot stop | Stop | Graceful shutdown notification |
+| Calibration report | Chart | Per-bucket predicted vs actual %, strategy breakdown, overconfidence alert |
 
 ---
 
 ## API Integrations
 
 ### Kalshi (Primary exchange)
-- **Auth:** RSA-PSS signature (PKCS1 PSS padding, salt length 32)
+- **Auth:** RSA-PSS signature (`PKCS1_PSS_PADDING`, salt length 32). Timestamp + method + full path signed with private key.
+- **Base URL:** `https://api.elections.kalshi.com/trade-api/v2`
 - **Endpoints used:**
-  - `GET /portfolio/balance` — cash + position value
-  - `GET /portfolio/positions` — open positions (filtered by event_exposure > 0)
-  - `POST /portfolio/orders` — place buy/sell orders
-  - `GET /markets` — fetch market prices (by series, status)
-  - `GET /markets/{ticker}` — individual market price (position management)
+  - `GET /portfolio/balance` — `balance` (cents) + `portfolio_value` (cents)
+  - `GET /portfolio/positions` — open positions (filtered by `event_exposure_dollars > 0`)
+  - `POST /portfolio/orders` — place buy/sell orders (count, ticker, action, side, yes_price in cents)
+  - `GET /markets?series_ticker=X&status=Y&limit=N` — batch fetch market prices
+  - `GET /markets/{ticker}` — individual market (position management, settlement check)
+- **Fee model:** Parabolic: `ceil(0.07 * contracts * price * (1-price) * 100) / 100`. Max at 50c (1.75c/contract), zero at 0 or $1.
 
 ### Polymarket US (Secondary exchange, disabled by default)
-- **Auth:** Ed25519 signature (signAsync, NO body in POST signature)
+- **Auth:** Ed25519 signature via `@noble/ed25519` library. Signature = `timestamp + method + path` (NO body for POST — critical fix, including body causes 401).
+- **Base URL:** `https://api.polymarket.us`
+- **Gateway URL:** `https://gateway.polymarket.us`
 - **Endpoints used:**
   - `GET /v1/account/balances` — cash balance
-  - `POST /v1/orders` — place orders (IOC limit orders)
-  - `GET /v1/markets` (gateway API) — fetch market listings (paginated, 200/page)
-- **Order format:**
-  ```json
-  {
-    "marketSlug": "aec-mlb-pit-chc-2026-04-12",
-    "intent": "ORDER_INTENT_BUY_LONG",
-    "type": "ORDER_TYPE_LIMIT",
-    "price": {"value": "0.60", "currency": "USD"},
-    "quantity": 40,
-    "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
-  }
-  ```
-- **Signing note:** The `sha512Sync` function from Node's crypto module is set once at initialization. Falls back to `signAsync` which has internal sha512. Handles frozen `ed.etc` objects gracefully.
+  - `POST /v1/orders` — place IOC limit orders (price set 2c above market to ensure fill)
+  - `GET /v1/markets?limit=200&offset=N&active=true&closed=false` (gateway) — paginated market listings
+  - `GET /v1/markets/{slug}` (gateway) — individual market for UFC settlement checks
+- **Order format:** All orders are `TIME_IN_FORCE_IMMEDIATE_OR_CANCEL` limit orders. If not filled immediately, order cancels — no hanging orders.
+- **Signing note:** `ed.etc.sha512Sync` set once at init. Handles frozen objects via `Object.defineProperty` fallback. Falls back to `signAsync` if fully sealed.
+- **Fees:** Zero taker fees (as of codebase date).
 
-### ESPN (Data source — no auth)
+### ESPN (Data source — no auth, no API key)
 - **Scoreboards:** `site.api.espn.com/apis/site/v2/sports/{sport}/scoreboard`
-- **Six leagues:** baseball/mlb, basketball/nba, hockey/nhl, soccer/usa.1, soccer/eng.1, soccer/esp.1
-- **Data extracted:**
+- **News:** `site.api.espn.com/apis/site/v2/sports/baseball/mlb/news?limit=3`
+- **Six league paths:** `baseball/mlb`, `basketball/nba`, `hockey/nhl`, `soccer/usa.1`, `soccer/eng.1`, `soccer/esp.1`
+- **All requests:** 5-second timeout, User-Agent: `arbor-ai/1`
+- **Data extracted per game:**
 
-| Data Point | Source | Used In |
+| Data Point | ESPN Path | Used In |
 |-----------|--------|---------|
 | Team records (overall) | `competitor.records[0].summary` | All prompts |
-| Home/away records | `competitor.records[type=home/road]` | Live-edge + pre-game |
+| Home/away records | `competitor.records[type=home/road].summary` | Live + pre-game |
 | Current pitcher stats | `competition.situation.pitcher.summary` | Live MLB |
 | Starting pitcher ERA | `competitor.probables[].statistics[ERA]` | Live + pre-game MLB |
 | Starting pitcher W-L | `competitor.probables[].statistics[W/L]` | Live + pre-game MLB |
 | Team batting average | `competitor.statistics[AVG]` | Live MLB |
-| NBA FG%, 3P%, REB, AST, FTA | `competitor.statistics[...]` | Live NBA |
-| Leading scorers | `competitor.leaders[points]` | Live NBA |
-| Inning/quarter scores | `competitor.linescores[]` | Live prompt |
+| NBA FG%, 3P% | `competitor.statistics[FG%/3P%]` | Live NBA |
+| NBA REB, AST, FTA | `competitor.statistics[REB/AST/FTA]` | Live NBA |
+| Leading scorers | `competitor.leaders[points].leaders[0]` | Live NBA |
+| Inning/quarter scores | `competitor.linescores[].displayValue` | Live prompt |
 | Runners on base | `competition.situation.onFirst/Second/Third` | Live MLB |
-| Outs | `competition.situation.outs` | Live MLB |
-| Current batter | `competition.situation.batter` | Live MLB |
-| Last play | `competition.situation.lastPlay.text` | Live MLB |
-| Game status detail | `competition.status.type.shortDetail` | All prompts |
-| Game state | `competition.status.type.state` | in/post filtering |
+| Outs count | `competition.situation.outs` | Live MLB |
+| Current batter | `competition.situation.batter.athlete.displayName` | Live MLB |
+| Last play text | `competition.situation.lastPlay.text` | Live context |
+| Game status | `competition.status.type.shortDetail` | All prompts |
+| Game state | `competition.status.type.state` | in/post/pre filtering |
+| Period/quarter | `competition.status.period` | Stage detection |
+| Winner flag | `competitor.winner` | Settlement, arb verification |
 
 ### CoinGecko (Crypto prices — no auth)
 - **Endpoint:** `api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd`
 - **Used in:** Broad scan prompt context for crypto market analysis
 
 ### Anthropic (AI decisions)
-- **Models:** Haiku 4.5 (screening, stop-loss eval), Sonnet 4.6 (predictions + web search)
-- **Web search:** `web_search_20250305` tool (1-5 uses per call depending on strategy)
-- **Cost:** ~$5-8/day at current usage
+- **Models:** Haiku 4.5 (screening, sell/hold eval), Sonnet 4.6 (all trade decisions)
+- **Web search tool:** `web_search_20250305` (max 1-5 uses per call)
+- **API version:** `2023-06-01`
+- **Cost tracking:** `stats.apiSpendCents` accumulates estimated cost. Haiku = $0.002, Sonnet = $0.03 + $0.01/search.
+- **Estimated cost:** ~$5-8/day at current usage
 
 ### Telegram (Notifications)
-- **Bot API:** sendMessage with HTML parse mode
-- **Notifications:** Every trade, daily reports (8pm + midnight), halt alerts, stop-loss triggers, strategy alerts, bot start/stop
-
----
-
-## Poll Cycle Flow
-
-Every 60 seconds, `pollCycle()` runs this sequence:
-
-```
-1. refreshPortfolio()
-   ├── Fetch Kalshi balance + positions
-   ├── Filter positions by active exposure (not settled/cashed out)
-   ├── Read trades.jsonl for open Poly positions
-   ├── Refresh Poly balance via Ed25519 signed request
-   └── Sync: auto-close JSONL entries not in Kalshi portfolio (5-min grace)
-
-2. Daily reset check (midnight ET)
-   └── Reset daily loss tracking, update consecutive losses from JSONL
-
-3. canTrade() gate
-   └── Check: not halted, daily loss OK, positions under dynamic limit, deployment under cap, cash >= $3
-
-4. checkLiveScoreEdges() [every cycle — most time-sensitive]
-   ├── Phase 1: Parallel ESPN fetch (6 leagues), collect games with leads/ties
-   ├── Score change detection + win expectancy baseline calculation
-   ├── Line movement detection (5c+ swings)
-   ├── Phase 2: Batch fetch all sports market prices (6 series in parallel)
-   ├── Draw bet check (soccer tied games, pure math)
-   ├── Phase 3: Queue candidates, cap at 6 Sonnet calls
-   └── Phase 4: Fire Sonnet calls in parallel (3 at a time), execute trades
-
-5. checkPreGamePredictions() [every 15 min, before 6pm ET, max 2/day]
-   ├── Fetch today's Kalshi sports markets (6 leagues, soccer +3 days)
-   ├── Group both team tickers per game, filter TIE
-   ├── Haiku screens most predictable games
-   ├── Sonnet + web search predicts each with baselines
-   └── Cross-platform price check, buy on cheaper
-
-6. checkUFCPredictions() [every 30 min]
-   ├── Fetch Poly UFC moneylines
-   ├── Haiku picks 2 most predictable fights
-   └── Sonnet researches fighters, buy if confidence passes
-
-7. claudeBroadScan() [every 30 min]
-   ├── Fetch 200+ markets across all categories + Golf/Masters keywords
-   ├── Filter: sports by ticker date, non-sports by close time, soccer +3 days
-   ├── Dedup sports, fetch context (ESPN news + BTC/ETH prices)
-   ├── Haiku screens for 5 candidates
-   ├── Sonnet researches each (sports BLOCKED from execution)
-   └── Execute non-sports trades only
-```
-
-Every 5 minutes, `settlementLoop()` runs:
-```
-1. managePositions()    — Claude-powered sell/hold + auto profit-take + nuclear stop
-2. checkSettlements()   — reconcile closed markets with trade log
-3. reviewStopLossOutcomes() — track whether stop-loss decisions were correct
-4. checkResolutionArbs() — buy winning sides below $0.95
-```
-
-Every hour, `calibrationLoop()` checks:
-```
-At 6am ET: runCalibration() — daily calibration engine
-```
-
-Every 30 minutes, `dailyReportLoop()` checks:
-```
-At midnight ET (hour 0): sendDailyReport()
-At 8pm ET (hour 20): sendDailyReport()
-```
-
-Every 5 minutes, `statsLoop()` runs:
-```
-logStats() — console log of claude calls, trades, API spend, balance, P&L
-```
+- **Bot API:** `api.telegram.org/bot{token}/sendMessage` with HTML parse_mode
+- **Error handling:** All Telegram sends are fire-and-forget (`.catch(() => {})`) — notification failures never block trading
 
 ---
 
@@ -1054,19 +1068,20 @@ logStats() — console log of claude calls, trades, API spend, balance, P&L
 - **Cost:** $7.59/month
 - **OS:** Linux
 - **Access:** SSH key auth (`~/.ssh/hetzner_arbor`)
+- **Deployment:** `bot/deploy-vps.sh` (rsync files + pm2 restart)
 
-### Process Management
-- **pm2** manages all processes
-- `arbor-ai`: main bot, auto-restart on crash, max 200MB memory
-- `arbor-health`: cron at 12:00 UTC (8am ET), runs once then stops
-- Logs: `./logs/ai-out.log`, `./logs/ai-error.log`
+### Process Management (pm2)
+- `arbor-ai`: main bot, auto-restart on crash, max 200MB memory, max 50 restarts
+- `arbor-health`: cron at `0 12 * * *` (12:00 UTC = 8am ET), runs once then stops
+- `arbor-arb`: legacy arb bot (stopped, same config as arbor-ai)
+- All: 10-second restart delay, dated log format, separate error/output log files
 
 ### Frontend Hosting
 - **Vercel:** React dashboard auto-deployed from git
 - **Proxy:** Serverless function at `/api/proxy` bridges HTTPS to VPS HTTP
-- **Cache:** 10-second s-maxage with 5-second stale-while-revalidate
+- **Cache:** `s-maxage=10, stale-while-revalidate=5`
 
-### Environment Variables Required
+### Environment Variables
 
 **VPS (bot/.env):**
 ```
@@ -1108,7 +1123,7 @@ API_TOKEN=arbor-2026
 
 ### Break-Even Analysis
 - At 60% win rate with average 55-cent entry price:
-  - Win: $0.45 profit per contract
+  - Win: $0.45 profit per contract (minus ~1.7c Kalshi fee at 55c)
   - Lose: $0.55 loss per contract
   - Per 10 trades: 6 wins ($2.70) - 4 losses ($2.20) = +$0.50 net
   - At 5 trades/day, $20 avg: ~$10/day = $300/month at $250 bankroll
@@ -1118,72 +1133,55 @@ API_TOKEN=arbor-2026
 ### Scaling (inverse risk curve)
 As bankroll grows, deployment percentage decreases:
 - $200: 85% deployed (aggressive — need growth)
+- $2,000: 75% deployed
 - $5,000: 60% deployed (moderate)
+- $20,000: 40% deployed
 - $50,000: 20% deployed (conservative — protect gains)
 
 ---
 
 ## Known Limitations
 
-1. **Early validation phase.** Need 50+ trades under the prediction system to validate win rate and calibration accuracy. The calibration engine and trade review system activate at that threshold.
+1. **Early validation phase.** Need 50+ settled trades to activate the calibration engine and trade review system. Until then, confidence thresholds and margins are based on design assumptions, not empirical data.
 
-2. **No Polymarket sell capability.** Can buy on Poly but can't sell/exit positions early. Stop-loss and Claude-powered exits are Kalshi-only. Poly positions ride to settlement.
+2. **No Polymarket sell capability.** Can buy on Poly but can't sell/exit positions early. All position management (stop-loss, Claude exits, profit-taking) is Kalshi-only. Poly positions ride to settlement.
 
-3. **Kalshi settlement delay.** Sports markets take hours to settle after games end. Capital is locked during this period. Resolution arbs partially mitigate this.
+3. **Kalshi settlement delay.** Sports markets take hours to settle after games end. Capital is locked during this period. Resolution arbs partially mitigate by buying winning sides before formal settlement.
 
-4. **Claude cost.** At ~$5-8/day, API costs eat into small-bankroll profits. Becomes negligible at $1,000+ bankroll.
+4. **Claude cost.** At ~$5-8/day, API costs eat into small-bankroll profits. At $250 bankroll with $10/day target profit, API costs are 50-80% of gross. Becomes negligible at $1,000+ bankroll.
 
-5. **Single point of failure.** One bot on one VPS. If VPS goes down, no trading. pm2 auto-restarts on crash, but hardware failure = downtime.
+5. **Single point of failure.** One bot on one VPS. If VPS goes down, no trading. pm2 auto-restarts on crash, but hardware failure = downtime until manual intervention.
 
 6. **No backtesting.** Predictions are forward-only. Can't validate strategy against historical data without building a separate backtesting framework.
 
-7. **ESPN dependency.** All live game data comes from ESPN's public API. If ESPN changes endpoints or rate-limits, live-edge and position management are affected.
+7. **ESPN dependency.** All live game data comes from ESPN's public API (no auth, no SLA). If ESPN changes endpoints, rate-limits, or goes down, live-edge, position management, and settlement reconciliation are affected.
 
-8. **Soccer draw complexity.** Draw bets use historical baselines without Claude analysis. The baseline accuracy depends on the specific matchup quality (top team vs bottom team has different draw rates than mid-table clash).
+8. **Soccer draw complexity.** Draw bets use historical baselines without Claude analysis. The baselines are averages across all matchups — a top team vs bottom team has different draw rates than a mid-table clash, but the same minute-based baseline is applied.
 
-9. **Broad scan sports blocked.** Sports games are blocked from broad-scan execution because side mapping (YES = which team?) is unreliable without proper ticker parsing. Pre-game and live-edge handle sports with correct mapping.
+9. **Pre-game limited to NBA/NHL.** MLB and soccer are blocked due to sport-specific confidence caps being too low to pass the 70% minimum. This means no pre-game bets during MLB-only afternoons.
 
-10. **Polymarket defaults off.** `KALSHI_ONLY=true` means cross-platform price advantage is not active by default. Must be explicitly enabled.
+10. **Polymarket defaults off.** `KALSHI_ONLY=true` means cross-platform price advantage is not active by default. Must be explicitly enabled by setting to `false`.
+
+11. **Resolution arbs: no ESPN verification for soccer.** The ESPN verification for resolution arbs only covers MLB, NBA, NFL, NHL. Soccer arbs rely solely on Kalshi's reported result.
+
+12. **Broad scan sports blocked.** Sports games are blocked from broad-scan trade execution because YES/NO side mapping is unreliable without proper ticker parsing. Only pre-game and live-edge handle sports with correct team-to-side mapping.
 
 ---
 
 ## Supabase Edge Functions (Legacy/Auxiliary)
 
-The `supabase/functions/` directory contains edge functions that were part of an earlier architecture:
+The `supabase/functions/` directory contains edge functions from an earlier architecture. These are NOT part of the active trading pipeline (which runs entirely in `bot/ai-edge.mjs`):
 
 | Function | Purpose |
 |----------|---------|
-| `scanner/` | Server-side scan cycle — fetches Kalshi/Polymarket markets, uses Claude for polarity verification, writes to Supabase |
-| `analytics/` | Analytics computation edge function |
-| `fastpoll/` | Fast polling edge function |
-| `kalshiws/` | Kalshi WebSocket connection handler |
+| `scanner/` | Server-side scan cycle with Claude polarity verification, orderbook walking, writes to Supabase DB |
+| `analytics/` | Analytics computation |
+| `fastpoll/` | Fast polling |
+| `kalshiws/` | Kalshi WebSocket handler |
 | `notify/` | Notification delivery |
 | `resolve/` | Market resolution verification |
-| `trade/` | Trade execution edge function |
+| `trade/` | Trade execution |
 
-These functions contain sophisticated logic (polarity-correct token mapping, orderbook walking, fuzzy market matching) but the primary trading pipeline now runs entirely in `bot/ai-edge.mjs`. The scanner's `calculator.ts` and `matcher.ts` logic is preserved in `src/lib/` for reference but not imported by the frontend.
+The scanner contains sophisticated logic (polarity-correct token mapping, orderbook walking via `walkOrderbook()`, fuzzy market title matching via `fuzzyScore()`) preserved in `src/lib/calculator.ts` and `src/lib/matcher.ts` for reference but not imported by the active frontend or bot.
 
----
-
-## Database Schema (Supabase Migrations)
-
-17 migration files define the Supabase schema:
-
-| Migration | Purpose |
-|-----------|---------|
-| 001_initial_schema | Base tables for markets, trades |
-| 002_scan_results | Scan result storage |
-| 003_scan_results_date_stats | Date-based statistics |
-| 004_polarity_columns | Polarity verification columns |
-| 005_positions_columns | Position tracking columns |
-| 006_positions_execution | Execution details |
-| 008_known_game_markets | Known game market cache |
-| 009_positions_kelly | Kelly criterion sizing fields |
-| 010_spread_persistence | Spread data persistence |
-| 011_positions_type | Position type classification |
-| 012_resolution_opportunities | Resolution arb tracking |
-| 013_spread_events_skipped | Skipped spread events |
-| 014_known_game_markets_espn | ESPN market mapping |
-| 015_positions_settlement | Settlement tracking |
-| 016_spread_events_alerted_at | Alert timestamps |
-| 017_spread_events_unique_pair_id | Unique pair identification |
+17 Supabase migration files (`supabase/migrations/001-017`) define the database schema for this legacy system, covering: markets, scan results, positions, known game markets, spread events, and settlement tracking.
