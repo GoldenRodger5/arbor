@@ -1183,6 +1183,150 @@ async function checkLiveScoreEdges() {
     }
   }
 
+  // === PRE-GAME POSITION GUARDIAN ===
+  // Check every 60s (not every 5min like managePositions) if any pre-game bets are going wrong.
+  // Pre-game bets were placed BEFORE the game started — any adverse score change is NEW info
+  // that wasn't in the original thesis and should be evaluated immediately.
+  //
+  // Why this matters: managePositions runs every 5 min with a -25% threshold.
+  // A pre-game NHL bet at 65¢ can drop to 40¢ (-38%) in 3 minutes if the other team
+  // scores twice. By the time the 5-min loop catches it, we've lost an extra $10+.
+  // This guardian catches it within 60 seconds.
+  if (liveGames.length > 0) {
+    try {
+      const pgLines = existsSync(TRADES_LOG)
+        ? readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim())
+        : [];
+      const pgTrades = pgLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      const preGameOpen = pgTrades.filter(t =>
+        t.status === 'open' &&
+        t.exchange === 'kalshi' &&
+        t.strategy === 'pre-game-prediction'
+      );
+
+      for (const trade of preGameOpen) {
+        const ticker = trade.ticker ?? '';
+        const teamSuffix = ticker.split('-').pop()?.toUpperCase() ?? '';
+        if (!teamSuffix) continue;
+
+        // Find this game in the ESPN data we already fetched
+        const game = liveGames.find(g => {
+          const ha = g.home.team?.abbreviation ?? '';
+          const aa = g.away.team?.abbreviation ?? '';
+          return tickerHasTeam(ticker, ha) && tickerHasTeam(ticker, aa);
+        });
+        if (!game) continue; // game not in progress yet or not found
+
+        // Determine: is our team losing?
+        const ourTeam = teamSuffix;
+        const homeAbbr = game.home.team?.abbreviation ?? '';
+        const awayAbbr = game.away.team?.abbreviation ?? '';
+        const isOurTeamHome = tickerHasTeam(ourTeam, homeAbbr);
+        const ourScore = isOurTeamHome ? game.homeScore : game.awayScore;
+        const theirScore = isOurTeamHome ? game.awayScore : game.homeScore;
+        const deficit = theirScore - ourScore;
+
+        // Only evaluate if our team is LOSING (deficit > 0)
+        if (deficit <= 0) continue;
+
+        // Cooldown: don't spam evaluations. 3 min for pre-game guardian (faster than normal 8-12 min).
+        const pgGuardKey = 'pg-guard:' + trade.ticker;
+        if (Date.now() - (tradeCooldowns.get(pgGuardKey) ?? 0) < 3 * 60 * 1000) continue;
+        tradeCooldowns.set(pgGuardKey, Date.now());
+
+        // Fetch current market price (batch prices aren't loaded yet — individual fetch)
+        let currentPrice = 0;
+        try {
+          const mktData = await kalshiGet(`/markets/${ticker}`);
+          const mkt = mktData.market ?? mktData;
+          currentPrice = parseFloat(mkt.yes_ask_dollars ?? '0');
+        } catch { continue; }
+        if (currentPrice <= 0) continue;
+
+        const entryPrice = trade.entryPrice ?? 0;
+        const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / entryPrice);
+        const pctChange = (currentPrice - entryPrice) / entryPrice;
+
+        // Pre-game positions get TIGHTER thresholds: evaluate at just -10% (vs -25% for live bets)
+        // because every adverse score is NEW information the pre-game thesis didn't account for
+        const PG_CLAUDE_THRESHOLD = -0.10;
+        if (pctChange >= PG_CLAUDE_THRESHOLD) {
+          // Down but not enough to evaluate yet — just log
+          if (pctChange < 0) {
+            console.log(`[pg-guard] ${ticker} our team trailing ${ourScore}-${theirScore} (${game.detail}), price ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%), watching...`);
+          }
+          continue;
+        }
+
+        // Determine sport + game context
+        const league = game.league;
+        const sport = league === 'nhl' ? 'NHL' : league === 'nba' ? 'NBA' : league === 'mlb' ? 'MLB' :
+          ['mls', 'epl', 'laliga'].includes(league) ? 'Soccer' : 'Sport';
+        const stage = league === 'mlb' ? (game.period <= 4 ? 'early' : game.period <= 6 ? 'mid' : 'late') :
+          league === 'nba' ? (game.period <= 2 ? 'early' : game.period === 3 ? 'mid' : 'late') :
+          league === 'nhl' ? (game.period === 1 ? 'early' : game.period === 2 ? 'mid' : 'late') :
+          game.period === 1 ? 'early' : 'late';
+
+        const we = getWinExpectancy(league, deficit, game.period, !isOurTeamHome) ?? 0;
+        const ourWE = 1 - we; // we're the trailing team
+
+        const comebackContext = {
+          NHL: 'NHL: 1-goal comebacks happen 30%. 2-goal comebacks ~15%. 3-goal comebacks ~5%. Down 3+ in the 3rd = essentially over.',
+          NBA: 'NBA: 15-point comebacks happen 13% in the 3-point era. 20-point comebacks happen 4%. 25+ is essentially over (<1%).',
+          MLB: 'MLB: 3-run comebacks happen 20% through 6 innings, 10% in the 7th+. 5+ run deficit after 6th inning = <3% comeback.',
+          Soccer: 'Soccer: 1-goal deficits equalize ~20% of the time. 2-goal deficit comeback is ~5%. Down 2+ after 75th minute = essentially over.',
+          Sport: 'Comebacks get less likely as the deficit grows and time runs out.',
+        }[sport] ?? '';
+
+        const profitPerContract = currentPrice - entryPrice;
+
+        console.log(`[pg-guard] ⚠️ PRE-GAME BET LOSING: ${trade.title} | ${ourTeam} trailing ${ourScore}-${theirScore} (${game.detail}) | ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%) | WE: ${(ourWE*100).toFixed(0)}%`);
+
+        const pgPrompt =
+          `You placed a PRE-GAME bet on ${sport} team ${ourTeam} to win at ${(entryPrice*100).toFixed(0)}¢. The game has started and YOUR TEAM IS LOSING.\n\n` +
+          `POSITION: Bought YES at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}% loss, -$${Math.abs(qty * profitPerContract).toFixed(2)}).\n` +
+          `Game: ${trade.title}\n` +
+          `LIVE SCORE: ${awayAbbr} ${game.awayScore} @ ${homeAbbr} ${game.homeScore} | ${game.detail}\n` +
+          `Game stage: ${stage.toUpperCase()} | Your team's win expectancy: ${(ourWE*100).toFixed(0)}%\n\n` +
+          `ORIGINAL THESIS: "${trade.reasoning}"\n\n` +
+          `${comebackContext}\n\n` +
+          `THIS IS A PRE-GAME BET — it was placed BEFORE the game started. The current score is NEW information.\n` +
+          `Is your original thesis still intact? Or has the game already proven it wrong?\n\n` +
+          `A) SELL: Lock in loss of $${Math.abs(qty * profitPerContract).toFixed(2)}. Free up $${(qty * currentPrice).toFixed(2)} capital for better opportunities.\n` +
+          `B) HOLD: If ${ourTeam} wins → +$${(qty * (1 - entryPrice)).toFixed(2)}. If loses → -$${(qty * entryPrice).toFixed(2)}.\n\n` +
+          `JSON ONLY: {"action": "sell"/"hold", "reasoning": "why — reference the original thesis"}`;
+
+        const pgGuardText = await claudeScreen(pgPrompt, { maxTokens: 200, timeout: 8000 });
+        if (pgGuardText) {
+          try {
+            const match = extractJSON(pgGuardText);
+            if (match) {
+              const d = JSON.parse(match);
+              if (d.action === 'sell') {
+                console.log(`[pg-guard] 🧠 SELL: ${trade.ticker} | ${d.reasoning?.slice(0, 80)}`);
+                // Read fresh trades, find this trade, execute sell
+                const freshLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+                const freshTrades = freshLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+                const freshTrade = freshTrades.find(t => t.id === trade.id);
+                if (freshTrade && freshTrade.status === 'open') {
+                  const result = await executeSell(freshTrade, qty, currentPrice, 'claude-stop');
+                  if (result) {
+                    writeFileSync(TRADES_LOG, freshTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
+                    console.log(`[pg-guard] Pre-game position closed: ${trade.ticker}`);
+                  }
+                }
+              } else {
+                console.log(`[pg-guard] 🧠 HOLD: ${trade.ticker} (${stage}, WE ${(ourWE*100).toFixed(0)}%) | ${d.reasoning?.slice(0, 80)}`);
+              }
+            }
+          } catch { /* skip */ }
+        }
+      }
+    } catch (e) {
+      console.error('[pg-guard] error:', e.message);
+    }
+  }
+
   if (liveGames.length === 0) return;
 
   // === PHASE 2: Find opportunities — score changed OR baseline-vs-price gap exists ===
