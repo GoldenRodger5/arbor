@@ -1,190 +1,102 @@
-export type ResolutionVerdict = 'SAFE' | 'CAUTION' | 'SKIP' | 'PENDING';
+// Arbor Prediction Trading Bot — UI Types
 
-export interface UnifiedMarket {
-  platform: 'kalshi' | 'polymarket';
-  marketId: string;
+export interface Trade {
+  id: string;
+  timestamp: string;
+  exchange: 'kalshi' | 'polymarket';
+  strategy: string;
+  ticker: string;
   title: string;
-  yesTokenId?: string;
-  noTokenId?: string;
-  closeTime?: string;
-  yesAsk?: number;
-  noAsk?: number;
-  resolutionCriteria?: string;
-  url?: string;
-}
-
-export interface OrderbookLevel {
-  price: number;
-  size: number;
-}
-
-export interface Orderbook {
-  marketId: string;
-  yesAsks: OrderbookLevel[];
-  noAsks: OrderbookLevel[];
-  yesBids: OrderbookLevel[];
-  noBids: OrderbookLevel[];
-  fetchedAt: number;
-}
-
-export interface ArbitrageLevel {
-  buyYesPlatform: 'kalshi' | 'polymarket';
-  buyYesPrice: number;
-  buyNoPlatform: 'kalshi' | 'polymarket';
-  buyNoPrice: number;
+  side: string;
   quantity: number;
-  totalCost: number;
-  grossProfitPct: number;
-  estimatedFees: number;
-  netProfitPct: number;
-  maxProfitDollars: number;
+  entryPrice: number;
+  deployCost: number;
+  filled: number;
+  orderId: string | null;
+  edge: number;
+  confidence: number;
+  reasoning: string;
+  liveScore?: string;
+  otherPlatformPrice?: number;
+  status: 'open' | 'settled' | 'sold-stop-loss' | 'sold-claude-stop' | 'sold-claude-sell' | 'closed-manual' | string;
+  exitPrice: number | null;
+  realizedPnL: number | null;
+  settledAt: string | null;
+  result?: string;
+  category?: string;
+  // AI review fields
+  reviewGrade?: string;
+  reviewText?: string;
+  reviewedAt?: string;
 }
 
-export interface ArbitrageOpportunity {
-  id: string;
-  kalshiMarket: UnifiedMarket;
-  polyMarket: UnifiedMarket;
-  matchScore: number;
-  verdict: ResolutionVerdict;
-  verdictReasoning?: string;
-  riskFactors?: string[];
-  // Claude verification output fields.
-  kalshiYesMeaning?: string;
-  polyHedgeOutcomeLabel?: string;
-  levels: ArbitrageLevel[];
-  bestNetSpread: number;
-  totalMaxProfit: number;
-  scannedAt: number;
-  // Capital-efficiency fields populated by the edge function as of 2026-04.
-  // Optional so older scan_results rows still parse cleanly.
-  daysToClose?: number;
-  annualizedReturn?: number;
-  effectiveCloseDate?: string;
-  kalshiCloseDate?: string;
-  polyCloseDate?: string;
-  belowThreshold?: boolean;
+export interface DailySnapshot {
+  date: string;
+  timestamp: string;
+  bankroll: number;
+  kalshiCash: number;
+  kalshiPositions: number;
+  polyBalance: number;
+  openPositionCount: number;
+  totalDeployed: number;
+  totalTrades: number;
+  settledTrades: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  totalPnL: number;
+  todayPnL: number;
+  todayTrades: number;
+  consecutiveLosses: number;
+  strategyStats: Record<string, StrategyStats>;
 }
 
-export interface ScannerStats {
-  kalshiCount: number;
-  polyCount: number;
-  matchedCount: number;
-  opportunityCount: number;
-  lastScanAt: number | null;
-  isScanning: boolean;
+export interface StrategyStats {
+  trades: number;
+  settled: number;
+  wins: number;
+  losses: number;
+  pnl: number;
 }
 
-export interface CapitalState {
-  totalCapital: number;
-  deployedCapital: number;
-  safetyReservePct: number;
-  realizedPnl: number;
-  activeCapital: number;
+export interface ScreenLog {
+  timestamp: string;
+  stage: string;
+  ticker?: string;
+  result?: string;
+  confidence?: number;
+  price?: number;
+  reasoning?: string;
+  [key: string]: unknown;
 }
 
-export interface ScannerConfig {
-  intervalSeconds: number;
-  minNetSpread: number;
+export interface BotState {
+  bankroll: number;
+  kalshiCash: number;
+  kalshiPositions: number;
+  polyBalance: number;
+  openPositionCount: number;
+  totalDeployed: number;
+  isRunning: boolean;
+  apiSpendCents: number;
+  claudeCalls: number;
+  tradesPlaced: number;
 }
 
-// UI-facing opportunity type used by the Opportunities page.
-// Adapted from ArbitrageOpportunity by the page component.
-export type Verdict = 'SAFE' | 'CAUTION' | 'SKIP';
-
-export interface OpportunityRow {
-  id: number;
-  event: string;
-  polyYes: number;
-  kalshiNo: number;
-  rawSpread: number;
-  netSpread: number;
-  maxDollar: number;
-  verdict: Verdict;
-  scanned: string;
-  polyDepth: { price: number; qty: number }[];
-  kalshiDepth: { price: number; qty: number }[];
-  daysToClose?: number;
-  annualizedReturn?: number;
-  effectiveCloseDate?: string;
-  kalshiCloseDate?: string;
-  polyCloseDate?: string;
-  polyUrl?: string;
-  kalshiUrl?: string;
-  verdictReasoning?: string;
-  riskFactors?: string[];
-  kalshiYesMeaning?: string;
-  polyHedgeOutcomeLabel?: string;
+export interface SportPerformance {
+  sport: string;
+  trades: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  pnl: number;
 }
 
-export interface AnalyticsSummary {
-  // Capital
-  totalCapital: number;
-  deployedCapital: number;
-  activeCapital: number;
-  realizedPnl: number;
-  // Trades
-  totalPositions: number;
-  openPositions: number;
-  settledPositions: number;
-  partialPositions: number;
-  failedPositions: number;
-  // Spreads
-  totalSpreadsDetected: number;
-  openSpreads: number;
-  closedSpreads: number;
-  avgSpreadDurationSeconds: number | null;
-  medianSpreadDurationSeconds: number | null;
-  fastestCloseSeconds: number | null;
-  slowestCloseSeconds: number | null;
-  avgPeakSpread: number;
-  avgFirstSpread: number;
-  spreadDecayRate: number | null;
-  // Alerts
-  totalAlerted: number;
-  totalExecuted: number;
-  alertRate: number;
-  executionRate: number;
-  // Scanner health
-  lastScanAt: string | null;
-  lastFastpollAt: string | null;
-}
-
-export interface SpreadEvent {
-  id: string;
-  pairId: string;
-  kalshiMarketId: string;
-  polyMarketId: string;
-  kalshiTitle: string;
-  firstDetectedAt: string;
-  lastSeenAt: string;
-  firstNetSpread: number;
-  peakNetSpread: number;
-  lastNetSpread: number;
-  scanCount: number;
-  closedAt: string | null;
-  durationSeconds: number | null;
-  wasAlerted: boolean;
-  wasExecuted: boolean;
-  closingReason: string | null;
-  source: 'scanner' | 'fastpoll';
-}
-
-export interface Position {
-  id: string;
-  kalshiTitle: string;
-  polyTitle: string;
-  kalshiMarketId: string | null;
-  polyMarketId: string | null;
-  status: 'pending' | 'open' | 'partial' | 'settled' | 'cancelled' | 'failed';
-  intendedKalshiSide: string | null;
-  intendedPolySide: string | null;
-  kalshiFillPrice: number | null;
-  polyFillPrice: number | null;
-  kalshiFillQuantity: number | null;
-  polyFillQuantity: number | null;
-  kalshiOrderId: string | null;
-  polyOrderId: string | null;
-  executedAt: string | null;
-  createdAt: string;
-  opportunityId: string | null;
+export interface CalibrationBucket {
+  label: string;
+  minConf: number;
+  maxConf: number;
+  total: number;
+  wins: number;
+  actualWinRate: number;
 }

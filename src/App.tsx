@@ -1,26 +1,26 @@
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import Layout from './components/Layout';
-import Scanner from './pages/Scanner';
-import Opportunities from './pages/Opportunities';
-import Analytics from './pages/Analytics';
-import Positions from './pages/Positions';
-import Settings from './pages/Settings';
-import { ScannerProvider } from './context/ScannerContext';
+import CommandCenter from './pages/CommandCenter';
+import PositionsPage from './pages/PositionsPage';
+import TradeHistory from './pages/TradeHistory';
+import AnalyticsPage from './pages/AnalyticsPage';
+import SettingsPage from './pages/SettingsPage';
+import { ArborProvider } from './context/ArborContext';
 
 const App = () => (
-  <ScannerProvider>
+  <ArborProvider>
     <BrowserRouter>
       <Layout>
         <Routes>
-          <Route path="/" element={<Scanner />} />
-          <Route path="/opportunities" element={<Opportunities />} />
-          <Route path="/analytics" element={<Analytics />} />
-          <Route path="/positions" element={<Positions />} />
-          <Route path="/settings" element={<Settings />} />
+          <Route path="/" element={<CommandCenter />} />
+          <Route path="/positions" element={<PositionsPage />} />
+          <Route path="/history" element={<TradeHistory />} />
+          <Route path="/analytics" element={<AnalyticsPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </Layout>
     </BrowserRouter>
-  </ScannerProvider>
+  </ArborProvider>
 );
 
 export default App;
