@@ -33,6 +33,11 @@ const ANTHROPIC_KEY = process.env.VITE_ANTHROPIC_API_KEY ?? process.env.ANTHROPI
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 
+// DRY RUN MODE: Run full pipeline but don't place real orders.
+// Set DRY_RUN=true in .env or pass --dry-run flag
+const DRY_RUN = process.env.DRY_RUN === 'true' || process.argv.includes('--dry-run');
+if (DRY_RUN) console.log('🧪 DRY RUN MODE — no real orders will be placed');
+
 const MIN_CONFIDENCE = 0.65;      // Claude must be ≥65% confident to trade
 const CONFIDENCE_MARGIN = 0.03;   // LEGACY flat margin — only used for draw bets + fallback
 
@@ -125,6 +130,10 @@ async function kalshiGet(path) {
 }
 
 async function kalshiPost(path, body) {
+  if (DRY_RUN) {
+    console.log(`[DRY RUN] Would POST ${path}: ${JSON.stringify(body).slice(0, 150)}`);
+    return { ok: true, status: 200, data: { order: { order_id: 'dry-run', quantity_filled: body.count ?? 0 } } };
+  }
   const res = await fetch(`${KALSHI_REST}${path}`, {
     method: 'POST', headers: kalshiHeaders('POST', path), body: JSON.stringify(body),
   });
@@ -232,6 +241,10 @@ async function refreshPolyBalance() {
 }
 
 async function polymarketPost(slug, intent, price, quantity) {
+  if (DRY_RUN) {
+    console.log(`[DRY RUN] Would POST Poly order: ${slug} ${intent} @${price} x${quantity}`);
+    return { ok: true, status: 200, data: { id: 'dry-run', quantity_filled: quantity } };
+  }
   if (!POLY_US_KEY_ID || !POLY_US_SECRET) {
     console.error('[poly-order] credentials not set');
     return { ok: false, status: 0, data: {} };
@@ -1825,15 +1838,30 @@ async function checkLiveScoreEdges() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 let lastPreGameScan = 0;
-const PREGAME_SCAN_INTERVAL = 5 * 60 * 1000; // every 5 min — catch pre-game price shifts
+const PREGAME_SCAN_INTERVAL = 5 * 60 * 1000;
+const MAX_PREGAME_PER_CYCLE = 2;   // Max trades per scan — be surgical, not spray-and-pray
+const MAX_PREGAME_PER_DAY = 4;     // Max pre-game trades per day — force selectivity
+let preGameTradesToday = 0;
+let preGameTradesDate = '';         // reset counter on new day
 
 async function checkPreGamePredictions() {
   if (Date.now() - lastPreGameScan < PREGAME_SCAN_INTERVAL) return;
   lastPreGameScan = Date.now();
   if (!canTrade()) return;
 
-  const sportsSeries = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME', 'KXEPLGAME', 'KXLALIGAGAME'];
+  // Daily limit on pre-game trades
   const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const todayDateStr = etNow.toISOString().slice(0, 10);
+  if (preGameTradesDate !== todayDateStr) {
+    preGameTradesToday = 0;
+    preGameTradesDate = todayDateStr;
+  }
+  if (preGameTradesToday >= MAX_PREGAME_PER_DAY) {
+    console.log(`[pre-game] Daily limit reached (${MAX_PREGAME_PER_DAY} trades). Skipping until tomorrow.`);
+    return;
+  }
+
+  const sportsSeries = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME', 'KXEPLGAME', 'KXLALIGAGAME'];
   const etTmrw = new Date(etNow.getTime() + 24 * 60 * 60 * 1000);
   const toShort = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
   const todayStr = toShort(etNow);
@@ -1922,8 +1950,10 @@ async function checkPreGamePredictions() {
     };
   });
 
-  // Fire in parallel batches of 3
+  // Fire in parallel batches of 3 — max 2 trades per cycle
+  let preGameTradesThisCycle = 0;
   for (let batch = 0; batch < pgPrompts.length; batch += 3) {
+    if (preGameTradesThisCycle >= MAX_PREGAME_PER_CYCLE) break;
     const batchItems = pgPrompts.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
       batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 500, maxSearches: 2 }))
@@ -1978,10 +2008,10 @@ async function checkPreGamePredictions() {
     const pgSportKey = expectedSport.toLowerCase();
     const preGameBaselines = { mlb: 0.54, nba: 0.63, nhl: 0.59, mls: 0.49, epl: 0.45, laliga: 0.45 };
     const pgBaseline = preGameBaselines[pgSportKey] ?? 0.55;
-    // For pre-game, the "baseline" is the home team win rate. Adjust: if betting YES (home), use baseline.
-    // If betting NO (away), use 1 - baseline. Then cap at baseline + 20% (wider than live since no score).
+    // Sport-specific cap: MLB is random (max +12%), NBA allows more (+20%), NHL mid (+15%)
+    const sportCapBonus = { mlb: 0.12, nba: 0.20, nhl: 0.15, mls: 0.12, epl: 0.12, laliga: 0.12 }[pgSportKey] ?? 0.15;
     const pgTargetBaseline = pick.side === 'yes' ? pgBaseline : (1 - pgBaseline);
-    const pgMaxAllowed = Math.min(0.90, pgTargetBaseline + 0.20);
+    const pgMaxAllowed = Math.min(0.85, pgTargetBaseline + sportCapBonus);
     if (confidence > pgMaxAllowed) {
       console.log(`[pre-game] Confidence capped: Claude said ${(confidence*100).toFixed(0)}% but pre-game baseline is ${(pgTargetBaseline*100).toFixed(0)}% → capped at ${(pgMaxAllowed*100).toFixed(0)}%`);
       confidence = pgMaxAllowed;
@@ -2020,9 +2050,10 @@ async function checkPreGamePredictions() {
     const priceInCents = Math.round(bestPrice * 100);
 
     if (!canDeployMore(qty * bestPrice)) continue;
+    if (preGameTradesToday >= MAX_PREGAME_PER_DAY) { console.log(`[pre-game] Daily limit reached`); continue; }
 
     const pgPlatformLabel = pgBest.platform === 'polymarket' ? `POLY (saved ${((price-bestPrice)*100).toFixed(0)}¢ vs Kalshi)` : 'KALSHI';
-    console.log(`[pre-game] 🎯 TRADE on ${pgPlatformLabel}: ${market.ticker} ${pick.side.toUpperCase()} @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
+    console.log(`[pre-game] 🎯 TRADE on ${pgPlatformLabel}: ${market.ticker} ${pick.side.toUpperCase()} @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}% (${preGameTradesToday+1}/${MAX_PREGAME_PER_DAY} today)`);
     logScreen({ stage: 'pre-game', ticker: market.ticker, result: 'TRADE', confidence, price: bestPrice, platform: pgBest.platform, reasoning: decision.reasoning });
 
     tradeCooldowns.set(market.ticker, Date.now());
@@ -2042,6 +2073,8 @@ async function checkPreGamePredictions() {
 
     if (pgResult.ok) {
       stats.tradesPlaced++;
+      preGameTradesToday++;
+      preGameTradesThisCycle++;
       logTrade({
         exchange: pgBest.platform, strategy: 'pre-game-prediction',
         ticker: pgBest.platform === 'polymarket' ? pgBest.slug : market.ticker,
@@ -2533,22 +2566,32 @@ async function claudeBroadScan() {
       const market = deduped.find(m => m.ticker === candidate.ticker);
       if (!market) continue;
 
-      const isSportsMarket = market.category === 'Sports';
+      const isSportsMarket = market.category === 'Sports' || market.category === 'Golf/Masters';
       const yesPrice = parseFloat(market.yesAsk);
       const noPrice = parseFloat(market.noAsk);
 
+      // Detect sport for sports markets
+      const bsTicker = market.ticker ?? '';
+      const bsDetectedSport = bsTicker.includes('MLB') ? 'MLB' : bsTicker.includes('NBA') ? 'NBA' :
+        bsTicker.includes('NHL') ? 'NHL' : bsTicker.includes('MLS') ? 'MLS' : bsTicker.includes('EPL') ? 'EPL' :
+        bsTicker.includes('LALIGA') ? 'La Liga' : 'Sports';
+      const bsTodayDate = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'long', day: 'numeric' });
+
       const decidePrompt = isSportsMarket
-        ? `You are a sports prediction analyst. Predict the outcome of this game.\n\n` +
+        ? `You are a ${bsDetectedSport} prediction analyst. Predict the outcome of this REGULAR SEASON ${bsDetectedSport} game being played TODAY, ${bsTodayDate}.\n\n` +
+          `THIS IS A ${bsDetectedSport} GAME. Not a futures market, not a playoff series.\n\n` +
           `MARKET: ${market.ticker}: "${market.title}"\n` +
+          `Sport: ${bsDetectedSport}\n` +
           `YES price: ${(yesPrice*100).toFixed(0)}¢ | NO price: ${(noPrice*100).toFixed(0)}¢\n` +
           `Screening note: "${candidate.reason}"\n\n` +
-          `RESEARCH: Look up both teams' current records, recent form, injuries.\n\n` +
-          `PREDICT: Who wins? How confident are you (0-100%)?\n` +
+          `RESEARCH: Look up both teams' 2026 records, starting pitchers/goalies, key injuries TODAY, recent form.\n\n` +
+          `PREDICT: Who wins this ${bsDetectedSport} game? How confident are you (0-100%)?\n` +
           `- If confidence ≥ 65% and the side you pick costs ≤ 75¢, BUY\n` +
-          `- Pick YES (home team/first team) or NO (away team/second team)\n\n` +
+          `- Pick YES (first team) or NO (second team)\n\n` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
-          `JSON ONLY:\n{"trade":false,"confidence":0.XX,"reasoning":"prediction"}\n` +
-          `OR {"trade":true,"ticker":"${market.ticker}","side":"yes"/"no","confidence":0.XX,"betAmount":N,"reasoning":"who wins and why"}`
+          `CRITICAL: Respond with ONLY a JSON object. No other text.\n` +
+          `{"trade":false,"confidence":0.XX,"reasoning":"${bsDetectedSport}: prediction"}\n` +
+          `OR {"trade":true,"ticker":"${market.ticker}","side":"yes"/"no","confidence":0.XX,"betAmount":N,"reasoning":"${bsDetectedSport}: who wins and why"}`
         : `You are a prediction analyst. Evaluate this market.\n\n` +
           `MARKET: ${market.ticker}: "${market.title}"\n` +
           `YES: ${(yesPrice*100).toFixed(0)}¢ | NO: ${(noPrice*100).toFixed(0)}¢\n` +
