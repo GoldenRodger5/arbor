@@ -154,6 +154,20 @@ function handleRequest(req, res) {
         else break;
       }
 
+      // Live bankroll estimate: last snapshot + P&L since then
+      const lastSnap = snapshots.length > 0 ? snapshots[snapshots.length - 1] : null;
+      const openDeployed = open.reduce((s, t) => s + (t.deployCost ?? 0), 0);
+
+      // Calculate P&L settled AFTER the last snapshot
+      const snapTime = lastSnap?.timestamp ? new Date(lastSnap.timestamp).getTime() : 0;
+      const pnlSinceSnap = settled
+        .filter(t => t.settledAt && new Date(t.settledAt).getTime() > snapTime)
+        .reduce((s, t) => s + (t.realizedPnL ?? 0), 0);
+
+      const liveBankroll = lastSnap
+        ? lastSnap.bankroll + pnlSinceSnap
+        : openDeployed + totalPnL;
+
       json(res, {
         totalTrades: trades.length,
         settledTrades: settled.length,
@@ -172,7 +186,10 @@ function handleRequest(req, res) {
         sportPerformance: Object.values(sportMap),
         strategyPerformance: Object.values(stratMap),
         calibration,
-        latestSnapshot: snapshots.length > 0 ? snapshots[snapshots.length - 1] : null,
+        latestSnapshot: lastSnap,
+        liveBankroll: Math.round(liveBankroll * 100) / 100,
+        openDeployed: Math.round(openDeployed * 100) / 100,
+        serverTime: new Date().toISOString(),
       });
 
     } else if (path === '/api/snapshots') {

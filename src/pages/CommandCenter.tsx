@@ -21,7 +21,7 @@ function StatCard({ label, value, sub }: { label: string; value: React.ReactNode
 }
 
 export default function CommandCenter() {
-  const { stats, positions, snapshots, trades, loading, lastRefresh, refresh } = useArbor();
+  const { stats, positions, snapshots, trades, loading, refreshing, error, connected, lastRefresh, refresh } = useArbor();
 
   // Confetti: trigger when a new win settles
   const [showConfetti, setShowConfetti] = useState(false);
@@ -38,10 +38,11 @@ export default function CommandCenter() {
   if (loading) return <div style={{ padding: 40, color: 'var(--text-secondary)' }}>Loading...</div>;
 
   const s = stats ?? {};
-  const bankroll = s.latestSnapshot?.bankroll ?? 0;
+  const bankroll = s.liveBankroll ?? s.latestSnapshot?.bankroll ?? 0;
   const kalshiCash = s.latestSnapshot?.kalshiCash ?? 0;
   const kalshiPos = s.latestSnapshot?.kalshiPositions ?? 0;
   const polyBal = s.latestSnapshot?.polyBalance ?? 0;
+  const openDeployed = s.openDeployed ?? positions.reduce((sum: number, p: any) => sum + (p.deployCost ?? 0), 0);
 
   // Chart data from snapshots
   const chartData = snapshots.map(sn => ({
@@ -73,19 +74,29 @@ export default function CommandCenter() {
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
         <div>
-          <h1 style={{ fontSize: 24, fontWeight: 700, margin: 0 }}>Command Center</h1>
-          <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 4 }}>
-            Last updated {lastRefresh ? `${Math.round((Date.now() - lastRefresh) / 1000)}s ago` : 'never'}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <h1 style={{ fontSize: 24, fontWeight: 700, margin: 0 }}>Command Center</h1>
+            <span style={{
+              width: 8, height: 8, borderRadius: '50%',
+              background: connected ? 'var(--green)' : 'var(--red)',
+              display: 'inline-block',
+            }} className={connected ? 'status-dot-live' : ''} />
+          </div>
+          <div style={{ fontSize: 12, color: error ? 'var(--red)' : 'var(--text-tertiary)', marginTop: 4 }}>
+            {error ? `Connection error: ${error}` : `Live — updates every 15s${refreshing ? ' (refreshing...)' : ''}`}
           </div>
         </div>
         <button
           onClick={refresh}
+          disabled={refreshing}
           style={{
-            background: 'var(--accent)', color: 'white', border: 'none', borderRadius: 8,
-            padding: '8px 16px', fontSize: 13, cursor: 'pointer', fontWeight: 500,
+            background: refreshing ? 'var(--bg-elevated)' : 'var(--accent)',
+            color: 'white', border: 'none', borderRadius: 8,
+            padding: '8px 16px', fontSize: 13, cursor: refreshing ? 'default' : 'pointer', fontWeight: 500,
+            opacity: refreshing ? 0.6 : 1, transition: 'opacity 150ms',
           }}
         >
-          Refresh
+          {refreshing ? 'Refreshing...' : 'Refresh'}
         </button>
       </div>
 

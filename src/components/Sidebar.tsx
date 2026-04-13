@@ -13,10 +13,10 @@ const navItems = [
 export default function Sidebar() {
   const location = useLocation();
   const navigate = useNavigate();
-  const { stats, positions, lastRefresh } = useArbor();
+  const { stats, positions, lastRefresh, connected } = useArbor();
   const s = stats ?? {};
 
-  const bankroll = s.latestSnapshot?.bankroll ?? 0;
+  const bankroll = s.liveBankroll ?? s.latestSnapshot?.bankroll ?? 0;
   const refreshAgo = lastRefresh ? `${Math.round((Date.now() - lastRefresh) / 1000)}s ago` : 'never';
 
   return (
@@ -30,10 +30,12 @@ export default function Sidebar() {
           Arbor
         </span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
-          <span className="status-dot-live" style={{
-            width: 8, height: 8, borderRadius: '50%', background: 'var(--green)', display: 'inline-block',
+          <span className={connected ? 'status-dot-live' : ''} style={{
+            width: 8, height: 8, borderRadius: '50%', background: connected ? 'var(--green)' : 'var(--red)', display: 'inline-block',
           }} />
-          <span style={{ fontSize: 11, color: 'var(--green)', fontWeight: 500 }}>LIVE TRADING</span>
+          <span style={{ fontSize: 11, color: connected ? 'var(--green)' : 'var(--red)', fontWeight: 500 }}>
+            {connected ? 'LIVE TRADING' : 'DISCONNECTED'}
+          </span>
         </div>
       </div>
 
