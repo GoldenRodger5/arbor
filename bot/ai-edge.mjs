@@ -322,6 +322,8 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
 const tradeCooldowns = new Map(); // ticker → lastTradedMs
 const lastGameStates = new Map(); // "ATH@NYM" → "1-0-5" (score-period, for change detection)
 const gameEntries = new Map();    // "game:ATH@NYM" → { count: 2, lastPrice: 0.62, totalDeployed: 24.36 }
+const lastSeenPrices = new Map(); // ticker → { price, ts } for line movement detection
+const LINE_MOVE_THRESHOLD = 0.05; // 5¢ move = something happened
 
 // Smart cooldown: allow adding to position IF price improved, block if same/worse
 function canScaleInto(gameKey, currentPrice) {
@@ -1067,8 +1069,44 @@ async function checkLiveScoreEdges() {
     }
   } catch { /* batch fetch failed, will fall back to individual calls */ }
 
-  console.log(`[live-edge] ${candidates.length} candidates, ${cachedPrices.size} prices cached | ${candidates.map(g => {
-    const tag = g._scoreChanged ? '⚡' : '📊';
+  // === LINE MOVEMENT DETECTION — flag big price swings for priority analysis ===
+  const lineMovers = [];
+  for (const [ticker, data] of cachedPrices) {
+    const prev = lastSeenPrices.get(ticker);
+    const currentPrice = data.yes;
+    if (prev) {
+      const move = Math.abs(currentPrice - prev.price);
+      if (move >= LINE_MOVE_THRESHOLD) {
+        const direction = currentPrice > prev.price ? '📈' : '📉';
+        const minutesAgo = Math.round((Date.now() - prev.ts) / 60000);
+        lineMovers.push({ ticker, title: data.title, from: prev.price, to: currentPrice, move, direction, minutesAgo });
+        console.log(`[line-move] ${direction} ${ticker}: ${(prev.price*100).toFixed(0)}¢ → ${(currentPrice*100).toFixed(0)}¢ (${move > 0 ? '+' : ''}${(move*100).toFixed(0)}¢ in ${minutesAgo}min)`);
+      }
+    }
+    lastSeenPrices.set(ticker, { price: currentPrice, ts: Date.now() });
+  }
+
+  // Boost candidates that had line movement — something happened (injury, weather, lineup)
+  if (lineMovers.length > 0) {
+    for (const mover of lineMovers) {
+      // Find the candidate for this game (ticker contains game base)
+      const gameBase = mover.ticker.lastIndexOf('-') > 0 ? mover.ticker.slice(0, mover.ticker.lastIndexOf('-')) : mover.ticker;
+      const candidate = candidates.find(g => {
+        const homeAbbr = g.home.team?.abbreviation ?? '';
+        const awayAbbr = g.away.team?.abbreviation ?? '';
+        return mover.ticker.includes(homeAbbr) || mover.ticker.includes(awayAbbr);
+      });
+      if (candidate) {
+        candidate._lineMove = mover;
+        candidate._baselineWE = Math.max(candidate._baselineWE, 0.90); // boost to top of priority queue
+      }
+    }
+    // Re-sort with line movers at top
+    candidates.sort((a, b) => b._baselineWE - a._baselineWE);
+  }
+
+  console.log(`[live-edge] ${candidates.length} candidates, ${cachedPrices.size} prices cached${lineMovers.length > 0 ? `, ${lineMovers.length} line movers` : ''} | ${candidates.map(g => {
+    const tag = g._lineMove ? '🔥' : g._scoreChanged ? '⚡' : '📊';
     return tag + g.away.team?.abbreviation + '@' + g.home.team?.abbreviation + '(' + (g._baselineWE*100).toFixed(0) + '%)';
   }).join(', ')})`);
 
@@ -1700,12 +1738,14 @@ async function checkPreGamePredictions() {
   if (preGameMarkets.length === 0) { console.log('[pre-game] No pre-game markets in range'); return; }
   console.log(`[pre-game] Found ${preGameMarkets.length} pre-game markets in sweet spot`);
 
-  // Send each game DIRECTLY to Sonnet with web search — no Haiku gating
+  // Send games to Sonnet in parallel batches of 3 — no Haiku gating
   // ~10-15 games/day × $0.08/call = $0.80-1.20/day. Worth it if even one becomes a winner.
-  // Limit to 8 per cycle to control API costs
-  for (const market of preGameMarkets.slice(0, 8)) {
-    const decideText = await claudeWithSearch(
-      `You are a professional sports bettor. Predict who wins this pre-game matchup.\n\n` +
+  const pgSlice = preGameMarkets.slice(0, 8);
+  const maxBetDisplay = getDynamicMaxTrade().toFixed(2);
+
+  const pgPrompts = pgSlice.map(market => ({
+    market,
+    prompt: `You are a professional sports bettor. Predict who wins this pre-game matchup.\n\n` +
       `GAME: ${market.title}\n` +
       `YES price: ${(market.yesAsk*100).toFixed(0)}¢ | NO price: ${(market.noAsk*100).toFixed(0)}¢\n\n` +
       `PRE-GAME BASELINES (verified historical data):\n` +
@@ -1726,26 +1766,37 @@ async function checkPreGamePredictions() {
       `- Poor starter pitching (ERA > 5.0) → DOWN 5-8%\n\n` +
       `BUY if confidence ≥ 65% AND at least 3 points above the price of the side you pick.\n` +
       `Pick YES (first team) or NO (second team) — whichever you're more confident in.\n` +
-      `Max bet: $${getDynamicMaxTrade().toFixed(2)} (bet MORE if confidence is much higher than price)\n\n` +
+      `Max bet: $${maxBetDisplay} (bet MORE if confidence is much higher than price)\n\n` +
       `JSON ONLY:\n` +
       `{"trade":false,"confidence":0.XX,"reasoning":"baseline X%, adjusted to Y% because [reasons]"}\n` +
       `OR {"trade":true,"side":"yes"/"no","confidence":0.XX,"betAmount":N,"reasoning":"baseline X%, adjusted to Y% because [reasons]"}`,
-      { maxTokens: 800, maxSearches: 2 }
+  }));
+
+  // Fire in parallel batches of 3
+  for (let batch = 0; batch < pgPrompts.length; batch += 3) {
+    const batchItems = pgPrompts.slice(batch, batch + 3);
+    const batchResults = await Promise.allSettled(
+      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 800, maxSearches: 2 }))
     );
-    if (!decideText) continue;
 
-    const jsonMatch = decideText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) continue;
-    let decision;
-    try { decision = JSON.parse(jsonMatch[0]); } catch { continue; }
+    for (let i = 0; i < batchItems.length; i++) {
+      const { market } = batchItems[i];
+      const decideText = batchResults[i].status === 'fulfilled' ? batchResults[i].value : null;
+      if (!decideText) continue;
 
-    const pick = { ticker: market.ticker, side: decision.side ?? 'yes' };
+      const jsonMatch = decideText.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) continue;
+      let decision;
+      try { decision = JSON.parse(jsonMatch[0]); } catch { continue; }
 
-    if (!decision.trade) {
-      console.log(`[pre-game] Sonnet rejected ${market.ticker}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
-      logScreen({ stage: 'pre-game-sonnet', ticker: market.ticker, result: 'rejected', confidence: decision.confidence, reasoning: decision.reasoning });
-      continue;
-    }
+      const pick = { ticker: market.ticker, side: decision.side ?? 'yes' };
+      const price = pick.side === 'yes' ? market.yesAsk : market.noAsk;
+
+      if (!decision.trade) {
+        console.log(`[pre-game] Sonnet rejected ${market.ticker}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
+        logScreen({ stage: 'pre-game-sonnet', ticker: market.ticker, result: 'rejected', confidence: decision.confidence, reasoning: decision.reasoning });
+        continue;
+      }
 
     let confidence = decision.confidence ?? 0;
 
@@ -1842,6 +1893,7 @@ async function checkPreGamePredictions() {
         `Potential profit: <b>$${(qty * (1 - bestPrice)).toFixed(2)}</b>${pgSavedMsg}\n\n` +
         `🧠 <i>${decision.reasoning}</i>`
       );
+    }
     }
   }
 }
@@ -2820,6 +2872,8 @@ async function checkSettlements() {
                 updated = true;
                 const icon = pnl >= 0 ? '✅' : '❌';
                 console.log(`[pnl] POLY SETTLED: ${slug} → ${won ? 'WIN' : 'LOSS'} | P&L: ${icon} $${pnl.toFixed(2)}`);
+                const pnlStr = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
+                await tg(`${icon} <b>SETTLED${won ? ' — WIN' : ' — LOSS'} (Poly)</b>\n\n<b>${trade.title ?? slug}</b>\nP&L: <b>${pnlStr}</b>`);
               }
             }
           } catch { /* skip */ }
@@ -2863,6 +2917,8 @@ async function checkSettlements() {
               updated = true;
               const icon = pnl >= 0 ? '✅' : '❌';
               console.log(`[pnl] POLY SETTLED: ${trade.ticker} → ${won ? 'WIN' : 'LOSS'} | P&L: ${icon} $${pnl.toFixed(2)}`);
+              const pnlStr2 = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
+              await tg(`${icon} <b>SETTLED${won ? ' — WIN' : ' — LOSS'} (Poly)</b>\n\n<b>${trade.title ?? trade.ticker}</b>\nP&L: <b>${pnlStr2}</b>`);
               break;
             }
           } catch { /* skip */ }
@@ -2911,6 +2967,16 @@ async function checkSettlements() {
 
       const icon = pnl >= 0 ? '✅' : '❌';
       console.log(`[pnl] SETTLED: ${trade.ticker} ${trade.side} → ${market.result} | P&L: ${icon} $${pnl.toFixed(2)}`);
+
+      // Send Telegram notification for every settlement
+      const pnlStr = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
+      await tg(
+        `${icon} <b>SETTLED${won ? ' — WIN' : ' — LOSS'}</b>\n\n` +
+        `<b>${trade.title ?? trade.ticker}</b>\n` +
+        `Bought ${trade.side?.toUpperCase()} @ ${((trade.entryPrice ?? 0)*100).toFixed(0)}¢ × ${qty}\n` +
+        `Result: <b>${market.result?.toUpperCase()}</b>\n` +
+        `P&L: <b>${pnlStr}</b>`
+      );
     }
 
     if (updated) {
