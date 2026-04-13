@@ -360,6 +360,8 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
 // State
 // ─────────────────────────────────────────────────────────────────────────────
 
+let lastHighConvictionAt = 0;      // timestamp of last high-conviction bet
+let highConvictionDeployed = 0;    // total $ in active high-conviction bets
 const tradeCooldowns = new Map(); // ticker → lastTradedMs
 const lastGameStates = new Map(); // "ATH@NYM" → "1-0-5" (score-period, for change detection)
 const gameEntries = new Map();    // "game:ATH@NYM" → { count: 2, lastPrice: 0.62, totalDeployed: 24.36 }
@@ -521,7 +523,52 @@ function canTrade() {
   return true;
 }
 
-function getPositionSize(exchange = 'kalshi', confidenceMargin = 0) {
+// High-conviction tier — detects near-certain late-game situations
+// Returns { isHighConv: true, tier: '30%'/'25%'/'20%', reason: '...' } or { isHighConv: false }
+function checkHighConviction(confidence, league, stage, diff, period) {
+  if (confidence < 0.90 || stage !== 'late') return { isHighConv: false };
+
+  // Safety rails: max 1 per hour, max 40% of bankroll in high-conviction
+  if (Date.now() - lastHighConvictionAt < 60 * 60 * 1000) return { isHighConv: false };
+  if (highConvictionDeployed >= getBankroll() * 0.40) return { isHighConv: false };
+
+  // Sport-specific lead thresholds for "game is over"
+  let qualifies = false;
+  let reason = '';
+
+  if (league === 'nba') {
+    if (diff >= 20) { qualifies = true; reason = `NBA Q4 up ${diff} pts — <1% comeback`; }
+    else if (diff >= 15 && period === 4) { qualifies = true; reason = `NBA Q4 up ${diff} pts — ~2% comeback`; }
+  } else if (league === 'nhl') {
+    if (diff >= 2) { qualifies = true; reason = `NHL P3 up ${diff} goals — ${diff >= 3 ? '<1%' : '~5%'} comeback`; }
+    else if (diff === 1 && period === 3) { qualifies = true; reason = `NHL P3 up 1 — check time remaining`; }
+  } else if (league === 'mlb') {
+    if (diff >= 4 && period >= 7) { qualifies = true; reason = `MLB ${period}th up ${diff} runs — ~2% comeback`; }
+    else if (diff >= 3 && period >= 8) { qualifies = true; reason = `MLB ${period}th up ${diff} runs — ~5% comeback`; }
+  } else if (league === 'mls' || league === 'epl' || league === 'laliga') {
+    if (diff >= 2) { qualifies = true; reason = `Soccer 75'+ up ${diff} goals — <3% comeback`; }
+  }
+
+  if (!qualifies) return { isHighConv: false };
+
+  // Determine tier based on confidence
+  const tier = confidence >= 0.93 ? 0.30 : confidence >= 0.90 ? 0.25 : 0.20;
+  return { isHighConv: true, tier, reason };
+}
+
+function getPositionSize(exchange = 'kalshi', confidenceMargin = 0, highConvTier = 0) {
+  const bankroll = getBankroll();
+
+  // High-conviction tier: 25-30% of bankroll instead of 10%
+  if (highConvTier > 0) {
+    const hcSize = bankroll * highConvTier;
+    const available = getAvailableCash(exchange);
+    const ceiling = getTradeCapCeiling();
+    const size = Math.min(hcSize, available, ceiling);
+    console.log(`[sizing] 🔥 HIGH CONVICTION: ${(highConvTier*100).toFixed(0)}% of $${bankroll.toFixed(0)} → $${size.toFixed(2)}`);
+    return Math.max(1, size);
+  }
+
   let size = getDynamicMaxTrade(exchange);
 
   // Scale UP for high-confidence trades — bigger margin = bigger bet
@@ -529,7 +576,6 @@ function getPositionSize(exchange = 'kalshi', confidenceMargin = 0) {
   if (confidenceMargin > 0.05) {
     const multiplier = Math.min(2.5, 1 + (confidenceMargin - 0.05) * 10);
     const scaledSize = size * multiplier;
-    // Still respect deployment cap and ceiling
     const ceiling = getTradeCapCeiling();
     size = Math.min(scaledSize, ceiling);
     if (multiplier > 1.1) console.log(`[sizing] High confidence (+${(confidenceMargin*100).toFixed(0)}%): ${multiplier.toFixed(1)}x → $${size.toFixed(2)}`);
@@ -1674,9 +1720,13 @@ async function checkLiveScoreEdges() {
         const bestEdge = confidence - bestPrice;
         if (confidence - bestPrice < reqMargin) continue; // recheck with best price (raw edge)
 
-        const maxBetLE = getPositionSize(best.platform, bestEdge);
+        // Check for high-conviction tier (late-game blowouts → 25-30% sizing)
+        const hcCheck = checkHighConviction(confidence, league, ctx?.stage ?? 'unknown', diff, period);
+        const maxBetLE = hcCheck.isHighConv
+          ? getPositionSize(best.platform, bestEdge, hcCheck.tier)
+          : getPositionSize(best.platform, bestEdge);
         const claudeBet = decision.betAmount ?? 0;
-        const safeBet = Math.min(claudeBet, maxBetLE);
+        const safeBet = hcCheck.isHighConv ? maxBetLE : Math.min(claudeBet, maxBetLE);
         if (safeBet < 1) {
           console.log(`[live-edge] Bet too small: max=$${maxBetLE.toFixed(2)} Claude=$${claudeBet}`);
           continue;
@@ -1686,8 +1736,16 @@ async function checkLiveScoreEdges() {
         const qty = Math.max(1, Math.floor(safeBet / bestPrice));
         const priceInCents = Math.round(bestPrice * 100);
 
+        // Track high-conviction deployment
+        if (hcCheck.isHighConv) {
+          lastHighConvictionAt = Date.now();
+          highConvictionDeployed += safeBet;
+          console.log(`[live-edge] 🔥 HIGH CONVICTION: ${hcCheck.reason}`);
+        }
+
+        const hcLabel = hcCheck.isHighConv ? '🔥 HIGH CONVICTION ' : '';
         const platformLabel = best.platform === 'polymarket' ? `POLY (${(price*100).toFixed(0)}¢ Kalshi → ${priceInCents}¢ Poly, saved ${((price-bestPrice)*100).toFixed(0)}¢)` : 'KALSHI';
-        console.log(`[live-edge] 🎯 TRADE on ${platformLabel}: ${ticker} ${targetAbbr} YES @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
+        console.log(`[live-edge] 🎯 ${hcLabel}TRADE on ${platformLabel}: ${ticker} ${targetAbbr} YES @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
         console.log(`  Score: ${awayAbbr} ${awayScore} @ ${homeAbbr} ${homeScore} (${gameDetail})`);
         console.log(`  Reason: ${decision.reasoning}`);
         logScreen({ stage: 'live-edge', ticker, result: 'TRADE', confidence, price: bestPrice, platform: best.platform, reasoning: decision.reasoning });
@@ -1721,11 +1779,13 @@ async function checkLiveScoreEdges() {
           recordGameEntry(`game:${homeAbbr}@${awayAbbr}`, bestPrice, actualDeployed);
 
           logTrade({
-            exchange: best.platform, strategy: 'live-prediction',
+            exchange: best.platform,
+            strategy: hcCheck.isHighConv ? 'high-conviction' : 'live-prediction',
             ticker: best.platform === 'polymarket' ? best.slug : ticker,
             title, side: 'yes',
             quantity: actualFill, entryPrice: bestPrice, deployCost: actualDeployed,
             filled: actualFill,
+            highConviction: hcCheck.isHighConv || undefined,
             orderId: (result.data?.order ?? result.data)?.order_id ?? result.data?.id ?? null,
             edge: bestEdge * 100, confidence,
             reasoning: decision.reasoning,
@@ -1734,14 +1794,17 @@ async function checkLiveScoreEdges() {
           });
 
           const savedMsg = best.platform === 'polymarket' ? `\n💡 Bought on Poly (${(price*100).toFixed(0)}¢ Kalshi → ${priceInCents}¢ Poly)` : '';
+          const hcMsg = hcCheck.isHighConv ? `\n🔥 <b>HIGH CONVICTION</b> — ${hcCheck.reason}` : '';
+          const betLabel = hcCheck.isHighConv ? '🔥 HIGH CONVICTION' :
+            targetAbbr === leadingAbbr ? '🎯 PREDICTION' : '🐕 UNDERDOG';
           await tg(
-            `🎯 <b>${targetAbbr === leadingAbbr ? 'PREDICTION' : '🐕 UNDERDOG'} BET — ${best.platform.toUpperCase()}</b>\n\n` +
+            `<b>${betLabel} BET — ${best.platform.toUpperCase()}</b>\n\n` +
             `<b>${title}</b>\n` +
             `Team: <b>${targetAbbr}</b> | Score: ${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore}\n` +
             `Status: ${gameDetail}\n\n` +
             `BUY @ ${priceInCents}¢ × ${actualFill} = <b>$${actualDeployed.toFixed(2)}</b>\n` +
             `Confidence: <b>${(confidence*100).toFixed(0)}%</b> vs price ${priceInCents}¢\n` +
-            `Potential profit: <b>$${(actualFill * (1 - bestPrice)).toFixed(2)}</b>${savedMsg}\n\n` +
+            `Potential profit: <b>$${(actualFill * (1 - bestPrice)).toFixed(2)}</b>${savedMsg}${hcMsg}\n\n` +
             `🧠 <i>${decision.reasoning}</i>`
           );
         } else {
