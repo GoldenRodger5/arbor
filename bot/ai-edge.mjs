@@ -892,10 +892,15 @@ async function refreshPortfolio() {
       for (const t of trades) {
         if (t.status !== 'open' || t.exchange !== 'kalshi') continue;
         if (!kalshiTickers.has(t.ticker)) {
-          // Kalshi no longer has this position — manually cashed out
+          // Grace period: don't auto-close positions placed in the last 5 minutes
+          // Kalshi API can be slow to reflect new orders
+          const placedAt = t.timestamp ? Date.parse(t.timestamp) : 0;
+          if (Date.now() - placedAt < 5 * 60 * 1000) {
+            continue; // too new, Kalshi might not have registered it yet
+          }
           t.status = 'closed-manual';
           t.settledAt = new Date().toISOString();
-          t.realizedPnL = t.realizedPnL ?? 0; // unknown P&L from manual close
+          t.realizedPnL = t.realizedPnL ?? 0;
           synced = true;
           console.log(`[sync] Auto-closed ${t.ticker} — no longer in Kalshi portfolio (manual cashout)`);
         }
