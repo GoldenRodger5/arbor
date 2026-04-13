@@ -37,27 +37,41 @@ const MIN_CONFIDENCE = 0.65;      // Claude must be ≥65% confident to trade
 const CONFIDENCE_MARGIN = 0.03;   // LEGACY flat margin — only used for draw bets + fallback
 
 // Dynamic confidence margin — sport-aware, price-aware, situation-aware
-// Goal: aggressive on cheap contracts (great risk/reward), selective on expensive ones
+//
+// KEY INSIGHT: Live and pre-game are completely different:
+// - LIVE: price = game state. 75¢ with a big lead = nearly free money. DON'T penalize high prices.
+// - PRE-GAME: price = market consensus. 75¢ favorite could easily lose. BE selective on expensive.
+//
+// We can't afford to spam cheap bets at $327 — need to be selective everywhere,
+// but ESPECIALLY selective on pre-game favorites and random sports (MLB).
 function getRequiredMargin(price, { sport = '', live = false, scoreChanged = false, lineMove = false } = {}) {
-  // Base margin by sport
+  // Base margin by sport — how predictable is this sport?
   const sportBase = {
-    nhl: 0.03, nba: 0.04, mlb: 0.05, mls: 0.05, epl: 0.05, laliga: 0.05,
-    ufc: 0.02, crypto: 0.04, economics: 0.04, politics: 0.04,
+    nhl: 0.03,    // low-scoring, binary outcomes, goalie variance
+    nba: 0.04,    // high-scoring but 15-pt comebacks happen 13%
+    mlb: 0.05,    // most random sport — best team wins 60% over a season
+    mls: 0.05, epl: 0.05, laliga: 0.05,  // draws kill, need conviction
+    ufc: 0.02,    // least efficient market, biggest edges
+    crypto: 0.04, economics: 0.04, politics: 0.04,
   }[sport] ?? 0.04;
 
-  // Price adjustment — cheap contracts need less margin (great risk/reward)
+  if (live) {
+    // LIVE BETS: Don't penalize high prices — they reflect the game state
+    // A team up 20 in Q4 at 85¢ is a BETTER bet than a pre-game toss-up at 50¢
+    let sitAdj = 0;
+    if (scoreChanged) sitAdj -= 0.01;         // market recalculating — act fast
+    if (lineMove) sitAdj -= 0.01;             // something happened, edge window
+    return Math.max(0.01, sportBase + sitAdj);
+  }
+
+  // PRE-GAME: Market has settled. Be selective, especially on expensive favorites.
+  // Expensive pre-game favorites are TRAPS — one loss at 75¢ wipes out 3 cheap wins.
   let priceAdj = 0;
-  if (price < 0.35) priceAdj = -0.01;       // under 35¢: reduce 1%
-  else if (price >= 0.60 && price < 0.80) priceAdj = 0.02;  // 60-80¢: add 2%
-  else if (price >= 0.80) priceAdj = 0.04;   // 80-90¢: add 4% — expensive, bad risk/reward
+  if (price >= 0.70) priceAdj = 0.03;         // 70¢+ pre-game favorite: need 3% more conviction
+  else if (price >= 0.55) priceAdj = 0.01;     // mid-range: slight bump
 
-  // Situation adjustment
-  let sitAdj = 0;
-  if (live && scoreChanged) sitAdj = -0.01;   // market adjusting to score change
-  if (lineMove) sitAdj -= 0.01;               // line moved, market catching up
-  if (!live) sitAdj += 0.01;                  // pre-game: market settled, need more edge
-
-  const margin = Math.max(0.01, sportBase + priceAdj + sitAdj);
+  // Pre-game always needs +1% vs live (market has had time to settle)
+  const margin = Math.max(0.02, sportBase + priceAdj + 0.01);
   return margin;
 }
 const MAX_PRICE = 0.90;           // Don't buy contracts above 90¢ — allows high-confidence late-game bets
