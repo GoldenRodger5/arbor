@@ -1234,16 +1234,17 @@ async function checkLiveScoreEdges() {
         let targetTeam = leading;
         let price = leadPrice;
 
-        // Underdog check: only if trailing team has a BETTER record than the leader
-        if (trailMarket && trailPrice >= 0.15 && trailPrice <= 0.40 && period <= 4 && diff <= 3) {
-          // Parse win counts from records to compare team quality
+        // Underdog check: only if trailing team has a MUCH better record AND deficit is small AND early in game
+        // Being down 2-0 in NHL means ~15-20% comeback chance. Even for a much better team, max ~30%.
+        // Only take underdog if: diff ≤ 1, period ≤ 2, trail team has 10+ more wins
+        if (trailMarket && trailPrice >= 0.15 && trailPrice <= 0.40 && period <= 2 && diff <= 1) {
           const trailRec = trailing.records?.[0]?.summary ?? '';
           const leadRec = leading.records?.[0]?.summary ?? '';
           const parseWins = (rec) => parseInt(rec.split('-')[0]) || 0;
           const trailWins = parseWins(trailRec);
           const leadWins = parseWins(leadRec);
-          // Only bet underdog if they have MORE wins (better team down early)
-          if (trailWins > leadWins) {
+          // Only bet underdog if they have SIGNIFICANTLY more wins (10+) — small quality gaps don't overcome deficits
+          if (trailWins > leadWins + 10) {
             targetMarket = trailMarket;
             targetAbbr = trailingAbbr;
             targetTeam = trailing;
@@ -1451,11 +1452,26 @@ async function checkLiveScoreEdges() {
         }
 
         // Confidence-based gate — simple and clear
-        const confidence = decision.confidence ?? 0;
+        let confidence = decision.confidence ?? 0;
         if (confidence < MIN_CONFIDENCE) {
           console.log(`[live-edge] Confidence too low: ${(confidence*100).toFixed(0)}% < 65%`);
           continue;
         }
+
+        // HARD CAP: Claude can't deviate more than 15% from historical baseline
+        // This prevents insanity like "17% baseline → 68% confidence" (Utah @ Calgary)
+        // Sports statistics exist for a reason — talent gaps are worth 5-10%, not 50%
+        const baselineWE = getWinExpectancy(league, diff, period, leadingAbbr === homeAbbr);
+        if (baselineWE != null) {
+          // For the target team: if they're leading, baseline = baselineWE. If trailing, baseline = 1 - baselineWE
+          const targetBaseline = targetAbbr === leadingAbbr ? baselineWE : (1 - baselineWE);
+          const maxAllowed = Math.min(0.95, targetBaseline + 0.15); // max 15% above baseline
+          if (confidence > maxAllowed) {
+            console.log(`[live-edge] Confidence capped: Claude said ${(confidence*100).toFixed(0)}% but baseline is ${(targetBaseline*100).toFixed(0)}% → capped at ${(maxAllowed*100).toFixed(0)}%`);
+            confidence = maxAllowed;
+          }
+        }
+
         // Confidence must exceed price for the bet to be +EV
         if (confidence < price + CONFIDENCE_MARGIN) {
           console.log(`[live-edge] Not enough margin: conf=${(confidence*100).toFixed(0)}% vs price=${(price*100).toFixed(0)}¢ (need ${(CONFIDENCE_MARGIN*100).toFixed(0)}%+ gap)`);
