@@ -935,6 +935,16 @@ const ABBR_MAP = {
   'TB': 'TBL', 'TBL': 'TB',       // Tampa Bay Lightning (NHL only — MLB TB is fine)
   'WSH': 'WAS', 'WAS': 'WSH',     // Washington (varies by sport)
   'ATH': 'OAK', 'OAK': 'ATH',     // Oakland/Athletics
+  // Soccer abbreviation mismatches (ESPN vs Kalshi)
+  'MAN': 'MUN', 'MUN': 'MAN',     // Manchester United
+  'LEE': 'LEE',                     // Leeds (same but for completeness)
+  'FIO': 'FIO',                     // Fiorentina
+  'LAZ': 'LAZ',                     // Lazio
+  'VAL': 'VLL', 'VLL': 'VAL',     // Valladolid
+  'EIB': 'EIB',                     // Eibar
+  'WOL': 'WLV', 'WLV': 'WOL',    // Wolverhampton
+  'BRE': 'BRE',                     // Brentford
+  'FUL': 'FUL',                     // Fulham
 };
 
 // Check if a ticker contains a team abbreviation (tries both ESPN and Kalshi versions)
@@ -1399,7 +1409,6 @@ async function checkLiveScoreEdges() {
         const homeAbbr = home.team?.abbreviation ?? '';
         const awayAbbr = away.team?.abbreviation ?? '';
         if (!homeAbbr || !awayAbbr) continue;
-        console.log(`[live-edge] Sonnet analyzing: ${away.team?.displayName} (${awayAbbr}) ${awayScore} @ ${home.team?.displayName} (${homeAbbr}) ${homeScore} (${gameDetail})`);
 
         // Get today/tonight Kalshi markets — pre-filter to THIS game's teams + today's date
         const etNowLE = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
@@ -1425,6 +1434,8 @@ async function checkLiveScoreEdges() {
           console.log(`[live-edge] No Kalshi market found for ${awayAbbr}@${homeAbbr} on ${todayStr}${tonightStr ? '/' + tonightStr : ''}`);
           continue;
         }
+
+        console.log(`[live-edge] Sonnet analyzing: ${away.team?.displayName} (${awayAbbr}) ${awayScore} @ ${home.team?.displayName} (${homeAbbr}) ${homeScore} (${gameDetail})`);
 
         // Check BOTH sides — leading team AND trailing team (underdog value)
         const leadingAbbr = leading.team?.abbreviation ?? '';
