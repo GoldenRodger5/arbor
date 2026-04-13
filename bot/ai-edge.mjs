@@ -848,17 +848,16 @@ async function refreshPortfolio() {
     kalshiPositionValue = (bal.portfolio_value ?? 0) / 100;
   } catch { /* keep old */ }
 
-  // Fetch Kalshi open positions — filter to those with actual contracts remaining
+  // Fetch Kalshi open positions — filter by event_exposure (active positions only)
   try {
     const data = await kalshiGet('/portfolio/positions');
     const allPositions = data.event_positions ?? data.market_positions ?? data.positions ?? [];
     openPositions = allPositions.map(p => ({
       ticker: p.event_ticker ?? p.ticker ?? p.market_ticker ?? '',
       cost: parseFloat(p.total_cost_dollars ?? '0'),
-      // Check for actual open contracts, not just historical cost
-      quantity: (p.yes_contracts ?? 0) + (p.no_contracts ?? 0) + (p.total_contracts ?? 0),
+      exposure: parseFloat(p.event_exposure_dollars ?? '0'),
       exchange: 'kalshi',
-    })).filter(p => p.cost > 0 && p.quantity > 0); // must have cost AND contracts
+    })).filter(p => p.exposure > 0); // only positions with active exposure (not settled/cashed out)
   } catch { openPositions = []; }
 
   // Add Polymarket open positions from trades log — Poly API doesn't have a positions endpoint
