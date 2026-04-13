@@ -281,9 +281,10 @@ async function tg(text) {
 // Claude with Web Search — researches before deciding
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Cheap Haiku screen — no web search, fast, $0.002/call
+// Cheap Haiku screen — no web search, fast, ~$0.002/call
 async function claudeScreen(prompt, { maxTokens = 300, timeout = 10000 } = {}) {
   stats.claudeCalls++;
+  stats.apiSpendCents += 0.2; // ~$0.002
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       signal: AbortSignal.timeout(timeout),
@@ -308,9 +309,10 @@ async function claudeScreen(prompt, { maxTokens = 300, timeout = 10000 } = {}) {
   }
 }
 
-// Expensive Sonnet + web search — only for final trade decisions
+// Expensive Sonnet + web search — only for final trade decisions, ~$0.03-0.05/call
 async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, timeout = 45000 } = {}) {
   stats.claudeCalls++;
+  stats.apiSpendCents += 3 + maxSearches; // ~$0.03 base + $0.01/search
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       signal: AbortSignal.timeout(timeout),
@@ -392,7 +394,7 @@ function recordGameEntry(gameKey, price, deployed) {
 let kalshiBalance = 0;
 let kalshiPositionValue = 0;
 let openPositions = [];  // fetched each cycle
-let stats = { claudeCalls: 0, tradesPlaced: 0 }; // only tracking active metrics
+let stats = { claudeCalls: 0, tradesPlaced: 0, apiSpendCents: 0 }; // track API costs
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Risk Management State
@@ -424,11 +426,13 @@ function getMaxDeployment() {
 
 function getMaxPositions() {
   const b = getBankroll();
-  if (b < 500) return 30;       // small account — deployment cap is the real limiter
-  if (b < 2000) return 40;
-  if (b < 10000) return 50;
-  if (b < 50000) return 60;
-  return 80;
+  // Fewer, larger, higher-conviction bets. Thin positions = fee drag + no impact.
+  if (b < 500) return 12;
+  if (b < 1000) return 15;
+  if (b < 2000) return 18;
+  if (b < 10000) return 25;
+  if (b < 50000) return 35;
+  return 50;
 }
 
 // Per-trade cap also scales: small accounts need room, big accounts need limits
@@ -751,6 +755,7 @@ async function sendDailyReport() {
     (stratLines || '  No trades yet') + '\n\n' +
     `Open: ${snap.openPositionCount} positions, $${snap.totalDeployed.toFixed(2)} deployed\n` +
     `Consecutive losses: ${snap.consecutiveLosses}\n` +
+    `API spend today: ~$${(stats.apiSpendCents / 100).toFixed(2)} (${stats.claudeCalls} calls)\n` +
     `🕐 ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })} ET`
   );
 }
@@ -3381,7 +3386,8 @@ function logStats() {
     } catch { /* skip */ }
   }
   const pnlStr = totalPnL >= 0 ? `+$${totalPnL.toFixed(2)}` : `-$${Math.abs(totalPnL).toFixed(2)}`;
-  console.log(`[ai-stats] claude=${stats.claudeCalls} trades=${stats.tradesPlaced} bal=$${kalshiBalance.toFixed(2)} poly=$${polyBalance.toFixed(2)} pnl=${pnlStr} (${settledCount} settled)`);
+  const apiSpend = (stats.apiSpendCents / 100).toFixed(2);
+  console.log(`[ai-stats] claude=${stats.claudeCalls} trades=${stats.tradesPlaced} api=$${apiSpend} bal=$${kalshiBalance.toFixed(2)} poly=$${polyBalance.toFixed(2)} pnl=${pnlStr} (${settledCount} settled)`);
 }
 
 async function main() {
