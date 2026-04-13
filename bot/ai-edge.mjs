@@ -1909,15 +1909,30 @@ async function checkPreGamePredictions() {
     return;
   }
 
-  // Daily limit on pre-game trades
+  // Daily limit — count from JSONL (survives restarts), not just in-memory counter
   const todayDateStr = etNow.toISOString().slice(0, 10);
   if (preGameTradesDate !== todayDateStr) {
-    preGameTradesToday = 0;
     preGameTradesDate = todayDateStr;
     preGameBetGames.clear();
+    // Restore count from JSONL — count ALL pre-game trades placed today, any status
+    preGameTradesToday = 0;
+    if (existsSync(TRADES_LOG)) {
+      const todayLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      for (const l of todayLines) {
+        try {
+          const t = JSON.parse(l);
+          if (t.strategy === 'pre-game-prediction' && t.timestamp?.startsWith(todayDateStr) && t.exchange === 'kalshi') {
+            preGameTradesToday++;
+            const tBase = t.ticker?.lastIndexOf('-') > 0 ? t.ticker.slice(0, t.ticker.lastIndexOf('-')) : t.ticker;
+            preGameBetGames.add(tBase);
+          }
+        } catch {}
+      }
+    }
+    if (preGameTradesToday > 0) console.log(`[pre-game] Restored count from JSONL: ${preGameTradesToday} pre-game trades today`);
   }
   if (preGameTradesToday >= MAX_PREGAME_PER_DAY) {
-    console.log(`[pre-game] Daily limit reached (${MAX_PREGAME_PER_DAY} trades). Skipping until tomorrow.`);
+    console.log(`[pre-game] Daily limit reached (${preGameTradesToday}/${MAX_PREGAME_PER_DAY} trades). Skipping.`);
     return;
   }
 
