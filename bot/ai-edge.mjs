@@ -998,7 +998,26 @@ async function checkLiveScoreEdges() {
   // Sort by baseline WE — highest opportunity first
   candidates.sort((a, b) => b._baselineWE - a._baselineWE);
 
-  console.log(`[live-edge] ${candidates.length} candidates from ${liveGames.length} live (${candidates.map(g => {
+  // === BATCH FETCH: Get ALL sports market prices in one parallel call ===
+  const cachedPrices = new Map();
+  const seriesList = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME', 'KXEPLGAME', 'KXLALIGAGAME'];
+  try {
+    const batchResults = await Promise.allSettled(
+      seriesList.map(s => kalshiGet(`/markets?series_ticker=${s}&status=open&limit=200`).catch(() => ({ markets: [] })))
+    );
+    for (const r of batchResults) {
+      for (const m of (r.status === 'fulfilled' ? (r.value?.markets ?? []) : [])) {
+        if (m.yes_ask_dollars && m.ticker) {
+          cachedPrices.set(m.ticker, {
+            yes: parseFloat(m.yes_ask_dollars), no: parseFloat(m.no_ask_dollars ?? '0'),
+            title: m.title ?? '', closeTime: m.close_time ?? '',
+          });
+        }
+      }
+    }
+  } catch { /* batch fetch failed, will fall back to individual calls */ }
+
+  console.log(`[live-edge] ${candidates.length} candidates, ${cachedPrices.size} prices cached | ${candidates.map(g => {
     const tag = g._scoreChanged ? '⚡' : '📊';
     return tag + g.away.team?.abbreviation + '@' + g.home.team?.abbreviation + '(' + (g._baselineWE*100).toFixed(0) + '%)';
   }).join(', ')})`);
@@ -1040,13 +1059,11 @@ async function checkLiveScoreEdges() {
 
         // Only bet draws when probability is high enough (>55%)
         if (drawProb >= 0.55) {
-          // Find the TIE market
-          const params = new URLSearchParams({ series_ticker: series, status: 'open', limit: '100' });
-          const mkts = await kalshiGet(`/markets?${params}`);
-          const tieMarket = (mkts.markets ?? []).find(m => {
-            const ticker = m.ticker ?? '';
-            return ticker.includes('-TIE') && tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
-          });
+          // Find the TIE market from cached prices (instant, no API call)
+          const tieEntry = [...cachedPrices.entries()].find(([t]) =>
+            t.includes('-TIE') && tickerHasTeam(t, homeAbbr) && tickerHasTeam(t, awayAbbr)
+          );
+          const tieMarket = tieEntry ? { ticker: tieEntry[0], yes_ask_dollars: String(tieEntry[1].yes), title: tieEntry[1].title } : null;
 
           if (tieMarket) {
             const tiePrice = parseFloat(tieMarket.yes_ask_dollars ?? '1');
@@ -1135,23 +1152,16 @@ async function checkLiveScoreEdges() {
         const etTmrwLE = new Date(etNowLE.getTime() + 24 * 60 * 60 * 1000);
         const tonightStr = etHourLE >= 22 ? toShortLE(etTmrwLE) : null;
 
-        const params = new URLSearchParams({ series_ticker: series, status: 'open', limit: '100' });
-        const mkts = await kalshiGet(`/markets?${params}`);
-
-        // Filter to ONLY markets for THIS game: must match teams AND TODAY's date
-        // Only accept tomorrow's date after 10pm ET (for games that started tonight)
-        const gameMarkets = (mkts.markets ?? []).filter(m => {
-          if (!m.yes_ask_dollars || !m.no_ask_dollars) return false;
-          const ya = parseFloat(m.yes_ask_dollars);
-          const na = parseFloat(m.no_ask_dollars);
-          if (ya < 0.01 || ya > 0.99 || na < 0.01 || na > 0.99) return false;
-          const ticker = m.ticker ?? '';
-          // Must be today's date (or tonight's late game after 10pm ET)
-          if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) return false;
-          // Must match BOTH playing teams (ticker contains both abbreviations)
-          // Use abbreviation mapper — ESPN "CHW" matches Kalshi "CWS" etc.
-          return tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
-        });
+        // Filter cached prices for THIS game (instant, no API call)
+        const gameMarkets = [...cachedPrices.entries()]
+          .filter(([ticker, data]) => {
+            if (data.yes < 0.01 || data.yes > 0.99) return false;
+            if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) return false;
+            return tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
+          })
+          .map(([ticker, data]) => ({
+            ticker, title: data.title, yes_ask_dollars: String(data.yes), no_ask_dollars: String(data.no),
+          }));
 
         if (gameMarkets.length === 0) {
           console.log(`[live-edge] No Kalshi market found for ${awayAbbr}@${homeAbbr} on ${todayStr}${tonightStr ? '/' + tonightStr : ''}`);
