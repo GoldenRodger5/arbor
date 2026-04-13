@@ -70,9 +70,18 @@ function handleRequest(req, res) {
       json(res, filtered);
 
     } else if (path === '/api/positions') {
+      // Merge: JSONL open trades + match with Kalshi active positions for accuracy
       const trades = readJsonl(TRADES_LOG);
       const exchangeFilter = url.searchParams.get('exchange') ?? 'kalshi';
-      const open = trades.filter(t => t.status === 'open' && (exchangeFilter === 'all' || t.exchange === exchangeFilter));
+      const open = trades.filter(t => {
+        if (t.status === 'testing-void') return false;
+        // Show 'open' AND 'closed-manual' that were placed today (likely still active on Kalshi)
+        const isToday = t.timestamp?.startsWith(new Date().toISOString().slice(0, 10));
+        const isActive = t.status === 'open' || (t.status === 'closed-manual' && isToday && t.exchange === 'kalshi');
+        if (!isActive) return false;
+        if (exchangeFilter !== 'all' && t.exchange !== exchangeFilter) return false;
+        return true;
+      });
       json(res, open);
 
     } else if (path === '/api/stats') {
