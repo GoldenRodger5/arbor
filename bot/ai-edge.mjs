@@ -1352,9 +1352,9 @@ async function checkLiveScoreEdges() {
           `BUY if: your probability ≥ 65% AND at least 3 points above price.\n` +
           `${targetAbbr !== leadingAbbr ? 'NOTE: This is an UNDERDOG bet. The baseline says they LOSE. Only bet if specific factors override the baseline.\n' : ''}` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)} (bet MORE if confidence is much higher than price)\n\n` +
-          `JSON ONLY:\n` +
-          `{"trade": false, "confidence": 0.XX, "reasoning": "baseline X%, adjusted to Y% because [reasons]. Price is Z¢ so [pass/buy]."}\n` +
-          `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "baseline X%, adjusted to Y% because [reasons]. Price Z¢ = good buy."}`;
+          `RESPOND WITH JSON ONLY — no analysis text, just the JSON object:\n` +
+          `{"trade": false, "confidence": 0.XX, "reasoning": "one sentence"}\n` +
+          `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "one sentence"}`;
         // Block if we already have a position on this game (check BOTH platforms)
         const ticker = targetMarket.ticker;
         const lastH = ticker.lastIndexOf('-');
@@ -1388,7 +1388,9 @@ async function checkLiveScoreEdges() {
 
         // Ask Claude to PREDICT the winner
         sonnetCallsThisCycle++;
-        const cText = await claudeWithSearch(livePrompt);
+        // maxSearches: 1 (we already have rich ESPN data in prompt — one search for team context is enough)
+        // maxTokens: 800 (prompt is rich, need room for JSON response)
+        const cText = await claudeWithSearch(livePrompt, { maxTokens: 800, maxSearches: 1 });
         if (!cText) { console.log(`[live-edge] Sonnet returned empty for ${homeAbbr}@${awayAbbr}`); continue; }
         const jsonMatch = cText.match(/\{[\s\S]*\}/);
         if (!jsonMatch) { console.log(`[live-edge] Sonnet response not JSON for ${homeAbbr}@${awayAbbr}: ${cText.slice(0, 100)}`); continue; }
