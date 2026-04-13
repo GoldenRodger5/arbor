@@ -1390,7 +1390,7 @@ async function checkLiveScoreEdges() {
         sonnetCallsThisCycle++;
         // maxSearches: 1 (we already have rich ESPN data in prompt — one search for team context is enough)
         // maxTokens: 800 (prompt is rich, need room for JSON response)
-        const cText = await claudeWithSearch(livePrompt, { maxTokens: 800, maxSearches: 1 });
+        const cText = await claudeWithSearch(livePrompt, { maxTokens: 1500, maxSearches: 1 });
         if (!cText) { console.log(`[live-edge] Sonnet returned empty for ${homeAbbr}@${awayAbbr}`); continue; }
         const jsonMatch = cText.match(/\{[\s\S]*\}/);
         if (!jsonMatch) { console.log(`[live-edge] Sonnet response not JSON for ${homeAbbr}@${awayAbbr}: ${cText.slice(0, 100)}`); continue; }
