@@ -1906,16 +1906,16 @@ async function checkPreGamePredictions() {
       `BUY if confidence ≥ 65% AND at least 3 points above the price of the side you pick.\n` +
       `Pick YES (first team) or NO (second team) — whichever you're more confident in.\n` +
       `Max bet: $${maxBetDisplay} (bet MORE if confidence is much higher than price)\n\n` +
-      `JSON ONLY:\n` +
-      `{"trade":false,"confidence":0.XX,"reasoning":"baseline X%, adjusted to Y% because [reasons]"}\n` +
-      `OR {"trade":true,"side":"yes"/"no","confidence":0.XX,"betAmount":N,"reasoning":"baseline X%, adjusted to Y% because [reasons]"}`,
+      `CRITICAL: You MUST respond with ONLY a JSON object. No analysis text before or after. Just the JSON.\n` +
+      `{"trade":false,"confidence":0.XX,"reasoning":"one sentence: baseline X% adjusted to Y% because Z"}\n` +
+      `OR {"trade":true,"side":"yes"/"no","confidence":0.XX,"betAmount":N,"reasoning":"one sentence: baseline X% adjusted to Y% because Z"}`,
   }));
 
   // Fire in parallel batches of 3
   for (let batch = 0; batch < pgPrompts.length; batch += 3) {
     const batchItems = pgPrompts.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 800, maxSearches: 2 }))
+      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 500, maxSearches: 2 }))
     );
 
     for (let i = 0; i < batchItems.length; i++) {
