@@ -1803,16 +1803,16 @@ async function checkLiveScoreEdges() {
         let price = leadPrice;
 
         // Sport-specific underdog rules — comebacks vary drastically by sport
-        // NHL: low-scoring, 2-goal deficit is massive (15-20% comeback). Only bet down 1, period 1.
+        // NHL: low-scoring, 2-goal deficit is massive (15-20% comeback). EXACTLY down 1, period 1 only.
         // NBA: high-scoring, 15-pt comebacks happen 13%. Underdogs viable if down ≤10 in Q1-Q2.
         // MLB: mid-variance, 3-run comebacks happen 20% thru 6 innings. Down ≤2 thru inning 5.
         // Soccer: 1-goal deficits equalize ~20% of the time. Down 1 in 1st half only.
         let underdogAllowed = false;
-        if (trailMarket && trailPrice >= 0.15 && trailPrice <= 0.40) {
-          if (league === 'nhl' && diff <= 1 && period <= 1) underdogAllowed = true;
+        if (trailMarket && trailPrice >= 0.15 && trailPrice <= 0.35) {
+          if (league === 'nhl' && diff === 1 && period === 1) underdogAllowed = true;  // EXACTLY 1 goal, EXACTLY P1
           else if (league === 'nba' && diff <= 10 && period <= 2) underdogAllowed = true;
           else if (league === 'mlb' && diff <= 2 && period <= 5) underdogAllowed = true;
-          else if ((league === 'mls' || league === 'epl' || league === 'laliga') && diff <= 1 && period <= 1) underdogAllowed = true;
+          else if ((league === 'mls' || league === 'epl' || league === 'laliga') && diff === 1 && period <= 1) underdogAllowed = true;
         }
 
         if (underdogAllowed) {
@@ -2039,7 +2039,11 @@ async function checkLiveScoreEdges() {
           `✓ Confidence ≥ 65%\n` +
           `✓ Confidence beats price by 4+ points (minimum — multiple factors needed for borderline cases)\n` +
           `✓ You have CLEAR conviction. If you had to talk yourself into it, say NO.\n` +
-          `${targetAbbr !== leadingAbbr ? '⚠️ UNDERDOG BET: The baseline says they LOSE. Need specific overriding factors.\n' : ''}` +
+          `${targetAbbr !== leadingAbbr ? `⚠️ UNDERDOG BET — HARD CAPS (non-negotiable):\n` +
+            `  • Your confidence CANNOT exceed ${league === 'nhl' ? '58' : league === 'nba' ? '60' : league === 'mlb' ? '58' : '55'}% regardless of team quality.\n` +
+            `  • Historical comeback rate for this deficit/time is the anchor — team records add AT MOST +10% above it.\n` +
+            `  • If the price is already reflecting smart money, you have NO edge — say NO.\n` +
+            `  • If you cannot name ONE specific, verifiable fact (not "they're the better team") that overrides the deficit — say NO.\n` : ''}` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
           `RESPOND WITH JSON ONLY:\n` +
           `{"trade": false, "confidence": 0.XX, "reasoning": "why market is right / what disqualified this"}\n` +
@@ -3790,6 +3794,16 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
     trade.exitPrice = currentPrice;
     trade.realizedPnL = Math.round(profit * 100) / 100;
     trade.settledAt = new Date().toISOString();
+    // After any stop-loss, lock out re-entry on this game for 30 min
+    // Prevents "revenge trading" — if we stopped out the game is going against us
+    if (isStopLoss) {
+      const stoppedBase = trade.ticker.lastIndexOf('-') > 0
+        ? trade.ticker.slice(0, trade.ticker.lastIndexOf('-'))
+        : trade.ticker;
+      const STOP_REENTRY_COOLDOWN = 30 * 60 * 1000;
+      tradeCooldowns.set(stoppedBase, Date.now() + STOP_REENTRY_COOLDOWN - COOLDOWN_MS);
+      console.log(`[exit] 🔒 Re-entry locked on ${stoppedBase} for 30 min after stop`);
+    }
   } else {
     // Partial exit — update quantity and cost, keep open
     const remainQty = totalQty - sellQty;
