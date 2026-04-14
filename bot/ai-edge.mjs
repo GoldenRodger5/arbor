@@ -1956,7 +1956,8 @@ async function checkLiveScoreEdges() {
           `- ${league === 'mlb' ? 'Weak bullpen (ERA > 5.0) → DOWN 3-5%' : league === 'nba' ? 'MODERN NBA: 15-pt comebacks happen 13% now (3pt era) — be less aggressive on big NBA leads' : (league === 'mls' || league === 'epl' || league === 'laliga') ? 'DRAWS happen 24-30% of games (EPL 28%). 1-goal leads hold ~65-78%. Minutes 55-70 = best comeback window. Red card on YOUR team = DOWN 25-30%.' : 'Empty net situation → DOWN 5-10%'}\n` +
           `- ${league === 'nba' ? 'Star player in foul trouble → DOWN 5-10% for their team' : 'Trailing team has momentum (just scored multiple) → DOWN 2-4%'}\n` +
           `- IMPORTANT: Time remaining matters MORE than period/quarter number. 10pts up with 8min left ≠ 10pts up with 30sec left.\n` +
-          `- RESTING/MISSING STARTERS: If the LEADING team is missing 3+ key players (resting, injured, scratched), apply a MANDATORY -10 to -15% reduction from baseline. A team resting their top line or star players is NOT the same team that earned that baseline win rate. If a team is resting their best players, the market already knows — do NOT bet on them.\n\n` +
+          `- RESTING/MISSING STARTERS: If the LEADING team is missing 3+ key players (resting, injured, scratched), apply a MANDATORY -10 to -15% reduction from baseline. A team resting their top line or star players is NOT the same team that earned that baseline win rate. If a team is resting their best players, the market already knows — do NOT bet on them.\n` +
+          `- PLAYOFF MOTIVATION MISMATCH — HARD NO: If the TRAILING/OPPOSING team is fighting for a playoff spot, playoff seeding, or clinching tonight, while the leading team is resting starters or has nothing to play for — this is a HARD NO regardless of score, record, or baseline. A desperate team fighting for their playoff life plays an entirely different game than their regular season numbers suggest. Motivation gap + resting starters = DO NOT BET. This is one of the most reliable patterns in sports: end-of-season clinching games vs resting favorites almost always favor the desperate team.\n\n` +
           `Use web search to check: are key players resting tonight? What are the injury reports? Then give your FINAL adjusted probability.\n\n` +
           `BUY if: your probability ≥ 65% AND at least 3 points above price.\n` +
           `${targetAbbr !== leadingAbbr ? 'NOTE: This is an UNDERDOG bet. The baseline says they LOSE. Only bet if specific factors override the baseline.\n' : ''}` +
@@ -2396,7 +2397,11 @@ async function checkPreGamePredictions() {
         `  ${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `  ${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `BASELINE: ${sportBaseline}\n\n` +
-        `RESEARCH: Look up both teams' 2026 records, starting pitchers/goalies, key injuries TODAY, recent form.\n\n` +
+        `RESEARCH: Look up both teams' 2026 records, starting pitchers/goalies, key injuries TODAY, recent form. Check if either team is resting starters.\n\n` +
+        `CRITICAL FLAGS — HARD NO on this bet if ANY of these are true:\n` +
+        `1. The team you want to bet ON is resting 3+ key players tonight (resting starters = not the same team)\n` +
+        `2. The OPPONENT has significant playoff/clinching implications tonight while your team has nothing to play for — desperate teams playing for their lives outperform their numbers; this motivation gap almost always favors the desperate team\n` +
+        `3. Both flags together = automatic NO regardless of record or price\n\n` +
         `Tell me WHICH TEAM WINS and how confident you are.\n` +
         `BUY if confidence ≥ 65% AND at least 3 points above that team's price.\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
