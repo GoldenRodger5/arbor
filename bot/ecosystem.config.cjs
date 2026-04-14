@@ -37,7 +37,7 @@ module.exports = {
       restart_delay: 10000,
       max_memory_restart: '200M',
       env: { NODE_ENV: 'production' },
-      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      // No log_date_format — bot adds its own ET timestamps via console.log override
       error_file: './logs/ai-error.log',
       out_file: './logs/ai-out.log',
       merge_logs: true,

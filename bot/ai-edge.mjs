@@ -24,6 +24,28 @@ import { createPrivateKey, sign as cryptoSign, constants as cryptoConstants } fr
 import 'dotenv/config';
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Time Helpers — everything in ET, never raw UTC
+// ─────────────────────────────────────────────────────────────────────────────
+
+function etNow() {
+  return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+}
+function etTodayStr() {
+  const d = etNow();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+function etHour() { return etNow().getHours(); }
+function etTimestamp() {
+  const d = etNow();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+}
+// Override console.log to prefix with ET timestamp
+const _origLog = console.log;
+const _origErr = console.error;
+console.log = (...args) => _origLog(etTimestamp() + ':', ...args);
+console.error = (...args) => _origErr(etTimestamp() + ':', ...args);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -389,7 +411,7 @@ const LINE_MOVE_THRESHOLD = 0.05; // 5¢ move = something happened
 try {
   if (existsSync('./logs/trades.jsonl')) {
     const restoreLines = readFileSync('./logs/trades.jsonl', 'utf-8').split('\n').filter(l => l.trim());
-    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayStr = etTodayStr();
     for (const l of restoreLines) {
       try {
         const t = JSON.parse(l);
@@ -820,7 +842,7 @@ function saveDailySnapshot() {
     }
 
     const snapshot = {
-      date: new Date().toISOString().slice(0, 10),
+      date: etTodayStr(),
       timestamp: new Date().toISOString(),
       bankroll: getBankroll(),
       kalshiCash: kalshiBalance,
@@ -1893,7 +1915,7 @@ async function checkLiveScoreEdges() {
         // This catches: closed-manual positions, pre-game bets on the OTHER team, etc.
         if (!hasPosition && existsSync(TRADES_LOG)) {
           try {
-            const todayStr = new Date().toISOString().slice(0, 10);
+            const todayStr = etTodayStr();
             const jLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
             for (const l of jLines) {
               try {
@@ -3212,8 +3234,7 @@ async function pollCycle() {
   if (dailyOpenBankroll === 0) resetDailyTracking();
 
   // Check for midnight ET reset (new trading day)
-  const etHour = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })).getHours();
-  if (etHour === 0 && Date.now() - lastHaltCheck > 60 * 60 * 1000) {
+  if (etHour() === 0 && Date.now() - lastHaltCheck > 60 * 60 * 1000) {
     lastHaltCheck = Date.now();
     resetDailyTracking();
     console.log('[risk] New trading day — reset daily limits');
@@ -4120,10 +4141,8 @@ async function main() {
   // Calibration engine — runs once per day at 6am ET (after overnight settlements)
   let lastCalibration = '';
   async function calibrationLoop() {
-    const etDate = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
-    const today = etDate.toISOString().slice(0, 10);
-    const etHour = etDate.getHours();
-    if (etHour === 6 && lastCalibration !== today) {
+    const today = etTodayStr();
+    if (etHour() === 6 && lastCalibration !== today) {
       lastCalibration = today;
       try { runCalibration(); } catch (e) { console.error('[calibrate] error:', e.message); }
     }
@@ -4134,12 +4153,11 @@ async function main() {
   // Daily report — checks every hour, sends at midnight ET
   let lastDailyReport = '';
   async function dailyReportLoop() {
-    const etDate = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
-    const today = etDate.toISOString().slice(0, 10);
-    const etHour = etDate.getHours();
+    const today = etTodayStr();
+    const hr = etHour();
     // Send at midnight ET (hour 0) and also at 8pm ET (end of trading day recap)
-    if ((etHour === 0 || etHour === 20) && lastDailyReport !== `${today}-${etHour}`) {
-      lastDailyReport = `${today}-${etHour}`;
+    if ((hr === 0 || hr === 20) && lastDailyReport !== `${today}-${hr}`) {
+      lastDailyReport = `${today}-${hr}`;
       try { await sendDailyReport(); } catch (e) { console.error('[daily-report] error:', e.message); }
     }
     setTimeout(dailyReportLoop, 30 * 60 * 1000); // check every 30 min
