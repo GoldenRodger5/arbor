@@ -1632,13 +1632,18 @@ async function checkLiveScoreEdges() {
       const candidate = candidates.find(g => {
         const homeAbbr = g.home.team?.abbreviation ?? '';
         const awayAbbr = g.away.team?.abbreviation ?? '';
-        return mover.ticker.includes(homeAbbr) || mover.ticker.includes(awayAbbr);
+        // Require BOTH teams to be present in the ticker — prevents cross-game false matches
+        // e.g. KXMLBGAME-...-CLE correctly won't match ARI@BAL even though BAL is in both
+        return tickerHasTeam(mover.ticker, homeAbbr) && tickerHasTeam(mover.ticker, awayAbbr);
       });
       if (candidate) {
         // Determine if move is confirming (toward leading team) or contra (against leading team)
         const leadingAbbr = candidate.leading?.team?.abbreviation ?? '';
         const moverTeam = mover.ticker.split('-').pop() ?? '';
-        const moverIsLeadingTeam = moverTeam === leadingAbbr;
+        // Check with ABBR_MAP variants: ESPN may say 'ARI' but Kalshi ticker suffix says 'AZ'
+        const moverIsLeadingTeam = moverTeam.toUpperCase() === leadingAbbr.toUpperCase() ||
+                                   moverTeam.toUpperCase() === (ABBR_MAP[leadingAbbr.toUpperCase()] ?? '').toUpperCase() ||
+                                   (ABBR_MAP[moverTeam.toUpperCase()] ?? '').toUpperCase() === leadingAbbr.toUpperCase();
         // Confirming: leading team YES going up, OR trailing team YES going down
         const isConfirming = (moverIsLeadingTeam && mover.to > mover.from) ||
                              (!moverIsLeadingTeam && mover.to < mover.from);
