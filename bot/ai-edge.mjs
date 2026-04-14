@@ -408,6 +408,44 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
 
 let lastHighConvictionAt = 0;      // timestamp of last high-conviction bet
 let highConvictionDeployed = 0;    // total $ in active high-conviction bets
+
+// ─────────────────────────────────────────────────────────────────────────────
+// State Persistence — survives restarts so we don't re-fire scans or burn credits
+// ─────────────────────────────────────────────────────────────────────────────
+const STATE_FILE = './logs/state.json';
+
+function saveState() {
+  try {
+    writeFileSync(STATE_FILE, JSON.stringify({
+      lastBroadScan,
+      lastPreGameScan,
+      lastUFCScan,
+      lastHighConvictionAt,
+      highConvictionDeployed,
+      savedAt: Date.now(),
+    }));
+  } catch (e) { console.error('[state] save error:', e.message); }
+}
+
+function loadState() {
+  try {
+    if (!existsSync(STATE_FILE)) return;
+    const s = JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
+    // Only restore if state was saved recently (within 2 hours) — stale state is useless
+    if (!s.savedAt || Date.now() - s.savedAt > 2 * 60 * 60 * 1000) {
+      console.log('[state] State file too old, starting fresh');
+      return;
+    }
+    if (s.lastBroadScan) lastBroadScan = s.lastBroadScan;
+    if (s.lastPreGameScan) lastPreGameScan = s.lastPreGameScan;
+    if (s.lastUFCScan) lastUFCScan = s.lastUFCScan;
+    if (s.lastHighConvictionAt) lastHighConvictionAt = s.lastHighConvictionAt;
+    if (s.highConvictionDeployed) highConvictionDeployed = s.highConvictionDeployed;
+    const broadWait = Math.max(0, Math.round((s.lastBroadScan + 1800000 - Date.now()) / 1000));
+    const preWait = Math.max(0, Math.round((s.lastPreGameScan + 900000 - Date.now()) / 1000));
+    console.log(`[state] Restored — broad scan in ${broadWait}s, pre-game in ${preWait}s`);
+  } catch (e) { console.error('[state] load error:', e.message); }
+}
 const tradeCooldowns = new Map(); // ticker → lastTradedMs
 const lastGameStates = new Map(); // "ATH@NYM" → "1-0-5" (score-period, for change detection)
 const gameEntries = new Map();    // "game:ATH@NYM" → { count: 2, lastPrice: 0.62, totalDeployed: 24.36 }
@@ -467,6 +505,9 @@ try {
     }
   }
 } catch (e) { console.error('[restore] error:', e.message); }
+
+// Load persisted scan timers and high-conviction state
+loadState();
 
 // Smart cooldown: allow adding to position IF price improved, block if same/worse
 function canScaleInto(gameKey, currentPrice) {
@@ -4140,6 +4181,7 @@ async function main() {
   // Stats on a separate non-overlapping chain
   async function statsLoop() {
     logStats();
+    saveState();
     setTimeout(statsLoop, 5 * 60 * 1000);
   }
   setTimeout(statsLoop, 5 * 60 * 1000);
@@ -4204,10 +4246,12 @@ async function main() {
 
   // Graceful shutdown
   process.on('SIGINT', async () => {
+    saveState();
     await tg('🛑 <b>AI Edge Bot Stopped</b>');
     process.exit(0);
   });
   process.on('SIGTERM', async () => {
+    saveState();
     await tg('🛑 <b>AI Edge Bot Stopped</b>');
     process.exit(0);
   });
