@@ -63,7 +63,7 @@ function getWinExpectancy(league, lead, period) {
 }
 
 function getMaxPrice(league, period) {
-  if (league === 'mlb') return 0.75;
+  if (league === 'mlb') return 0.78;
   if (league === 'nhl') return period >= 3 ? 0.82 : 0.75;
   if (league === 'nba') return period >= 4 ? 0.80 : 0.75;
   return 0.75;
@@ -217,9 +217,9 @@ console.log('\n═══ SECTION 1: Win Expectancy Floor Gate ═══');
 // ─── SECTION 2: Price Ceiling Gate ────────────────────────────────────────────
 console.log('\n═══ SECTION 2: Price Ceiling Gate ═══');
 
-test('MLB inning 6, price 74¢ → PASSES ceiling (75¢)', 0.74 <= getMaxPrice('mlb', 6), true);
-test('MLB inning 6, price 76¢ → BLOCKED (75¢ ceiling)', 0.76 > getMaxPrice('mlb', 6), true);
-test('MLB inning 9, price 94¢ → BLOCKED (75¢ ceiling)', 0.94 > getMaxPrice('mlb', 9), true);
+test('MLB inning 6, price 77¢ → PASSES ceiling (78¢)', 0.77 <= getMaxPrice('mlb', 6), true);
+test('MLB inning 6, price 79¢ → BLOCKED (78¢ ceiling)', 0.79 > getMaxPrice('mlb', 6), true);
+test('MLB inning 9, price 94¢ → BLOCKED (78¢ ceiling)', 0.94 > getMaxPrice('mlb', 9), true);
 test('NHL P2, price 74¢ → PASSES ceiling (75¢)', 0.74 <= getMaxPrice('nhl', 2), true);
 test('NHL P2, price 76¢ → BLOCKED (75¢ ceiling)', 0.76 > getMaxPrice('nhl', 2), true);
 test('NHL P3, price 80¢ → PASSES ceiling (82¢)', 0.80 <= getMaxPrice('nhl', 3), true);
