@@ -107,14 +107,14 @@ function getRequiredMargin(price, { sport = '', live = false, scoreChanged = fal
 const MAX_PRICE = 0.75;           // Default ceiling — use getMaxPrice(league, period) for sport-specific limits
 
 // Sport-specific price ceiling based on variance research:
-// MLB: 75¢ always — single HR can erase any lead, even in 8th inning
+// MLB: 78¢ — raised from 75¢ to capture mid-game situations (inning 7-8) where real edge exists
 // NHL P3: 82¢ — 2-goal leads with <10min left are genuinely 93%+ WE, market at 80¢ has real edge
 // NHL P1/P2: 75¢ — still 40+ min of hockey left, comebacks very possible
 // NBA Q4: 80¢ — 15-pt comeback in Q4 happens only 8%, 20-pt is <2%
 // NBA Q1-Q3: 75¢ — modern NBA 3-pt era, big swings happen fast
 // Soccer: 75¢ always — draws kill contracts, never overpay for a lead
 function getMaxPrice(league, period) {
-  if (league === 'mlb') return 0.75;
+  if (league === 'mlb') return 0.78;
   if (league === 'nhl') return period >= 3 ? 0.82 : 0.75;
   if (league === 'nba') return period >= 4 ? 0.80 : 0.75;
   if (['mls', 'epl', 'laliga'].includes(league)) return 0.75;
@@ -2044,7 +2044,7 @@ async function checkLiveScoreEdges() {
           `═══ STEP 4 — DECISION ═══\n` +
           `BUY only if ALL three are true:\n` +
           `✓ Confidence ≥ 65%\n` +
-          `✓ Confidence beats price by 4+ points (minimum — multiple factors needed for borderline cases)\n` +
+          `✓ Confidence beats price by 3+ points for late-game strong leads (WE ≥ 80%, inning 7+ / P3 / Q4). 4+ points required for early game (Q1/P1/innings 1-5) or marginal leads under 80% WE.\n` +
           `✓ You have CLEAR conviction. If you had to talk yourself into it, say NO.\n` +
           `${targetAbbr !== leadingAbbr ? `⚠️ UNDERDOG BET — HARD CAPS (non-negotiable):\n` +
             `  • Your confidence CANNOT exceed ${league === 'nhl' ? '58' : league === 'nba' ? '60' : league === 'mlb' ? '58' : '55'}% regardless of team quality.\n` +
