@@ -2439,28 +2439,87 @@ async function checkPreGamePredictions() {
       'La Liga': 'La Liga home ~47%, draw ~26%, away ~27%. DRAW = contract LOSES. Look up form table, injuries.',
     }[sport] ?? 'Home team wins ~55%. Look up records, injuries, recent form.';
 
+    const pgPromptText = sport === 'NBA'
+      ? `You are a professional NBA bettor. Predict who wins this REGULAR SEASON game being played TODAY, ${todayDate}.\n\n` +
+        `GAME: ${market.title}\n` +
+        `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
+        `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
+        `BASELINE: NBA home team wins 63%. Back-to-back team loses 3-5% WR. Star player out = -10%.\n\n` +
+        `═══ STEP 1 — RESEARCH (use both searches here) ═══\n` +
+        `A) Is either team on a back-to-back tonight? Check tonight's schedule vs yesterday's.\n` +
+        `B) Is any star player (15+ ppg) injured, questionable, or OUT today? Check today's injury report.\n` +
+        `C) What is each team's home/away record this season?\n` +
+        `D) Does either team have playoff seeding implications — or is either team eliminated/tanking?\n\n` +
+        `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
+        `❌ Team you want to bet ON is resting 3+ starters tonight → NO\n` +
+        `❌ Star player (15+ ppg) is officially OUT for the team you want → NO (different team without them)\n` +
+        `❌ Opponent is fighting for playoff seeding/clinching AND your team has nothing to play for → NO\n` +
+        `❌ Your team on back-to-back AND star player is questionable/probable → NO (compounding risk)\n\n` +
+        `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs) ═══\n` +
+        `Start from 63% home / 37% away baseline. Adjust:\n` +
+        `+ Your team has 2+ days rest vs opponent on back-to-back → UP 3-5%\n` +
+        `+ Star player dominant recent form (25+ ppg last 5 games) → UP 3-5%\n` +
+        `+ Opponent eliminated/tanking (nothing to play for, rotating lineup) → UP 5-8%\n` +
+        `+ Strong home record (60%+ at home) vs weak away record for opponent → UP 2-4%\n` +
+        `- Your team on back-to-back (second game) → DOWN 3-5%\n` +
+        `- Opponent star on a hot streak (above season average last 5) → DOWN 3-5%\n` +
+        `- Your team lost 3+ straight → DOWN 3-5% (slumps are real in NBA)\n` +
+        `- Opponent plays at a significantly faster pace than your team → DOWN 2-4% (pace mismatch favors trailing team)\n` +
+        `- H2H: opponent won 10+ of last 15 meetings → DOWN 4-6%\n\n` +
+        `═══ STEP 4 — DECISION ═══\n` +
+        `BUY only if ALL three are true:\n` +
+        `✓ Confidence ≥ 70% (higher bar than live — no score anchor)\n` +
+        `✓ Confidence beats price by 5+ points\n` +
+        `✓ You have a specific reason why — not just "they're the better team"\n` +
+        `Max bet: $${maxBetDisplay}\n\n` +
+        `JSON ONLY:\n` +
+        `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"reasoning":"one sentence"}`
+
+      : /* NHL */
+        `You are a professional NHL bettor. Predict who wins this REGULAR SEASON game being played TODAY, ${todayDate}.\n\n` +
+        `GAME: ${market.title}\n` +
+        `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
+        `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
+        `BASELINE: NHL home team wins 59%. Goalie is the single most important factor. Scoring first = 70% win rate.\n\n` +
+        `═══ STEP 1 — RESEARCH (goalie confirmation is mandatory) ═══\n` +
+        `A) WHO IS CONFIRMED STARTING IN GOAL for BOTH teams tonight? This is your first search. If you cannot confirm both starters, DO NOT BET.\n` +
+        `B) What is each confirmed starter's season SV% and GAA? Any recent bad form (GAA > 3.0 in last 5 starts)?\n` +
+        `C) Is either team on a back-to-back or playing their 3rd game in 4 nights?\n` +
+        `D) Does either team have playoff/clinching implications tonight?\n\n` +
+        `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
+        `❌ Starting goalie for the team you want to bet is NOT confirmed → NO (you don't know what you're betting)\n` +
+        `❌ Your goalie has GAA > 3.5 in last 5 starts → NO (actively bad form, not a sample-size issue)\n` +
+        `❌ Team you want to bet ON is resting 3+ skaters → NO\n` +
+        `❌ Opponent has playoff/clinching implications AND your team has nothing to play for → NO\n` +
+        `❌ Your team is on their 3rd game in 4 nights AND opponent is rested → NO (severe fatigue)\n\n` +
+        `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs) ═══\n` +
+        `Start from 59% home / 41% away baseline. Adjust:\n` +
+        `+ Elite goalie starting (SV% > .920) → UP 4-6%\n` +
+        `+ Your team has better power play % AND penalty kill % → UP 2-4% (discipline edge)\n` +
+        `+ Opponent on back-to-back or 3rd in 4 nights → UP 3-5%\n` +
+        `+ Your team won 4 of last 5 → UP 2-3% (form/momentum is real in NHL)\n` +
+        `- Goalie SV% .895-.910 → DOWN 4-6%\n` +
+        `- Goalie SV% below .895 → DOWN 6-8%\n` +
+        `- Your team on back-to-back (second game) → DOWN 3-5%\n` +
+        `- Opponent's PP% is top-10 AND your PK% is bottom-10 → DOWN 3-5%\n` +
+        `- Your team lost 3+ straight → DOWN 3-5%\n` +
+        `- H2H: opponent won 10+ of last 15 meetings → DOWN 4-6%\n` +
+        `- NOTE: If this game goes to OT, it is a 3v3 coin flip. Factor this in for any 1-goal-expected tight matchup.\n\n` +
+        `═══ STEP 4 — DECISION ═══\n` +
+        `BUY only if ALL three are true:\n` +
+        `✓ Confidence ≥ 70% (higher bar than live — no score anchor)\n` +
+        `✓ Confidence beats price by 5+ points\n` +
+        `✓ Goalie is confirmed and you trust the matchup\n` +
+        `Max bet: $${maxBetDisplay}\n\n` +
+        `JSON ONLY:\n` +
+        `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"reasoning":"one sentence"}`;
+
     return {
       market,
       sport,
-      prompt: `You are a professional ${sport} bettor. Predict who wins this REGULAR SEASON game being played TODAY, ${todayDate}.\n\n` +
-        `THIS IS A ${sport} GAME. Not a futures market, not a playoff series.\n\n` +
-        `GAME: ${market.title}\n` +
-        `Sport: ${sport}\n\n` +
-        `The two teams and their prices:\n` +
-        `  ${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
-        `  ${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
-        `BASELINE: ${sportBaseline}\n\n` +
-        `RESEARCH: Look up both teams' 2026 records, starting pitchers/goalies, key injuries TODAY, recent form. Check if either team is resting starters.\n\n` +
-        `CRITICAL FLAGS — HARD NO on this bet if ANY of these are true:\n` +
-        `1. The team you want to bet ON is resting 3+ key players tonight (resting starters = not the same team)\n` +
-        `2. The OPPONENT has significant playoff/clinching implications tonight while your team has nothing to play for — desperate teams playing for their lives outperform their numbers; this motivation gap almost always favors the desperate team\n` +
-        `3. Both flags together = automatic NO regardless of record or price\n\n` +
-        `Tell me WHICH TEAM WINS and how confident you are.\n` +
-        `BUY if confidence ≥ 65% AND at least 3 points above that team's price.\n` +
-        `Max bet: $${maxBetDisplay}\n\n` +
-        `CRITICAL: Respond with ONLY a JSON object. No other text.\n` +
-        `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"reasoning":"one sentence"}`,
+      prompt: pgPromptText,
     };
   });
 
