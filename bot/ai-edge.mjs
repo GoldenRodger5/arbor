@@ -1690,6 +1690,27 @@ async function checkLiveScoreEdges() {
       }
     }
 
+    // === CODE-LEVEL HARD FILTER: Leading team win rate < 40% → auto-skip ===
+    // A bad team protecting a lead is fundamentally different from an average team.
+    // Don't waste Sonnet calls on situations Claude will (or should) reject anyway.
+    // Extract win rate from ESPN records summary (e.g. "32-34-14" → 32 wins, 80 games)
+    {
+      const leadingRecord = leading.records?.[0]?.summary ?? '';
+      if (leadingRecord) {
+        const parts = leadingRecord.split('-').map(Number);
+        // NHL/NBA: W-L-OTL. MLB: W-L. Soccer: W-D-L
+        const wins = parts[0] || 0;
+        const totalGames = parts.reduce((a, b) => a + (isNaN(b) ? 0 : b), 0);
+        if (totalGames >= 20) { // need enough games to be meaningful
+          const winPct = wins / totalGames;
+          if (winPct < 0.40) {
+            console.log(`[live-edge] Skipping weak team: ${leading.team?.abbreviation ?? ''} win rate ${(winPct*100).toFixed(0)}% (${leadingRecord}) < 40% — bad teams don't protect leads reliably`);
+            continue;
+          }
+        }
+      }
+    }
+
     // Cap Sonnet calls per cycle to avoid stale prices on later games
     if (sonnetCallsThisCycle >= MAX_SONNET_PER_CYCLE) {
       console.log(`[live-edge] Sonnet cap reached (${MAX_SONNET_PER_CYCLE}), remaining games deferred to next cycle`);
@@ -1942,25 +1963,34 @@ async function checkLiveScoreEdges() {
           `\n═══ MARKET ═══\n` +
           `${targetAbbr} YES @ ${(price*100).toFixed(0)}¢ (market thinks ${(price*100).toFixed(0)}% chance)\n` +
           `${targetAbbr === leadingAbbr ? '(LEADING team' : '(TRAILING team — underdog'}${targetIsHome ? ', HOME)' : ', AWAY)'}\n\n` +
-          `═══ YOUR JOB ═══\n` +
-          `Start from the historical baseline above. Then ADJUST up or down:\n` +
-          `+ Better team (record, talent) → UP 2-5%\n` +
-          `+ Home field → already in baseline (+3% home advantage)\n` +
-          `+ ${league === 'mlb' ? 'Pitcher with ERA < 3.0 → UP 5-8%' : league === 'nba' ? 'Star player dominating (25+ pts) → UP 3-5%' : (league === 'mls' || league === 'epl' || league === 'laliga') ? 'Home advantage: EPL 45% home wins, MLS 49%. Red card on opponent = UP 25-30%. First goal is critical momentum shift.' : 'Goalie with SV% > .925 → UP 3-5%'}\n` +
-          `- Trailing team is much better → DOWN 3-8%\n` +
-          `- ${league === 'mlb' ? 'Weak bullpen (ERA > 5.0) → DOWN 5-8%' : league === 'nba' ? 'MODERN NBA: 15-pt comebacks happen 13% now (3pt era) — be less aggressive on big NBA leads' : (league === 'mls' || league === 'epl' || league === 'laliga') ? 'DRAWS happen 24-30% of games (EPL 28%). 1-goal leads hold ~65-78%. Red card on YOUR team = DOWN 25-30%.' : 'Goalie with SV% < .905 protecting a lead → DOWN 5-8% (a bad goalie will likely allow the equalizer over a full period)'}\n` +
-          `- ${league === 'nba' ? 'Star player in foul trouble → DOWN 5-10% for their team' : 'Trailing team has momentum (just scored multiple) → DOWN 2-4%'}\n` +
-          `- IMPORTANT: Time remaining matters MORE than period/quarter number. 10pts up with 8min left ≠ 10pts up with 30sec left.\n` +
-          `- INFERIOR TEAM PROTECTING LEAD: The baseline assumes an AVERAGE team. If the LEADING team has a win percentage below 40% (bottom of standings), reduce baseline by 6-10%. A bad team with a bad goalie is NOT the same as an average team with the same lead.\n` +
-          `- H2H DOMINANCE: If the trailing team has won 7+ of the last 10 head-to-head meetings, DOWN 4-6%. A 10+ H2H win streak is a HARD NO — historical patterns this strong override single-game leads.\n` +
-          `- RESTING/MISSING STARTERS: If the LEADING team is missing 3+ key players, apply MANDATORY -10 to -15%. A resting team is not the same team that earned that baseline.\n` +
-          `- PLAYOFF MOTIVATION MISMATCH — HARD NO: If the trailing team is fighting for a playoff spot or clinching tonight while the leading team is resting or has nothing to play for — DO NOT BET. Desperate teams outperform their numbers; this pattern is one of the most reliable in sports.\n` +
-          `- COMPOUNDING NEGATIVES — HARD NO: If THREE OR MORE of these are true: (1) leading team is bottom-30% of league, (2) leading goalie SV% < .905, (3) trailing team has 5+ H2H wins in last 10, (4) leading team is resting starters — say NO. Multiple compounding negatives mean the baseline is meaningless.\n\n` +
-          `CRITICAL — JSON MUST MATCH YOUR REASONING: If your written analysis concludes "marginal edge," "only X points of edge," or "just above threshold" — your JSON confidence MUST reflect that. DO NOT round up confidence to force a trade. If you find yourself saying "modest bet" or "just clears the bar," say NO instead. We only want HIGH-CONVICTION bets where the case is clear, not bets we talked ourselves into.\n\n` +
-          `Use web search to check: H2H records, injury reports, goalie stats, standings position. Then give your FINAL adjusted probability.\n\n` +
-          `BUY only if: your probability ≥ 65% AND at least 3 points above price AND you have genuine conviction — not just marginal math.\n` +
-          `The 3-point minimum is a FLOOR, not a target. Multiple negative factors mean you need MORE edge, not less. When in doubt, say NO.\n` +
-          `${targetAbbr !== leadingAbbr ? 'NOTE: This is an UNDERDOG bet. The baseline says they LOSE. Only bet if specific factors clearly override the baseline.\n' : ''}` +
+          `═══ STEP 1 — SEARCH FIRST, ANALYZE SECOND ═══\n` +
+          `Before touching the baseline, use web search to check these FOUR things:\n` +
+          `A) Is the leading team resting 3+ starters tonight? (injury report / lineup)\n` +
+          `B) What is the leading team's goalie ${league === 'nhl' ? 'SV%' : league === 'mlb' ? 'starter ERA and pitch count' : 'key player status'}?\n` +
+          `C) What is the H2H record between these two teams this season and last 2 seasons?\n` +
+          `D) Does the TRAILING team have playoff/clinching implications tonight?\n\n` +
+          `═══ STEP 2 — HARD NOs (if ANY apply, respond {"trade":false} immediately) ═══\n` +
+          `❌ Leading team is resting 3+ key players → NO (not the same team)\n` +
+          `❌ Trailing team is fighting for playoffs/clinching AND leading team has nothing to play for → NO\n` +
+          `❌ Trailing team has won 10+ of last 15 H2H meetings → NO (historical dominance overrides current score)\n` +
+          (league === 'nhl' ? `❌ Leading goalie SV% is below .895 → NO (cannot trust them to protect a lead for a full period)\n` : '') +
+          (league === 'mlb' ? `❌ Starter has 90+ pitches and bullpen ERA > 5.0 with 3+ innings left → NO (bullpen collapse risk)\n` : '') +
+          `❌ You find yourself saying "modest," "marginal," "just clears the bar," or "only X points of edge" → NO\n\n` +
+          `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs triggered) ═══\n` +
+          `Start from the historical baseline. Adjust based on what you found:\n` +
+          `+ Leading team clearly better (record, talent, home) → UP 2-5%\n` +
+          `+ ${league === 'mlb' ? 'Dominant starter still pitching (ERA < 3.0, low pitch count)' : league === 'nba' ? 'Star player dominating (25+ pts, team on a run)' : league === 'nhl' ? 'Elite goalie in net (SV% > .920)' : 'Red card on opponent = UP 25-30%'} → UP 3-6%\n` +
+          `- Trailing team is better (record, talent) → DOWN 3-8%\n` +
+          `- Trailing team has momentum (just scored, on a run) → DOWN 3-5%\n` +
+          `- ${league === 'mlb' ? 'Runners on base with power hitters up (1 HR erases any lead)' : league === 'nba' ? '15-pt comebacks happen 13% now (3pt era) — be less aggressive on big leads' : league === 'nhl' ? 'Leading goalie SV% .895-.910 (below average)' : 'Draws happen 24-30% of games — draw = contract LOSES'} → DOWN 3-6%\n` +
+          `- H2H: trailing team won 7-9 of last 15 → DOWN 3-5%\n` +
+          `- IMPORTANT: Time remaining matters more than period number. 10pts up with 3 min left ≠ 10pts up with 10 min left.\n\n` +
+          `═══ STEP 4 — DECISION ═══\n` +
+          `BUY only if ALL three are true:\n` +
+          `✓ Confidence ≥ 65%\n` +
+          `✓ Confidence beats price by 5+ points (not 3 — multiple factors needed)\n` +
+          `✓ You have CLEAR conviction. If you had to talk yourself into it, say NO.\n` +
+          `${targetAbbr !== leadingAbbr ? '⚠️ UNDERDOG BET: The baseline says they LOSE. Need specific overriding factors.\n' : ''}` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
           `RESPOND WITH JSON ONLY:\n` +
           `{"trade": false, "confidence": 0.XX, "reasoning": "one sentence"}\n` +
@@ -2103,8 +2133,8 @@ async function checkLiveScoreEdges() {
         }
 
         // Dynamic margin — sport-aware, price-aware, situation-aware
-        // Entry gate uses RAW edge (confidence - price). Fees affect profit, not prediction quality.
-        const reqMargin = getRequiredMargin(price, { sport: league, live: true, scoreChanged: !!item._scoreChanged, lineMove: !!item._lineMove });
+        // Hard floor: require at least 5% edge. 3% was too thin — SJ@NSH had 1-4pt edge and still bet.
+        const reqMargin = Math.max(0.05, getRequiredMargin(price, { sport: league, live: true, scoreChanged: !!item._scoreChanged, lineMove: !!item._lineMove }));
         const rawEdge = confidence - price;
         if (rawEdge < reqMargin) {
           console.log(`[live-edge] Not enough margin on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(rawEdge*100).toFixed(1)}% need=${(reqMargin*100).toFixed(0)}%`);
