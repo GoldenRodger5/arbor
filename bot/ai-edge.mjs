@@ -1715,6 +1715,12 @@ async function checkLiveScoreEdges() {
           .filter(([ticker, data]) => {
             if (data.yes < 0.01 || data.yes > 0.99) return false;
             if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) return false;
+            // Safety check: if market closes more than 8 hours from now, it's a future game — skip
+            // This prevents matching tomorrow's 7:45pm game when looking for tonight's live game
+            if (data.closeTime) {
+              const closeMs = Date.parse(data.closeTime);
+              if (Number.isFinite(closeMs) && closeMs - Date.now() > 8 * 60 * 60 * 1000) return false;
+            }
             return tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
           })
           .map(([ticker, data]) => ({
