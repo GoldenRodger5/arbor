@@ -1786,6 +1786,7 @@ async function checkLiveScoreEdges() {
                   scoreDiff: 0, // draw-bets are always on tied games
                   periodAtEntry: period,
                   weAtEntry: drawProb, // the model's draw probability IS the WE estimate
+                  isLeadingTeam: false, // draw bets have no leader — treat as non-leader for calibration
                 });
 
                 await tg(
@@ -2947,6 +2948,9 @@ async function checkPreGamePredictions() {
         // Calibration fields
         league: pgSportKey,
         weAtEntry: pgTargetBaseline, // pre-game home/away baseline WE
+        scoreDiff: 0,       // pre-game = before first pitch/puck drop
+        periodAtEntry: 0,   // pre-game = period 0
+        isLeadingTeam: null, // pre-game = no leader yet
       });
 
       const pgSavedMsg = pgBest.platform === 'polymarket' ? `\n💡 Poly was cheaper than Kalshi` : '';
