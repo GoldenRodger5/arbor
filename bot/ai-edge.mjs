@@ -2164,7 +2164,7 @@ async function checkLiveScoreEdges() {
   for (let batch = 0; batch < sonnetQueue.length; batch += 3) {
     const batchItems = sonnetQueue.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 2 }))
+      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 2 })) // live-edge: 1500 is sufficient, responses are already clean
     );
 
     for (let i = 0; i < batchItems.length; i++) {
@@ -2599,7 +2599,7 @@ async function checkPreGamePredictions() {
     if (preGameTradesThisCycle >= MAX_PREGAME_PER_CYCLE) break;
     const batchItems = pgPrompts.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 2 }))
+      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 2000, maxSearches: 2 }))
     );
 
     for (let i = 0; i < batchItems.length; i++) {
