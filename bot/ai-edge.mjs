@@ -1483,11 +1483,15 @@ async function checkLiveScoreEdges() {
   candidates.sort((a, b) => b._baselineWE - a._baselineWE);
 
   // === BATCH FETCH: Get ALL sports market prices in one parallel call ===
+  // KEY FIX: Use max_close_ts to only fetch markets closing within next 24h.
+  // Without this, Kalshi returns future games first (April 16+) and live games
+  // are buried past the 200 limit. max_close_ts ensures we always get tonight's games.
   const cachedPrices = new Map();
   const seriesList = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME', 'KXEPLGAME', 'KXLALIGAGAME'];
+  const maxCloseTs = Math.floor((Date.now() + 24 * 60 * 60 * 1000) / 1000); // next 24 hours
   try {
     const batchResults = await Promise.allSettled(
-      seriesList.map(s => kalshiGet(`/markets?series_ticker=${s}&status=open&limit=200`).catch(() => ({ markets: [] })))
+      seriesList.map(s => kalshiGet(`/markets?series_ticker=${s}&status=open&limit=500&max_close_ts=${maxCloseTs}`).catch(() => ({ markets: [] })))
     );
     for (const r of batchResults) {
       for (const m of (r.status === 'fulfilled' ? (r.value?.markets ?? []) : [])) {
