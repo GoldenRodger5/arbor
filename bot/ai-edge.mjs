@@ -548,15 +548,16 @@ try {
 loadState();
 
 // Smart cooldown: allow adding to position IF price improved, block if same/worse
-function canScaleInto(gameKey, currentPrice) {
+// proposedAmount: optional — if provided, checks whether current + proposed would exceed cap
+function canScaleInto(gameKey, currentPrice, proposedAmount = 0) {
   const entry = gameEntries.get(gameKey);
   if (!entry) return true; // first entry — always allowed
 
   // Block if max entries reached (dynamic — fewer entries at smaller bankrolls)
   if (entry.count >= getMaxEntriesPerGame()) return false;
 
-  // Block if total exposure on this game exceeds bankroll cap
-  if (entry.totalDeployed >= getBankroll() * MAX_GAME_EXPOSURE_PCT) return false;
+  // Block if total exposure (including proposed new bet) would exceed bankroll cap
+  if (entry.totalDeployed + proposedAmount >= getBankroll() * MAX_GAME_EXPOSURE_PCT) return false;
 
   // Allow if price is BETTER (lower) than last entry — we're averaging down
   if (currentPrice < entry.lastPrice - 0.02) return true; // at least 2¢ cheaper
@@ -2146,7 +2147,7 @@ async function checkLiveScoreEdges() {
         sonnetQueue.push({
           prompt: livePrompt, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period,
           leadingAbbr, gameDetail, price, ticker, gameBase, title, targetAbbr, targetTeam,
-          targetIsHome: targetAbbr === homeAbbr, leading,
+          targetIsHome: targetAbbr === homeAbbr, leading, hasPosition,
           _lineMove, _scoreChanged,
         });
 
@@ -2174,7 +2175,7 @@ async function checkLiveScoreEdges() {
 
       // Destructure back the context we need
       const { league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, leadingAbbr,
-              gameDetail, price, ticker, gameBase, title, targetAbbr } = item;
+              gameDetail, price, ticker, gameBase, title, targetAbbr, hasPosition } = item;
 
       try {
         const jsonMatch = extractJSON(cText);
@@ -2257,6 +2258,13 @@ async function checkLiveScoreEdges() {
           continue;
         }
         if (!canDeployMore(safeBet)) { console.log(`[live-edge] BLOCKED ${targetAbbr}: deployment cap (safeBet=$${safeBet.toFixed(2)})`); continue; }
+
+        // Scale-in cap re-check with actual bet size — prevents stacking beyond MAX_GAME_EXPOSURE_PCT
+        if (hasPosition && !canScaleInto(gameBase, bestPrice, safeBet)) {
+          const gameExp = gameEntries.get(gameBase);
+          console.log(`[live-edge] BLOCKED ${targetAbbr}: scale-in would exceed game cap ($${(gameExp?.totalDeployed ?? 0).toFixed(2)} + $${safeBet.toFixed(2)} > $${(getBankroll() * MAX_GAME_EXPOSURE_PCT).toFixed(2)} cap)`);
+          continue;
+        }
 
         const qty = Math.max(1, Math.floor(safeBet / bestPrice));
         const priceInCents = Math.round(bestPrice * 100);
