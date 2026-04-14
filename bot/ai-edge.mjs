@@ -1988,7 +1988,7 @@ async function checkLiveScoreEdges() {
           `\n═══ MARKET ═══\n` +
           `${targetAbbr} YES @ ${(price*100).toFixed(0)}¢ (market thinks ${(price*100).toFixed(0)}% chance)\n` +
           `${targetAbbr === leadingAbbr ? '(LEADING team' : '(TRAILING team — underdog'}${targetIsHome ? ', HOME)' : ', AWAY)'}\n` +
-          (_lineMove ? `⚠️ LINE MOVEMENT: Price moved ${_lineMove.direction} from ${(_lineMove.from*100).toFixed(0)}¢ → ${(_lineMove.to*100).toFixed(0)}¢ in the last ${_lineMove.minutesAgo} min. Something changed — factor this into your conviction.\n` : '') +
+          (_lineMove ? `⚠️ LINE MOVEMENT: Price moved ${_lineMove.direction} from ${(_lineMove.from*100).toFixed(0)}¢ → ${(_lineMove.to*100).toFixed(0)}¢ in the last ${_lineMove.minutesAgo} min.\n` : '') +
           `\n═══ STEP 1 — SEARCH FIRST, ANALYZE SECOND ═══\n` +
           `Before touching the baseline, use web search to check these FOUR things:\n` +
           `A) Is the leading team resting 3+ starters tonight? (injury report / lineup)\n` +
@@ -2009,7 +2009,7 @@ async function checkLiveScoreEdges() {
             `- Starter at 80+ pitches — bullpen transition coming → DOWN 3-5%\n` +
             `- POWER HITTER ALERT: If trailing team has 25+ HR hitters coming up WITH RUNNERS ON BASE → DOWN 5-8%. A 3-run HR erases any lead in one pitch. This is the single biggest MLB risk.\n` +
             `- Leading team bullpen ERA > 5.0 last 10 days → DOWN 5-8%\n` +
-            `- HIGH-RUN PARK (Coors Field, Great American Ballpark, Globe Life Field, Yankee Stadium) → reduce lead confidence 3-5%. Runs come easier; leads evaporate faster.\n`
+            `- HIGH-RUN PARK (Coors Field, Great American Ballpark, Globe Life Field) → reduce lead confidence 3-5%. Runs come easier; leads evaporate faster.\n`
           : league === 'nba' ?
             `+ Star player dominating (25+ pts, efficiency up) → UP 3-5%\n` +
             `+ Opponent is tanking/resting (eliminated, trading players, nothing to play for) → UP 5-8%\n` +
@@ -2020,7 +2020,7 @@ async function checkLiveScoreEdges() {
             `+ 2-goal lead (any period): much more reliable than 1-goal. 2-goal P3 = 93% WE. Trust the math.\n` +
             `+ Elite goalie (SV% > .920) → UP 3-5%\n` +
             `- Leading goalie SV% .895-.910 → DOWN 4-6%\n` +
-            `- OT RISK (1-goal lead in P3, check the clock): 10-14 min remaining → OT probability ~20%, reduce confidence 2-3%. Under 10 min → OT probability ~30%, reduce 4-6%. Under 5 min → reduce 8-10%. OT = 3v3 sudden death coin flip regardless of which team dominated regulation.\n` +
+            `- OT RISK (1-goal lead in P3, check the clock): 10-14 min remaining → OT probability ~20%, reduce confidence 2-3%. Under 10 min → OT probability ~25-30%, reduce 3-5%. Under 5 min → reduce only 2-3% (leads are MORE secure this late — teams lock down, ice the puck, go defensive). OT = 3v3 sudden death coin flip regardless of which team dominated regulation.\n` +
             `- Trailing team on power play right now → DOWN 8-12% until it's resolved\n`
           : `+ Strong home record for leading team → UP 2-3%\n` +
             `- DRAWS happen 24-30% of games. 1-goal lead means draw is still very possible. Draw = contract LOSES.\n` +
@@ -2036,7 +2036,7 @@ async function checkLiveScoreEdges() {
           `═══ STEP 4 — DECISION ═══\n` +
           `BUY only if ALL three are true:\n` +
           `✓ Confidence ≥ 65%\n` +
-          `✓ Confidence beats price by 5+ points (not 3 — multiple factors needed)\n` +
+          `✓ Confidence beats price by 4+ points (minimum — multiple factors needed for borderline cases)\n` +
           `✓ You have CLEAR conviction. If you had to talk yourself into it, say NO.\n` +
           `${targetAbbr !== leadingAbbr ? '⚠️ UNDERDOG BET: The baseline says they LOSE. Need specific overriding factors.\n' : ''}` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
@@ -2482,15 +2482,15 @@ async function checkPreGamePredictions() {
         `D) Does either team have playoff seeding implications — or is either team eliminated/tanking?\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Team you want to bet ON is resting 3+ starters tonight → NO\n` +
-        `❌ Star player (15+ ppg) is officially OUT for the team you want → NO (different team without them)\n` +
         `❌ Opponent is fighting for playoff seeding/clinching AND your team has nothing to play for → NO\n` +
-        `❌ Your team on back-to-back AND star player is questionable/probable → NO (compounding risk)\n\n` +
+        `❌ Your team on back-to-back AND star player is DOUBTFUL or OUT → NO (compounding risk)\n\n` +
         `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs) ═══\n` +
         `Start from 63% home / 37% away baseline. Adjust:\n` +
         `+ Your team has 2+ days rest vs opponent on back-to-back → UP 3-5%\n` +
         `+ Star player dominant recent form (25+ ppg last 5 games) → UP 3-5%\n` +
         `+ Opponent eliminated/tanking (nothing to play for, rotating lineup) → UP 5-8%\n` +
         `+ Strong home record (60%+ at home) vs weak away record for opponent → UP 2-4%\n` +
+        `- Star player (15+ ppg) officially OUT tonight → DOWN 8-12% (adjust baseline; do not auto-block — check if opponent is also weak/tanking)\n` +
         `- Your team on back-to-back (second game) → DOWN 3-5%\n` +
         `- Opponent star on a hot streak (above season average last 5) → DOWN 3-5%\n` +
         `- Your team lost 3+ straight → DOWN 3-5% (slumps are real in NBA)\n` +
@@ -2499,7 +2499,7 @@ async function checkPreGamePredictions() {
         `═══ STEP 4 — DECISION ═══\n` +
         `BUY only if ALL three are true:\n` +
         `✓ Confidence ≥ 70% (higher bar than live — no score anchor)\n` +
-        `✓ Confidence beats price by 5+ points\n` +
+        `✓ Confidence beats price by 4+ points\n` +
         `✓ You have a specific reason why — not just "they're the better team"\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
         `JSON ONLY:\n` +
@@ -2519,7 +2519,6 @@ async function checkPreGamePredictions() {
         `D) Does either team have playoff/clinching implications tonight?\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Starting goalie for the team you want to bet is NOT confirmed → NO (you don't know what you're betting)\n` +
-        `❌ Your goalie has GAA > 3.5 in last 5 starts → NO (actively bad form, not a sample-size issue)\n` +
         `❌ Team you want to bet ON is resting 3+ skaters → NO\n` +
         `❌ Opponent has playoff/clinching implications AND your team has nothing to play for → NO\n` +
         `❌ Your team is on their 3rd game in 4 nights AND opponent is rested → NO (severe fatigue)\n\n` +
@@ -2529,6 +2528,7 @@ async function checkPreGamePredictions() {
         `+ Your team has better power play % AND penalty kill % → UP 2-4% (discipline edge)\n` +
         `+ Opponent on back-to-back or 3rd in 4 nights → UP 3-5%\n` +
         `+ Your team won 4 of last 5 → UP 2-3% (form/momentum is real in NHL)\n` +
+        `- Goalie GAA > 3.5 in last 5 starts → DOWN 8-12% (check opponent quality for those games — not all GAA is equal)\n` +
         `- Goalie SV% .895-.910 → DOWN 4-6%\n` +
         `- Goalie SV% below .895 → DOWN 6-8%\n` +
         `- Your team on back-to-back (second game) → DOWN 3-5%\n` +
@@ -2539,7 +2539,7 @@ async function checkPreGamePredictions() {
         `═══ STEP 4 — DECISION ═══\n` +
         `BUY only if ALL three are true:\n` +
         `✓ Confidence ≥ 70% (higher bar than live — no score anchor)\n` +
-        `✓ Confidence beats price by 5+ points\n` +
+        `✓ Confidence beats price by 4+ points\n` +
         `✓ Goalie is confirmed and you trust the matchup\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
         `JSON ONLY:\n` +
@@ -2897,19 +2897,24 @@ async function checkUFCPredictions() {
       continue;
     }
 
-    // Cross-reference: Haiku and Sonnet must agree on the winner
-    // If they picked different fighters, neither model is confident enough — skip
+    // Cross-reference: Haiku screened, Sonnet analyzed with web data — Sonnet wins when they disagree
     const sonnetFighter = (decision.fighter ?? '').toLowerCase();
     const haikuFighter = (pick.fighter ?? '').toLowerCase();
     const sonnetSide = decision.side ?? pick.side;
     const agreesOnFighter = sonnetFighter && haikuFighter &&
       (sonnetFighter.includes(haikuFighter.split(' ').pop()) || haikuFighter.includes(sonnetFighter.split(' ').pop()) || decision.side === pick.side);
     if (!agreesOnFighter) {
-      console.log(`[ufc] BLOCKED: Haiku picked ${pick.fighter} but Sonnet picked ${decision.fighter} — models disagree, skipping`);
-      logScreen({ stage: 'ufc', slug: pick.slug, result: 'disagreement', reasoning: `Haiku: ${pick.fighter}, Sonnet: ${decision.fighter}` });
-      continue;
+      // Sonnet has 3 web searches and full fighter analysis — trust it over Haiku's quick screen
+      // Log the disagreement but proceed with Sonnet's pick (if it has valid side/fighter data)
+      if (!decision.fighter || !decision.side) {
+        console.log(`[ufc] BLOCKED: Sonnet disagreed with Haiku but gave incomplete pick — skipping (Haiku: ${pick.fighter}, Sonnet: ${decision.fighter ?? 'none'})`);
+        logScreen({ stage: 'ufc', slug: pick.slug, result: 'disagreement-incomplete', reasoning: `Haiku: ${pick.fighter}, Sonnet: ${decision.fighter}` });
+        continue;
+      }
+      console.log(`[ufc] ⚡ Sonnet overrides Haiku: Haiku picked ${pick.fighter}, Sonnet picked ${decision.fighter} — trusting Sonnet`);
+      logScreen({ stage: 'ufc', slug: pick.slug, result: 'sonnet-override', reasoning: `Haiku: ${pick.fighter}, Sonnet: ${decision.fighter}` });
     }
-    // Use Sonnet's side if provided, fall back to Haiku's
+    // Always use Sonnet's side — it has more information
     decision.side = sonnetSide || pick.side;
 
     const confidence = decision.confidence ?? 0;
