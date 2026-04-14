@@ -549,17 +549,9 @@ function canTrade() {
     return false;
   }
 
-  // Check daily loss limit (scales with bankroll)
-  const currentBankroll = getBankroll();
-  const dailyLossLimit = Math.max(10, dailyOpenBankroll * DAILY_LOSS_PCT);
-  const dailyPnL = currentBankroll - dailyOpenBankroll;
-  if (dailyOpenBankroll > 0 && dailyPnL < -dailyLossLimit) {
-    tradingHalted = true;
-    haltReason = `Daily loss limit hit: $${Math.abs(dailyPnL).toFixed(2)} lost today (limit: $${dailyLossLimit.toFixed(2)} = ${(DAILY_LOSS_PCT*100).toFixed(0)}% of $${dailyOpenBankroll.toFixed(2)})`;
-    tg(`🛑 <b>TRADING HALTED</b>\n\n${haltReason}\n\nBot will resume tomorrow.`);
-    console.log(`[risk] ${haltReason}`);
-    return false;
-  }
+  // Daily loss limit DISABLED — was triggering on deployed capital (open positions)
+  // not actual realized losses. Needs to be rewritten to track realized P&L only.
+  // TODO: rebuild daily loss tracking from settled trades in JSONL, not bankroll delta
 
   // Check max positions (dynamic) — only count positions with meaningful cost
   const maxPos = getMaxPositions();
