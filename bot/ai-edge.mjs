@@ -1940,19 +1940,23 @@ async function checkLiveScoreEdges() {
           `Start from the historical baseline above. Then ADJUST up or down:\n` +
           `+ Better team (record, talent) → UP 2-5%\n` +
           `+ Home field → already in baseline (+3% home advantage)\n` +
-          `+ Strong pitching/goaltending → UP 2-3%\n` +
-          `+ ${league === 'mlb' ? 'Pitcher with ERA < 3.0 → UP 5-8%' : league === 'nba' ? 'Star player dominating (25+ pts) → UP 3-5%' : (league === 'mls' || league === 'epl' || league === 'laliga') ? 'Home advantage: EPL 45% home wins, MLS 49%. Red card on opponent = UP 25-30% (win prob 47%→18% for red-carded home team). First goal is critical momentum shift.' : 'Goalie with SV% > .925 → UP 3-5%'}\n` +
+          `+ ${league === 'mlb' ? 'Pitcher with ERA < 3.0 → UP 5-8%' : league === 'nba' ? 'Star player dominating (25+ pts) → UP 3-5%' : (league === 'mls' || league === 'epl' || league === 'laliga') ? 'Home advantage: EPL 45% home wins, MLS 49%. Red card on opponent = UP 25-30%. First goal is critical momentum shift.' : 'Goalie with SV% > .925 → UP 3-5%'}\n` +
           `- Trailing team is much better → DOWN 3-8%\n` +
-          `- ${league === 'mlb' ? 'Weak bullpen (ERA > 5.0) → DOWN 3-5%' : league === 'nba' ? 'MODERN NBA: 15-pt comebacks happen 13% now (3pt era) — be less aggressive on big NBA leads' : (league === 'mls' || league === 'epl' || league === 'laliga') ? 'DRAWS happen 24-30% of games (EPL 28%). 1-goal leads hold ~65-78%. Minutes 55-70 = best comeback window. Red card on YOUR team = DOWN 25-30%.' : 'Empty net situation → DOWN 5-10%'}\n` +
+          `- ${league === 'mlb' ? 'Weak bullpen (ERA > 5.0) → DOWN 5-8%' : league === 'nba' ? 'MODERN NBA: 15-pt comebacks happen 13% now (3pt era) — be less aggressive on big NBA leads' : (league === 'mls' || league === 'epl' || league === 'laliga') ? 'DRAWS happen 24-30% of games (EPL 28%). 1-goal leads hold ~65-78%. Red card on YOUR team = DOWN 25-30%.' : 'Goalie with SV% < .905 protecting a lead → DOWN 5-8% (a bad goalie will likely allow the equalizer over a full period)'}\n` +
           `- ${league === 'nba' ? 'Star player in foul trouble → DOWN 5-10% for their team' : 'Trailing team has momentum (just scored multiple) → DOWN 2-4%'}\n` +
           `- IMPORTANT: Time remaining matters MORE than period/quarter number. 10pts up with 8min left ≠ 10pts up with 30sec left.\n` +
-          `- RESTING/MISSING STARTERS: If the LEADING team is missing 3+ key players (resting, injured, scratched), apply a MANDATORY -10 to -15% reduction from baseline. A team resting their top line or star players is NOT the same team that earned that baseline win rate. If a team is resting their best players, the market already knows — do NOT bet on them.\n` +
-          `- PLAYOFF MOTIVATION MISMATCH — HARD NO: If the TRAILING/OPPOSING team is fighting for a playoff spot, playoff seeding, or clinching tonight, while the leading team is resting starters or has nothing to play for — this is a HARD NO regardless of score, record, or baseline. A desperate team fighting for their playoff life plays an entirely different game than their regular season numbers suggest. Motivation gap + resting starters = DO NOT BET. This is one of the most reliable patterns in sports: end-of-season clinching games vs resting favorites almost always favor the desperate team.\n\n` +
-          `Use web search to check: are key players resting tonight? What are the injury reports? Then give your FINAL adjusted probability.\n\n` +
-          `BUY if: your probability ≥ 65% AND at least 3 points above price.\n` +
-          `${targetAbbr !== leadingAbbr ? 'NOTE: This is an UNDERDOG bet. The baseline says they LOSE. Only bet if specific factors override the baseline.\n' : ''}` +
-          `Max bet: $${getDynamicMaxTrade().toFixed(2)} (bet MORE if confidence is much higher than price)\n\n` +
-          `RESPOND WITH JSON ONLY — no analysis text, just the JSON object:\n` +
+          `- INFERIOR TEAM PROTECTING LEAD: The baseline assumes an AVERAGE team. If the LEADING team has a win percentage below 40% (bottom of standings), reduce baseline by 6-10%. A bad team with a bad goalie is NOT the same as an average team with the same lead.\n` +
+          `- H2H DOMINANCE: If the trailing team has won 7+ of the last 10 head-to-head meetings, DOWN 4-6%. A 10+ H2H win streak is a HARD NO — historical patterns this strong override single-game leads.\n` +
+          `- RESTING/MISSING STARTERS: If the LEADING team is missing 3+ key players, apply MANDATORY -10 to -15%. A resting team is not the same team that earned that baseline.\n` +
+          `- PLAYOFF MOTIVATION MISMATCH — HARD NO: If the trailing team is fighting for a playoff spot or clinching tonight while the leading team is resting or has nothing to play for — DO NOT BET. Desperate teams outperform their numbers; this pattern is one of the most reliable in sports.\n` +
+          `- COMPOUNDING NEGATIVES — HARD NO: If THREE OR MORE of these are true: (1) leading team is bottom-30% of league, (2) leading goalie SV% < .905, (3) trailing team has 5+ H2H wins in last 10, (4) leading team is resting starters — say NO. Multiple compounding negatives mean the baseline is meaningless.\n\n` +
+          `CRITICAL — JSON MUST MATCH YOUR REASONING: If your written analysis concludes "marginal edge," "only X points of edge," or "just above threshold" — your JSON confidence MUST reflect that. DO NOT round up confidence to force a trade. If you find yourself saying "modest bet" or "just clears the bar," say NO instead. We only want HIGH-CONVICTION bets where the case is clear, not bets we talked ourselves into.\n\n` +
+          `Use web search to check: H2H records, injury reports, goalie stats, standings position. Then give your FINAL adjusted probability.\n\n` +
+          `BUY only if: your probability ≥ 65% AND at least 3 points above price AND you have genuine conviction — not just marginal math.\n` +
+          `The 3-point minimum is a FLOOR, not a target. Multiple negative factors mean you need MORE edge, not less. When in doubt, say NO.\n` +
+          `${targetAbbr !== leadingAbbr ? 'NOTE: This is an UNDERDOG bet. The baseline says they LOSE. Only bet if specific factors clearly override the baseline.\n' : ''}` +
+          `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
+          `RESPOND WITH JSON ONLY:\n` +
           `{"trade": false, "confidence": 0.XX, "reasoning": "one sentence"}\n` +
           `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "one sentence"}`;
         // Block if we already have a position on this game (check BOTH platforms)
