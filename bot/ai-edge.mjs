@@ -419,13 +419,17 @@ const LINE_MOVE_THRESHOLD = 0.05; // 5¢ move = something happened
 try {
   if (existsSync('./logs/trades.jsonl')) {
     const restoreLines = readFileSync('./logs/trades.jsonl', 'utf-8').split('\n').filter(l => l.trim());
-    const todayStr = etTodayStr();
+    // ET midnight in UTC: today ET midnight = today's date at 04:00 UTC (ET = UTC-4)
+    const etMidnightUTC = (() => { const d = etNow(); d.setHours(0,0,0,0); return d.getTime() - (d.getTime() - new Date(d.toLocaleString('en-US',{timeZone:'UTC'})).getTime()); })();
+    const etTodayStartMs = new Date(etNow().toISOString().slice(0,10) + 'T04:00:00Z').getTime();
+    const etTodayEndMs = etTodayStartMs + 24 * 60 * 60 * 1000;
     for (const l of restoreLines) {
       try {
         const t = JSON.parse(l);
         if (t.status !== 'open' && t.status !== 'closed-manual') continue;
-        // Only restore today's trades (older ones don't matter for cooldowns/entries)
-        if (!t.timestamp?.startsWith(todayStr)) continue;
+        // Only restore today's trades — compare UTC timestamp against ET day window (ET midnight = UTC 04:00)
+        const tradeMs = t.timestamp ? Date.parse(t.timestamp) : 0;
+        if (tradeMs < etTodayStartMs || tradeMs >= etTodayEndMs) continue;
         const ticker = t.ticker ?? '';
 
         // Restore gameEntries — figure out the game key from team abbreviations in ticker
@@ -1924,13 +1928,15 @@ async function checkLiveScoreEdges() {
         // This catches: closed-manual positions, pre-game bets on the OTHER team, etc.
         if (!hasPosition && existsSync(TRADES_LOG)) {
           try {
-            const todayStr = etTodayStr();
+            const dupStartMs = new Date(etNow().toISOString().slice(0,10) + 'T04:00:00Z').getTime();
+            const dupEndMs = dupStartMs + 24 * 60 * 60 * 1000;
             const jLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
             for (const l of jLines) {
               try {
                 const jt = JSON.parse(l);
                 if (jt.status === 'testing-void') continue;
-                if (!jt.timestamp?.startsWith(todayStr)) continue;
+                const jtMs = jt.timestamp ? Date.parse(jt.timestamp) : 0;
+                if (jtMs < dupStartMs || jtMs >= dupEndMs) continue;
                 const jticker = (jt.ticker ?? '').toLowerCase();
                 // Check if this trade is for the same game (either team)
                 if (tickerHasTeam(jticker, homeAbbr) && tickerHasTeam(jticker, awayAbbr)) {
