@@ -426,10 +426,21 @@ async function claudeSonnet(prompt, { maxTokens = 400, timeout = 20000 } = {}) {
 }
 
 // Expensive Sonnet + web search — only for final trade decisions, ~$0.03-0.05/call
-async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, timeout = 45000 } = {}) {
+async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, timeout = 45000, system = null } = {}) {
   stats.claudeCalls++;
   stats.apiSpendCents += 3 + maxSearches; // ~$0.03 base + $0.01/search
   try {
+    const body = {
+      model: CLAUDE_DECIDER,
+      max_tokens: maxTokens,
+      tools: [{
+        type: 'web_search_20250305',
+        name: 'web_search',
+        max_uses: maxSearches,
+      }],
+      messages: [{ role: 'user', content: prompt }],
+    };
+    if (system) body.system = system;
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       signal: AbortSignal.timeout(timeout),
       method: 'POST',
@@ -438,16 +449,7 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
         'anthropic-version': '2023-06-01',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        model: CLAUDE_DECIDER,
-        max_tokens: maxTokens,
-        tools: [{
-          type: 'web_search_20250305',
-          name: 'web_search',
-          max_uses: maxSearches,
-        }],
-        messages: [{ role: 'user', content: prompt }],
-      }),
+      body: JSON.stringify(body),
     });
 
     if (!res.ok) {
@@ -2267,7 +2269,7 @@ async function checkLiveScoreEdges() {
   for (let batch = 0; batch < sonnetQueue.length; batch += 3) {
     const batchItems = sonnetQueue.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 2 })) // live-edge: 1500 is sufficient, responses are already clean
+      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 2, system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
     );
 
     for (let i = 0; i < batchItems.length; i++) {
@@ -2721,7 +2723,7 @@ async function checkPreGamePredictions() {
     if (preGameTradesThisCycle >= MAX_PREGAME_PER_CYCLE) break;
     const batchItems = pgPrompts.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 2000, maxSearches: 2 }))
+      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 2000, maxSearches: 2, system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
     );
 
     for (let i = 0; i < batchItems.length; i++) {
