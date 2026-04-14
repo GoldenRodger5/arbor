@@ -1695,6 +1695,11 @@ async function checkLiveScoreEdges() {
                   orderId: (result.data.order ?? result.data).order_id ?? null,
                   edge: margin * 100, confidence: drawProb,
                   reasoning: `${homeScore}-${awayScore} at ${effectiveMin}'. Draw baseline ${(drawProb*100).toFixed(0)}% vs price ${priceInCents}¢.`,
+                  // Calibration fields
+                  league,
+                  scoreDiff: 0, // draw-bets are always on tied games
+                  periodAtEntry: period,
+                  weAtEntry: drawProb, // the model's draw probability IS the WE estimate
                 });
 
                 await tg(
@@ -2204,10 +2209,13 @@ async function checkLiveScoreEdges() {
         // Leading team: +10% max (tighter — WE math is reliable for favorites in-game)
         // Trailing team: +15% max (looser — underdog upside needs more room, separate hard caps handle the ceiling)
         // Prevents insanity like "17% baseline → 68% confidence" (Utah @ Calgary)
+        let weAtEntry = null;          // WE table value for the specific team we're betting on
+        let isLeadingTeamTarget = false; // true = betting the leader, false = betting the underdog
         const baselineWE = getWinExpectancy(league, diff, period, leadingAbbr === homeAbbr);
         if (baselineWE != null) {
-          const isLeadingTeamTarget = targetAbbr === leadingAbbr;
+          isLeadingTeamTarget = targetAbbr === leadingAbbr;
           const targetBaseline = isLeadingTeamTarget ? baselineWE : (1 - baselineWE);
+          weAtEntry = targetBaseline;
           const capMargin = isLeadingTeamTarget ? 0.10 : 0.15; // tighter for leading team
           const maxAllowed = Math.min(0.95, targetBaseline + capMargin);
           if (confidence > maxAllowed) {
@@ -2327,6 +2335,13 @@ async function checkLiveScoreEdges() {
             reasoning: decision.reasoning,
             liveScore: `${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore} (${gameDetail})`,
             otherPlatformPrice: best.platform === 'polymarket' ? price : (polyMatch?.s0Price ?? null),
+            // Calibration fields — used by calibrate.mjs to measure prediction accuracy
+            league,
+            scoreDiff: diff,
+            periodAtEntry: period,
+            liveStageAtEntry: liveStage,
+            weAtEntry,                          // WE table's prediction for this team (null if no table entry)
+            isLeadingTeam: isLeadingTeamTarget, // true = betting leader, false = betting underdog
           });
 
           const savedMsg = best.platform === 'polymarket' ? `\n💡 Bought on Poly (${(price*100).toFixed(0)}¢ Kalshi → ${priceInCents}¢ Poly)` : '';
@@ -2833,6 +2848,9 @@ async function checkPreGamePredictions() {
         orderId: (pgResult.data?.order ?? pgResult.data)?.order_id ?? pgResult.data?.id ?? null,
         edge: edge * 100, confidence,
         reasoning: decision.reasoning,
+        // Calibration fields
+        league: pgSportKey,
+        weAtEntry: pgTargetBaseline, // pre-game home/away baseline WE
       });
 
       const pgSavedMsg = pgBest.platform === 'polymarket' ? `\n💡 Poly was cheaper than Kalshi` : '';
