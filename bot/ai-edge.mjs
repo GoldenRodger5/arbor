@@ -1741,22 +1741,35 @@ async function checkLiveScoreEdges() {
         const tonightStr = etHourLE >= 22 ? toShortLE(etTmrwLE) : null;
 
         // Filter cached prices for THIS game (instant, no API call)
-        // CRITICAL: When the same teams play multiple days in a row (series),
-        // the bot can match TOMORROW's pre-game market to TONIGHT's live score.
-        // Guard: if the game is decisive (WE > 85%) but the market price is near 50c
-        // (40-65c), it's almost certainly a DIFFERENT DAY's pre-game market — a live
-        // market for a game with 90%+ WE would be priced at 85c+, not 53c.
-        const currentBaseWE = g._baselineWE ?? 0.50;
+        // BUG FIXED: The API returns markets sorted by ticker ascending (Apr 16 first, Apr 13 last).
+        // When same teams play consecutive days (series), BOTH 26APR13 and 26APR14 markets match.
+        // The old code used g._baselineWE (undefined variable — g not in scope here, caused silent
+        // ReferenceError caught by try/catch, guard never ran). Fixed below with correct variable.
+        //
+        // Two-part fix:
+        // 1. Compute WE from variables that ARE in scope (diff, period, league)
+        // 2. Sort results so todayStr markets come before tonightStr — when same teams play
+        //    tomorrow too, today's live market is found first by .find()
+        const currentBaseWE = getWinExpectancy(league, diff, period) ?? 0.50;
         const gameMarkets = [...cachedPrices.entries()]
           .filter(([ticker, data]) => {
             if (data.yes < 0.01 || data.yes > 0.99) return false;
             if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) return false;
-            // WRONG-DAY MARKET GUARD: decisive game (85%+ WE) but price near 50c = wrong game
-            if (currentBaseWE >= 0.85 && data.yes < 0.65 && data.yes > 0.35) {
-              console.log(`[live-edge] Skipping stale/wrong-day market ${ticker} — WE ${(currentBaseWE*100).toFixed(0)}% but price ${(data.yes*100).toFixed(0)}c (pre-game market for different day)`);
+            // WRONG-DAY MARKET GUARD: if WE is decisive (85%+) but market price is near 50c
+            // (35-65c range), it's tomorrow's pre-game market, not tonight's live one.
+            // A real live market for a game with 90%+ WE would be priced 85c+.
+            if (currentBaseWE >= 0.85 && data.yes >= 0.35 && data.yes <= 0.65) {
+              console.log(`[live-edge] Skipping wrong-day market: ${ticker} — WE=${(currentBaseWE*100).toFixed(0)}% but price=${(data.yes*100).toFixed(0)}c (pre-game for diff day)`);
               return false;
             }
             return tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
+          })
+          // Sort: todayStr markets first, tonightStr (tomorrow UTC) markets second
+          // Ensures .find() picks today's live market when both dates match
+          .sort(([a], [b]) => {
+            const aToday = a.includes(todayStr) ? 0 : 1;
+            const bToday = b.includes(todayStr) ? 0 : 1;
+            return aToday - bToday;
           })
           .map(([ticker, data]) => ({
             ticker, title: data.title, yes_ask_dollars: String(data.yes), no_ask_dollars: String(data.no),
