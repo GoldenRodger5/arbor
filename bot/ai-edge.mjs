@@ -2053,6 +2053,9 @@ async function checkLiveScoreEdges() {
             for (const l of jLines) {
               try {
                 const jt = JSON.parse(l);
+                // Only block re-entry if the trade is still OPEN — not if cashed out or settled
+                // If a position was closed/settled/sold, allow re-betting the same game
+                if (jt.status !== 'open') continue;
                 if (jt.status === 'testing-void') continue;
                 const jtMs = jt.timestamp ? Date.parse(jt.timestamp) : 0;
                 if (jtMs < dupStartMs || jtMs >= dupEndMs) continue;
