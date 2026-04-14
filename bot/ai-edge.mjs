@@ -1755,14 +1755,16 @@ async function checkLiveScoreEdges() {
           .filter(([ticker, data]) => {
             if (data.yes < 0.01 || data.yes > 0.99) return false;
             if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) return false;
-            // WRONG-DAY MARKET GUARD: if WE is decisive (85%+) but market price is near 50c
-            // (35-65c range), it's tomorrow's pre-game market, not tonight's live one.
-            // A real live market for a game with 90%+ WE would be priced 85c+.
+            // Team check FIRST — only apply wrong-day guard to markets for THIS game
+            if (!tickerHasTeam(ticker, homeAbbr) || !tickerHasTeam(ticker, awayAbbr)) return false;
+            // WRONG-DAY MARKET GUARD: only for markets that match this game's teams.
+            // If WE is decisive (85%+) but this matching market is priced near 50c,
+            // it's tomorrow's pre-game market — a real live market at 90%+ WE would be 85c+.
             if (currentBaseWE >= 0.85 && data.yes >= 0.35 && data.yes <= 0.65) {
               console.log(`[live-edge] Skipping wrong-day market: ${ticker} — WE=${(currentBaseWE*100).toFixed(0)}% but price=${(data.yes*100).toFixed(0)}c (pre-game for diff day)`);
               return false;
             }
-            return tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
+            return true;
           })
           // Sort: todayStr markets first, tonightStr (tomorrow UTC) markets second
           // Ensures .find() picks today's live market when both dates match
