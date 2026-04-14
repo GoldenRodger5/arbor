@@ -1877,18 +1877,43 @@ async function checkLiveScoreEdges() {
         const gameBase = lastH > 0 ? ticker.slice(0, lastH) : ticker;
         const ha = homeAbbr.toLowerCase();
         const aa = awayAbbr.toLowerCase();
-        const hasPosition = openPositions.some(p => {
+
+        // Check BOTH Kalshi portfolio AND today's JSONL trades for this game.
+        // The portfolio API can miss positions (closed-manual sync), so JSONL is the source of truth.
+        // This also prevents betting BOTH sides (pre-game bet on team A, live bet on team B).
+        let hasPosition = openPositions.some(p => {
           const pt = (p.ticker ?? '').toLowerCase();
-          // Match Kalshi base ticker
           const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
           if (pBase === gameBase) return true;
-          // Match Poly slug (contains team abbreviations)
           if (p.exchange === 'polymarket' && tickerHasTeam(pt, homeAbbr) && tickerHasTeam(pt, awayAbbr)) return true;
           return false;
         });
-        // Block if we already have a position on this game — prevents duplicate buys after restarts
+
+        // Also check JSONL for ANY trade today on this game (any team, any status except testing-void)
+        // This catches: closed-manual positions, pre-game bets on the OTHER team, etc.
+        if (!hasPosition && existsSync(TRADES_LOG)) {
+          try {
+            const todayStr = new Date().toISOString().slice(0, 10);
+            const jLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+            for (const l of jLines) {
+              try {
+                const jt = JSON.parse(l);
+                if (jt.status === 'testing-void') continue;
+                if (!jt.timestamp?.startsWith(todayStr)) continue;
+                const jticker = (jt.ticker ?? '').toLowerCase();
+                // Check if this trade is for the same game (either team)
+                if (tickerHasTeam(jticker, homeAbbr) && tickerHasTeam(jticker, awayAbbr)) {
+                  hasPosition = true;
+                  break;
+                }
+              } catch {}
+            }
+          } catch {}
+        }
+
+        // Block if we already have a position on this game — prevents duplicate buys and both-sides bets
         if (hasPosition) {
-          // Only allow scaling in if price dropped significantly (5¢+ cheaper)
+          // Only allow scaling in if price dropped significantly (2¢+ cheaper) AND same team
           if (!canScaleInto(`game:${homeAbbr}@${awayAbbr}`, price)) {
             console.log(`[live-edge] Already have position on ${homeAbbr}@${awayAbbr}, skipping`);
             continue;
@@ -2123,6 +2148,12 @@ let preGameTradesDate = '';         // reset counter on new day
 const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
 
 async function checkPreGamePredictions() {
+  // PRE-GAME DISABLED — daily limit and duplicate detection were broken,
+  // causing massive over-deployment (10x buys on CLE@STL, 5x on MIA@ATL).
+  // Needs rebuild before re-enabling.
+  console.log(`[pre-game] DISABLED — pending fix for daily limit and duplicate detection`);
+  return;
+
   if (Date.now() - lastPreGameScan < PREGAME_SCAN_INTERVAL) return;
   lastPreGameScan = Date.now();
   if (!canTrade()) return;
