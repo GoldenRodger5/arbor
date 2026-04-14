@@ -84,13 +84,18 @@ try {
 //
 // We can't afford to spam cheap bets at $327 — need to be selective everywhere,
 // but ESPECIALLY selective on pre-game favorites and random sports (MLB).
-function getRequiredMargin(price, { sport = '', live = false, scoreChanged = false, lineMove = false } = {}) {
+function getRequiredMargin(price, { sport = '', live = false, scoreChanged = false,
+  lineMove = false, lineMoveConfirming = false, lineMoveContra = false,
+  lineMoveVelocity = 0, crossConfirmed = false } = {}) {
   // Calibration override takes precedence over hardcoded values (live bets only)
   if (live && CAL.requiredMarginLive?.[sport] != null) {
     const overrideBase = CAL.requiredMarginLive[sport];
     let sitAdj = 0;
-    if (scoreChanged) sitAdj -= 0.01;
-    if (lineMove) sitAdj -= 0.01;
+    if (scoreChanged)        sitAdj -= 0.01;
+    if (lineMoveConfirming)  sitAdj -= 0.01; // market agrees — act fast
+    if (lineMoveContra)      sitAdj += 0.02; // market moving against — investigate
+    if (crossConfirmed)      sitAdj -= 0.005; // both contracts agree — stronger signal
+    if (lineMoveVelocity > 3) sitAdj -= 0.005; // fast spike = urgent information window
     return Math.max(0.01, overrideBase + sitAdj);
   }
 
@@ -108,8 +113,11 @@ function getRequiredMargin(price, { sport = '', live = false, scoreChanged = fal
     // LIVE BETS: Don't penalize high prices — they reflect the game state
     // A team up 20 in Q4 at 85¢ is a BETTER bet than a pre-game toss-up at 50¢
     let sitAdj = 0;
-    if (scoreChanged) sitAdj -= 0.01;         // market recalculating — act fast
-    if (lineMove) sitAdj -= 0.01;             // something happened, edge window
+    if (scoreChanged)        sitAdj -= 0.01;   // market recalculating — act fast
+    if (lineMoveConfirming)  sitAdj -= 0.01;   // market agrees with us — edge window
+    if (lineMoveContra)      sitAdj += 0.02;   // market moving against — be cautious
+    if (crossConfirmed)      sitAdj -= 0.005;  // both Kalshi contracts agree — strong signal
+    if (lineMoveVelocity > 3) sitAdj -= 0.005; // fast move = urgent — act before window closes
     return Math.max(0.01, sportBase + sitAdj);
   }
 
@@ -1142,72 +1150,103 @@ function tickerHasTeam(ticker, teamAbbr) {
 // MLB: probability of leading team winning, by run lead and inning
 // Source: Tom Tango (tangotiger.net/we.html), FanGraphs, 1903-2024 data
 // Note: 3-run lead value differs by scoring environment (~4.3 R/G in 2020s)
+// MLB: win probability for leading team, by run lead (1-8) and inning (1-9)
+// Source: Fangraphs WE tables, Baseball Reference — neutral park, ~54% home baseline
 const MLB_WIN_EXPECTANCY = {
   1: { 1: 0.56, 2: 0.58, 3: 0.60, 4: 0.64, 5: 0.67, 6: 0.71, 7: 0.77, 8: 0.84, 9: 0.91 },
   2: { 1: 0.64, 2: 0.67, 3: 0.70, 4: 0.76, 5: 0.79, 6: 0.83, 7: 0.88, 8: 0.93, 9: 0.96 },
   3: { 1: 0.72, 2: 0.75, 3: 0.78, 4: 0.85, 5: 0.87, 6: 0.90, 7: 0.93, 8: 0.96, 9: 0.98 },
   4: { 1: 0.79, 2: 0.82, 3: 0.85, 4: 0.90, 5: 0.92, 6: 0.94, 7: 0.96, 8: 0.98, 9: 0.99 },
   5: { 1: 0.85, 2: 0.87, 3: 0.90, 4: 0.93, 5: 0.95, 6: 0.97, 7: 0.98, 8: 0.99, 9: 0.99 },
+  6: { 1: 0.89, 2: 0.91, 3: 0.93, 4: 0.95, 5: 0.96, 6: 0.97, 7: 0.98, 8: 0.99, 9: 0.99 },
+  7: { 1: 0.93, 2: 0.94, 3: 0.95, 4: 0.96, 5: 0.97, 6: 0.98, 7: 0.99, 8: 0.99, 9: 0.99 },
+  8: { 1: 0.95, 2: 0.96, 3: 0.97, 4: 0.97, 5: 0.98, 6: 0.99, 7: 0.99, 8: 0.99, 9: 0.99 },
 };
 
-// NBA: probability of leading team winning, by point lead and quarter
-// Source: Professor MJ, inpredictable.com, Albert's Blog — MODERN era (2015+)
-// Key: 15-point comebacks now happen 13% of time (was 6% pre-2002) due to 3-point shooting
-// Home court: 62.7% overall (much stronger than MLB/NHL)
+// NBA: win probability for leading team, by point lead (1-25) and quarter (1-4)
+// Source: Basketball Reference, inpredictable.com — MODERN era (2015+, 3-point era)
+// Per-point granularity for Q4 (most critical — a 7-pt Q4 lead ≠ a 5-pt Q4 lead)
+// Key: 3-pt era means comebacks easier than pre-2015 (15-pt comeback happens 13% now vs 6% pre-2002)
 const NBA_WIN_EXPECTANCY = {
-  5:  { 1: 0.57, 2: 0.60, 3: 0.65, 4: 0.75 },
-  10: { 1: 0.63, 2: 0.69, 3: 0.77, 4: 0.86 },
-  15: { 1: 0.70, 2: 0.78, 3: 0.85, 4: 0.92 },
-  20: { 1: 0.78, 2: 0.85, 3: 0.91, 4: 0.96 },
-  25: { 1: 0.85, 2: 0.90, 3: 0.95, 4: 0.98 },
+  1:  { 1: 0.53, 2: 0.54, 3: 0.56, 4: 0.56 },
+  2:  { 1: 0.54, 2: 0.56, 3: 0.58, 4: 0.60 },
+  3:  { 1: 0.55, 2: 0.57, 3: 0.61, 4: 0.64 },
+  4:  { 1: 0.56, 2: 0.59, 3: 0.63, 4: 0.69 },
+  5:  { 1: 0.57, 2: 0.60, 3: 0.65, 4: 0.74 },
+  6:  { 1: 0.58, 2: 0.62, 3: 0.67, 4: 0.79 },
+  7:  { 1: 0.59, 2: 0.64, 3: 0.70, 4: 0.83 },
+  8:  { 1: 0.60, 2: 0.66, 3: 0.73, 4: 0.86 },
+  9:  { 1: 0.61, 2: 0.67, 3: 0.75, 4: 0.89 },
+  10: { 1: 0.63, 2: 0.69, 3: 0.77, 4: 0.91 },
+  11: { 1: 0.64, 2: 0.71, 3: 0.79, 4: 0.92 },
+  12: { 1: 0.66, 2: 0.73, 3: 0.81, 4: 0.93 },
+  13: { 1: 0.67, 2: 0.75, 3: 0.83, 4: 0.94 },
+  14: { 1: 0.69, 2: 0.76, 3: 0.84, 4: 0.95 },
+  15: { 1: 0.70, 2: 0.78, 3: 0.85, 4: 0.95 },
+  16: { 1: 0.72, 2: 0.80, 3: 0.87, 4: 0.96 },
+  17: { 1: 0.73, 2: 0.81, 3: 0.88, 4: 0.97 },
+  18: { 1: 0.75, 2: 0.83, 3: 0.89, 4: 0.97 },
+  19: { 1: 0.76, 2: 0.84, 3: 0.90, 4: 0.97 },
+  20: { 1: 0.78, 2: 0.85, 3: 0.91, 4: 0.98 },
+  21: { 1: 0.79, 2: 0.86, 3: 0.92, 4: 0.98 },
+  22: { 1: 0.81, 2: 0.87, 3: 0.93, 4: 0.98 },
+  23: { 1: 0.82, 2: 0.88, 3: 0.94, 4: 0.99 },
+  24: { 1: 0.83, 2: 0.89, 3: 0.94, 4: 0.99 },
+  25: { 1: 0.85, 2: 0.90, 3: 0.95, 4: 0.99 },
 };
 
-// NHL: probability of leading team winning, by goal lead and period
+// NHL: win probability for leading team, by goal lead (1-4) and period (1-3)
 // Source: Hockey Graphs, MoneyPuck — scoring first jumps to 70% win prob
 // Home ice: 59% overall
 const NHL_WIN_EXPECTANCY = {
   1: { 1: 0.62, 2: 0.68, 3: 0.79 },
   2: { 1: 0.80, 2: 0.86, 3: 0.93 },
   3: { 1: 0.92, 2: 0.95, 3: 0.99 },
+  4: { 1: 0.96, 2: 0.97, 3: 0.99 },
 };
 
-function getWinExpectancy(league, lead, period) {
+// Home advantage adjustments applied after table lookup
+// Leading team that is also the home team gets a boost; away-team leaders get slight reduction
+const HOME_ADJ = { mlb: 0.02, nba: 0.03, nhl: 0.02, mls: 0.02, epl: 0.02, laliga: 0.02 };
+const AWAY_ADJ = { mlb: -0.01, nba: -0.01, nhl: -0.01, mls: -0.01, epl: -0.01, laliga: -0.01 };
+
+function getWinExpectancy(league, lead, period, isHome = null) {
   let table, leadKey, periodKey;
 
   if (league === 'mlb') {
     table = MLB_WIN_EXPECTANCY;
-    leadKey = Math.min(lead, 5);
+    leadKey = Math.min(lead, 8);
     periodKey = Math.min(Math.max(period, 1), 9);
   } else if (league === 'mls' || league === 'epl' || league === 'laliga') {
     // Soccer: goal lead by half (1=first half, 2=second half)
     // Source: brendansudol.github.io, EPL/MLS data
-    // Home leading 1-0 at HT: ~70% win. Away 1-0: reaches 70% at 68th min
-    // 2-0 in 2nd half: >90% win. Draws: EPL 28%, MLS 24%
     table = { 1: { 1: 0.65, 2: 0.78 }, 2: { 1: 0.82, 2: 0.92 }, 3: { 1: 0.94, 2: 0.98 } };
     leadKey = Math.min(lead, 3);
     periodKey = Math.min(Math.max(period, 1), 2);
   } else if (league === 'nba') {
     table = NBA_WIN_EXPECTANCY;
-    // Round to nearest bracket
-    leadKey = lead >= 25 ? 25 : lead >= 20 ? 20 : lead >= 15 ? 15 : lead >= 10 ? 10 : 5;
+    leadKey = Math.min(Math.max(lead, 1), 25); // exact per-point lookup, cap at 25
     periodKey = Math.min(Math.max(period, 1), 4);
   } else if (league === 'nhl') {
     table = NHL_WIN_EXPECTANCY;
-    leadKey = Math.min(lead, 3);
+    leadKey = Math.min(lead, 4);
     periodKey = Math.min(Math.max(period, 1), 3);
   } else {
     return null;
   }
 
   if (!table[leadKey] || !table[leadKey][periodKey]) return null;
-  return table[leadKey][periodKey];
+  const base = table[leadKey][periodKey];
+
+  // Apply home advantage if known — leading home team gets a boost, leading away team slight reduction
+  if (isHome === true)  return Math.min(0.99, base + (HOME_ADJ[league] ?? 0.02));
+  if (isHome === false) return Math.max(0.01, base + (AWAY_ADJ[league] ?? -0.01));
+  return base;
 }
 
 function getWinExpectancyText(league, lead, period, isHome) {
-  const base = getWinExpectancy(league, lead, period);
-  if (!base) return '';
-  const homeAdj = isHome ? 0.03 : -0.01;
-  const adjusted = Math.min(0.99, base + homeAdj);
+  const adjusted = getWinExpectancy(league, lead, period, isHome);
+  if (!adjusted) return '';
   const trailing = Math.max(0.01, 1 - adjusted);
   const periodName = league === 'mlb' ? `inning ${period}` : league === 'nba' ? `Q${period}` : `period ${period}`;
   const unitName = league === 'nba' ? 'points' : league === 'mlb' ? 'runs' : 'goals';
@@ -1574,9 +1613,11 @@ async function checkLiveScoreEdges() {
       const move = Math.abs(currentPrice - prev.price);
       if (move >= LINE_MOVE_THRESHOLD) {
         const direction = currentPrice > prev.price ? '📈' : '📉';
-        const minutesAgo = Math.round((Date.now() - prev.ts) / 60000);
-        lineMovers.push({ ticker, title: data.title, from: prev.price, to: currentPrice, move, direction, minutesAgo });
-        console.log(`[line-move] ${direction} ${ticker}: ${(prev.price*100).toFixed(0)}¢ → ${(currentPrice*100).toFixed(0)}¢ (${move > 0 ? '+' : ''}${(move*100).toFixed(0)}¢ in ${minutesAgo}min)`);
+        const elapsedMin = Math.max(1, (Date.now() - prev.ts) / 60000);
+        const minutesAgo = Math.round(elapsedMin);
+        const velocity = (move * 100) / elapsedMin; // cents per minute — distinguishes urgent spike from slow drift
+        lineMovers.push({ ticker, title: data.title, from: prev.price, to: currentPrice, move, direction, minutesAgo, velocity });
+        console.log(`[line-move] ${direction} ${ticker}: ${(prev.price*100).toFixed(0)}¢ → ${(currentPrice*100).toFixed(0)}¢ (${(move*100).toFixed(0)}¢ in ${minutesAgo}min, ${velocity.toFixed(1)}¢/min)`);
       }
     }
     lastSeenPrices.set(ticker, { price: currentPrice, ts: Date.now() });
@@ -1594,15 +1635,36 @@ async function checkLiveScoreEdges() {
         return mover.ticker.includes(homeAbbr) || mover.ticker.includes(awayAbbr);
       });
       if (candidate) {
-        candidate._lineMove = mover;
+        // Determine if move is confirming (toward leading team) or contra (against leading team)
+        const leadingAbbr = candidate.leading?.team?.abbreviation ?? '';
+        const moverTeam = mover.ticker.split('-').pop() ?? '';
+        const moverIsLeadingTeam = moverTeam === leadingAbbr;
+        // Confirming: leading team YES going up, OR trailing team YES going down
+        const isConfirming = (moverIsLeadingTeam && mover.to > mover.from) ||
+                             (!moverIsLeadingTeam && mover.to < mover.from);
+
+        // Cross-contract check: did the OTHER team's contract also move the same way?
+        // e.g., COL YES up AND BOS YES down = both Kalshi contracts agree → stronger signal
+        const crossConfirmed = lineMovers.some(m => {
+          if (m.ticker === mover.ticker) return false;
+          const mBase = m.ticker.lastIndexOf('-') > 0 ? m.ticker.slice(0, m.ticker.lastIndexOf('-')) : m.ticker;
+          if (mBase !== gameBase) return false;
+          const mTeam = m.ticker.split('-').pop() ?? '';
+          const mIsLeading = mTeam === leadingAbbr;
+          return (mIsLeading && m.to > m.from) || (!mIsLeading && m.to < m.from);
+        });
+
+        candidate._lineMove = { ...mover, confirming: isConfirming, crossConfirmed };
+
         // Only boost priority if baseline WE is already tradeable (65%+)
-        // Line moves on low-WE games (1-run lead inn 2) are just scoring noise
-        if (candidate._baselineWE >= 0.65) {
+        // Contra moves don't get boosted — they're a warning, not an opportunity
+        if (isConfirming && candidate._baselineWE >= 0.65) {
           candidate._baselineWE = Math.max(candidate._baselineWE, 0.90); // boost to top of priority queue
         }
+        console.log(`[line-move] ${isConfirming ? '✅ CONFIRMING' : '⚠️ CONTRA'} for ${leadingAbbr} (mover: ${moverTeam} ${mover.direction} ${(mover.velocity ?? 0).toFixed(1)}¢/min)${crossConfirmed ? ' — CROSS-CONFIRMED' : ''}`);
       }
     }
-    // Re-sort with line movers at top (only mid/late game ones are actually boosted)
+    // Re-sort — confirming moves at top, contra moves stay at natural WE rank
     candidates.sort((a, b) => b._baselineWE - a._baselineWE);
   }
 
@@ -2031,7 +2093,8 @@ async function checkLiveScoreEdges() {
           `\n═══ MARKET ═══\n` +
           `${targetAbbr} YES @ ${(price*100).toFixed(0)}¢ (market thinks ${(price*100).toFixed(0)}% chance)\n` +
           `${targetAbbr === leadingAbbr ? '(LEADING team' : '(TRAILING team — underdog'}${targetIsHome ? ', HOME)' : ', AWAY)'}\n` +
-          (_lineMove ? `⚠️ LINE MOVEMENT: Price moved ${_lineMove.direction} from ${(_lineMove.from*100).toFixed(0)}¢ → ${(_lineMove.to*100).toFixed(0)}¢ in the last ${_lineMove.minutesAgo} min.\n` : '') +
+          (_lineMove?.confirming === true  ? `📈 LINE MOVEMENT (CONFIRMING${_lineMove.crossConfirmed ? ', CROSS-CONFIRMED' : ''}): Market moved TOWARD ${targetAbbr}: ${(_lineMove.from*100).toFixed(0)}¢ → ${(_lineMove.to*100).toFixed(0)}¢ in ${_lineMove.minutesAgo}min (${(_lineMove.velocity ?? 0).toFixed(1)}¢/min). Market agrees — edge window closing.\n` : '') +
+          (_lineMove?.confirming === false ? `⚠️ CONTRA LINE MOVEMENT: Market moved AGAINST ${targetAbbr}: ${(_lineMove.from*100).toFixed(0)}¢ → ${(_lineMove.to*100).toFixed(0)}¢ in ${_lineMove.minutesAgo}min (${(_lineMove.velocity ?? 0).toFixed(1)}¢/min). Investigate why before betting — possible injury, scoring run, or news.\n` : '') +
           `\n═══ STEP 1 — SEARCH FIRST, ANALYZE SECOND ═══\n` +
           `⚠️ RESEARCH RULES: Only state facts you found via web search. Never invent statistics, records, or lineup information. You may draw inferences from confirmed data (e.g., "team has clinched so they may be conserving energy") but flag all inferences explicitly. If you cannot confirm something, say so — do not guess.\n\n` +
           `Search in this order:\n` +
@@ -2248,7 +2311,15 @@ async function checkLiveScoreEdges() {
         // Hard floor: require at least 5% edge. 3% was too thin — SJ@NSH had 1-4pt edge and still bet.
         // Min edge lowered from 5% back to 4%: SJ won tonight at 4% edge.
         // 5% was too tight — blocks valid bets. Sport base margins already handle per-sport.
-        const reqMargin = Math.max(0.04, getRequiredMargin(price, { sport: league, live: true, scoreChanged: !!item._scoreChanged, lineMove: !!item._lineMove }));
+        const reqMargin = Math.max(0.04, getRequiredMargin(price, {
+          sport: league, live: true,
+          scoreChanged: !!item._scoreChanged,
+          lineMove: !!item._lineMove,
+          lineMoveConfirming: item._lineMove?.confirming === true,
+          lineMoveContra:     item._lineMove?.confirming === false && !!item._lineMove,
+          lineMoveVelocity:   item._lineMove?.velocity ?? 0,
+          crossConfirmed:     item._lineMove?.crossConfirmed === true,
+        }));
         const rawEdge = confidence - price;
         if (rawEdge < reqMargin) {
           console.log(`[live-edge] Not enough margin on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(rawEdge*100).toFixed(1)}% need=${(reqMargin*100).toFixed(0)}%`);
