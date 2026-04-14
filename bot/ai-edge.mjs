@@ -1047,7 +1047,7 @@ async function refreshPortfolio() {
       exposure: parseFloat(p.event_exposure_dollars ?? '0'),
       exchange: 'kalshi',
     })).filter(p => p.exposure > 0); // only positions with active exposure (not settled/cashed out)
-  } catch { openPositions = []; }
+  } catch { /* keep old openPositions on fetch failure — don't wipe known positions */ }
 
   // Add Polymarket open positions from trades log — Poly API doesn't have a positions endpoint
   try {
@@ -1080,12 +1080,17 @@ async function refreshPortfolio() {
       let synced = false;
       for (const t of trades) {
         if (t.status !== 'open' || t.exchange !== 'kalshi') continue;
-        if (!kalshiTickers.has(t.ticker)) {
-          // Grace period: don't auto-close positions placed in the last 5 minutes
-          // Kalshi API can be slow to reflect new orders
+        // Prefix-aware match: event_ticker ('KXNHLGAME-26APR14MTLPHI') must match
+        // market ticker ('KXNHLGAME-26APR14MTLPHI-PHI') — Kalshi API returns event-level tickers
+        const isStillOpen = [...kalshiTickers].some(kt =>
+          t.ticker === kt || t.ticker.startsWith(kt + '-') || kt.startsWith(t.ticker + '-')
+        );
+        if (!isStillOpen) {
+          // Grace period: 15 min — Kalshi API can lag, and event vs market ticker mismatch
+          // is common. 5min was too short (PHI bet triggered false auto-close at 5min 3sec).
           const placedAt = t.timestamp ? Date.parse(t.timestamp) : 0;
-          if (Date.now() - placedAt < 5 * 60 * 1000) {
-            continue; // too new, Kalshi might not have registered it yet
+          if (Date.now() - placedAt < 15 * 60 * 1000) {
+            continue; // too new, skip
           }
           t.status = 'closed-manual';
           t.settledAt = new Date().toISOString();
