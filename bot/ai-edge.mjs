@@ -1950,9 +1950,10 @@ async function checkLiveScoreEdges() {
 
         const edge = confidence - price;
 
+        console.log(`[live-edge] ✅ ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}) PASSED margin: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(edge*100).toFixed(1)}% — checking risk gates...`);
+
         // Risk checks
-        if (!canTrade()) continue;
-        // Sport exposure cap removed — sports are our main revenue driver
+        if (!canTrade()) { console.log(`[live-edge] BLOCKED ${targetAbbr}: canTrade() failed`); continue; }
 
         // === CROSS-PLATFORM PRICE CHECK — buy on cheaper platform ===
         const polyMoneylines = await getPolyMoneylines();
@@ -1962,7 +1963,7 @@ async function checkLiveScoreEdges() {
         // Use the better price for sizing
         const bestPrice = best.price;
         const bestEdge = confidence - bestPrice;
-        if (confidence - bestPrice < reqMargin) continue; // recheck with best price (raw edge)
+        if (confidence - bestPrice < reqMargin) { console.log(`[live-edge] BLOCKED ${targetAbbr}: cross-platform recheck failed (bestPrice=${(bestPrice*100).toFixed(0)}¢)`); continue; }
 
         // Check for high-conviction tier (late-game blowouts → 25-30% sizing)
         const hcCheck = checkHighConviction(confidence, league, ctx?.stage ?? 'unknown', diff, period);
@@ -1972,10 +1973,10 @@ async function checkLiveScoreEdges() {
         const claudeBet = decision.betAmount ?? 0;
         const safeBet = hcCheck.isHighConv ? maxBetLE : Math.min(claudeBet, maxBetLE);
         if (safeBet < 1) {
-          console.log(`[live-edge] Bet too small: max=$${maxBetLE.toFixed(2)} Claude=$${claudeBet}`);
+          console.log(`[live-edge] BLOCKED ${targetAbbr}: bet too small (max=$${maxBetLE.toFixed(2)} Claude=$${claudeBet})`);
           continue;
         }
-        if (!canDeployMore(safeBet)) continue;
+        if (!canDeployMore(safeBet)) { console.log(`[live-edge] BLOCKED ${targetAbbr}: deployment cap (safeBet=$${safeBet.toFixed(2)})`); continue; }
 
         const qty = Math.max(1, Math.floor(safeBet / bestPrice));
         const priceInCents = Math.round(bestPrice * 100);
