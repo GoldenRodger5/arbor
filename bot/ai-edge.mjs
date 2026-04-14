@@ -1677,15 +1677,21 @@ async function checkLiveScoreEdges() {
     //   - 3-run lead inn 1 (72% WE) → analyze (real blowout)
     //   - 5-pt NBA Q1 (57% WE) → skip
     //   - 15-pt NBA Q1 (70% WE) → analyze
-    // Sport-specific floors based on variance research:
-    //   - MLB is most random (HR can erase any lead instantly) → 75% floor
-    //     75% WE = 2-run lead in 4th+, 3-run lead in 2nd+, 4-run lead anytime
-    //   - NHL/NBA/Soccer → 65% floor (still meaningful leads)
+    // Sport-specific WE floors based on actual trade data and variance research:
+    //   - MLB: 75% floor (HR can erase any lead instantly)
+    //   - NHL 1-goal leads: 75% floor (1-goal P2 = 68% WE, too volatile — OTT@NJ proved it)
+    //     Only 1-goal P3 (79% WE) and all 2-goal+ leads (80%+ WE) qualify
+    //   - NHL 2-goal+ leads: 65% floor (80%+ WE from P1 = solid)
+    //   - NBA/Soccer: 65% floor
     {
       const baseWE = getWinExpectancy(league, diff, period) ?? 0.50;
-      const MIN_WE_FOR_SONNET = league === 'mlb' ? 0.75 : 0.65;
+      const MIN_WE_FOR_SONNET = (() => {
+        if (league === 'mlb') return 0.75;
+        if (league === 'nhl' && diff === 1) return 0.75; // 1-goal P3=79% passes, P2=68% blocked
+        return 0.65;
+      })();
       if (baseWE < MIN_WE_FOR_SONNET) {
-        console.log(`[live-edge] Skipping low-WE: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} ${diff}-${league === 'nba' ? 'pt' : league === 'mlb' ? 'run' : 'goal'} lead P${period}, WE=${(baseWE*100).toFixed(0)}% (need ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%+ for ${league.toUpperCase()})`);
+        console.log(`[live-edge] Skipping low-WE: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} ${diff}-${league === 'nba' ? 'pt' : league === 'mlb' ? 'run' : 'goal'} lead P${period}, WE=${(baseWE*100).toFixed(0)}% (need ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%+ for ${league.toUpperCase()} ${diff === 1 ? '1-goal' : ''})`);
         continue;
       }
     }
@@ -1798,10 +1804,14 @@ async function checkLiveScoreEdges() {
           const trailRec = trailing.records?.[0]?.summary ?? '';
           const leadRec = leading.records?.[0]?.summary ?? '';
           const parseWins = (rec) => parseInt(rec.split('-')[0]) || 0;
+          const parseTotalGames = (rec) => rec.split('-').map(Number).reduce((a,b) => a+(isNaN(b)?0:b), 0);
           const trailWins = parseWins(trailRec);
           const leadWins = parseWins(leadRec);
-          // Only bet underdog if they have SIGNIFICANTLY more wins (10+)
-          if (trailWins > leadWins + 10) {
+          const trailTotal = parseTotalGames(trailRec);
+          const trailWinPct = trailTotal > 0 ? trailWins / trailTotal : 0;
+          // Trailing team must have significantly more wins (10+) AND a decent win rate (≥35%)
+          // UTA@CGY at 29c: Utah had bad record — stop-losses proved it was a mistake
+          if (trailWins > leadWins + 10 && trailWinPct >= 0.35) {
             targetMarket = trailMarket;
             targetAbbr = trailingAbbr;
             targetTeam = trailing;
@@ -1979,12 +1989,32 @@ async function checkLiveScoreEdges() {
           `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs triggered) ═══\n` +
           `Start from the historical baseline. Adjust based on what you found:\n` +
           `+ Leading team clearly better (record, talent, home) → UP 2-5%\n` +
-          `+ ${league === 'mlb' ? 'Dominant starter still pitching (ERA < 3.0, low pitch count)' : league === 'nba' ? 'Star player dominating (25+ pts, team on a run)' : league === 'nhl' ? 'Elite goalie in net (SV% > .920)' : 'Red card on opponent = UP 25-30%'} → UP 3-6%\n` +
-          `- Trailing team is better (record, talent) → DOWN 3-8%\n` +
-          `- Trailing team has momentum (just scored, on a run) → DOWN 3-5%\n` +
-          `- ${league === 'mlb' ? 'Runners on base with power hitters up (1 HR erases any lead)' : league === 'nba' ? '15-pt comebacks happen 13% now (3pt era) — be less aggressive on big leads' : league === 'nhl' ? 'Leading goalie SV% .895-.910 (below average)' : 'Draws happen 24-30% of games — draw = contract LOSES'} → DOWN 3-6%\n` +
+          (league === 'mlb' ?
+            `+ Dominant starter still pitching (ERA < 3.0, under 80 pitches) → UP 5-8%\n` +
+            `+ Strong bullpen ERA < 3.5 about to enter → UP 2-4%\n` +
+            `- Starter at 80+ pitches — bullpen transition coming → DOWN 3-5%\n` +
+            `- POWER HITTER ALERT: If trailing team has 25+ HR hitters coming up WITH RUNNERS ON BASE → DOWN 5-8%. A 3-run HR erases any lead in one pitch. This is the single biggest MLB risk.\n` +
+            `- Leading team bullpen ERA > 5.0 last 10 days → DOWN 5-8%\n`
+          : league === 'nba' ?
+            `+ Star player dominating (25+ pts, efficiency up) → UP 3-5%\n` +
+            `+ Opponent is tanking/resting (eliminated, trading players, nothing to play for) → UP 5-8%\n` +
+            `- Trailing team star player getting hot (last 2 quarters) → DOWN 3-6%\n` +
+            `- Leading team on second game of back-to-back → DOWN 2-4%\n` +
+            `- 15-pt comebacks happen 13% in the 3-point era. 10-pt leads in Q3 are NOT safe. Only Q4 10-pt leads are reliable (86% WE).\n`
+          : league === 'nhl' ?
+            `+ 2-goal lead (any period): much more reliable than 1-goal. 2-goal P3 = 93% WE. Trust the math.\n` +
+            `+ Elite goalie (SV% > .920) → UP 3-5%\n` +
+            `- Leading goalie SV% .895-.910 → DOWN 4-6%\n` +
+            `- OT RISK: 1-goal lead with under 8 min in P3 → OT probability ~25-35%. OT is a coin flip. Factor this into confidence (reduce 4-6% if OT is likely).\n` +
+            `- Trailing team on power play right now → DOWN 8-12% until it's resolved\n`
+          : `+ Strong home record for leading team → UP 2-3%\n` +
+            `- DRAWS happen 24-30% of games. 1-goal lead means draw is still very possible. Draw = contract LOSES.\n` +
+            `- Red card on YOUR team → DOWN 25-30%\n`
+          ) +
+          `- Trailing team is better on record (record, talent) → DOWN 3-8%\n` +
+          `- Trailing team has momentum (just scored) → DOWN 3-5%\n` +
           `- H2H: trailing team won 7-9 of last 15 → DOWN 3-5%\n` +
-          `- IMPORTANT: Time remaining matters more than period number. 10pts up with 3 min left ≠ 10pts up with 10 min left.\n\n` +
+          `- Time remaining: 3 min left with a lead ≠ 10 min left with same lead. Adjust accordingly.\n\n` +
           `═══ STEP 4 — DECISION ═══\n` +
           `BUY only if ALL three are true:\n` +
           `✓ Confidence ≥ 65%\n` +
