@@ -1483,15 +1483,14 @@ async function checkLiveScoreEdges() {
   candidates.sort((a, b) => b._baselineWE - a._baselineWE);
 
   // === BATCH FETCH: Get ALL sports market prices in one parallel call ===
-  // KEY FIX: Use max_close_ts to only fetch markets closing within next 24h.
-  // Without this, Kalshi returns future games first (April 16+) and live games
-  // are buried past the 200 limit. max_close_ts ensures we always get tonight's games.
+  // NOTE: Kalshi sorts markets by ticker name. We need pagination to get ALL markets
+  // including tonight's live games (they appear later in the list after future games).
+  // Fetch up to 1000 per series to ensure we don't miss any live game.
   const cachedPrices = new Map();
   const seriesList = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME', 'KXEPLGAME', 'KXLALIGAGAME'];
-  const maxCloseTs = Math.floor((Date.now() + 24 * 60 * 60 * 1000) / 1000); // next 24 hours
   try {
     const batchResults = await Promise.allSettled(
-      seriesList.map(s => kalshiGet(`/markets?series_ticker=${s}&status=open&limit=500&max_close_ts=${maxCloseTs}`).catch(() => ({ markets: [] })))
+      seriesList.map(s => kalshiGet(`/markets?series_ticker=${s}&status=open&limit=1000`).catch(() => ({ markets: [] })))
     );
     for (const r of batchResults) {
       for (const m of (r.status === 'fulfilled' ? (r.value?.markets ?? []) : [])) {
@@ -1746,13 +1745,9 @@ async function checkLiveScoreEdges() {
           .filter(([ticker, data]) => {
             if (data.yes < 0.01 || data.yes > 0.99) return false;
             if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) return false;
-            // Safety check: if market closes more than 10 hours from now, it's a future game — skip
-            // 10h allows tonight's late games (started 9-10pm ET, close ~1am ET = 5am UTC = ~7h away)
-            // but blocks tomorrow afternoon games (7:45pm EDT = ~22h away)
-            if (data.closeTime) {
-              const closeMs = Date.parse(data.closeTime);
-              if (Number.isFinite(closeMs) && closeMs - Date.now() > 10 * 60 * 60 * 1000) return false;
-            }
+            // Note: Kalshi close_time is the settlement DEADLINE (often days after game),
+            // not the game end time — cannot use it to filter live vs future games.
+            // The ticker date string (26APR13/26APR14) is the correct filter.
             return tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
           })
           .map(([ticker, data]) => ({
