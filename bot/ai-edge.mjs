@@ -1740,39 +1740,19 @@ async function checkLiveScoreEdges() {
         const etTmrwLE = new Date(etNowLE.getTime() + 24 * 60 * 60 * 1000);
         const tonightStr = etHourLE >= 22 ? toShortLE(etTmrwLE) : null;
 
-        // Filter cached prices for THIS game (instant, no API call)
-        // BUG FIXED: The API returns markets sorted by ticker ascending (Apr 16 first, Apr 13 last).
-        // When same teams play consecutive days (series), BOTH 26APR13 and 26APR14 markets match.
-        // The old code used g._baselineWE (undefined variable — g not in scope here, caused silent
-        // ReferenceError caught by try/catch, guard never ran). Fixed below with correct variable.
-        //
-        // Two-part fix:
-        // 1. Compute WE from variables that ARE in scope (diff, period, league)
-        // 2. Sort results so todayStr markets come before tonightStr — when same teams play
-        //    tomorrow too, today's live market is found first by .find()
-        const currentBaseWE = getWinExpectancy(league, diff, period) ?? 0.50;
+        // Filter cached prices for THIS game — find by team abbreviations, pick most live market
+        // SIMPLE APPROACH: No date string filtering needed.
+        // A live market reflects the current score (e.g. 94c when team leads 4-0).
+        // A pre-game market is always near 50/50 (e.g. 53c).
+        // Sort by distance from 50c — the live market naturally sorts first.
+        // This eliminates all todayStr/tonightStr/UTC-vs-ET complexity entirely.
         const gameMarkets = [...cachedPrices.entries()]
           .filter(([ticker, data]) => {
             if (data.yes < 0.01 || data.yes > 0.99) return false;
-            if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) return false;
-            // Team check FIRST — only apply wrong-day guard to markets for THIS game
-            if (!tickerHasTeam(ticker, homeAbbr) || !tickerHasTeam(ticker, awayAbbr)) return false;
-            // WRONG-DAY MARKET GUARD: only for markets that match this game's teams.
-            // If WE is decisive (85%+) but this matching market is priced near 50c,
-            // it's tomorrow's pre-game market — a real live market at 90%+ WE would be 85c+.
-            if (currentBaseWE >= 0.85 && data.yes >= 0.35 && data.yes <= 0.65) {
-              console.log(`[live-edge] Skipping wrong-day market: ${ticker} — WE=${(currentBaseWE*100).toFixed(0)}% but price=${(data.yes*100).toFixed(0)}c (pre-game for diff day)`);
-              return false;
-            }
-            return true;
+            return tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
           })
-          // Sort: todayStr markets first, tonightStr (tomorrow UTC) markets second
-          // Ensures .find() picks today's live market when both dates match
-          .sort(([a], [b]) => {
-            const aToday = a.includes(todayStr) ? 0 : 1;
-            const bToday = b.includes(todayStr) ? 0 : 1;
-            return aToday - bToday;
-          })
+          // Sort by distance from 50c descending — most decisive (live) market first
+          .sort(([, a], [, b]) => Math.abs(b.yes - 0.50) - Math.abs(a.yes - 0.50))
           .map(([ticker, data]) => ({
             ticker, title: data.title, yes_ask_dollars: String(data.yes), no_ask_dollars: String(data.no),
           }));
