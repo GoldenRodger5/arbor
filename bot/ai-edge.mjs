@@ -1699,26 +1699,10 @@ async function checkLiveScoreEdges() {
       }
     }
 
-    // === CODE-LEVEL HARD FILTER: Leading team win rate < 40% → auto-skip ===
-    // A bad team protecting a lead is fundamentally different from an average team.
-    // Don't waste Sonnet calls on situations Claude will (or should) reject anyway.
-    // Extract win rate from ESPN records summary (e.g. "32-34-14" → 32 wins, 80 games)
-    {
-      const leadingRecord = leading.records?.[0]?.summary ?? '';
-      if (leadingRecord) {
-        const parts = leadingRecord.split('-').map(Number);
-        // NHL/NBA: W-L-OTL. MLB: W-L. Soccer: W-D-L
-        const wins = parts[0] || 0;
-        const totalGames = parts.reduce((a, b) => a + (isNaN(b) ? 0 : b), 0);
-        if (totalGames >= 20) { // need enough games to be meaningful
-          const winPct = wins / totalGames;
-          if (winPct < 0.40) {
-            console.log(`[live-edge] Skipping weak team: ${leading.team?.abbreviation ?? ''} win rate ${(winPct*100).toFixed(0)}% (${leadingRecord}) < 40% — bad teams don't protect leads reliably`);
-            continue;
-          }
-        }
-      }
-    }
+    // NOTE: Removed code-level <40% win rate hard block.
+    // SJ (bottom team) won tonight with a 1-goal P3 lead. The baseline WE is real.
+    // Bad teams DO protect leads 79% of the time (P3 1-goal). Let Claude assess
+    // with full context instead of auto-blocking. Win rate is now a prompt adjustment.
 
     // Cap Sonnet calls per cycle to avoid stale prices on later games
     if (sonnetCallsThisCycle >= MAX_SONNET_PER_CYCLE) {
@@ -1983,10 +1967,8 @@ async function checkLiveScoreEdges() {
           `C) What is the H2H record between these two teams this season and last 2 seasons?\n` +
           `D) Does the TRAILING team have playoff/clinching implications tonight?\n\n` +
           `═══ STEP 2 — HARD NOs (if ANY apply, respond {"trade":false} immediately) ═══\n` +
-          `❌ Leading team is resting 3+ key players → NO (not the same team)\n` +
+          `❌ Leading team is resting 3+ key players → NO (not the same team that earned that record)\n` +
           `❌ Trailing team is fighting for playoffs/clinching AND leading team has nothing to play for → NO\n` +
-          `❌ Trailing team has won 10+ of last 15 H2H meetings → NO (historical dominance overrides current score)\n` +
-          (league === 'nhl' ? `❌ Leading goalie SV% is below .895 → NO (cannot trust them to protect a lead for a full period)\n` : '') +
           (league === 'mlb' ? `❌ Starter has 90+ pitches and bullpen ERA > 5.0 with 3+ innings left → NO (bullpen collapse risk)\n` : '') +
           `❌ You find yourself saying "modest," "marginal," "just clears the bar," or "only X points of edge" → NO\n\n` +
           `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs triggered) ═══\n` +
@@ -2014,9 +1996,12 @@ async function checkLiveScoreEdges() {
             `- DRAWS happen 24-30% of games. 1-goal lead means draw is still very possible. Draw = contract LOSES.\n` +
             `- Red card on YOUR team → DOWN 25-30%\n`
           ) +
-          `- Trailing team is better on record (record, talent) → DOWN 3-8%\n` +
+          `- Trailing team is significantly better (record, talent) → DOWN 4-8%\n` +
           `- Trailing team has momentum (just scored) → DOWN 3-5%\n` +
-          `- H2H: trailing team won 7-9 of last 15 → DOWN 3-5%\n` +
+          `- H2H: trailing team won 7-9 of last 15 → DOWN 3-5%. Won 10+ of last 15 → DOWN 6-8% (strong signal but not automatic NO — SJ held off NSH despite H2H deficit).\n` +
+          (league === 'nhl' ? `- Leading goalie SV% .885-.895 → DOWN 6-8% (bad but not automatic NO — bad goalies still hold leads sometimes)\n` : '') +
+          `- Leading team win rate below 35% → DOWN 6-10% (weak teams protect leads less reliably)\n` +
+          `- Trailing team is at HOME with loud playoff/crucial crowd → DOWN 3-5% (home crowd lifts desperate teams)\n` +
           `- Time remaining: 3 min left with a lead ≠ 10 min left with same lead. Adjust accordingly.\n\n` +
           `═══ STEP 4 — DECISION ═══\n` +
           `BUY only if ALL three are true:\n` +
@@ -2170,7 +2155,9 @@ async function checkLiveScoreEdges() {
 
         // Dynamic margin — sport-aware, price-aware, situation-aware
         // Hard floor: require at least 5% edge. 3% was too thin — SJ@NSH had 1-4pt edge and still bet.
-        const reqMargin = Math.max(0.05, getRequiredMargin(price, { sport: league, live: true, scoreChanged: !!item._scoreChanged, lineMove: !!item._lineMove }));
+        // Min edge lowered from 5% back to 4%: SJ won tonight at 4% edge.
+        // 5% was too tight — blocks valid bets. Sport base margins already handle per-sport.
+        const reqMargin = Math.max(0.04, getRequiredMargin(price, { sport: league, live: true, scoreChanged: !!item._scoreChanged, lineMove: !!item._lineMove }));
         const rawEdge = confidence - price;
         if (rawEdge < reqMargin) {
           console.log(`[live-edge] Not enough margin on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(rawEdge*100).toFixed(1)}% need=${(reqMargin*100).toFixed(0)}%`);
