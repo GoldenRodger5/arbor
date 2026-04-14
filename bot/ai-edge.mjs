@@ -104,7 +104,22 @@ function getRequiredMargin(price, { sport = '', live = false, scoreChanged = fal
   const margin = Math.max(0.02, sportBase + priceAdj + 0.01);
   return margin;
 }
-const MAX_PRICE = 0.75;           // Don't buy above 75¢ — at 80¢+ we risk $0.80 to win $0.20, brutal risk/reward
+const MAX_PRICE = 0.75;           // Default ceiling — use getMaxPrice(league, period) for sport-specific limits
+
+// Sport-specific price ceiling based on variance research:
+// MLB: 75¢ always — single HR can erase any lead, even in 8th inning
+// NHL P3: 82¢ — 2-goal leads with <10min left are genuinely 93%+ WE, market at 80¢ has real edge
+// NHL P1/P2: 75¢ — still 40+ min of hockey left, comebacks very possible
+// NBA Q4: 80¢ — 15-pt comeback in Q4 happens only 8%, 20-pt is <2%
+// NBA Q1-Q3: 75¢ — modern NBA 3-pt era, big swings happen fast
+// Soccer: 75¢ always — draws kill contracts, never overpay for a lead
+function getMaxPrice(league, period) {
+  if (league === 'mlb') return 0.75;
+  if (league === 'nhl') return period >= 3 ? 0.82 : 0.75;
+  if (league === 'nba') return period >= 4 ? 0.80 : 0.75;
+  if (['mls', 'epl', 'laliga'].includes(league)) return 0.75;
+  return MAX_PRICE;
+}
 const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — base fraction
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 5 * 60 * 1000;  // 5 min base cooldown (can be bypassed for better prices)
@@ -1672,13 +1687,15 @@ async function checkLiveScoreEdges() {
     //   - 3-run lead inn 1 (72% WE) → analyze (real blowout)
     //   - 5-pt NBA Q1 (57% WE) → skip
     //   - 15-pt NBA Q1 (70% WE) → analyze
-    // Replaces rigid inning/period filters with one universal number.
+    // Sport-specific floors based on variance research:
+    //   - MLB is most random (HR can erase any lead instantly) → 75% floor
+    //     75% WE = 2-run lead in 4th+, 3-run lead in 2nd+, 4-run lead anytime
+    //   - NHL/NBA/Soccer → 65% floor (still meaningful leads)
     {
-      const isLeading = leading === (diff > 0 ? (homeScore > awayScore ? home : away) : null);
       const baseWE = getWinExpectancy(league, diff, period) ?? 0.50;
-      const MIN_WE_FOR_SONNET = 0.65;
+      const MIN_WE_FOR_SONNET = league === 'mlb' ? 0.75 : 0.65;
       if (baseWE < MIN_WE_FOR_SONNET) {
-        console.log(`[live-edge] Skipping low-WE: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} ${diff}-${league === 'nba' ? 'pt' : league === 'mlb' ? 'run' : 'goal'} lead P${period}, WE=${(baseWE*100).toFixed(0)}% (need ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%+)`);
+        console.log(`[live-edge] Skipping low-WE: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} ${diff}-${league === 'nba' ? 'pt' : league === 'mlb' ? 'run' : 'goal'} lead P${period}, WE=${(baseWE*100).toFixed(0)}% (need ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%+ for ${league.toUpperCase()})`);
         continue;
       }
     }
@@ -2006,13 +2023,14 @@ async function checkLiveScoreEdges() {
           continue; // within cooldown and no existing position to scale into
         }
 
-        // Price filter — skip if already decided (80¢+ = not enough upside) or lottery
+        // Price filter — sport-specific ceiling (NHL P3 allows 82¢, MLB always caps at 75¢)
+        const sportMaxPrice = getMaxPrice(league, period);
         if (price <= 0.05) {
           console.log(`[live-edge] Skipping: ${leadingAbbr} @${(price*100).toFixed(0)}¢ (lottery ticket)`);
           continue;
         }
-        if (price >= MAX_PRICE) {
-          console.log(`[live-edge] Skipping: ${leadingAbbr} @${(price*100).toFixed(0)}¢ (too expensive, not enough upside)`);
+        if (price >= sportMaxPrice) {
+          console.log(`[live-edge] Skipping: ${leadingAbbr} @${(price*100).toFixed(0)}¢ (above ${(sportMaxPrice*100).toFixed(0)}¢ ceiling for ${league.toUpperCase()} P${period})`);
           continue;
         }
 
@@ -3643,7 +3661,13 @@ async function checkSettlements() {
   try {
     const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
     const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    const openKalshi = trades.filter(t => t.status === 'open' && t.exchange === 'kalshi');
+    // Include closed-manual Kalshi trades — they may have actually settled on Kalshi
+    // but the portfolio sync marked them closed-manual before settlement was written
+    const openKalshi = trades.filter(t =>
+      (t.status === 'open' || t.status === 'closed-manual') &&
+      t.exchange === 'kalshi' &&
+      t.realizedPnL == null  // only if P&L not yet recorded
+    );
     const openPoly = trades.filter(t => t.status === 'open' && t.exchange === 'polymarket');
     let updated = false;
 
@@ -3733,54 +3757,74 @@ async function checkSettlements() {
     }
 
     if (openKalshi.length === 0 && !updated) return;
-    const openTrades = openKalshi;
 
-    // Fetch closed/settled markets
-    let closedMarkets = [];
-    for (const status of ['closed', 'settled']) {
-      try {
-        const data = await kalshiGet(`/markets?status=${status}&limit=100`);
-        closedMarkets.push(...(data.markets ?? []));
-      } catch { /* skip */ }
+    // Use /portfolio/settlements — returns OUR specific settlement history directly.
+    // Much better than fetching all closed markets (limit 100 misses our specific tickers).
+    // Response: { settlements: [{ ticker, market_result, yes_count, no_count, revenue, settled_time, fee_cost }] }
+    let settlements = [];
+    try {
+      const data = await kalshiGet('/portfolio/settlements?limit=100');
+      settlements = data.settlements ?? [];
+    } catch (e) {
+      console.error('[pnl] settlements fetch error:', e.message);
+      // Fallback: try fetching closed markets the old way
+      for (const status of ['closed', 'settled']) {
+        try {
+          const data = await kalshiGet(`/markets?status=${status}&limit=100`);
+          // Convert to same format as settlements response
+          for (const m of (data.markets ?? [])) {
+            if (m.result) settlements.push({ ticker: m.ticker, market_result: m.result, yes_count: 0, no_count: 0, revenue: 0, settled_time: null, fee_cost: 0 });
+          }
+        } catch { /* skip */ }
+      }
     }
-    if (closedMarkets.length === 0) return;
 
-    const closedMap = new Map();
-    for (const m of closedMarkets) closedMap.set(m.ticker, m);
+    if (settlements.length === 0) return;
+
+    // Build map: ticker → settlement data
+    const settlementMap = new Map();
+    for (const s of settlements) {
+      if (s.ticker) settlementMap.set(s.ticker, s);
+    }
 
     for (const trade of trades) {
       if (trade.status !== 'open' || trade.exchange !== 'kalshi') continue;
-      // Check all market tickers that could match this trade (with team suffixes)
-      const market = closedMap.get(trade.ticker);
-      if (!market || !market.result) continue;
+      const settlement = settlementMap.get(trade.ticker);
+      if (!settlement || !settlement.market_result) continue;
 
-      // Calculate P&L: if we bought YES and result is 'yes', we win $1/contract
-      const won = (trade.side === 'yes' && market.result === 'yes') ||
-                  (trade.side === 'no' && market.result === 'no');
+      // P&L from Kalshi's revenue field (actual payout in cents → dollars)
+      // revenue = total payout received. cost = deployCost. pnl = revenue - cost.
+      // Fallback: calculate from market_result and qty if revenue is missing.
+      const won = (trade.side === 'yes' && settlement.market_result === 'yes') ||
+                  (trade.side === 'no' && settlement.market_result === 'no');
       const exitPrice = won ? 1.0 : 0.0;
-      // Use quantity (what we ordered), not filled (often 0 from initial API response)
-      // The real fill count is deployCost / entryPrice
       const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / (trade.entryPrice || 1));
-      const proceeds = qty * exitPrice;
-      const pnl = proceeds - (trade.deployCost ?? 0);
+
+      // Use Kalshi's actual revenue if available (includes accurate fill count)
+      let pnl;
+      if (settlement.revenue && settlement.revenue > 0) {
+        const revenueDollars = settlement.revenue / 100; // Kalshi returns cents
+        pnl = revenueDollars - (trade.deployCost ?? 0);
+      } else {
+        pnl = (qty * exitPrice) - (trade.deployCost ?? 0);
+      }
 
       trade.status = 'settled';
       trade.exitPrice = exitPrice;
       trade.realizedPnL = Math.round(pnl * 100) / 100;
-      trade.settledAt = new Date().toISOString();
-      trade.result = market.result;
+      trade.settledAt = settlement.settled_time ?? new Date().toISOString();
+      trade.result = settlement.market_result;
       updated = true;
 
       const icon = pnl >= 0 ? '✅' : '❌';
-      console.log(`[pnl] SETTLED: ${trade.ticker} ${trade.side} → ${market.result} | P&L: ${icon} $${pnl.toFixed(2)}`);
+      console.log(`[pnl] SETTLED: ${trade.ticker} ${trade.side} → ${settlement.market_result} | P&L: ${icon} $${pnl.toFixed(2)}`);
 
-      // Send Telegram notification for every settlement
       const pnlStr = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
       await tg(
         `${icon} <b>SETTLED${won ? ' — WIN' : ' — LOSS'}</b>\n\n` +
         `<b>${trade.title ?? trade.ticker}</b>\n` +
         `Bought ${trade.side?.toUpperCase()} @ ${((trade.entryPrice ?? 0)*100).toFixed(0)}¢ × ${qty}\n` +
-        `Result: <b>${market.result?.toUpperCase()}</b>\n` +
+        `Result: <b>${settlement.market_result?.toUpperCase()}</b>\n` +
         `P&L: <b>${pnlStr}</b>`
       );
     }
