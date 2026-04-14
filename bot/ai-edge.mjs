@@ -104,12 +104,20 @@ function getRequiredMargin(price, { sport = '', live = false, scoreChanged = fal
   const margin = Math.max(0.02, sportBase + priceAdj + 0.01);
   return margin;
 }
-const MAX_PRICE = 0.90;           // Don't buy contracts above 90¢ — allows high-confidence late-game bets
+const MAX_PRICE = 0.75;           // Don't buy above 75¢ — at 80¢+ we risk $0.80 to win $0.20, brutal risk/reward
 const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — base fraction
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 5 * 60 * 1000;  // 5 min base cooldown (can be bypassed for better prices)
-const MAX_ENTRIES_PER_GAME = 3;     // Max times we can buy into the same game
-const MAX_GAME_EXPOSURE_PCT = 0.15; // Max 15% of bankroll on one game
+const MAX_GAME_EXPOSURE_PCT = 0.08; // Max 8% of bankroll on one game (was 15% — too concentrated at small bankroll)
+
+// Scale-in entries scale with bankroll — at small bankroll, concentrate less on single games
+function getMaxEntriesPerGame() {
+  const b = getBankroll();
+  if (b < 1000) return 1;   // Under $1K: one entry per game, spread capital wider
+  if (b < 2000) return 2;   // $1K-$2K: allow one add if price improves
+  return 3;                  // $2K+: full scale-in logic
+}
+const MAX_ENTRIES_PER_GAME = 3; // Legacy constant — use getMaxEntriesPerGame() instead
 const MAX_DAYS_OUT = 1;            // Same-day only — capital turns over nightly
 const CLAUDE_SCREENER = 'claude-haiku-4-5-20251001';  // Cheap screening — $0.002/call
 const CLAUDE_DECIDER = 'claude-sonnet-4-6';            // Expensive analysis — only on candidates
@@ -461,10 +469,10 @@ function canScaleInto(gameKey, currentPrice) {
   const entry = gameEntries.get(gameKey);
   if (!entry) return true; // first entry — always allowed
 
-  // Block if max entries reached
-  if (entry.count >= MAX_ENTRIES_PER_GAME) return false;
+  // Block if max entries reached (dynamic — fewer entries at smaller bankrolls)
+  if (entry.count >= getMaxEntriesPerGame()) return false;
 
-  // Block if total exposure on this game exceeds 15% of bankroll
+  // Block if total exposure on this game exceeds bankroll cap
   if (entry.totalDeployed >= getBankroll() * MAX_GAME_EXPOSURE_PCT) return false;
 
   // Allow if price is BETTER (lower) than last entry — we're averaging down
@@ -1885,8 +1893,9 @@ async function checkLiveScoreEdges() {
           `- Trailing team is much better → DOWN 3-8%\n` +
           `- ${league === 'mlb' ? 'Weak bullpen (ERA > 5.0) → DOWN 3-5%' : league === 'nba' ? 'MODERN NBA: 15-pt comebacks happen 13% now (3pt era) — be less aggressive on big NBA leads' : (league === 'mls' || league === 'epl' || league === 'laliga') ? 'DRAWS happen 24-30% of games (EPL 28%). 1-goal leads hold ~65-78%. Minutes 55-70 = best comeback window. Red card on YOUR team = DOWN 25-30%.' : 'Empty net situation → DOWN 5-10%'}\n` +
           `- ${league === 'nba' ? 'Star player in foul trouble → DOWN 5-10% for their team' : 'Trailing team has momentum (just scored multiple) → DOWN 2-4%'}\n` +
-          `- IMPORTANT: Time remaining matters MORE than period/quarter number. 10pts up with 8min left ≠ 10pts up with 30sec left.\n\n` +
-          `Use web search if you need injury/streak info. Then give your FINAL adjusted probability.\n\n` +
+          `- IMPORTANT: Time remaining matters MORE than period/quarter number. 10pts up with 8min left ≠ 10pts up with 30sec left.\n` +
+          `- RESTING/MISSING STARTERS: If the LEADING team is missing 3+ key players (resting, injured, scratched), apply a MANDATORY -10 to -15% reduction from baseline. A team resting their top line or star players is NOT the same team that earned that baseline win rate. If a team is resting their best players, the market already knows — do NOT bet on them.\n\n` +
+          `Use web search to check: are key players resting tonight? What are the injury reports? Then give your FINAL adjusted probability.\n\n` +
           `BUY if: your probability ≥ 65% AND at least 3 points above price.\n` +
           `${targetAbbr !== leadingAbbr ? 'NOTE: This is an UNDERDOG bet. The baseline says they LOSE. Only bet if specific factors override the baseline.\n' : ''}` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)} (bet MORE if confidence is much higher than price)\n\n` +
