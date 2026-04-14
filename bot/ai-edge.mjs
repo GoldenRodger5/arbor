@@ -1963,7 +1963,7 @@ async function checkLiveScoreEdges() {
           `═══ STEP 1 — SEARCH FIRST, ANALYZE SECOND ═══\n` +
           `Before touching the baseline, use web search to check these FOUR things:\n` +
           `A) Is the leading team resting 3+ starters tonight? (injury report / lineup)\n` +
-          `B) What is the leading team's goalie ${league === 'nhl' ? 'SV%' : league === 'mlb' ? 'starter ERA and pitch count' : 'key player status'}?\n` +
+          `B) ${league === 'mlb' ? `What is the starter's ERA and current pitch count?${period >= 7 ? ' Also: is the closer available tonight (did he pitch in the last 24-48 hours)?' : ''}` : league === 'nhl' ? `What is the leading team's starting goalie SV% this season?` : `What is the leading team's key player status tonight?`}\n` +
           `C) What is the H2H record between these two teams this season and last 2 seasons?\n` +
           `D) Does the TRAILING team have playoff/clinching implications tonight?\n\n` +
           `═══ STEP 2 — HARD NOs (if ANY apply, respond {"trade":false} immediately) ═══\n` +
@@ -1979,7 +1979,8 @@ async function checkLiveScoreEdges() {
             `+ Strong bullpen ERA < 3.5 about to enter → UP 2-4%\n` +
             `- Starter at 80+ pitches — bullpen transition coming → DOWN 3-5%\n` +
             `- POWER HITTER ALERT: If trailing team has 25+ HR hitters coming up WITH RUNNERS ON BASE → DOWN 5-8%. A 3-run HR erases any lead in one pitch. This is the single biggest MLB risk.\n` +
-            `- Leading team bullpen ERA > 5.0 last 10 days → DOWN 5-8%\n`
+            `- Leading team bullpen ERA > 5.0 last 10 days → DOWN 5-8%\n` +
+            `- HIGH-RUN PARK (Coors Field, Great American Ballpark, Globe Life Field, Yankee Stadium) → reduce lead confidence 3-5%. Runs come easier; leads evaporate faster.\n`
           : league === 'nba' ?
             `+ Star player dominating (25+ pts, efficiency up) → UP 3-5%\n` +
             `+ Opponent is tanking/resting (eliminated, trading players, nothing to play for) → UP 5-8%\n` +
@@ -1990,7 +1991,7 @@ async function checkLiveScoreEdges() {
             `+ 2-goal lead (any period): much more reliable than 1-goal. 2-goal P3 = 93% WE. Trust the math.\n` +
             `+ Elite goalie (SV% > .920) → UP 3-5%\n` +
             `- Leading goalie SV% .895-.910 → DOWN 4-6%\n` +
-            `- OT RISK: 1-goal lead with under 8 min in P3 → OT probability ~25-35%. OT is a coin flip. Factor this into confidence (reduce 4-6% if OT is likely).\n` +
+            `- OT RISK (1-goal lead in P3, check the clock): 10-14 min remaining → OT probability ~20%, reduce confidence 2-3%. Under 10 min → OT probability ~30%, reduce 4-6%. Under 5 min → reduce 8-10%. OT = 3v3 sudden death coin flip regardless of which team dominated regulation.\n` +
             `- Trailing team on power play right now → DOWN 8-12% until it's resolved\n`
           : `+ Strong home record for leading team → UP 2-3%\n` +
             `- DRAWS happen 24-30% of games. 1-goal lead means draw is still very possible. Draw = contract LOSES.\n` +
@@ -2106,7 +2107,7 @@ async function checkLiveScoreEdges() {
   for (let batch = 0; batch < sonnetQueue.length; batch += 3) {
     const batchItems = sonnetQueue.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 1 }))
+      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 2 }))
     );
 
     for (let i = 0; i < batchItems.length; i++) {
