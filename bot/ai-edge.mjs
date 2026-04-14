@@ -2364,12 +2364,6 @@ let preGameTradesDate = '';         // reset counter on new day
 const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
 
 async function checkPreGamePredictions() {
-  // PRE-GAME DISABLED — daily limit and duplicate detection were broken,
-  // causing massive over-deployment (10x buys on CLE@STL, 5x on MIA@ATL).
-  // Needs rebuild before re-enabling.
-  console.log(`[pre-game] DISABLED — pending fix for daily limit and duplicate detection`);
-  return;
-
   if (Date.now() - lastPreGameScan < PREGAME_SCAN_INTERVAL) return;
   lastPreGameScan = Date.now();
   if (!canTrade()) return;
@@ -2394,10 +2388,14 @@ async function checkPreGamePredictions() {
       for (const l of todayLines) {
         try {
           const t = JSON.parse(l);
-          if (t.strategy === 'pre-game-prediction' && t.timestamp?.startsWith(todayDateStr) && t.exchange === 'kalshi') {
+          if (t.strategy === 'pre-game-prediction' && t.timestamp?.startsWith(todayDateStr)) {
             preGameTradesToday++;
-            const tBase = t.ticker?.lastIndexOf('-') > 0 ? t.ticker.slice(0, t.ticker.lastIndexOf('-')) : t.ticker;
-            preGameBetGames.add(tBase);
+            // Use Kalshi base if available — Polymarket tickers are slugs, not base tickers
+            const rawTicker = t.ticker ?? '';
+            const tBase = rawTicker.startsWith('KX')
+              ? (rawTicker.lastIndexOf('-') > 0 ? rawTicker.slice(0, rawTicker.lastIndexOf('-')) : rawTicker)
+              : (t.kalshiBase ?? rawTicker); // fallback to kalshiBase field if logged
+            if (tBase) preGameBetGames.add(tBase);
           }
         } catch {}
       }
@@ -2776,15 +2774,24 @@ async function checkPreGamePredictions() {
     if (alreadyHasPosition) { console.log(`[pre-game] Already have Kalshi position on ${market.base}`); continue; }
 
     // Also check JSONL for today's trades on this game (catches trades from earlier restarts)
+    // Don't require status=open — any non-void pre-game trade today blocks re-entry (one shot per game)
     if (existsSync(TRADES_LOG)) {
       const todayTrades = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      const todayDateStr2 = etNow.toISOString().slice(0, 10);
       const hasTodayTrade = todayTrades.some(l => {
         try {
           const t = JSON.parse(l);
-          return t.status === 'open' && t.ticker?.includes(market.base);
+          if (t.status === 'testing-void') return false;
+          if (!t.timestamp?.startsWith(todayDateStr2)) return false;
+          if (t.strategy !== 'pre-game-prediction') return false;
+          // Kalshi ticker: check if it includes the base
+          if (t.ticker?.includes(market.base)) return true;
+          // Polymarket ticker: check stored kalshiBase fallback
+          if (t.kalshiBase === market.base) return true;
+          return false;
         } catch { return false; }
       });
-      if (hasTodayTrade) { console.log(`[pre-game] Already have JSONL position on ${market.base}`); continue; }
+      if (hasTodayTrade) { console.log(`[pre-game] Already bet on ${market.base} today (JSONL)`); continue; }
     }
 
     const pgPlatformLabel = pgBest.platform === 'polymarket' ? `POLY (saved ${((price-bestPrice)*100).toFixed(0)}¢ vs Kalshi)` : 'KALSHI';
@@ -2814,6 +2821,7 @@ async function checkPreGamePredictions() {
       logTrade({
         exchange: pgBest.platform, strategy: 'pre-game-prediction',
         ticker: pgBest.platform === 'polymarket' ? pgBest.slug : pick.ticker,
+        kalshiBase: market.base, // always stored so restart restore can find it regardless of platform
         title: market.title,
         side: 'yes', quantity: qty, entryPrice: bestPrice,
         bettingOn: bettingOnTeam,
