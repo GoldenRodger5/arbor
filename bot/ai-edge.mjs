@@ -370,6 +370,34 @@ async function claudeScreen(prompt, { maxTokens = 300, timeout = 10000 } = {}) {
   }
 }
 
+// Sonnet without search tools — for nuanced decisions that don't need real-time data, ~$0.02/call
+async function claudeSonnet(prompt, { maxTokens = 400, timeout = 20000 } = {}) {
+  stats.claudeCalls++;
+  stats.apiSpendCents += 2; // ~$0.02
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      signal: AbortSignal.timeout(timeout),
+      method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: CLAUDE_DECIDER,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.content?.[0]?.text ?? '';
+  } catch (e) {
+    console.error('[claude-sonnet] error:', e.message);
+    return null;
+  }
+}
+
 // Expensive Sonnet + web search — only for final trade decisions, ~$0.03-0.05/call
 async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, timeout = 45000 } = {}) {
   stats.claudeCalls++;
@@ -1418,7 +1446,7 @@ async function checkLiveScoreEdges() {
           `B) HOLD: If ${ourTeam} wins → +$${(qty * (1 - entryPrice)).toFixed(2)}. If loses → -$${(qty * entryPrice).toFixed(2)}.\n\n` +
           `JSON ONLY: {"action": "sell"/"hold", "reasoning": "why — reference the original thesis"}`;
 
-        const pgGuardText = await claudeScreen(pgPrompt, { maxTokens: 200, timeout: 8000 });
+        const pgGuardText = await claudeSonnet(pgPrompt, { maxTokens: 400, timeout: 20000 });
         if (pgGuardText) {
           try {
             const match = extractJSON(pgGuardText);
@@ -1557,7 +1585,7 @@ async function checkLiveScoreEdges() {
   // Collect Sonnet work items for parallel execution
   const sonnetQueue = [];
 
-  for (const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail, isSoccer, _scoreChanged } of candidates) {
+  for (const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail, isSoccer, _scoreChanged, _lineMove } of candidates) {
     const seriesMap = { mlb: 'KXMLBGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME', mls: 'KXMLSGAME', epl: 'KXEPLGAME', laliga: 'KXLALIGAGAME' };
     const series = seriesMap[league] ?? 'KXMLBGAME';
 
@@ -1959,8 +1987,9 @@ async function checkLiveScoreEdges() {
           soccerDrawWarning +
           `\n═══ MARKET ═══\n` +
           `${targetAbbr} YES @ ${(price*100).toFixed(0)}¢ (market thinks ${(price*100).toFixed(0)}% chance)\n` +
-          `${targetAbbr === leadingAbbr ? '(LEADING team' : '(TRAILING team — underdog'}${targetIsHome ? ', HOME)' : ', AWAY)'}\n\n` +
-          `═══ STEP 1 — SEARCH FIRST, ANALYZE SECOND ═══\n` +
+          `${targetAbbr === leadingAbbr ? '(LEADING team' : '(TRAILING team — underdog'}${targetIsHome ? ', HOME)' : ', AWAY)'}\n` +
+          (_lineMove ? `⚠️ LINE MOVEMENT: Price moved ${_lineMove.direction} from ${(_lineMove.from*100).toFixed(0)}¢ → ${(_lineMove.to*100).toFixed(0)}¢ in the last ${_lineMove.minutesAgo} min. Something changed — factor this into your conviction.\n` : '') +
+          `\n═══ STEP 1 — SEARCH FIRST, ANALYZE SECOND ═══\n` +
           `Before touching the baseline, use web search to check these FOUR things:\n` +
           `A) Is the leading team resting 3+ starters tonight? (injury report / lineup)\n` +
           `B) ${league === 'mlb' ? `What is the starter's ERA and current pitch count?${period >= 7 ? ' Also: is the closer available tonight (did he pitch in the last 24-48 hours)?' : ''}` : league === 'nhl' ? `What is the leading team's starting goalie SV% this season?` : `What is the leading team's key player status tonight?`}\n` +
@@ -2092,6 +2121,7 @@ async function checkLiveScoreEdges() {
           prompt: livePrompt, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period,
           leadingAbbr, gameDetail, price, ticker, gameBase, title, targetAbbr, targetTeam,
           targetIsHome: targetAbbr === homeAbbr, leading,
+          _lineMove, _scoreChanged,
         });
 
     } catch (e) {
@@ -2835,23 +2865,23 @@ async function checkUFCPredictions() {
     const price = pick.side === 'side0' ? market.s0Price : market.s1Price;
     if (price > MAX_PRICE || price < 0.05) continue;
 
-    // Sonnet deep dive on this fight
+    // Sonnet deep dive — cold analysis, no Haiku anchor to avoid confirmation bias
     const decideText = await claudeWithSearch(
-      `You are a professional MMA bettor. Predict this fight.\n\n` +
+      `You are a professional MMA bettor. Predict this fight independently.\n\n` +
       `FIGHT: ${market.title}\n` +
-      `${market.s0Name} @ ${(market.s0Price*100).toFixed(0)}¢ vs ${market.s1Name} @ ${(market.s1Price*100).toFixed(0)}¢\n` +
-      `Haiku's pick: ${pick.fighter} — "${pick.reason}"\n\n` +
+      `${market.s0Name} (side0) @ ${(market.s0Price*100).toFixed(0)}¢ vs ${market.s1Name} (side1) @ ${(market.s1Price*100).toFixed(0)}¢\n\n` +
       `RESEARCH: Look up both fighters' records, recent fights, fighting style, strengths/weaknesses.\n\n` +
-      `PREDICT: How confident are you? Consider:\n` +
+      `PREDICT: Who wins and why? Consider:\n` +
       `- Overall MMA record and recent form (last 3-5 fights)\n` +
       `- Fighting style matchup (striker vs grappler, etc.)\n` +
       `- Physical advantages (reach, size, cardio)\n` +
-      `- Level of competition faced\n\n` +
-      `BUY if confidence ≥ 65% AND at least 3 points above price.\n` +
+      `- Level of competition faced\n` +
+      `- Ring rust (long layoffs hurt performance)\n\n` +
+      `BUY if confidence ≥ 65% AND at least 3 points above that fighter's price.\n` +
       `Max bet: $${getPositionSize('polymarket').toFixed(2)}\n\n` +
       `JSON ONLY:\n` +
       `{"trade":false,"confidence":0.XX,"reasoning":"prediction"}\n` +
-      `OR {"trade":true,"side":"${pick.side}","confidence":0.XX,"betAmount":N,"reasoning":"who wins and why"}`,
+      `OR {"trade":true,"fighter":"exact name","side":"side0" or "side1","confidence":0.XX,"betAmount":N,"reasoning":"who wins and why"}`,
       { maxTokens: 800, maxSearches: 3 }
     );
     if (!decideText) continue;
@@ -2862,10 +2892,25 @@ async function checkUFCPredictions() {
     try { decision = JSON.parse(jsonMatch); } catch { continue; }
 
     if (!decision.trade) {
-      console.log(`[ufc] Sonnet rejected ${pick.fighter}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
+      console.log(`[ufc] Sonnet rejected (${market.title}): conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
       logScreen({ stage: 'ufc', slug: pick.slug, result: 'rejected', confidence: decision.confidence, reasoning: decision.reasoning });
       continue;
     }
+
+    // Cross-reference: Haiku and Sonnet must agree on the winner
+    // If they picked different fighters, neither model is confident enough — skip
+    const sonnetFighter = (decision.fighter ?? '').toLowerCase();
+    const haikuFighter = (pick.fighter ?? '').toLowerCase();
+    const sonnetSide = decision.side ?? pick.side;
+    const agreesOnFighter = sonnetFighter && haikuFighter &&
+      (sonnetFighter.includes(haikuFighter.split(' ').pop()) || haikuFighter.includes(sonnetFighter.split(' ').pop()) || decision.side === pick.side);
+    if (!agreesOnFighter) {
+      console.log(`[ufc] BLOCKED: Haiku picked ${pick.fighter} but Sonnet picked ${decision.fighter} — models disagree, skipping`);
+      logScreen({ stage: 'ufc', slug: pick.slug, result: 'disagreement', reasoning: `Haiku: ${pick.fighter}, Sonnet: ${decision.fighter}` });
+      continue;
+    }
+    // Use Sonnet's side if provided, fall back to Haiku's
+    decision.side = sonnetSide || pick.side;
 
     const confidence = decision.confidence ?? 0;
     // UFC: most inefficient market, smallest margin needed
