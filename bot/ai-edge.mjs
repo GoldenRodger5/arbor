@@ -3232,8 +3232,10 @@ async function claudeBroadScan() {
     positionBases.add(p.ticker);
   }
 
-  // Filter out markets we already have positions on
+  // Filter out markets we already have positions on, and sports game markets
+  // (live-edge and pre-game handle sports games with proper context — broad scan can't)
   const tradeable = allMarkets.filter(m => {
+    if (/^KX(MLB|NBA|NFL|NHL|MLS|EPL|LALIGA)GAME-/i.test(m.ticker)) return false;
     const lastH = m.ticker.lastIndexOf('-');
     const base = lastH > 0 ? m.ticker.slice(0, lastH) : m.ticker;
     return !positionBases.has(base) && !positionBases.has(m.ticker);
@@ -3329,6 +3331,13 @@ async function claudeBroadScan() {
     for (const candidate of candidates.slice(0, 5)) {
       const market = deduped.find(m => m.ticker === candidate.ticker);
       if (!market) continue;
+
+      // Skip sports game markets early — live-edge and pre-game handle these with proper
+      // live score + WE data. Broad scan can't reliably map YES/NO sides or get game context.
+      if (/^KX(MLB|NBA|NFL|NHL|MLS|EPL|LALIGA)GAME-/i.test(market.ticker)) {
+        console.log(`[broad-scan] Skipping sports game ${market.ticker} — handled by live-edge/pre-game`);
+        continue;
+      }
 
       const isSportsMarket = market.category === 'Sports' || market.category === 'Golf/Masters';
       const yesPrice = parseFloat(market.yesAsk);
