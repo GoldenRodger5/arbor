@@ -707,7 +707,8 @@ function checkHighConviction(confidence, league, stage, diff, period) {
     else if (diff >= 15 && period === 4) { qualifies = true; reason = `NBA Q4 up ${diff} pts — ~2% comeback`; }
   } else if (league === 'nhl') {
     if (diff >= 2) { qualifies = true; reason = `NHL P3 up ${diff} goals — ${diff >= 3 ? '<1%' : '~5%'} comeback`; }
-    else if (diff === 1 && period === 3) { qualifies = true; reason = `NHL P3 up 1 — check time remaining`; }
+    // 1-goal P3 removed from HC: 20-25% OT probability, OT is near-random for avg teams
+    // Don't deploy 25-30% bankroll on situations with genuine coin-flip risk
   } else if (league === 'mlb') {
     if (diff >= 4 && period >= 7) { qualifies = true; reason = `MLB ${period}th up ${diff} runs — ~2% comeback`; }
     else if (diff >= 3 && period >= 8) { qualifies = true; reason = `MLB ${period}th up ${diff} runs — ~5% comeback`; }
@@ -2008,6 +2009,7 @@ async function checkLiveScoreEdges() {
             `+ Strong bullpen ERA < 3.5 about to enter → UP 2-4%\n` +
             `- Starter at 80+ pitches — bullpen transition coming → DOWN 3-5%\n` +
             `- SITUATION ALERT: Check the "Situation" line above. Runners in scoring position (2nd or 3rd) with 0-1 outs for the TRAILING team → DOWN 6-10%. This is live — a single or sac fly ties or cuts the lead immediately.\n` +
+            `- BATTING ORDER ALERT: The "At bat" line shows the current batter. Search "[batter name] batting order [team] 2025" to determine lineup position. Cleanup hitters (3-4-5) at the plate with runners on = HIGH danger. Leadoff/bottom-order hitters (1-2, 7-9) at the plate = lower threat. A #4 hitter with runners on is 2-3x more dangerous than a #8 hitter in the same situation.\n` +
             `- POWER HITTER ALERT: If trailing team has 25+ HR hitters coming up WITH RUNNERS ON BASE → DOWN 5-8%. A 3-run HR erases any lead in one pitch. This is the single biggest MLB risk.\n` +
             `- Leading team bullpen ERA > 5.0 last 10 days → DOWN 5-8%\n` +
             `- HIGH-RUN PARK (Coors Field, Great American Ballpark, Globe Life Field) → reduce lead confidence 3-5%. Runs come easier; leads evaporate faster.\n`
@@ -2021,7 +2023,7 @@ async function checkLiveScoreEdges() {
             `+ 2-goal lead (any period): much more reliable than 1-goal. 2-goal P3 = 93% WE. Trust the math.\n` +
             `+ Elite goalie (SV% > .920) → UP 3-5%\n` +
             `- Leading goalie SV% .895-.910 → DOWN 4-6%\n` +
-            `- OT RISK (1-goal lead in P3, check the clock): 10-14 min remaining → OT probability ~20%, reduce confidence 2-3%. Under 10 min → OT probability ~25-30%, reduce 3-5%. Under 5 min → reduce only 2-3% (leads are MORE secure this late — teams lock down, ice the puck, go defensive). OT = 3v3 sudden death coin flip regardless of which team dominated regulation.\n` +
+            `- OT RISK (1-goal lead in P3, check the clock): 10-14 min remaining → OT probability ~20%, reduce confidence 2-3%. Under 10 min → OT probability ~25-30%, reduce 3-5%. Under 5 min → reduce 2-3% (teams lock down, go defensive). IMPORTANT: OT is NOT a coin flip — team OT win rates span 29% to 60%+. Search "[team] NHL OT record 2024-25" before finalizing confidence. Elite OT teams (Colorado, LA Kings ~60%+) justify less reduction; poor OT teams (Detroit ~29%) justify more. Under 2 min P3 with 1-goal lead, also search "[trailing team] shootout record 2024-25" — some teams are elite in shootouts (30%+ extra risk).\n` +
             `- Trailing team on power play right now → DOWN 8-12% until it's resolved\n`
           : `+ Strong home record for leading team → UP 2-3%\n` +
             `- DRAWS happen 24-30% of games. 1-goal lead means draw is still very possible. Draw = contract LOSES.\n` +
