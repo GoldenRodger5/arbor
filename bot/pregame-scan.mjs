@@ -255,7 +255,7 @@ async function runPregameScan() {
 
     let rawResponse;
     try {
-      rawResponse = await claudeWithSearch(prompt, { maxTokens: 600, maxSearches: 2 });
+      rawResponse = await claudeWithSearch(prompt, { maxTokens: 1500, maxSearches: 2 });
     } catch (e) {
       console.log(`  ERROR: ${e.message}`);
       results.push({ market, sport, error: e.message });
@@ -268,8 +268,11 @@ async function runPregameScan() {
       continue;
     }
 
-    // Extract JSON
-    const jsonMatch = rawResponse.match(/\{[\s\S]*"trade"[\s\S]*\}/);
+    // Extract JSON — look for last JSON object containing "trade" key
+    const allJsonMatches = [...rawResponse.matchAll(/\{[^{}]*"trade"[^{}]*\}/g)];
+    const jsonMatch = allJsonMatches.length > 0
+      ? [allJsonMatches[allJsonMatches.length - 1][0]]
+      : rawResponse.match(/\{[\s\S]{10,300}"trade"[\s\S]{0,300}\}/);
     if (!jsonMatch) {
       console.log(`  No JSON found in response. Raw: ${rawResponse.slice(0, 200)}`);
       results.push({ market, sport, rawResponse, error: 'no JSON' });
