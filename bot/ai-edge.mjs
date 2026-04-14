@@ -2804,8 +2804,9 @@ async function claudeBroadScan() {
 
   // Non-sports — use series tickers (category API is broken)
   const nonSportsSeries = [
-    { series: 'KXBTC', label: 'Crypto' },
-    { series: 'KXETH', label: 'Crypto' },
+    // Crypto disabled — focus on sports edge only for now
+    // { series: 'KXBTC', label: 'Crypto' },
+    // { series: 'KXETH', label: 'Crypto' },
     { series: 'KXFED', label: 'Economics' },
     { series: 'KXCPI', label: 'Economics' },
     { series: 'KXGDP', label: 'Economics' },
