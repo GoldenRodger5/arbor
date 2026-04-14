@@ -2599,7 +2599,7 @@ async function checkPreGamePredictions() {
     if (preGameTradesThisCycle >= MAX_PREGAME_PER_CYCLE) break;
     const batchItems = pgPrompts.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 500, maxSearches: 2 }))
+      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 2 }))
     );
 
     for (let i = 0; i < batchItems.length; i++) {
@@ -3031,17 +3031,19 @@ async function claudeBroadScan() {
 
   console.log('[broad-scan] Running Claude broad market scan...');
 
-  // Fetch markets across categories — sports, crypto, politics, economics
+  // Fetch markets across categories — crypto, politics, economics
+  // Sports game markets (KXMLBGAME etc.) are excluded: live-edge handles them with score+WE context.
+  // Broad scan has no live game context so those would always be filtered out as untradeable anyway.
   const categories = [
-    { name: 'Sports', series: ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME', 'KXEPLGAME', 'KXLALIGAGAME'] },
     { name: 'Crypto', keywords: ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto'] },
     { name: 'Economics', keywords: ['cpi', 'fed', 'gdp', 'jobs', 'inflation', 'rate'] },
   ];
 
   const allMarkets = [];
 
-  // Sports — game-winners + additional sports series
-  const sportsSeries = [...categories[0].series, 'KXNFLGAME'];
+  // Sports — only non-game sports markets (stats, futures, etc.) via general search
+  // Skip the KXMLBGAME/NBA/NHL/etc. game-winner series — all get filtered as untradeable
+  const sportsSeries = [];
   for (const s of sportsSeries) {
     try {
       const data = await kalshiGet(`/markets?series_ticker=${s}&status=open&limit=200`);
