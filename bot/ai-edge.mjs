@@ -718,9 +718,9 @@ function checkHighConviction(confidence, league, stage, diff, period) {
   } else if (league === 'mlb') {
     if (diff >= 4 && period >= 7) { qualifies = true; reason = `MLB ${period}th up ${diff} runs — ~2% comeback`; }
     else if (diff >= 3 && period >= 8) { qualifies = true; reason = `MLB ${period}th up ${diff} runs — ~5% comeback`; }
-  } else if (league === 'mls' || league === 'epl' || league === 'laliga') {
-    if (diff >= 2) { qualifies = true; reason = `Soccer 75'+ up ${diff} goals — <3% comeback`; }
   }
+  // Soccer excluded from HC — liveStage 'late' starts at minute 46 (period 2 start),
+  // not 75'. Without minute tracking we can't safely enforce the real threshold.
 
   if (!qualifies) return { isHighConv: false };
 
@@ -817,6 +817,9 @@ function resetDailyTracking() {
   dailyOpenBankroll = getBankroll();
   tradingHalted = false;
   haltReason = '';
+  // Reset HC state daily — prior night's bets shouldn't count against today's cap
+  highConvictionDeployed = 0;
+  lastHighConvictionAt = 0;
   updateConsecutiveLosses();
   console.log(`[risk] Daily reset: bankroll=$${dailyOpenBankroll.toFixed(2)} consecutiveLosses=${consecutiveLosses}`);
 }
