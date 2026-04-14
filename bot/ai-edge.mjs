@@ -485,25 +485,15 @@ try {
         if (tradeMs < etTodayStartMs || tradeMs >= etTodayEndMs) continue;
         const ticker = t.ticker ?? '';
 
-        // Restore gameEntries — figure out the game key from team abbreviations in ticker
-        // Kalshi tickers: KXNHLGAME-26APR13CARPHI-CAR → teams are in the second-to-last segment
-        const parts = ticker.split('-');
-        if (parts.length >= 3) {
-          const teamBlock = parts[parts.length - 2]; // e.g., "CARPHI" or "26APR131840WSHPIT"
-          // Extract last 6 chars which contain both 3-letter team codes
-          const last6 = teamBlock.slice(-6);
-          if (last6.length === 6) {
-            const t1 = last6.slice(0, 3);
-            const t2 = last6.slice(3);
-            const gameKey = `game:${t1}@${t2}`;
-            const altKey = `game:${t2}@${t1}`;
-            const key = gameEntries.has(altKey) ? altKey : gameKey;
-            const entry = gameEntries.get(key) ?? { count: 0, lastPrice: 0, totalDeployed: 0 };
-            entry.count++;
-            entry.lastPrice = t.entryPrice ?? 0;
-            entry.totalDeployed += t.deployCost ?? 0;
-            gameEntries.set(key, entry);
-          }
+        // Restore gameEntries — use ticker BASE as canonical key (consistent regardless of which side we bet)
+        // e.g. KXNHLGAME-26APR13DALTOR-DAL and KXNHLGAME-26APR13DALTOR-TOR both use "KXNHLGAME-26APR13DALTOR"
+        const base = ticker.lastIndexOf('-') > 0 ? ticker.slice(0, ticker.lastIndexOf('-')) : ticker;
+        if (base) {
+          const entry = gameEntries.get(base) ?? { count: 0, lastPrice: 0, totalDeployed: 0 };
+          entry.count++;
+          entry.lastPrice = t.entryPrice ?? 0;
+          entry.totalDeployed += t.deployCost ?? 0;
+          gameEntries.set(base, entry);
         }
 
         // Restore tradeCooldowns from trade timestamp
@@ -2008,18 +1998,17 @@ async function checkLiveScoreEdges() {
         }
 
         // Block if we already have a position on this game — prevents duplicate buys and both-sides bets
+        // Use ticker BASE as canonical game key (consistent regardless of which team side we bet)
         if (hasPosition) {
-          // Only allow scaling in if price dropped significantly (2¢+ cheaper) AND same team
-          if (!canScaleInto(`game:${homeAbbr}@${awayAbbr}`, price)) {
+          if (!canScaleInto(gameBase, price)) {
             console.log(`[live-edge] Already have position on ${homeAbbr}@${awayAbbr}, skipping`);
             continue;
           }
           console.log(`[live-edge] 📈 Scale-in: ${homeAbbr}@${awayAbbr} price dropped to ${(price*100).toFixed(0)}¢`);
         }
 
-        // Smart cooldown: base 5min between new entries
-        const matchupKey = `game:${homeAbbr}@${awayAbbr}`;
-        const timeSinceLastTrade = Date.now() - (tradeCooldowns.get(matchupKey) ?? 0);
+        // Smart cooldown: base 5min between new entries (use gameBase as canonical key)
+        const timeSinceLastTrade = Date.now() - (tradeCooldowns.get(gameBase) ?? 0);
         if (timeSinceLastTrade < COOLDOWN_MS && !hasPosition) {
           continue; // within cooldown and no existing position to scale into
         }
@@ -2190,7 +2179,7 @@ async function checkLiveScoreEdges() {
           }
           const actualDeployed = actualFill * bestPrice;
           stats.tradesPlaced++;
-          recordGameEntry(`game:${homeAbbr}@${awayAbbr}`, bestPrice, actualDeployed);
+          recordGameEntry(gameBase, bestPrice, actualDeployed); // use ticker base as canonical key
 
           logTrade({
             exchange: best.platform,
