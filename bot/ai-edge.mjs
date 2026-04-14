@@ -2007,6 +2007,7 @@ async function checkLiveScoreEdges() {
             `+ Dominant starter still pitching (ERA < 3.0, under 80 pitches) → UP 5-8%\n` +
             `+ Strong bullpen ERA < 3.5 about to enter → UP 2-4%\n` +
             `- Starter at 80+ pitches — bullpen transition coming → DOWN 3-5%\n` +
+            `- SITUATION ALERT: Check the "Situation" line above. Runners in scoring position (2nd or 3rd) with 0-1 outs for the TRAILING team → DOWN 6-10%. This is live — a single or sac fly ties or cuts the lead immediately.\n` +
             `- POWER HITTER ALERT: If trailing team has 25+ HR hitters coming up WITH RUNNERS ON BASE → DOWN 5-8%. A 3-run HR erases any lead in one pitch. This is the single biggest MLB risk.\n` +
             `- Leading team bullpen ERA > 5.0 last 10 days → DOWN 5-8%\n` +
             `- HIGH-RUN PARK (Coors Field, Great American Ballpark, Globe Life Field) → reduce lead confidence 3-5%. Runs come easier; leads evaporate faster.\n`
@@ -2041,8 +2042,8 @@ async function checkLiveScoreEdges() {
           `${targetAbbr !== leadingAbbr ? '⚠️ UNDERDOG BET: The baseline says they LOSE. Need specific overriding factors.\n' : ''}` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
           `RESPOND WITH JSON ONLY:\n` +
-          `{"trade": false, "confidence": 0.XX, "reasoning": "one sentence"}\n` +
-          `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "one sentence"}`;
+          `{"trade": false, "confidence": 0.XX, "reasoning": "why market is right / what disqualified this"}\n` +
+          `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "WHY MARKET IS WRONG: [what you found]. KEY RISK: [what could beat you]. CONVICTION: [the specific factor that pushed you over threshold]."}`;
         // Block if we already have a position on this game (check BOTH platforms)
         const ticker = targetMarket.ticker;
         const lastH = ticker.lastIndexOf('-');
