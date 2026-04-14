@@ -1185,11 +1185,15 @@ function getWinExpectancyText(league, lead, period, isHome) {
   if (!base) return '';
   const homeAdj = isHome ? 0.03 : -0.01;
   const adjusted = Math.min(0.99, base + homeAdj);
-  const sport = league === 'mlb' ? 'MLB' : league === 'nba' ? 'NBA' : 'NHL';
+  const trailing = Math.max(0.01, 1 - adjusted);
   const periodName = league === 'mlb' ? `inning ${period}` : league === 'nba' ? `Q${period}` : `period ${period}`;
+  const unitName = league === 'nba' ? 'points' : league === 'mlb' ? 'runs' : 'goals';
   const isSoccer = ['mls', 'epl', 'laliga'].includes(league);
-  const drawWarning = isSoccer ? ' IMPORTANT: Soccer has draws (~25% of games). Your team must WIN outright — a draw means your contract LOSES.' : '';
-  return `HISTORICAL BASELINE: Teams leading by ${lead} ${league === 'nba' ? 'points' : league === 'mlb' ? 'runs' : 'goals'} in ${periodName} ${isHome ? '(home)' : '(away)'} win ${(adjusted * 100).toFixed(0)}% of the time historically.${drawWarning} Start from this baseline and adjust up/down.`;
+  const drawWarning = isSoccer ? '\n⚠️ DRAW WARNING: Soccer draws ~25% of games. Your team must WIN outright — a draw means your contract LOSES.' : '';
+  return `MATHEMATICAL WIN EXPECTANCY (WE) — YOUR ANCHOR\n` +
+    `Leading team wins: ${(adjusted * 100).toFixed(0)}%  |  Trailing team wins: ${(trailing * 100).toFixed(0)}%\n` +
+    `(Based on all historical games where a team led by ${lead} ${unitName} at ${periodName}${isHome ? ', home team leading' : ', away team leading'})\n` +
+    `CONSTRAINT: Your final confidence must stay within 12 points of these numbers. Moving beyond that requires a specific confirmed fact from your research — not general team quality, narrative, or sentiment.${drawWarning}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1948,6 +1952,11 @@ async function checkLiveScoreEdges() {
         // Get win expectancy baseline for this exact game situation
         const targetIsHome = targetAbbr === homeAbbr;
         const baselineText = getWinExpectancyText(league, diff, period, leadingAbbr === homeAbbr);
+        // Pre-compute WE values for the calibration reminder in Step 4
+        const _weRaw = getWinExpectancy(league, diff, period);
+        const _weAdj = _weRaw != null ? Math.min(0.99, _weRaw + (leadingAbbr === homeAbbr ? 0.03 : -0.01)) : null;
+        const _weTarget = _weAdj != null ? (targetAbbr === leadingAbbr ? _weAdj : (1 - _weAdj)) : null;
+        const _weTargetPct = _weTarget != null ? (_weTarget * 100).toFixed(0) : null;
 
         // Soccer: extract team-specific draw rates from records (W-D-L format)
         let soccerDrawWarning = '';
@@ -2046,6 +2055,7 @@ async function checkLiveScoreEdges() {
           `- Trailing team is at HOME with loud playoff/crucial crowd → DOWN 3-5% (home crowd lifts desperate teams)\n` +
           `- Time remaining: 3 min left with a lead ≠ 10 min left with same lead. Adjust accordingly.\n\n` +
           `═══ STEP 4 — DECISION ═══\n` +
+          (_weTargetPct != null ? `⚠️ CALIBRATION CHECK: The WE math says ${targetAbbr} wins ${_weTargetPct}% from here. Before you decide, verify your final confidence is within 12 points of this number. If it's not — name the single specific confirmed fact that justifies the deviation. "They're the better team" does not count.\n\n` : '') +
           `BUY only if ALL three are true:\n` +
           `✓ Confidence ≥ 65%\n` +
           `✓ Confidence beats price by 3+ points for late-game strong leads (WE ≥ 80%, inning 7+ / P3 / Q4). 4+ points required for early game (Q1/P1/innings 1-5) or marginal leads under 80% WE.\n` +
@@ -2186,16 +2196,18 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
-        // HARD CAP: Claude can't deviate more than 15% from historical baseline
-        // This prevents insanity like "17% baseline → 68% confidence" (Utah @ Calgary)
-        // Sports statistics exist for a reason — talent gaps are worth 5-10%, not 50%
+        // HARD CAP: Claude can't deviate far from historical baseline
+        // Leading team: +10% max (tighter — WE math is reliable for favorites in-game)
+        // Trailing team: +15% max (looser — underdog upside needs more room, separate hard caps handle the ceiling)
+        // Prevents insanity like "17% baseline → 68% confidence" (Utah @ Calgary)
         const baselineWE = getWinExpectancy(league, diff, period, leadingAbbr === homeAbbr);
         if (baselineWE != null) {
-          // For the target team: if they're leading, baseline = baselineWE. If trailing, baseline = 1 - baselineWE
-          const targetBaseline = targetAbbr === leadingAbbr ? baselineWE : (1 - baselineWE);
-          const maxAllowed = Math.min(0.95, targetBaseline + 0.15); // max 15% above baseline
+          const isLeadingTeamTarget = targetAbbr === leadingAbbr;
+          const targetBaseline = isLeadingTeamTarget ? baselineWE : (1 - baselineWE);
+          const capMargin = isLeadingTeamTarget ? 0.10 : 0.15; // tighter for leading team
+          const maxAllowed = Math.min(0.95, targetBaseline + capMargin);
           if (confidence > maxAllowed) {
-            console.log(`[live-edge] Confidence capped on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): Claude said ${(confidence*100).toFixed(0)}% but baseline is ${(targetBaseline*100).toFixed(0)}% → capped at ${(maxAllowed*100).toFixed(0)}%`);
+            console.log(`[live-edge] Confidence capped on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): Claude said ${(confidence*100).toFixed(0)}% but WE baseline is ${(targetBaseline*100).toFixed(0)}% → capped at ${(maxAllowed*100).toFixed(0)}% (leading=${isLeadingTeamTarget})`);
             confidence = maxAllowed;
           }
         }
