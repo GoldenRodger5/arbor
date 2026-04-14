@@ -1858,19 +1858,26 @@ async function checkLiveScoreEdges() {
         const etTmrwLE = new Date(etNowLE.getTime() + 24 * 60 * 60 * 1000);
         const tonightStr = etHourLE >= 22 ? toShortLE(etTmrwLE) : null;
 
-        // Filter cached prices for THIS game — find by team abbreviations, pick most live market
-        // SIMPLE APPROACH: No date string filtering needed.
-        // A live market reflects the current score (e.g. 94c when team leads 4-0).
-        // A pre-game market is always near 50/50 (e.g. 53c).
-        // Sort by distance from 50c — the live market naturally sorts first.
-        // This eliminates all todayStr/tonightStr/UTC-vs-ET complexity entirely.
+        // Filter cached prices for THIS game — find by team abbreviations, pick most live market.
+        // PRIMARY sort: prefer today's date in ticker (prevents betting tomorrow's market).
+        // TIEBREAK: distance from 50¢ — the live in-progress market is more decisive.
+        // This handles cases like: today's PHI live @58¢ vs tomorrow's PHI favored @65¢ pre-game.
+        // Without date preference the sort would pick tomorrow's 65¢ first — wrong game.
+        const isToday = (ticker) => ticker.includes(todayStr) || (tonightStr && ticker.includes(tonightStr));
         const gameMarkets = [...cachedPrices.entries()]
           .filter(([ticker, data]) => {
             if (data.yes < 0.01 || data.yes > 0.99) return false;
             return tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
           })
-          // Sort by distance from 50c descending — most decisive (live) market first
-          .sort(([, a], [, b]) => Math.abs(b.yes - 0.50) - Math.abs(a.yes - 0.50))
+          .sort(([tickerA, a], [tickerB, b]) => {
+            // Today's markets always before future markets
+            const aToday = isToday(tickerA);
+            const bToday = isToday(tickerB);
+            if (aToday && !bToday) return -1;
+            if (!aToday && bToday) return 1;
+            // Within same-day group: most decisive (furthest from 50¢) first
+            return Math.abs(b.yes - 0.50) - Math.abs(a.yes - 0.50);
+          })
           .map(([ticker, data]) => ({
             ticker, title: data.title, yes_ask_dollars: String(data.yes), no_ask_dollars: String(data.no),
           }));
