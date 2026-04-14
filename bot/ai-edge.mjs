@@ -1996,19 +1996,22 @@ async function checkLiveScoreEdges() {
           `${targetAbbr === leadingAbbr ? '(LEADING team' : '(TRAILING team — underdog'}${targetIsHome ? ', HOME)' : ', AWAY)'}\n` +
           (_lineMove ? `⚠️ LINE MOVEMENT: Price moved ${_lineMove.direction} from ${(_lineMove.from*100).toFixed(0)}¢ → ${(_lineMove.to*100).toFixed(0)}¢ in the last ${_lineMove.minutesAgo} min.\n` : '') +
           `\n═══ STEP 1 — SEARCH FIRST, ANALYZE SECOND ═══\n` +
-          `Before touching the baseline, use web search to check these FOUR things:\n` +
-          `A) Is the leading team resting 3+ starters tonight? (injury report / lineup)\n` +
-          `B) ${league === 'mlb' ? `What is the starter's ERA and current pitch count?${period >= 7 ? ' Also: is the closer available tonight (did he pitch in the last 24-48 hours)?' : ''}` : league === 'nhl' ? `What is the leading team's starting goalie SV% this season?` : `What is the leading team's key player status tonight?`}\n` +
-          `C) What is the H2H record between these two teams this season and last 2 seasons?\n` +
-          `D) Does the TRAILING team have playoff/clinching implications tonight?\n\n` +
+          `⚠️ RESEARCH RULES: Only state facts you found via web search. Never invent statistics, records, or lineup information. You may draw inferences from confirmed data (e.g., "team has clinched so they may be conserving energy") but flag all inferences explicitly. If you cannot confirm something, say so — do not guess.\n\n` +
+          `Search in this order:\n` +
+          `A) STAKES FOR BOTH TEAMS: Search "[leading team] playoff standings 2026" and "[trailing team] playoff standings 2026". What does tonight mean for each team? Is either in a must-win? Already eliminated? Clinched and likely coasting? This context shapes everything below.\n` +
+          `B) LEADING TEAM LINEUP: Is the leading team resting or missing key players tonight? Search "[leading team] injury report tonight" or "[leading team] lineup [date]". Confirm starters are playing.\n` +
+          `C) ${league === 'mlb' ? `PITCHING: What is the starter's ERA and current pitch count? ${period >= 7 ? 'Also: is the closer available tonight (did he pitch in the last 24-48 hours)?' : ''}` : league === 'nhl' ? `GOALIE: What is the leading team's starting goalie SV% this season? Confirm they are starting tonight.` : `KEY PLAYERS: What is the leading team's star player status tonight? Any notable injuries or hot/cold streaks?`}\n` +
+          `D) H2H: What is the head-to-head record between these teams this season and last 2 seasons?\n\n` +
           `═══ STEP 2 — HARD NOs (if ANY apply, respond {"trade":false} immediately) ═══\n` +
           `❌ Leading team is resting 3+ key players → NO (not the same team that earned that record)\n` +
-          `❌ Trailing team is fighting for playoffs/clinching AND leading team has nothing to play for → NO\n` +
+          `❌ Trailing team is in active playoff survival (must win or season ends) AND leading team is already mathematically eliminated OR confirmed rotating lineup/resting regulars → NO (motivation gap too large — urgency overcomes scoreboard)\n` +
           (league === 'mlb' ? `❌ Starter has 90+ pitches and bullpen ERA > 5.0 with 3+ innings left → NO (bullpen collapse risk)\n` : '') +
           `❌ You find yourself saying "modest," "marginal," "just clears the bar," or "only X points of edge" → NO\n\n` +
           `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs triggered) ═══\n` +
           `Start from the historical baseline. Adjust based on what you found:\n` +
           `+ Leading team clearly better (record, talent, home) → UP 2-5%\n` +
+          `+ Leading team is in a must-win, clinching, or playoff seeding-critical game (confirmed by standings) → UP 3-5% (urgency sharpens play and lead defense)\n` +
+          `- Leading team mathematically eliminated AND confirmed coasting (search found they are rotating lineup or resting regulars tonight) → DOWN 4-6% (effort level is genuinely diminished)\n` +
           (league === 'mlb' ?
             `+ Dominant starter still pitching (ERA < 3.0, under 80 pitches) → UP 5-8%\n` +
             `+ Strong bullpen ERA < 3.5 about to enter → UP 2-4%\n` +
@@ -2023,7 +2026,8 @@ async function checkLiveScoreEdges() {
             `+ Opponent is tanking/resting (eliminated, trading players, nothing to play for) → UP 5-8%\n` +
             `- Trailing team star player getting hot (last 2 quarters) → DOWN 3-6%\n` +
             `- Leading team on second game of back-to-back → DOWN 2-4%\n` +
-            `- 15-pt comebacks happen 13% in the 3-point era. 10-pt leads in Q3 are NOT safe. Only Q4 10-pt leads are reliable (86% WE).\n`
+            `- 15-pt comebacks happen 13% in the 3-point era. 10-pt leads in Q3 are NOT safe. Only Q4 10-pt leads are reliable (86% WE).\n` +
+            `⚠️ SLUMP/RETURN WARNING: If you are tempted to call a team "in bad form," first confirm their key players were healthy during that stretch. A team returning stars from injury tonight has a RESET baseline — their recent results without those players do not predict tonight's performance.\n`
           : league === 'nhl' ?
             `+ 2-goal lead (any period): much more reliable than 1-goal. 2-goal P3 = 93% WE. Trust the math.\n` +
             `+ Elite goalie (SV% > .920) → UP 3-5%\n` +
@@ -2482,77 +2486,83 @@ async function checkPreGamePredictions() {
     }[sport] ?? 'Home team wins ~55%. Look up records, injuries, recent form.';
 
     const pgPromptText = sport === 'NBA'
-      ? `You are a professional NBA bettor. Predict who wins this REGULAR SEASON game being played TODAY, ${todayDate}.\n\n` +
+      ? `You are a professional NBA bettor. Predict who wins this game being played TODAY, ${todayDate}.\n\n` +
+        `⚠️ RESEARCH RULES: Only state facts you confirmed via web search. Never invent injury status, records, or lineup info. You may infer from data (e.g., "team clinched — likely resting") but flag it as an inference. If you cannot confirm something critical, say NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `BASELINE: NBA home team wins 63%. Back-to-back team loses 3-5% WR. Star player out = -10%.\n\n` +
-        `═══ STEP 1 — RESEARCH (use both searches here) ═══\n` +
-        `A) Is either team on a back-to-back tonight? Check tonight's schedule vs yesterday's.\n` +
-        `B) Is any star player (15+ ppg) injured, questionable, or OUT today? Check today's injury report.\n` +
-        `C) What is each team's home/away record this season?\n` +
-        `D) Does either team have playoff seeding implications — or is either team eliminated/tanking?\n\n` +
+        `═══ STEP 1 — RESEARCH (search in this order) ═══\n` +
+        `A) CONFIRMED ROSTERS: Search "[team1] injury report ${todayDate}" and "[team2] injury report ${todayDate}". Who is OUT, who is back, who is questionable? List confirmed starters. Do NOT assume injury status — look it up.\n` +
+        `B) BACK-TO-BACK: Did either team play yesterday? Check yesterday's schedule.\n` +
+        `C) RECORDS: What is each team's overall, home, and away record this season?\n` +
+        `D) STAKES FOR BOTH TEAMS: What does tonight mean for each team? Is either in a must-win, eliminated, clinched, or playing for seeding? Search "[team] playoff standings 2026" for both. A team with everything to play for is more reliable than a team coasting.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
-        `❌ Team you want to bet ON is resting 3+ starters tonight → NO\n` +
-        `❌ Opponent is fighting for playoff seeding/clinching AND your team has nothing to play for → NO\n` +
+        `❌ Team you want to bet ON is resting 3+ starters tonight (confirmed in search) → NO\n` +
+        `❌ Opponent is in a must-win/playoff survival situation AND your team is already eliminated or confirmed resting → NO (motivation gap too large)\n` +
         `❌ Your team on back-to-back AND star player is DOUBTFUL or OUT → NO (compounding risk)\n\n` +
         `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs) ═══\n` +
-        `Start from 63% home / 37% away baseline. Adjust:\n` +
+        `Start from 63% home / 37% away baseline. Adjust only based on what you confirmed in Step 1:\n` +
+        `+ Your team in a must-win, clinching, or playoff seeding-critical game → UP 3-5% (urgency drives performance)\n` +
         `+ Your team has 2+ days rest vs opponent on back-to-back → UP 3-5%\n` +
-        `+ Star player dominant recent form (25+ ppg last 5 games) → UP 3-5%\n` +
-        `+ Opponent eliminated/tanking (nothing to play for, rotating lineup) → UP 5-8%\n` +
+        `+ Star player back from injury tonight AND playing full minutes → UP 4-7% (roster upgrade; reset baseline from their absence games)\n` +
+        `+ Opponent confirmed eliminated/tanking (search shows rotating lineup, resting regulars) → UP 5-8%\n` +
         `+ Strong home record (60%+ at home) vs weak away record for opponent → UP 2-4%\n` +
-        `- Star player (15+ ppg) officially OUT tonight → DOWN 8-12% (adjust baseline; do not auto-block — check if opponent is also weak/tanking)\n` +
+        `- Your team already eliminated OR clinched comfortable position AND confirmed resting key players tonight → DOWN 5-8%\n` +
+        `- Star player (15+ ppg) officially OUT tonight → DOWN 8-12%\n` +
         `- Your team on back-to-back (second game) → DOWN 3-5%\n` +
-        `- Opponent star on a hot streak (above season average last 5) → DOWN 3-5%\n` +
-        `- Your team lost 3+ straight → DOWN 3-5% (slumps are real in NBA)\n` +
-        `- Opponent plays at a significantly faster pace than your team → DOWN 2-4% (pace mismatch favors trailing team)\n` +
+        `- Opponent star on confirmed hot streak (above season avg last 5, verified) → DOWN 3-5%\n` +
+        `- Your team lost 3+ straight → DOWN 3-5% ONLY if their key players were healthy during that stretch. If stars were injured and are returning tonight, this adjustment does NOT apply — the roster change resets the baseline.\n` +
+        `- Opponent plays at a significantly faster pace → DOWN 2-4%\n` +
         `- H2H: opponent won 10+ of last 15 meetings → DOWN 4-6%\n\n` +
         `═══ STEP 4 — DECISION ═══\n` +
         `BUY only if ALL three are true:\n` +
         `✓ Confidence ≥ 70% (higher bar than live — no score anchor)\n` +
         `✓ Confidence beats price by 4+ points\n` +
-        `✓ You have a specific reason why — not just "they're the better team"\n` +
+        `✓ You have a specific confirmed reason — not "they're the better team" or a narrative built from unverified claims\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
         `JSON ONLY:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"reasoning":"one sentence"}`
 
       : /* NHL */
-        `You are a professional NHL bettor. Predict who wins this REGULAR SEASON game being played TODAY, ${todayDate}.\n\n` +
+        `You are a professional NHL bettor. Predict who wins this game being played TODAY, ${todayDate}.\n\n` +
+        `⚠️ RESEARCH RULES: Only state facts you confirmed via web search. Never invent goalie starters, SV%, injury status, or standings. You may infer from confirmed data (e.g., "clinched team may rest starters") but flag all inferences explicitly. If you cannot confirm something critical (especially goalies), say NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `BASELINE: NHL home team wins 59%. Goalie is the single most important factor. Scoring first = 70% win rate.\n\n` +
-        `═══ STEP 1 — RESEARCH (goalie confirmation is mandatory) ═══\n` +
-        `A) WHO IS CONFIRMED STARTING IN GOAL for BOTH teams tonight? This is your first search. If you cannot confirm both starters, DO NOT BET.\n` +
-        `B) What is each confirmed starter's season SV% and GAA? Any recent bad form (GAA > 3.0 in last 5 starts)?\n` +
-        `C) Is either team on a back-to-back or playing their 3rd game in 4 nights?\n` +
-        `D) Does either team have playoff/clinching implications tonight?\n\n` +
+        `═══ STEP 1 — RESEARCH (search in this order) ═══\n` +
+        `A) CONFIRMED GOALIES — MANDATORY FIRST SEARCH: Search "[team1] starting goalie tonight" and "[team2] starting goalie tonight". You must confirm BOTH starters by name before proceeding. "Expected" or "likely" is not enough — if any source says "unconfirmed" or you find conflicting info, treat as unconfirmed.\n` +
+        `B) GOALIE QUALITY: What is each confirmed starter's season SV% and GAA? Any bad recent form (GAA > 3.0 in last 5 starts)? Search "[goalie name] stats 2025-26".\n` +
+        `C) SCHEDULE/FATIGUE: Is either team on a back-to-back or playing their 3rd game in 4 nights?\n` +
+        `D) STAKES FOR BOTH TEAMS: What does tonight mean for each team? Search "[team1] playoff standings 2026" and "[team2] playoff standings 2026". Is either team in a must-win? Clinched and likely coasting? Already eliminated? A team fighting for a playoff spot plays harder — a clinched/eliminated team may rotate skaters.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Starting goalie for the team you want to bet is NOT confirmed → NO (you don't know what you're betting)\n` +
-        `❌ Team you want to bet ON is resting 3+ skaters → NO\n` +
-        `❌ Opponent has playoff/clinching implications AND your team has nothing to play for → NO\n` +
+        `❌ Team you want to bet ON is resting 3+ skaters (confirmed in search) → NO\n` +
+        `❌ Opponent is in active playoff survival (must win or season ends) AND your team is already mathematically eliminated OR confirmed resting regulars → NO (motivation gap too large)\n` +
         `❌ Your team is on their 3rd game in 4 nights AND opponent is rested → NO (severe fatigue)\n\n` +
         `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs) ═══\n` +
-        `Start from 59% home / 41% away baseline. Adjust:\n` +
+        `Start from 59% home / 41% away baseline. Adjust only based on confirmed research:\n` +
+        `+ Your team in a must-win, clinching, or playoff seeding-critical game (confirmed) → UP 3-4% (urgency drives compete level)\n` +
         `+ Elite goalie starting (SV% > .920) → UP 4-6%\n` +
-        `+ Your team has better power play % AND penalty kill % → UP 2-4% (discipline edge)\n` +
+        `+ Your team has better power play % AND penalty kill % → UP 2-4%\n` +
         `+ Opponent on back-to-back or 3rd in 4 nights → UP 3-5%\n` +
         `+ Your team won 4 of last 5 → UP 2-3% (form/momentum is real in NHL)\n` +
-        `- Goalie GAA > 3.5 in last 5 starts → DOWN 8-12% (check opponent quality for those games — not all GAA is equal)\n` +
+        `- Your team already clinched comfortable position AND confirmed resting key skaters or backup goalie tonight → DOWN 4-6%\n` +
+        `- Goalie GAA > 3.5 in last 5 starts → DOWN 8-12% (check opponent quality — not all GAA is equal)\n` +
         `- Goalie SV% .895-.910 → DOWN 4-6%\n` +
         `- Goalie SV% below .895 → DOWN 6-8%\n` +
         `- Your team on back-to-back (second game) → DOWN 3-5%\n` +
         `- Opponent's PP% is top-10 AND your PK% is bottom-10 → DOWN 3-5%\n` +
         `- Your team lost 3+ straight → DOWN 3-5%\n` +
         `- H2H: opponent won 10+ of last 15 meetings → DOWN 4-6%\n` +
-        `- NOTE: If this game goes to OT, it is a 3v3 coin flip. Factor this in for any 1-goal-expected tight matchup.\n\n` +
+        `- NOTE: If this game goes to OT, it is a 3v3 near-coin-flip. Factor this in for any expected tight 1-goal matchup.\n\n` +
         `═══ STEP 4 — DECISION ═══\n` +
         `BUY only if ALL three are true:\n` +
         `✓ Confidence ≥ 70% (higher bar than live — no score anchor)\n` +
         `✓ Confidence beats price by 4+ points\n` +
-        `✓ Goalie is confirmed and you trust the matchup\n` +
+        `✓ Goalie is confirmed, stakes are understood, and you have a specific reason — not just "better team"\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
         `JSON ONLY:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
