@@ -452,6 +452,11 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
 let lastHighConvictionAt = 0;      // timestamp of last high-conviction bet
 let highConvictionDeployed = 0;    // total $ in active high-conviction bets
 
+// Scan timer state — declared here (before loadState) to avoid TDZ errors on startup
+let lastBroadScan = 0;     // moved from line ~2981
+let lastPreGameScan = 0;   // moved from line ~2329
+let lastUFCScan = 0;       // moved from line ~2812
+
 // ─────────────────────────────────────────────────────────────────────────────
 // State Persistence — survives restarts so we don't re-fire scans or burn credits
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2326,7 +2331,7 @@ async function checkLiveScoreEdges() {
 // Pre-Game Predictions — bet on today's games BEFORE they start
 // ─────────────────────────────────────────────────────────────────────────────
 
-let lastPreGameScan = 0;
+// lastPreGameScan declared at top (before loadState) to avoid TDZ
 const PREGAME_SCAN_INTERVAL = 15 * 60 * 1000; // every 15 min — only NBA/NHL qualify, no need to scan constantly
 const MAX_PREGAME_PER_CYCLE = 2;   // Max trades per scan — be surgical, not spray-and-pray
 const MAX_PREGAME_PER_DAY = 2;     // Max 2 pre-game trades — only the absolute strongest
@@ -2809,7 +2814,7 @@ async function checkPreGamePredictions() {
 // UFC Predictions — Polymarket-only fight predictions
 // ─────────────────────────────────────────────────────────────────────────────
 
-let lastUFCScan = 0;
+// lastUFCScan declared at top (before loadState) to avoid TDZ
 const UFC_SCAN_INTERVAL = 30 * 60 * 1000; // every 30 min (fights don't change fast)
 
 async function checkUFCPredictions() {
@@ -2978,7 +2983,7 @@ async function checkUFCPredictions() {
 // Claude Broad Market Scan — finds edges across ALL market types
 // ─────────────────────────────────────────────────────────────────────────────
 
-let lastBroadScan = 0;
+// lastBroadScan declared at top (before loadState) to avoid TDZ
 const BROAD_SCAN_INTERVAL = 30 * 60 * 1000; // every 30 min — sports blocked, only non-sports remain
 
 async function claudeBroadScan() {
