@@ -3385,11 +3385,9 @@ async function pollCycle() {
   // Risk check — skip everything if halted
   if (!canTrade()) return;
 
-  // Skip if available cash too low
+  // Min cash cap removed — let canTrade() and canDeployMore() handle limits
   const availCash = getAvailableCash('kalshi');
-  if (availCash < 3) {
-    console.log(`[ai-edge] Available cash $${availCash.toFixed(2)} < $3 (reserve protected) — skipping`);
-    return;
+  if (false) { // disabled
   }
 
   // Live in-game predictions FIRST — most time-sensitive (scores change every minute)
