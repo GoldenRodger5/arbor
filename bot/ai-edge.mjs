@@ -1071,36 +1071,80 @@ async function refreshPortfolio() {
   // Also refresh Poly balance
   await refreshPolyBalance();
 
-  // Sync: auto-close JSONL entries that Kalshi no longer reports (manual cashouts)
+  // Sync: two-way reconciliation between Kalshi portfolio and JSONL trades log
   try {
     if (existsSync(TRADES_LOG)) {
-      const kalshiTickers = new Set(openPositions.filter(p => p.exchange === 'kalshi').map(p => p.ticker));
+      const kalshiPositions = openPositions.filter(p => p.exchange === 'kalshi');
+      const kalshiTickers = new Set(kalshiPositions.map(p => p.ticker));
       const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
       const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
       let synced = false;
+
+      // ── Part 1: Close bot bets that are gone from Kalshi (manual cashout) ──
       for (const t of trades) {
         if (t.status !== 'open' || t.exchange !== 'kalshi') continue;
-        // Prefix-aware match: event_ticker ('KXNHLGAME-26APR14MTLPHI') must match
-        // market ticker ('KXNHLGAME-26APR14MTLPHI-PHI') — Kalshi API returns event-level tickers
+        // Prefix-aware match: Kalshi API returns event_ticker without team suffix
         const isStillOpen = [...kalshiTickers].some(kt =>
           t.ticker === kt || t.ticker.startsWith(kt + '-') || kt.startsWith(t.ticker + '-')
         );
         if (!isStillOpen) {
-          // Grace period: 15 min — Kalshi API can lag, and event vs market ticker mismatch
-          // is common. 5min was too short (PHI bet triggered false auto-close at 5min 3sec).
+          // Grace period: 15 min — Kalshi API can lag, event vs market ticker mismatch common
           const placedAt = t.timestamp ? Date.parse(t.timestamp) : 0;
-          if (Date.now() - placedAt < 15 * 60 * 1000) {
-            continue; // too new, skip
+          if (Date.now() - placedAt < 15 * 60 * 1000) continue;
+          // Estimate P&L from cached market price at exit time
+          const cachedPrice = cachedPrices?.get(t.ticker);
+          const exitPrice = cachedPrice?.yes ?? null;
+          if (exitPrice != null && t.entryPrice != null && t.quantity != null) {
+            // realizedPnL = (exitPrice - entryPrice) × qty  (sold before settlement)
+            t.realizedPnL = parseFloat(((exitPrice - t.entryPrice) * t.quantity).toFixed(2));
+            t.exitPrice = exitPrice;
+          } else {
+            t.realizedPnL = t.realizedPnL ?? null; // unknown — don't zero it out
           }
           t.status = 'closed-manual';
           t.settledAt = new Date().toISOString();
-          t.realizedPnL = t.realizedPnL ?? 0;
           synced = true;
-          console.log(`[sync] Auto-closed ${t.ticker} — no longer in Kalshi portfolio (manual cashout)`);
+          const pnlStr = t.realizedPnL != null ? ` P&L≈$${t.realizedPnL.toFixed(2)}` : ' P&L=unknown';
+          console.log(`[sync] Manual cashout: ${t.ticker}${pnlStr}`);
         }
       }
+
+      // ── Part 2: Detect manual bets (Kalshi positions with no JSONL entry) ──
+      const trackedTickers = new Set(trades.filter(t => t.exchange === 'kalshi').map(t => t.ticker));
+      for (const pos of kalshiPositions) {
+        if (pos.exposure <= 0) continue;
+        // Check if this position matches any tracked trade (prefix-aware)
+        const isTracked = [...trackedTickers].some(tt =>
+          tt === pos.ticker || tt.startsWith(pos.ticker + '-') || pos.ticker.startsWith(tt + '-')
+        );
+        if (!isTracked) {
+          // New untracked position — log it so P&L and calibration stay complete
+          const record = {
+            id: `manual-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            timestamp: new Date().toISOString(),
+            exchange: 'kalshi', strategy: 'manual',
+            ticker: pos.ticker, title: pos.ticker,
+            side: 'yes', deployCost: pos.cost, quantity: null,
+            entryPrice: null, // we don't know the original entry price
+            edge: null, confidence: null, reasoning: 'Manually placed outside bot',
+            status: 'open', exitPrice: null, realizedPnL: null,
+          };
+          appendFileSync(TRADES_LOG, JSON.stringify(record) + '\n');
+          trackedTickers.add(pos.ticker);
+          console.log(`[sync] Detected manual bet: ${pos.ticker} ~$${pos.cost.toFixed(2)} deployed`);
+        }
+      }
+
       if (synced) {
-        writeFileSync(TRADES_LOG, trades.map(t => JSON.stringify(t)).join('\n') + '\n');
+        const updatedLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+        const updatedTrades = updatedLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        for (const t of trades) {
+          if (t.status === 'closed-manual') {
+            const idx = updatedTrades.findIndex(u => u.id === t.id);
+            if (idx >= 0) updatedTrades[idx] = t;
+          }
+        }
+        writeFileSync(TRADES_LOG, updatedTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
       }
     }
   } catch (e) { console.error('[sync] error:', e.message); }
