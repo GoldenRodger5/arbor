@@ -1741,13 +1741,21 @@ async function checkLiveScoreEdges() {
         const tonightStr = etHourLE >= 22 ? toShortLE(etTmrwLE) : null;
 
         // Filter cached prices for THIS game (instant, no API call)
+        // CRITICAL: When the same teams play multiple days in a row (series),
+        // the bot can match TOMORROW's pre-game market to TONIGHT's live score.
+        // Guard: if the game is decisive (WE > 85%) but the market price is near 50c
+        // (40-65c), it's almost certainly a DIFFERENT DAY's pre-game market — a live
+        // market for a game with 90%+ WE would be priced at 85c+, not 53c.
+        const currentBaseWE = g._baselineWE ?? 0.50;
         const gameMarkets = [...cachedPrices.entries()]
           .filter(([ticker, data]) => {
             if (data.yes < 0.01 || data.yes > 0.99) return false;
             if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) return false;
-            // Note: Kalshi close_time is the settlement DEADLINE (often days after game),
-            // not the game end time — cannot use it to filter live vs future games.
-            // The ticker date string (26APR13/26APR14) is the correct filter.
+            // WRONG-DAY MARKET GUARD: decisive game (85%+ WE) but price near 50c = wrong game
+            if (currentBaseWE >= 0.85 && data.yes < 0.65 && data.yes > 0.35) {
+              console.log(`[live-edge] Skipping stale/wrong-day market ${ticker} — WE ${(currentBaseWE*100).toFixed(0)}% but price ${(data.yes*100).toFixed(0)}c (pre-game market for different day)`);
+              return false;
+            }
             return tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
           })
           .map(([ticker, data]) => ({
