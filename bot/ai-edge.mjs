@@ -384,6 +384,56 @@ const gameEntries = new Map();    // "game:ATH@NYM" → { count: 2, lastPrice: 0
 const lastSeenPrices = new Map(); // ticker → { price, ts } for line movement detection
 const LINE_MOVE_THRESHOLD = 0.05; // 5¢ move = something happened
 
+// Restore gameEntries + tradeCooldowns from trades.jsonl on startup so restarts don't
+// wipe knowledge of existing positions (prevents double-buys and scale-in at worse prices)
+try {
+  if (existsSync('./logs/trades.jsonl')) {
+    const restoreLines = readFileSync('./logs/trades.jsonl', 'utf-8').split('\n').filter(l => l.trim());
+    const todayStr = new Date().toISOString().slice(0, 10);
+    for (const l of restoreLines) {
+      try {
+        const t = JSON.parse(l);
+        if (t.status !== 'open' && t.status !== 'closed-manual') continue;
+        // Only restore today's trades (older ones don't matter for cooldowns/entries)
+        if (!t.timestamp?.startsWith(todayStr)) continue;
+        const ticker = t.ticker ?? '';
+
+        // Restore gameEntries — figure out the game key from team abbreviations in ticker
+        // Kalshi tickers: KXNHLGAME-26APR13CARPHI-CAR → teams are in the second-to-last segment
+        const parts = ticker.split('-');
+        if (parts.length >= 3) {
+          const teamBlock = parts[parts.length - 2]; // e.g., "CARPHI" or "26APR131840WSHPIT"
+          // Extract last 6 chars which contain both 3-letter team codes
+          const last6 = teamBlock.slice(-6);
+          if (last6.length === 6) {
+            const t1 = last6.slice(0, 3);
+            const t2 = last6.slice(3);
+            const gameKey = `game:${t1}@${t2}`;
+            const altKey = `game:${t2}@${t1}`;
+            const key = gameEntries.has(altKey) ? altKey : gameKey;
+            const entry = gameEntries.get(key) ?? { count: 0, lastPrice: 0, totalDeployed: 0 };
+            entry.count++;
+            entry.lastPrice = t.entryPrice ?? 0;
+            entry.totalDeployed += t.deployCost ?? 0;
+            gameEntries.set(key, entry);
+          }
+        }
+
+        // Restore tradeCooldowns from trade timestamp
+        const tradeTime = t.timestamp ? Date.parse(t.timestamp) : 0;
+        if (tradeTime > 0) {
+          tradeCooldowns.set(ticker, tradeTime);
+          const base = ticker.lastIndexOf('-') > 0 ? ticker.slice(0, ticker.lastIndexOf('-')) : ticker;
+          tradeCooldowns.set(base, tradeTime);
+        }
+      } catch { /* skip */ }
+    }
+    if (gameEntries.size > 0) {
+      console.log(`[restore] Restored ${gameEntries.size} game entries from JSONL: ${[...gameEntries.entries()].map(([k, v]) => `${k}(${v.count}x@${(v.lastPrice*100).toFixed(0)}¢=$${v.totalDeployed.toFixed(2)})`).join(', ')}`);
+    }
+  }
+} catch (e) { console.error('[restore] error:', e.message); }
+
 // Smart cooldown: allow adding to position IF price improved, block if same/worse
 function canScaleInto(gameKey, currentPrice) {
   const entry = gameEntries.get(gameKey);
