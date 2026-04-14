@@ -1966,7 +1966,12 @@ async function checkLiveScoreEdges() {
         if (confidence - bestPrice < reqMargin) { console.log(`[live-edge] BLOCKED ${targetAbbr}: cross-platform recheck failed (bestPrice=${(bestPrice*100).toFixed(0)}¢)`); continue; }
 
         // Check for high-conviction tier (late-game blowouts → 25-30% sizing)
-        const hcCheck = checkHighConviction(confidence, league, ctx?.stage ?? 'unknown', diff, period);
+        // Determine game stage from period (ctx is not available in live-edge — it's from managePositions)
+        const liveStage = league === 'mlb' ? (period <= 4 ? 'early' : period <= 6 ? 'mid' : 'late') :
+          league === 'nba' ? (period <= 2 ? 'early' : period === 3 ? 'mid' : 'late') :
+          league === 'nhl' ? (period === 1 ? 'early' : period === 2 ? 'mid' : 'late') :
+          period === 1 ? 'early' : 'late';
+        const hcCheck = checkHighConviction(confidence, league, liveStage, diff, period);
         const maxBetLE = hcCheck.isHighConv
           ? getPositionSize(best.platform, bestEdge, hcCheck.tier)
           : getPositionSize(best.platform, bestEdge);
