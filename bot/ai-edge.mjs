@@ -1742,11 +1742,12 @@ async function checkLiveScoreEdges() {
           .filter(([ticker, data]) => {
             if (data.yes < 0.01 || data.yes > 0.99) return false;
             if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) return false;
-            // Safety check: if market closes more than 8 hours from now, it's a future game — skip
-            // This prevents matching tomorrow's 7:45pm game when looking for tonight's live game
+            // Safety check: if market closes more than 10 hours from now, it's a future game — skip
+            // 10h allows tonight's late games (started 9-10pm ET, close ~1am ET = 5am UTC = ~7h away)
+            // but blocks tomorrow afternoon games (7:45pm EDT = ~22h away)
             if (data.closeTime) {
               const closeMs = Date.parse(data.closeTime);
-              if (Number.isFinite(closeMs) && closeMs - Date.now() > 8 * 60 * 60 * 1000) return false;
+              if (Number.isFinite(closeMs) && closeMs - Date.now() > 10 * 60 * 60 * 1000) return false;
             }
             return tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
           })
