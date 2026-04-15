@@ -2256,7 +2256,7 @@ async function checkLiveScoreEdges() {
           `═══ STEP 2 — HARD NOs (if ANY apply, respond {"trade":false} immediately) ═══\n` +
           `❌ Leading team is resting 3+ key players → NO (not the same team that earned that record)\n` +
           `❌ Trailing team is in active playoff survival (must win or season ends) AND leading team is already mathematically eliminated OR confirmed rotating lineup/resting regulars → NO (motivation gap too large — urgency overcomes scoreboard)\n` +
-          (league === 'mlb' ? `❌ Starter has 90+ pitches and bullpen ERA > 5.0 with 3+ innings left → NO (bullpen collapse risk)\n` : '') +
+          (league === 'mlb' ? `❌ Starter has 90+ pitches AND bullpen ERA > 5.0 AND lead is only 1-2 runs → NO (one hit ties or cuts it, bad pen can't hold). For 3+ run leads a 5.0 ERA pen still holds 90%+ of the time — do NOT apply this to 3-run leads.\n` : '') +
           (league === 'mlb' && diff === 1 && period >= 7 ? `❌ MLB 1-RUN P${period}+ BULLPEN GATE: You must confirm the leading team's bullpen ERA (last 10 days or season) OR closer availability tonight. If your search returned no usable bullpen data — say NO immediately. The market has the same score we do; without bullpen state, you have no information edge and no business betting against it.\n` : '') +
           `❌ You find yourself saying "modest," "marginal," "just clears the bar," or "only X points of edge" → NO\n\n` +
           `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs triggered) ═══\n` +
