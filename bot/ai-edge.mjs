@@ -528,6 +528,7 @@ const lastGameStates = new Map(); // "ATH@NYM" → "1-0-5" (score-period, for ch
 const gameEntries = new Map();    // "game:ATH@NYM" → { count: 2, lastPrice: 0.62, totalDeployed: 24.36 }
 const lastSeenPrices = new Map(); // ticker → { price, ts } for line movement detection
 const LINE_MOVE_THRESHOLD = 0.05; // 5¢ move = something happened
+const missingFromKalshi = new Map(); // tradeId → firstMissingMs — 2-strike rule before closing
 
 // Restore gameEntries + tradeCooldowns from trades.jsonl on startup so restarts don't
 // wipe knowledge of existing positions (prevents double-buys and scale-in at worse prices)
@@ -1041,12 +1042,37 @@ async function refreshPortfolio() {
   try {
     const data = await kalshiGet('/portfolio/positions');
     const allPositions = data.event_positions ?? data.market_positions ?? data.positions ?? [];
-    openPositions = allPositions.map(p => ({
+    const freshPositions = allPositions.map(p => ({
       ticker: p.event_ticker ?? p.ticker ?? p.market_ticker ?? '',
       cost: parseFloat(p.total_cost_dollars ?? '0'),
       exposure: parseFloat(p.event_exposure_dollars ?? '0'),
       exchange: 'kalshi',
-    })).filter(p => p.exposure > 0); // only positions with active exposure (not settled/cashed out)
+    })).filter(p => p.exposure > 0);
+
+    // Sanity guard: if API returns 0 Kalshi positions but JSONL has recent open trades (within 20min),
+    // the API response is likely stale/lagged — keep existing positions rather than wiping them.
+    // This prevents false "manual cashout" marks right after a restart or during Kalshi API lag.
+    const prevKalshiCount = openPositions.filter(p => p.exchange === 'kalshi').length;
+    if (freshPositions.length === 0 && prevKalshiCount > 0) {
+      let hasRecentOpenTrade = false;
+      try {
+        if (existsSync(TRADES_LOG)) {
+          const recentCutoff = Date.now() - 20 * 60 * 1000;
+          const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim()).slice(-50);
+          hasRecentOpenTrade = lines.some(l => { try { const t = JSON.parse(l); return t.status === 'open' && t.exchange === 'kalshi' && Date.parse(t.timestamp) > recentCutoff; } catch { return false; } });
+        }
+      } catch {}
+      if (hasRecentOpenTrade) {
+        console.log(`[portfolio] Kalshi API returned 0 positions but recent open trades exist — keeping previous position data`);
+        // Don't overwrite openPositions — keep stale Kalshi data, just update Poly below
+      } else {
+        openPositions = openPositions.filter(p => p.exchange !== 'kalshi');
+        for (const p of freshPositions) openPositions.push(p);
+      }
+    } else {
+      openPositions = openPositions.filter(p => p.exchange !== 'kalshi');
+      for (const p of freshPositions) openPositions.push(p);
+    }
   } catch { /* keep old openPositions on fetch failure — don't wipe known positions */ }
 
   // Add Polymarket open positions from trades log — Poly API doesn't have a positions endpoint
@@ -1087,10 +1113,24 @@ async function refreshPortfolio() {
         const isStillOpen = [...kalshiTickers].some(kt =>
           t.ticker === kt || t.ticker.startsWith(kt + '-') || kt.startsWith(t.ticker + '-')
         );
+        if (isStillOpen) {
+          // Position confirmed present — clear any miss streak
+          missingFromKalshi.delete(t.id);
+          continue;
+        }
         if (!isStillOpen) {
           // Grace period: 15 min — Kalshi API can lag, event vs market ticker mismatch common
           const placedAt = t.timestamp ? Date.parse(t.timestamp) : 0;
           if (Date.now() - placedAt < 15 * 60 * 1000) continue;
+          // 2-strike rule: must be absent from Kalshi for 2+ consecutive sync cycles (~2 min)
+          // before we close it. A single API miss (empty response, lag) won't kill a real position.
+          const firstMissing = missingFromKalshi.get(t.id);
+          if (!firstMissing) {
+            missingFromKalshi.set(t.id, Date.now());
+            console.log(`[sync] ${t.ticker} absent from Kalshi (strike 1) — watching`);
+            continue; // don't close yet, wait for next sync to confirm
+          }
+          if (Date.now() - firstMissing < 90 * 1000) continue; // wait at least 90s between strikes
           // Estimate P&L from cached market price at exit time
           const cachedPrice = cachedPrices?.get(t.ticker);
           const exitPrice = cachedPrice?.yes ?? null;
