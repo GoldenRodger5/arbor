@@ -9,8 +9,8 @@ test.describe('Arbor UI smoke', () => {
     await expect(page.getByText('BANKROLL')).toBeVisible();
     // Bankroll value should appear as $N (wait for async fetch to settle)
     await expect(page.locator('text=/\\$\\d/').first()).toBeVisible({ timeout: 10_000 });
-    // Nav hub should show OPEN POSITIONS and RECENT sections
-    await expect(page.getByText(/OPEN POSITIONS/i)).toBeVisible();
+    // Nav hub should show OPEN POSITIONS and RECENT sections (match uppercase label exactly)
+    await expect(page.locator('.label').filter({ hasText: /OPEN POSITIONS/ })).toBeVisible();
     await expect(page.getByText('RECENT')).toBeVisible();
     // Pause button exists
     await expect(page.getByRole('button', { name: /Pause Bot|Resume Bot/i })).toBeVisible();
