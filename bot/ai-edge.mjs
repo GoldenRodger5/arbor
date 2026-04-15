@@ -4217,25 +4217,23 @@ async function checkSettlements() {
 
     if (openKalshi.length === 0 && !updated) return;
 
-    // Use /portfolio/settlements — returns OUR specific settlement history directly.
-    // Much better than fetching all closed markets (limit 100 misses our specific tickers).
-    // Response: { settlements: [{ ticker, market_result, yes_count, no_count, revenue, settled_time, fee_cost }] }
+    // Check each open Kalshi trade directly via /markets/{ticker} — more reliable than
+    // /portfolio/settlements which requires different API permissions.
+    // /markets/{ticker} is already used successfully elsewhere in the bot.
     let settlements = [];
-    try {
-      const data = await kalshiGet('/portfolio/settlements?limit=100');
-      settlements = data.settlements ?? [];
-    } catch (e) {
-      console.error('[pnl] settlements fetch error:', e.message);
-      // Fallback: try fetching closed markets the old way
-      for (const status of ['closed', 'settled']) {
-        try {
-          const data = await kalshiGet(`/markets?status=${status}&limit=100`);
-          // Convert to same format as settlements response
-          for (const m of (data.markets ?? [])) {
-            if (m.result) settlements.push({ ticker: m.ticker, market_result: m.result, yes_count: 0, no_count: 0, revenue: 0, settled_time: null, fee_cost: 0 });
-          }
-        } catch { /* skip */ }
-      }
+    for (const trade of openKalshi) {
+      try {
+        const mktData = await kalshiGet(`/markets/${trade.ticker}`);
+        const market = mktData?.market ?? mktData;
+        if (market?.result) {
+          settlements.push({
+            ticker: trade.ticker,
+            market_result: market.result,
+            revenue: null, // not available from market endpoint — calculate from result + qty
+            settled_time: market.close_time ?? null,
+          });
+        }
+      } catch { /* market not found or not settled yet — skip */ }
     }
 
     if (settlements.length === 0) return;
