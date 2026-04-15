@@ -6,12 +6,15 @@
  * Default port: 3456
  */
 
-import { readFileSync, writeFileSync, existsSync, statSync, watchFile, unwatchFile } from 'fs';
+import { readFileSync, writeFileSync, existsSync, statSync, watchFile } from 'fs';
 import { createServer } from 'http';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { config as loadDotenv } from 'dotenv';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+// Load .env from the bot/ folder regardless of cwd (pm2 runs us from /root/arbor)
+loadDotenv({ path: join(__dirname, '.env') });
 const PORT = process.env.API_PORT ?? 3456;
 const API_TOKEN = process.env.API_TOKEN ?? 'arbor-2026';
 const TRADES_LOG = join(__dirname, 'logs/trades.jsonl');
@@ -77,6 +80,43 @@ tailWatcher(SCREENS_LOG, 'screen');
 
 // Heartbeat every 25s so proxies/load-balancers don't close idle connections.
 setInterval(() => broadcast('ping', { t: Date.now() }), 25_000);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Anthropic client — Haiku for quick summaries. Cached per key.
+// ─────────────────────────────────────────────────────────────────────────────
+const ANTHROPIC_KEY = process.env.VITE_ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_API_KEY ?? '';
+const llmCache = new Map(); // key → { at, text }
+const LLM_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function callHaiku(system, user) {
+  if (!ANTHROPIC_KEY) throw new Error('ANTHROPIC_API_KEY missing');
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': ANTHROPIC_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 600,
+      system,
+      messages: [{ role: 'user', content: user }],
+    }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) throw new Error(`Anthropic ${res.status}`);
+  const data = await res.json();
+  return data.content?.[0]?.text ?? '';
+}
+
+async function cachedHaiku(key, system, user) {
+  const hit = llmCache.get(key);
+  if (hit && Date.now() - hit.at < LLM_CACHE_TTL_MS) return hit.text;
+  const text = await callHaiku(system, user);
+  llmCache.set(key, { at: Date.now(), text });
+  return text;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Read POST body as JSON
@@ -177,6 +217,119 @@ async function handleRequest(req, res) {
       json(res, state);
       return;
     }
+    // ─── Live-feed LLM summary ─────────────────────────────────────────────
+    if (path === '/api/summary') {
+      const hours = Math.min(6, parseInt(url.searchParams.get('hours') ?? '1'));
+      const LOG_FILE = join(__dirname, 'logs/ai-out.log');
+      if (!existsSync(LOG_FILE)) { json(res, { summary: 'No log data available yet.', generatedAt: null }); return; }
+
+      const content = readFileSync(LOG_FILE, 'utf-8');
+      const now = Date.now();
+      const cutoff = now - hours * 60 * 60 * 1000;
+      const recentLines = content.split('\n').filter(l => {
+        const m = l.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
+        if (!m) return false;
+        return new Date(m[1].replace(' ', 'T') + 'Z').getTime() >= cutoff;
+      }).slice(-400);
+
+      if (recentLines.length === 0) {
+        json(res, { summary: 'Quiet — no bot activity in this window.', generatedAt: new Date().toISOString(), lines: 0 });
+        return;
+      }
+
+      // Condense: keep only interesting lines (trades, skips, analysis, risk, exits)
+      const filtered = recentLines.filter(l =>
+        /\[(live-edge|pre-game|broad-scan|exit|risk|pnl)\]/.test(l) &&
+        !/portfolio|cachedPrices|claude=/.test(l)
+      ).slice(-200);
+
+      const cacheKey = `summary:${hours}h:${filtered.length}:${filtered[filtered.length - 1]?.slice(0, 30) ?? ''}`;
+      try {
+        const summary = await cachedHaiku(
+          cacheKey,
+          'You summarize a sports betting bot\'s activity log for the operator. Be concise, specific, and skimmable. Focus on: trades placed, positions closed, noteworthy skips (and why), current status. Use 3-5 bullets max, each 1 line. No preamble.',
+          `Last ${hours}h of activity (${filtered.length} events):\n\n${filtered.join('\n')}\n\nSummarize the activity in 3-5 short bullets.`
+        );
+        json(res, { summary, generatedAt: new Date().toISOString(), lines: filtered.length, hours });
+      } catch (e) {
+        json(res, { summary: `Summary unavailable: ${e.message}`, generatedAt: null, lines: filtered.length });
+      }
+      return;
+    }
+
+    // ─── Recap (daily + weekly) ────────────────────────────────────────────
+    if (path === '/api/recap') {
+      const period = (url.searchParams.get('period') ?? 'daily').toLowerCase();
+      const trades = readJsonl(TRADES_LOG).filter(t => t.status !== 'testing-void' && t.exchange === 'kalshi');
+
+      const now = new Date();
+      const periodMs = period === 'weekly' ? 7 * 864e5 : 1 * 864e5;
+      const start = period === 'weekly'
+        ? now.getTime() - periodMs
+        : (() => { const d = new Date(now); d.setDate(d.getDate() - 1); d.setHours(0, 0, 0, 0); return d.getTime(); })();
+      const end = period === 'weekly' ? now.getTime() : (() => { const d = new Date(now); d.setHours(0, 0, 0, 0); return d.getTime(); })();
+
+      const settled = trades.filter(t => {
+        const at = new Date(t.settledAt ?? t.timestamp).getTime();
+        return at >= start && at < end && (t.status === 'settled' || t.status?.startsWith('sold-'));
+      });
+      const placed = trades.filter(t => {
+        const at = new Date(t.timestamp).getTime();
+        return at >= start && at < end;
+      });
+
+      const wins = settled.filter(t => (t.realizedPnL ?? 0) > 0);
+      const losses = settled.filter(t => (t.realizedPnL ?? 0) < 0);
+      const totalPnL = settled.reduce((s, t) => s + (t.realizedPnL ?? 0), 0);
+
+      const best = settled.reduce((b, t) => (t.realizedPnL ?? 0) > (b?.realizedPnL ?? -Infinity) ? t : b, null);
+      const worst = settled.reduce((w, t) => (t.realizedPnL ?? 0) < (w?.realizedPnL ?? Infinity) ? t : w, null);
+
+      // Per sport
+      const sportMap = {};
+      for (const t of settled) {
+        const sport = getSportFromTicker(t.ticker);
+        if (!sportMap[sport]) sportMap[sport] = { sport, trades: 0, wins: 0, pnl: 0 };
+        sportMap[sport].trades++;
+        if ((t.realizedPnL ?? 0) > 0) sportMap[sport].wins++;
+        sportMap[sport].pnl += t.realizedPnL ?? 0;
+      }
+
+      // Optional LLM commentary (cached 30 min)
+      let commentary = null;
+      try {
+        const compact = settled.slice(-25).map(t => {
+          const r = t.reasoning?.slice(0, 140) ?? '';
+          const pnl = t.realizedPnL?.toFixed(2) ?? '?';
+          return `${t.title} · ${t.side?.toUpperCase()} @ ${Math.round(t.entryPrice * 100)}¢ · PnL $${pnl} · conf ${Math.round((t.confidence ?? 0) * 100)}% · ${r}`;
+        }).join('\n');
+        const key = `recap:${period}:${start}:${end}:${settled.length}`;
+        commentary = await cachedHaiku(
+          key,
+          'You are a thoughtful betting coach reviewing a bot\'s recent settled trades. Be concise: 3-4 short paragraphs. Call out what went right, what went wrong, and one concrete lesson. Don\'t be generic.',
+          `Recap period: ${period}. ${settled.length} settled, ${wins.length}W/${losses.length}L, PnL $${totalPnL.toFixed(2)}.\n\nTrades:\n${compact || '(none)'}\n\nGive a short honest recap.`
+        );
+      } catch (e) { commentary = null; }
+
+      json(res, {
+        period,
+        start: new Date(start).toISOString(),
+        end: new Date(end).toISOString(),
+        placed: placed.length,
+        settled: settled.length,
+        wins: wins.length,
+        losses: losses.length,
+        winRate: settled.length ? Math.round((wins.length / settled.length) * 100) : null,
+        totalPnL: Math.round(totalPnL * 100) / 100,
+        best: best ? { title: best.title, pnl: best.realizedPnL, ticker: best.ticker } : null,
+        worst: worst ? { title: worst.title, pnl: worst.realizedPnL, ticker: worst.ticker } : null,
+        sportBreakdown: Object.values(sportMap).map(s => ({ ...s, pnl: Math.round(s.pnl * 100) / 100, winRate: s.trades ? Math.round((s.wins / s.trades) * 100) : 0 })),
+        commentary,
+        generatedAt: new Date().toISOString(),
+      });
+      return;
+    }
+
     if (path === '/api/control/sell' && req.method === 'POST') {
       const body = await readBody(req).catch(() => ({}));
       if (!body?.tradeId && !body?.ticker) {

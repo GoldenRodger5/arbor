@@ -5,16 +5,8 @@ import { api } from '@/lib/api';
 import { toast } from 'sonner';
 import { buzz, notificationPermission, requestNotificationPermission } from '@/lib/notify';
 import { useEffect, useState } from 'react';
-
-function PnlNumber({ value, size = 28 }: { value: number; size?: number }) {
-  const color = value >= 0 ? 'var(--green)' : 'var(--red)';
-  const sign = value >= 0 ? '+' : '';
-  return (
-    <span className="font-mono" style={{ color, fontSize: size, fontWeight: 700 }}>
-      {sign}${Math.abs(value).toFixed(2)}
-    </span>
-  );
-}
+import AnimatedNumber from '@/components/AnimatedNumber';
+import RecapBanner from '@/components/RecapBanner';
 
 function sportOf(ticker?: string, strategy?: string): string {
   const tk = (ticker ?? '').toUpperCase();
@@ -134,13 +126,21 @@ export default function TodayPage() {
         border: '1px solid var(--border)', borderRadius: 16, padding: 20,
       }}>
         <div className="label" style={{ marginBottom: 6 }}>BANKROLL</div>
-        <div className="font-mono" style={{ fontSize: 38, fontWeight: 700, letterSpacing: '-0.02em' }}>
-          ${bankroll.toFixed(2)}
-        </div>
+        <AnimatedNumber
+          value={bankroll}
+          prefix="$"
+          style={{ fontSize: 38, fontWeight: 700, letterSpacing: '-0.02em', display: 'block' }}
+        />
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 16, marginTop: 10 }}>
           <div>
             <div className="label">TODAY</div>
-            <PnlNumber value={todayPnL} size={22} />
+            <AnimatedNumber
+              value={todayPnL}
+              prefix="$"
+              signed
+              colorize
+              style={{ fontSize: 22, fontWeight: 700 }}
+            />
           </div>
           <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
             {todayTrades} trade{todayTrades !== 1 ? 's' : ''} · {todaySettled} settled
@@ -154,6 +154,9 @@ export default function TodayPage() {
           )}
         </div>
       </div>
+
+      {/* Recap banner (first open of day / week) */}
+      <RecapBanner />
 
       {/* Notifications prompt (first visit) */}
       {notifState === 'default' && (

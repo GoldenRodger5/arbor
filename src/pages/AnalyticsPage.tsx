@@ -1,143 +1,274 @@
+import { useMemo, useState } from 'react';
 import { useArbor } from '@/context/ArborContext';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell, ScatterChart, Scatter, CartesianGrid,
   AreaChart, Area,
 } from 'recharts';
+import BottomSheet from '@/components/BottomSheet';
+import TradeCard from '@/components/TradeCard';
+import { buzz } from '@/lib/notify';
 
 const COLORS = ['#6366F1', '#22C55E', '#EF4444', '#F59E0B', '#06B6D4', '#EC4899', '#8B5CF6'];
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+type Timeframe = 'today' | '7d' | '30d' | 'all';
+const TIMEFRAMES: { key: Timeframe; label: string }[] = [
+  { key: 'today', label: 'Today' },
+  { key: '7d', label: '7 days' },
+  { key: '30d', label: '30 days' },
+  { key: 'all', label: 'All' },
+];
+
+function tfStart(tf: Timeframe): number {
+  const now = new Date();
+  if (tf === 'today') { const d = new Date(now); d.setHours(0, 0, 0, 0); return d.getTime(); }
+  if (tf === '7d') return now.getTime() - 7 * 864e5;
+  if (tf === '30d') return now.getTime() - 30 * 864e5;
+  return 0;
+}
+
+function sportOf(t: any): string {
+  const tk = (t.ticker ?? '').toUpperCase();
+  if (tk.includes('MLB')) return 'MLB';
+  if (tk.includes('NBA')) return 'NBA';
+  if (tk.includes('NHL')) return 'NHL';
+  if (tk.includes('MLS') || tk.includes('EPL') || tk.includes('LALIGA')) return 'Soccer';
+  if (t.strategy === 'ufc-prediction') return 'UFC';
+  return 'Other';
+}
+
+function Section({ title, action, children }: { title: string; action?: React.ReactNode; children: React.ReactNode }) {
   return (
-    <div style={{ background: 'var(--bg-surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 20, marginBottom: 16 }}>
-      <div className="label" style={{ marginBottom: 14 }}>{title}</div>
+    <div style={{
+      background: 'var(--bg-surface)', border: '1px solid var(--border)',
+      borderRadius: 12, padding: 20, marginBottom: 16,
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+        <div className="label">{title}</div>
+        {action}
+      </div>
       {children}
     </div>
   );
 }
 
 export default function AnalyticsPage() {
-  const { stats, snapshots, trades } = useArbor();
-  const s = stats ?? {};
+  const { trades } = useArbor();
+  const [tf, setTf] = useState<Timeframe>('7d');
+  const [drill, setDrill] = useState<{ title: string; subtitle?: string; trades: any[] } | null>(null);
 
-  // Sport performance chart data
-  const sportData = (s.sportPerformance ?? []).map((sp: any) => ({
-    ...sp,
-    sport: sp.sport?.toUpperCase(),
-    fill: sp.pnl >= 0 ? 'var(--green)' : 'var(--red)',
-  }));
+  const start = tfStart(tf);
+  const filtered = useMemo(() => trades.filter(t => new Date(t.timestamp).getTime() >= start), [trades, start]);
+  const settled = useMemo(() => filtered.filter(t => t.status === 'settled' || t.status?.startsWith('sold-')), [filtered]);
 
-  // Strategy pie data
-  const stratData = (s.strategyPerformance ?? []).map((st: any, i: number) => ({
-    name: st.strategy?.replace('-prediction', '').replace('-', ' '),
-    value: st.trades,
-    pnl: st.pnl,
-    winRate: st.winRate,
-    fill: COLORS[i % COLORS.length],
-  }));
+  // ─── Derived analytics (filtered to timeframe) ─────────────────────────────
+  const totalPnL = settled.reduce((s, t) => s + (t.realizedPnL ?? 0), 0);
+  const wins = settled.filter(t => (t.realizedPnL ?? 0) > 0).length;
+  const winRate = settled.length ? Math.round((wins / settled.length) * 100) : 0;
 
-  // Calibration scatter data
-  const calData = (s.calibration ?? []).map((b: any) => ({
-    predicted: (b.min + b.max) / 2 * 100,
-    actual: b.actualWinRate,
-    total: b.total,
-    label: b.label,
-  }));
+  // Daily PnL series
+  const dailySeries = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const t of settled) {
+      const d = new Date(t.settledAt ?? t.timestamp).toISOString().slice(5, 10);
+      map[d] = (map[d] ?? 0) + (t.realizedPnL ?? 0);
+    }
+    const entries = Object.entries(map).sort();
+    let running = 0;
+    return entries.map(([date, pnl]) => { running += pnl; return { date, pnl: Math.round(pnl * 100) / 100, running: Math.round(running * 100) / 100 }; });
+  }, [settled]);
 
-  // Bankroll chart
-  const bankrollData = snapshots.map(sn => ({
-    date: sn.date?.slice(5),
-    bankroll: sn.bankroll,
-    pnl: sn.totalPnL,
-  }));
+  // Per-sport
+  const sportData = useMemo(() => {
+    const map: Record<string, { sport: string; trades: number; wins: number; pnl: number }> = {};
+    for (const t of settled) {
+      const s = sportOf(t);
+      if (!map[s]) map[s] = { sport: s, trades: 0, wins: 0, pnl: 0 };
+      map[s].trades++;
+      if ((t.realizedPnL ?? 0) > 0) map[s].wins++;
+      map[s].pnl += t.realizedPnL ?? 0;
+    }
+    return Object.values(map).map(s => ({ ...s, pnl: Math.round(s.pnl * 100) / 100, winRate: s.trades ? Math.round((s.wins / s.trades) * 100) : 0 }));
+  }, [settled]);
 
-  // Time distribution
-  const hourMap: Record<number, { trades: number; wins: number; pnl: number }> = {};
-  for (const t of trades) {
-    const hr = new Date(t.timestamp).getHours();
-    if (!hourMap[hr]) hourMap[hr] = { trades: 0, wins: 0, pnl: 0 };
-    hourMap[hr].trades++;
-    if (t.status === 'settled' && (t.realizedPnL ?? 0) > 0) hourMap[hr].wins++;
-    if (t.realizedPnL != null) hourMap[hr].pnl += t.realizedPnL;
-  }
-  const hourData = Object.entries(hourMap).map(([hr, d]) => ({
-    hour: `${hr}:00`,
-    trades: d.trades,
-    pnl: Math.round(d.pnl * 100) / 100,
-  })).sort((a, b) => parseInt(a.hour) - parseInt(b.hour));
+  // Strategy
+  const stratData = useMemo(() => {
+    const map: Record<string, { name: string; value: number; pnl: number; wins: number }> = {};
+    for (const t of filtered) {
+      const s = t.strategy ?? 'unknown';
+      if (!map[s]) map[s] = { name: s.replace('-prediction', '').replace('-', ' '), value: 0, pnl: 0, wins: 0 };
+      map[s].value++;
+      if (t.realizedPnL != null) map[s].pnl += t.realizedPnL;
+      if ((t.realizedPnL ?? 0) > 0) map[s].wins++;
+    }
+    return Object.values(map).map((s, i) => ({ ...s, pnl: Math.round(s.pnl * 100) / 100, winRate: s.value ? Math.round((s.wins / s.value) * 100) : 0, fill: COLORS[i % COLORS.length] }));
+  }, [filtered]);
+
+  // Calibration
+  const calData = useMemo(() => {
+    const buckets = [
+      { label: '65-70%', min: 0.65, max: 0.70 },
+      { label: '70-75%', min: 0.70, max: 0.75 },
+      { label: '75-80%', min: 0.75, max: 0.80 },
+      { label: '80-85%', min: 0.80, max: 0.85 },
+      { label: '85-90%', min: 0.85, max: 0.90 },
+      { label: '90%+', min: 0.90, max: 1.01 },
+    ].map(b => ({ ...b, total: 0, wins: 0 }));
+    for (const t of settled) {
+      if (t.confidence == null) continue;
+      for (const b of buckets) {
+        if (t.confidence >= b.min && t.confidence < b.max) { b.total++; if ((t.realizedPnL ?? 0) > 0) b.wins++; break; }
+      }
+    }
+    return buckets.filter(b => b.total > 0).map(b => ({
+      label: b.label,
+      predicted: (b.min + b.max) / 2 * 100,
+      actual: Math.round((b.wins / b.total) * 100),
+      total: b.total,
+    }));
+  }, [settled]);
+
+  // Hour of day
+  const hourData = useMemo(() => {
+    const map: Record<number, { trades: number; pnl: number }> = {};
+    for (const t of filtered) {
+      const hr = new Date(t.timestamp).getHours();
+      if (!map[hr]) map[hr] = { trades: 0, pnl: 0 };
+      map[hr].trades++;
+      if (t.realizedPnL != null) map[hr].pnl += t.realizedPnL;
+    }
+    return Object.entries(map).map(([hr, d]) => ({
+      hour: `${hr}:00`,
+      hourNum: parseInt(hr),
+      trades: d.trades,
+      pnl: Math.round(d.pnl * 100) / 100,
+    })).sort((a, b) => a.hourNum - b.hourNum);
+  }, [filtered]);
 
   const tooltipStyle = {
     contentStyle: { background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 },
     labelStyle: { color: 'var(--text-secondary)' },
   };
 
+  // ─── Drill-down handlers ────────────────────────────────────────────────
+  const drillSport = (sport: string) => {
+    buzz('light');
+    setDrill({
+      title: `${sport} — ${tf === 'all' ? 'All time' : TIMEFRAMES.find(t => t.key === tf)?.label}`,
+      subtitle: `${settled.filter(t => sportOf(t) === sport).length} settled trades`,
+      trades: filtered.filter(t => sportOf(t) === sport).reverse(),
+    });
+  };
+  const drillHour = (hr: number) => {
+    buzz('light');
+    setDrill({
+      title: `${hr}:00 hour`,
+      subtitle: `Trades initiated between ${hr}:00 and ${hr + 1}:00`,
+      trades: filtered.filter(t => new Date(t.timestamp).getHours() === hr).reverse(),
+    });
+  };
+  const drillBucket = (b: typeof calData[number]) => {
+    buzz('light');
+    setDrill({
+      title: `Confidence ${b.label}`,
+      subtitle: `${b.total} settled · ${b.actual}% actual win rate (predicted ~${Math.round(b.predicted)}%)`,
+      trades: settled.filter(t => t.confidence != null && t.confidence * 100 >= parseInt(b.label) && t.confidence * 100 < parseInt(b.label) + 5).reverse(),
+    });
+  };
+
   return (
     <div>
-      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 20 }}>Analytics</h1>
+      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 12 }}>Analytics</h1>
 
-      {/* Bankroll Growth */}
-      {bankrollData.length > 0 && (
-        <Section title="BANKROLL GROWTH">
+      {/* Timeframe pills */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+        {TIMEFRAMES.map(t => (
+          <button key={t.key} onClick={() => { buzz('light'); setTf(t.key); }} style={{
+            padding: '8px 14px', borderRadius: 8,
+            background: tf === t.key ? 'var(--accent)' : 'var(--bg-surface)',
+            color: tf === t.key ? 'white' : 'var(--text-secondary)',
+            border: '1px solid var(--border)',
+            fontSize: 12, fontWeight: 600, cursor: 'pointer',
+          }}>{t.label}</button>
+        ))}
+      </div>
+
+      {/* Summary bar */}
+      <div style={{
+        display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10, marginBottom: 16,
+      }}>
+        {[
+          { label: 'TRADES', val: filtered.length, color: 'var(--text-primary)' },
+          { label: 'WIN RATE', val: `${winRate}%`, color: winRate >= 55 ? 'var(--green)' : winRate >= 45 ? 'var(--amber)' : 'var(--red)' },
+          { label: 'P&L', val: `${totalPnL >= 0 ? '+' : ''}$${totalPnL.toFixed(2)}`, color: totalPnL >= 0 ? 'var(--green)' : 'var(--red)' },
+        ].map(x => (
+          <div key={x.label} style={{
+            background: 'var(--bg-surface)', border: '1px solid var(--border)',
+            borderRadius: 10, padding: '12px 14px',
+          }}>
+            <div className="label" style={{ fontSize: 10 }}>{x.label}</div>
+            <div className="font-mono" style={{ fontSize: 18, fontWeight: 700, color: x.color, marginTop: 4 }}>
+              {x.val}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Running PnL */}
+      {dailySeries.length > 0 && (
+        <Section title="RUNNING P&L">
           <ResponsiveContainer width="100%" height={220}>
-            <AreaChart data={bankrollData}>
+            <AreaChart data={dailySeries}>
               <defs>
                 <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#6366F1" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="#6366F1" stopOpacity={0} />
+                  <stop offset="5%" stopColor={totalPnL >= 0 ? '#22C55E' : '#EF4444'} stopOpacity={0.3} />
+                  <stop offset="95%" stopColor={totalPnL >= 0 ? '#22C55E' : '#EF4444'} stopOpacity={0} />
                 </linearGradient>
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
               <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} />
               <YAxis tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} tickFormatter={v => `$${v}`} />
               <Tooltip {...tooltipStyle} formatter={(v: number) => [`$${v.toFixed(2)}`]} />
-              <Area type="monotone" dataKey="bankroll" stroke="#6366F1" fill="url(#bg)" strokeWidth={2} />
+              <Area type="monotone" dataKey="running" stroke={totalPnL >= 0 ? '#22C55E' : '#EF4444'} fill="url(#bg)" strokeWidth={2} />
             </AreaChart>
           </ResponsiveContainer>
         </Section>
       )}
 
-      {/* Sport Performance */}
+      {/* Per-sport (tap to drill) */}
       {sportData.length > 0 && (
-        <Section title="PERFORMANCE BY SPORT">
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-            <div>
-              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 8 }}>Win Rate</div>
-              <ResponsiveContainer width="100%" height={200}>
-                <BarChart data={sportData}>
-                  <XAxis dataKey="sport" tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} />
-                  <YAxis tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} tickFormatter={v => `${v}%`} />
-                  <Tooltip {...tooltipStyle} formatter={(v: number) => [`${v}%`]} />
-                  <Bar dataKey="winRate" radius={[4, 4, 0, 0]}>
-                    {sportData.map((d: any, i: number) => (
-                      <Cell key={i} fill={d.winRate >= 55 ? 'var(--green)' : d.winRate >= 45 ? 'var(--amber)' : 'var(--red)'} />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-            <div>
-              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 8 }}>P&L ($)</div>
-              <ResponsiveContainer width="100%" height={200}>
-                <BarChart data={sportData}>
-                  <XAxis dataKey="sport" tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} />
-                  <YAxis tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} tickFormatter={v => `$${v}`} />
-                  <Tooltip {...tooltipStyle} formatter={(v: number) => [`$${v.toFixed(2)}`]} />
-                  <Bar dataKey="pnl" radius={[4, 4, 0, 0]}>
-                    {sportData.map((d: any, i: number) => (
-                      <Cell key={i} fill={d.pnl >= 0 ? 'var(--green)' : 'var(--red)'} />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-          {/* Sport table */}
-          <div style={{ marginTop: 12 }}>
-            {sportData.map((sp: any) => (
-              <div key={sp.sport} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', borderBottom: '1px solid var(--border)', fontSize: 13 }}>
-                <span style={{ fontWeight: 500 }}>{sp.sport}</span>
-                <span className="font-mono">{sp.trades} trades | {sp.winRate}% win | <span style={{ color: sp.pnl >= 0 ? 'var(--green)' : 'var(--red)' }}>{sp.pnl >= 0 ? '+' : ''}${sp.pnl.toFixed(2)}</span></span>
-              </div>
+        <Section title="BY SPORT · TAP TO DRILL">
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={sportData} onClick={(e: any) => e?.activeLabel && drillSport(e.activeLabel)}>
+              <XAxis dataKey="sport" tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} />
+              <YAxis tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} tickFormatter={v => `$${v}`} />
+              <Tooltip {...tooltipStyle} formatter={(v: number) => [`$${v.toFixed(2)}`]} />
+              <Bar dataKey="pnl" radius={[4, 4, 0, 0]} cursor="pointer">
+                {sportData.map((d, i) => (
+                  <Cell key={i} fill={d.pnl >= 0 ? 'var(--green)' : 'var(--red)'} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+          <div style={{ marginTop: 10 }}>
+            {sportData.map(sp => (
+              <button
+                key={sp.sport}
+                onClick={() => drillSport(sp.sport)}
+                style={{
+                  width: '100%', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  padding: '8px 10px', background: 'var(--bg-base)', borderRadius: 6,
+                  border: '1px solid var(--border)', marginBottom: 6, cursor: 'pointer',
+                  fontSize: 12,
+                }}
+              >
+                <span style={{ fontWeight: 600 }}>{sp.sport}</span>
+                <span className="font-mono" style={{ color: 'var(--text-secondary)' }}>
+                  {sp.trades} · {sp.winRate}% · <span style={{ color: sp.pnl >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                    {sp.pnl >= 0 ? '+' : ''}${sp.pnl.toFixed(2)}
+                  </span>
+                </span>
+              </button>
             ))}
           </div>
         </Section>
@@ -145,56 +276,44 @@ export default function AnalyticsPage() {
 
       {/* Calibration */}
       {calData.length > 0 && (
-        <Section title="CONFIDENCE CALIBRATION">
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12 }}>
-            Dots on the diagonal = perfectly calibrated. Above = underconfident (good). Below = overconfident (bad).
+        <Section title="CONFIDENCE CALIBRATION · TAP TO DRILL">
+          <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 10 }}>
+            Diagonal = perfect. Above diagonal = underconfident (good). Below = overconfident (bad).
           </div>
-          <ResponsiveContainer width="100%" height={250}>
+          <ResponsiveContainer width="100%" height={230}>
             <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 10 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-              <XAxis dataKey="predicted" name="Predicted" tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} label={{ value: 'Predicted %', position: 'bottom', fontSize: 11, fill: 'var(--text-tertiary)' }} />
-              <YAxis dataKey="actual" name="Actual" tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} label={{ value: 'Actual Win %', angle: -90, position: 'left', fontSize: 11, fill: 'var(--text-tertiary)' }} />
+              <XAxis dataKey="predicted" type="number" domain={[60, 100]} tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} />
+              <YAxis dataKey="actual" type="number" domain={[0, 100]} tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} />
               <Tooltip {...tooltipStyle} formatter={(v: number, name: string) => [`${v}%`, name]} />
-              <Scatter data={calData} fill="var(--accent)">
-                {calData.map((d: any, i: number) => (
+              <Scatter data={calData} onClick={(d: any) => d?.payload && drillBucket(d.payload)} cursor="pointer">
+                {calData.map((d, i) => (
                   <Cell key={i} fill={d.actual >= d.predicted ? 'var(--green)' : 'var(--red)'} />
                 ))}
               </Scatter>
             </ScatterChart>
           </ResponsiveContainer>
-          <div style={{ display: 'flex', gap: 16, marginTop: 8, fontSize: 12, color: 'var(--text-tertiary)', justifyContent: 'center' }}>
-            {calData.map((b: any) => (
-              <span key={b.label}>
-                {b.label}: <span className="font-mono" style={{ color: b.actual >= b.predicted ? 'var(--green)' : 'var(--red)' }}>
-                  {b.actual}%
-                </span> ({b.total} trades)
-              </span>
-            ))}
-          </div>
         </Section>
       )}
 
-      {/* Strategy Breakdown */}
+      {/* Strategy */}
       {stratData.length > 0 && (
-        <Section title="STRATEGY BREAKDOWN">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
-            <ResponsiveContainer width={180} height={180}>
+        <Section title="STRATEGY MIX">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 18, flexWrap: 'wrap' }}>
+            <ResponsiveContainer width={160} height={160}>
               <PieChart>
-                <Pie data={stratData} dataKey="value" cx="50%" cy="50%" innerRadius={40} outerRadius={70} paddingAngle={2}>
-                  {stratData.map((d: any, i: number) => (
-                    <Cell key={i} fill={d.fill} />
-                  ))}
+                <Pie data={stratData} dataKey="value" cx="50%" cy="50%" innerRadius={35} outerRadius={65} paddingAngle={2}>
+                  {stratData.map((d, i) => <Cell key={i} fill={d.fill} />)}
                 </Pie>
-                <Tooltip {...tooltipStyle} formatter={(v: number, name: string) => [v, name]} />
+                <Tooltip {...tooltipStyle} />
               </PieChart>
             </ResponsiveContainer>
-            <div style={{ flex: 1 }}>
-              {stratData.map((st: any) => (
-                <div key={st.name} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, fontSize: 13 }}>
-                  <span style={{ width: 10, height: 10, borderRadius: 2, background: st.fill, flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 180 }}>
+              {stratData.map(st => (
+                <div key={st.name} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, fontSize: 12 }}>
+                  <span style={{ width: 10, height: 10, borderRadius: 2, background: st.fill }} />
                   <span style={{ flex: 1 }}>{st.name}</span>
-                  <span className="font-mono" style={{ color: 'var(--text-secondary)' }}>{st.value} trades</span>
-                  <span className="font-mono" style={{ color: 'var(--text-secondary)' }}>{st.winRate}%</span>
+                  <span className="font-mono" style={{ color: 'var(--text-secondary)' }}>{st.value}</span>
                   <span className="font-mono" style={{ color: st.pnl >= 0 ? 'var(--green)' : 'var(--red)' }}>
                     {st.pnl >= 0 ? '+' : ''}${st.pnl.toFixed(2)}
                   </span>
@@ -205,15 +324,18 @@ export default function AnalyticsPage() {
         </Section>
       )}
 
-      {/* Trading Hours */}
+      {/* Hour of day */}
       {hourData.length > 0 && (
-        <Section title="PERFORMANCE BY HOUR (ET)">
+        <Section title="BY HOUR · TAP TO DRILL">
           <ResponsiveContainer width="100%" height={180}>
-            <BarChart data={hourData}>
+            <BarChart data={hourData} onClick={(e: any) => {
+              const hr = e?.activePayload?.[0]?.payload?.hourNum;
+              if (hr != null) drillHour(hr);
+            }}>
               <XAxis dataKey="hour" tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} />
               <YAxis tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} tickFormatter={v => `$${v}`} />
               <Tooltip {...tooltipStyle} />
-              <Bar dataKey="pnl" radius={[4, 4, 0, 0]}>
+              <Bar dataKey="pnl" radius={[4, 4, 0, 0]} cursor="pointer">
                 {hourData.map((d, i) => (
                   <Cell key={i} fill={d.pnl >= 0 ? 'var(--green)' : 'var(--red)'} />
                 ))}
@@ -222,6 +344,26 @@ export default function AnalyticsPage() {
           </ResponsiveContainer>
         </Section>
       )}
+
+      {/* Drill-down sheet */}
+      <BottomSheet
+        open={drill != null}
+        onOpenChange={(open) => !open && setDrill(null)}
+        title={drill?.title}
+        subtitle={drill?.subtitle}
+      >
+        {drill && (
+          drill.trades.length === 0 ? (
+            <div style={{ color: 'var(--text-tertiary)', fontSize: 13, padding: 20, textAlign: 'center' }}>
+              No trades in this slice.
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {drill.trades.slice(0, 30).map(t => <TradeCard key={t.id} trade={t} compact />)}
+            </div>
+          )
+        )}
+      </BottomSheet>
     </div>
   );
 }

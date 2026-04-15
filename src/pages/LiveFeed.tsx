@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { api } from '@/lib/api';
 
 const API_BASE = import.meta.env.VITE_API_URL ?? 'http://87.99.155.128:3456';
 const API_TOKEN = import.meta.env.VITE_API_TOKEN ?? 'arbor-2026';
@@ -24,6 +25,79 @@ const typeColors: Record<string, { bg: string; text: string; icon: string }> = {
 };
 
 const tagFilters = ['all', 'live-edge', 'pre-game', 'broad-scan', 'portfolio', 'exit', 'pnl', 'sync', 'risk'];
+
+function SummaryCard() {
+  const [summary, setSummary] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [generatedAt, setGeneratedAt] = useState<string | null>(null);
+  const [hours, setHours] = useState(1);
+  const [err, setErr] = useState<string | null>(null);
+
+  const load = async (h = hours) => {
+    setLoading(true);
+    setErr(null);
+    try {
+      const data = await api.getSummary(h);
+      setSummary(data.summary);
+      setGeneratedAt(data.generatedAt);
+    } catch (e: any) {
+      setErr(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(hours); }, [hours]);
+
+  return (
+    <div style={{
+      background: 'linear-gradient(135deg, rgba(99,102,241,0.08), rgba(99,102,241,0.02))',
+      border: '1px solid rgba(99,102,241,0.25)', borderRadius: 12,
+      padding: 14, marginBottom: 12,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: 14 }}>🧠</span>
+        <span className="label" style={{ color: 'var(--accent)' }}>AI SUMMARY</span>
+        <div style={{ flex: 1 }} />
+        {[1, 3, 6].map(h => (
+          <button key={h} onClick={() => setHours(h)} style={{
+            padding: '2px 8px', borderRadius: 4, fontSize: 10,
+            background: hours === h ? 'var(--accent)' : 'transparent',
+            color: hours === h ? 'white' : 'var(--text-tertiary)',
+            border: '1px solid var(--border)', cursor: 'pointer',
+          }}>{h}h</button>
+        ))}
+        <button onClick={() => load(hours)} disabled={loading} style={{
+          padding: '2px 8px', borderRadius: 4, fontSize: 10,
+          background: 'transparent', color: 'var(--text-tertiary)',
+          border: '1px solid var(--border)', cursor: loading ? 'default' : 'pointer',
+          opacity: loading ? 0.5 : 1,
+        }}>{loading ? '…' : '↻'}</button>
+      </div>
+
+      {err && <div style={{ fontSize: 12, color: 'var(--red)' }}>{err}</div>}
+
+      {summary ? (
+        <div style={{
+          fontSize: 13, color: 'var(--text-secondary)',
+          lineHeight: 1.6, whiteSpace: 'pre-wrap',
+        }}>
+          {summary}
+        </div>
+      ) : loading ? (
+        <div className="skeleton" style={{ height: 60, borderRadius: 6 }} />
+      ) : (
+        <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>No summary yet.</div>
+      )}
+
+      {generatedAt && (
+        <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginTop: 8 }}>
+          Generated {new Date(generatedAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })} · cached 5 min
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function LiveFeed() {
   const [entries, setEntries] = useState<FeedEntry[]>([]);
@@ -73,7 +147,7 @@ export default function LiveFeed() {
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <h1 style={{ fontSize: 24, fontWeight: 700, margin: 0 }}>Live Feed</h1>
         <div style={{ display: 'flex', gap: 8 }}>
           <button onClick={() => setPaused(!paused)} style={{
@@ -90,6 +164,9 @@ export default function LiveFeed() {
           </button>
         </div>
       </div>
+
+      {/* AI Summary */}
+      <SummaryCard />
 
       {/* Filters */}
       <div style={{ display: 'flex', gap: 6, marginBottom: 12, flexWrap: 'wrap' }}>

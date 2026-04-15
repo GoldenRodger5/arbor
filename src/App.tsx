@@ -9,6 +9,7 @@ import TradeReview from './pages/TradeReview';
 import LiveFeed from './pages/LiveFeed';
 import GamesPage from './pages/GamesPage';
 import TodayPage from './pages/TodayPage';
+import RecapPage from './pages/RecapPage';
 import { ArborProvider } from './context/ArborContext';
 import { Toaster } from '@/components/ui/sonner';
 import InstallPrompt from './components/InstallPrompt';
@@ -19,6 +20,7 @@ const App = () => (
       <Layout>
         <Routes>
           <Route path="/" element={<TodayPage />} />
+          <Route path="/recap" element={<RecapPage />} />
           <Route path="/overview" element={<CommandCenter />} />
           <Route path="/positions" element={<PositionsPage />} />
           <Route path="/history" element={<TradeHistory />} />

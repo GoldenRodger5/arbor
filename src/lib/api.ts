@@ -58,4 +58,25 @@ export const api = {
     post<any>('/api/control/strategy', { strategy, action }),
   sellPosition: (args: { tradeId?: string; ticker?: string; reason?: string }) =>
     post<any>('/api/control/sell', args),
+  getSummary: (hours = 1) =>
+    get<{ summary: string; generatedAt: string | null; lines?: number; hours?: number }>(`/api/summary?hours=${hours}`),
+  getRecap: (period: 'daily' | 'weekly' = 'daily') =>
+    get<RecapData>(`/api/recap?period=${period}`),
+};
+
+export type RecapData = {
+  period: 'daily' | 'weekly';
+  start: string;
+  end: string;
+  placed: number;
+  settled: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  totalPnL: number;
+  best: { title: string; pnl: number; ticker: string } | null;
+  worst: { title: string; pnl: number; ticker: string } | null;
+  sportBreakdown: { sport: string; trades: number; wins: number; pnl: number; winRate: number }[];
+  commentary: string | null;
+  generatedAt: string;
 };

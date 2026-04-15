@@ -6,9 +6,10 @@ import Confetti from '@/components/Confetti';
 import Achievements from '@/components/Achievements';
 
 const MORE_NAV = [
-  { label: 'Analytics', path: '/analytics', icon: '📈', desc: 'Charts & calibration' },
+  { label: 'Analytics', path: '/analytics', icon: '📈', desc: 'Charts & drill-downs' },
+  { label: 'Recap', path: '/recap', icon: '📅', desc: 'Daily & weekly' },
   { label: 'Trade Review', path: '/review', icon: '🧠', desc: 'AI-graded post-game' },
-  { label: 'Live Feed', path: '/live', icon: '📡', desc: 'Raw bot logs' },
+  { label: 'Live Feed', path: '/live', icon: '📡', desc: 'Bot activity + summary' },
   { label: 'Settings', path: '/settings', icon: '⚙️', desc: 'Control the bot' },
 ];
 
