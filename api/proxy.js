@@ -78,13 +78,17 @@ export default async function handler(req, res) {
     }
 
     // ─── Standard GET passthrough ────────────────────────────────────────────
-    const response = await fetch(upstream, { signal: AbortSignal.timeout(10_000) });
+    // LLM endpoints can take 20-30s; keep other endpoints snappy.
+    const isLLM = path.startsWith('/api/summary') || path.startsWith('/api/recap');
+    const timeout = isLLM ? 55_000 : 10_000;
+    const response = await fetch(upstream, { signal: AbortSignal.timeout(timeout) });
     if (!response.ok) {
       res.status(response.status).json({ error: `VPS returned ${response.status}` });
       return;
     }
     const data = await response.json();
-    res.setHeader('Cache-Control', 's-maxage=10, stale-while-revalidate=5');
+    // Cache LLM output longer at the edge; live data stays fresh.
+    res.setHeader('Cache-Control', isLLM ? 's-maxage=120, stale-while-revalidate=60' : 's-maxage=10, stale-while-revalidate=5');
     res.status(200).json(data);
   } catch (e) {
     res.status(502).json({ error: e.message });

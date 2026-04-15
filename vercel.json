@@ -1,0 +1,10 @@
+{
+  "rewrites": [
+    { "source": "/((?!api|assets|favicon.ico|sw.js|workbox-.*|registerSW.js|manifest.webmanifest|icon-.*|robots.txt|placeholder.svg).*)", "destination": "/index.html" }
+  ],
+  "headers": [
+    { "source": "/sw.js", "headers": [{ "key": "Cache-Control", "value": "public, max-age=0, must-revalidate" }] },
+    { "source": "/workbox-(.*)", "headers": [{ "key": "Cache-Control", "value": "public, max-age=0, must-revalidate" }] },
+    { "source": "/manifest.webmanifest", "headers": [{ "key": "Cache-Control", "value": "public, max-age=3600" }] }
+  ]
+}

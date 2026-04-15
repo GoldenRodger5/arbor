@@ -88,7 +88,7 @@ const ANTHROPIC_KEY = process.env.VITE_ANTHROPIC_API_KEY ?? process.env.ANTHROPI
 const llmCache = new Map(); // key → { at, text }
 const LLM_CACHE_TTL_MS = 5 * 60 * 1000;
 
-async function callHaiku(system, user) {
+async function callLLM({ model = 'claude-sonnet-4-6', system, user, maxTokens = 900 }) {
   if (!ANTHROPIC_KEY) throw new Error('ANTHROPIC_API_KEY missing');
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -98,22 +98,25 @@ async function callHaiku(system, user) {
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 600,
+      model,
+      max_tokens: maxTokens,
       system,
       messages: [{ role: 'user', content: user }],
     }),
-    signal: AbortSignal.timeout(20_000),
+    signal: AbortSignal.timeout(30_000),
   });
-  if (!res.ok) throw new Error(`Anthropic ${res.status}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Anthropic ${res.status}: ${text.slice(0, 200)}`);
+  }
   const data = await res.json();
   return data.content?.[0]?.text ?? '';
 }
 
-async function cachedHaiku(key, system, user) {
+async function cachedLLM(key, opts) {
   const hit = llmCache.get(key);
   if (hit && Date.now() - hit.at < LLM_CACHE_TTL_MS) return hit.text;
-  const text = await callHaiku(system, user);
+  const text = await callLLM(opts);
   llmCache.set(key, { at: Date.now(), text });
   return text;
 }
@@ -243,14 +246,46 @@ async function handleRequest(req, res) {
         !/portfolio|cachedPrices|claude=/.test(l)
       ).slice(-200);
 
+      // Snapshot current bankroll/open state so the summary has stakes
+      let contextBlock = '';
+      try {
+        const trades = readJsonl(TRADES_LOG).filter(t => t.exchange === 'kalshi' && t.status !== 'testing-void');
+        const snaps = readJsonl(DAILY_LOG);
+        const open = trades.filter(t => t.status === 'open');
+        const lastSnap = snaps[snaps.length - 1];
+        const snapTime = lastSnap?.timestamp ? new Date(lastSnap.timestamp).getTime() : 0;
+        const settledSince = trades
+          .filter(t => (t.status === 'settled' || t.status?.startsWith('sold-')) && t.settledAt && new Date(t.settledAt).getTime() > snapTime)
+          .reduce((s, t) => s + (t.realizedPnL ?? 0), 0);
+        const bankroll = lastSnap ? lastSnap.bankroll + settledSince : null;
+        const openList = open.slice(0, 10).map(t => `  • ${t.title} · ${t.side?.toUpperCase()} @ ${Math.round((t.entryPrice ?? 0) * 100)}¢ · conf ${Math.round((t.confidence ?? 0) * 100)}% · deployed $${(t.deployCost ?? 0).toFixed(2)}`).join('\n') || '  (none)';
+        contextBlock = `Current state:\n  Bankroll: ${bankroll != null ? '$' + bankroll.toFixed(2) : 'unknown'}\n  Open positions: ${open.length}\n${openList}\n\n`;
+      } catch { contextBlock = ''; }
+
       const cacheKey = `summary:${hours}h:${filtered.length}:${filtered[filtered.length - 1]?.slice(0, 30) ?? ''}`;
       try {
-        const summary = await cachedHaiku(
-          cacheKey,
-          'You summarize a sports betting bot\'s activity log for the operator. Be concise, specific, and skimmable. Focus on: trades placed, positions closed, noteworthy skips (and why), current status. Use 3-5 bullets max, each 1 line. No preamble.',
-          `Last ${hours}h of activity (${filtered.length} events):\n\n${filtered.join('\n')}\n\nSummarize the activity in 3-5 short bullets.`
-        );
-        json(res, { summary, generatedAt: new Date().toISOString(), lines: filtered.length, hours });
+        const summary = await cachedLLM(cacheKey, {
+          model: 'claude-sonnet-4-6',
+          maxTokens: 700,
+          system:
+            `You are a sharp, terse operations analyst for a live sports betting bot. The operator is a sophisticated user who wants to understand what the bot has been doing at a glance. Write like a pro trader's morning note: specific, skimmable, actionable.
+
+Output format (markdown, 4-6 short lines, no preamble):
+- **Activity:** N opportunities considered, X traded, Y skipped
+- **Notable trades / skips:** one concrete example with the *reason*
+- **What the bot is watching:** leagues/games currently in scope
+- **Risk/health:** anything unusual (errors, pauses, deployment cap, cooldowns)
+- **One-line bottom line:** what the operator should take away
+
+Rules:
+- Quote actual tickers/teams/prices when possible. Round confidence/price to nearest %.
+- Never invent data. If nothing happened, say so in one line.
+- Skip filler ("the bot is scanning..."). Assume the reader knows how it works.
+- No emoji spam. Use at most one per bullet if it aids scanning.`,
+          user:
+            `${contextBlock}Activity log (last ${hours}h, ${filtered.length} events, most recent last):\n\n${filtered.slice(-180).join('\n')}\n\nGenerate the summary.`
+        });
+        json(res, { summary, generatedAt: new Date().toISOString(), lines: filtered.length, hours, model: 'claude-sonnet-4-6' });
       } catch (e) {
         json(res, { summary: `Summary unavailable: ${e.message}`, generatedAt: null, lines: filtered.length });
       }
@@ -259,7 +294,8 @@ async function handleRequest(req, res) {
 
     // ─── Recap (daily + weekly) ────────────────────────────────────────────
     if (path === '/api/recap') {
-      const period = (url.searchParams.get('period') ?? 'daily').toLowerCase();
+      const raw = (url.searchParams.get('period') ?? 'daily').toLowerCase();
+      const period = raw === 'weekly' ? 'weekly' : 'daily';
       const trades = readJsonl(TRADES_LOG).filter(t => t.status !== 'testing-void' && t.exchange === 'kalshi');
 
       const now = new Date();
@@ -295,20 +331,49 @@ async function handleRequest(req, res) {
         sportMap[sport].pnl += t.realizedPnL ?? 0;
       }
 
-      // Optional LLM commentary (cached 30 min)
+      // Per-sport summary for context in the prompt
+      const sportLine = Object.values(sportMap)
+        .map(s => `${s.sport.toUpperCase()} ${s.trades}t ${s.wins}W ${s.pnl >= 0 ? '+' : ''}$${s.pnl.toFixed(2)}`)
+        .join(' · ') || '(no settlements)';
+
+      // LLM commentary — Sonnet, richer prompt
       let commentary = null;
       try {
-        const compact = settled.slice(-25).map(t => {
-          const r = t.reasoning?.slice(0, 140) ?? '';
+        const compact = settled.slice(-30).map(t => {
+          const r = t.reasoning?.slice(0, 200) ?? '';
           const pnl = t.realizedPnL?.toFixed(2) ?? '?';
-          return `${t.title} · ${t.side?.toUpperCase()} @ ${Math.round(t.entryPrice * 100)}¢ · PnL $${pnl} · conf ${Math.round((t.confidence ?? 0) * 100)}% · ${r}`;
+          return `[${t.ticker}] ${t.title} · ${t.side?.toUpperCase()} @ ${Math.round((t.entryPrice ?? 0) * 100)}¢ · ${pnl != null ? `PnL $${pnl}` : 'open'} · conf ${Math.round((t.confidence ?? 0) * 100)}% · ${r}`;
         }).join('\n');
         const key = `recap:${period}:${start}:${end}:${settled.length}`;
-        commentary = await cachedHaiku(
-          key,
-          'You are a thoughtful betting coach reviewing a bot\'s recent settled trades. Be concise: 3-4 short paragraphs. Call out what went right, what went wrong, and one concrete lesson. Don\'t be generic.',
-          `Recap period: ${period}. ${settled.length} settled, ${wins.length}W/${losses.length}L, PnL $${totalPnL.toFixed(2)}.\n\nTrades:\n${compact || '(none)'}\n\nGive a short honest recap.`
-        );
+        commentary = await cachedLLM(key, {
+          model: 'claude-sonnet-4-6',
+          maxTokens: 900,
+          system:
+            `You are a pro sports bettor reviewing a trading bot's recent performance for its operator. Your goal is an honest, specific, actionable recap. No cheerleading, no hedging.
+
+Output (markdown, ~4 short sections with clear headings):
+
+**What went right** — 2-3 bullets. Name specific trades or patterns. Tie decisions to outcomes.
+**What went wrong** — 2-3 bullets. Same standard. Call out process-vs-outcome clearly (a lucky win is not the same as a well-reasoned one).
+**The pattern to watch** — 1 bullet. Is the bot systematically over/underconfident in any sport, price band, or game state?
+**One concrete action** — 1 sentence. A single, testable change or thing to monitor next period.
+
+Rules:
+- Quote actual numbers (tickers, confidence %, prices, PnL). Avoid vague language.
+- If the sample is small (<5 settlements), say so and keep conclusions tentative.
+- Distinguish outcome from process. "Lost money on a good trade" is valid feedback.
+- No preamble, no sign-off.`,
+          user:
+            `Recap period: ${period} (${new Date(start).toISOString().slice(0, 10)} → ${new Date(end).toISOString().slice(0, 10)})
+Placed: ${placed.length} · Settled: ${settled.length} · ${wins.length}W/${losses.length}L · Win% ${settled.length ? Math.round((wins.length / settled.length) * 100) : '—'}
+Total PnL: $${totalPnL.toFixed(2)}
+Per sport: ${sportLine}
+
+Settled trades (most recent last):
+${compact || '(no settled trades this period)'}
+
+Write the recap.`
+        });
       } catch (e) { commentary = null; }
 
       json(res, {
