@@ -36,6 +36,9 @@ export default function TodayPage() {
 
   const s = stats ?? {};
   const bankroll = s.liveBankroll ?? s.latestSnapshot?.bankroll ?? 0;
+  const bankrollSource = s.bankrollSource as string | undefined;
+  const bankrollAt = s.livePortfolio?.at as string | undefined;
+  const closedManualCount = s.closedManualTrades ?? 0;
   const todayPnL = s.todayPnL ?? 0;
   const todayTrades = s.todayTrades ?? 0;
   const todaySettled = s.todaySettled ?? 0;
@@ -125,12 +128,32 @@ export default function TodayPage() {
         background: 'linear-gradient(135deg, var(--bg-surface), var(--bg-elevated))',
         border: '1px solid var(--border)', borderRadius: 16, padding: 20,
       }}>
-        <div className="label" style={{ marginBottom: 6 }}>BANKROLL</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+          <span className="label">BANKROLL</span>
+          {bankrollSource === 'live-portfolio' ? (
+            <span title={bankrollAt ? `From bot portfolio log at ${bankrollAt}` : 'From bot portfolio log'} style={{
+              fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 4,
+              background: 'rgba(34,197,94,0.15)', color: 'var(--green)',
+              letterSpacing: '0.06em',
+            }}>LIVE</span>
+          ) : (
+            <span title="No recent portfolio log — showing snapshot estimate" style={{
+              fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 4,
+              background: 'rgba(245,158,11,0.15)', color: 'var(--amber)',
+              letterSpacing: '0.06em',
+            }}>EST</span>
+          )}
+        </div>
         <AnimatedNumber
           value={bankroll}
           prefix="$"
           style={{ fontSize: 38, fontWeight: 700, letterSpacing: '-0.02em', display: 'block' }}
         />
+        {closedManualCount > 0 && (
+          <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
+            {closedManualCount} trade{closedManualCount !== 1 ? 's' : ''} with unknown PnL not included in stats
+          </div>
+        )}
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 16, marginTop: 10 }}>
           <div>
             <div className="label">TODAY</div>

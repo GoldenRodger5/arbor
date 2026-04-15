@@ -249,9 +249,42 @@ export default function SettingsPage() {
       {/* System status */}
       <Section title="SYSTEM STATUS">
         <InfoRow label="Total Trades" value={s.totalTrades ?? 0} />
-        <InfoRow label="Settled" value={`${s.settledTrades ?? 0} (${s.wins ?? 0}W / ${s.losses ?? 0}L)`} />
-        <InfoRow label="Win Rate" value={s.winRate != null ? `${s.winRate}%` : 'N/A'} />
+        <InfoRow label="Settled (known PnL)" value={`${s.settledTrades ?? 0} (${s.wins ?? 0}W / ${s.losses ?? 0}L)`} />
+        <InfoRow
+          label="Closed w/ unknown PnL"
+          value={s.closedManualTrades ?? 0}
+        />
+        <InfoRow label="Win Rate (of known)" value={s.winRate != null ? `${s.winRate}%` : 'N/A'} />
         <InfoRow label="Open Positions" value={s.openTrades ?? 0} />
+      </Section>
+
+      {/* Bankroll source */}
+      <Section title="BANKROLL SOURCE">
+        <InfoRow label="Live bankroll" value={<>${(s.liveBankroll ?? 0).toFixed(2)}</>} />
+        <InfoRow
+          label="Source"
+          value={s.bankrollSource === 'live-portfolio' ? 'Bot portfolio log (LIVE)' : 'Snapshot estimate'}
+        />
+        {s.livePortfolio && (
+          <>
+            <InfoRow label="Kalshi cash" value={<>${s.livePortfolio.kalshiCash.toFixed(2)}</>} />
+            <InfoRow label="Kalshi positions" value={<>${s.livePortfolio.kalshiPositions.toFixed(2)}</>} />
+            <InfoRow label="Polymarket" value={<>${s.livePortfolio.polyBalance.toFixed(2)}</>} />
+            <InfoRow label="Portfolio updated" value={s.livePortfolio.at ?? '—'} />
+          </>
+        )}
+        {s.bankrollIsEstimated && (
+          <InfoRow
+            label="Estimate range"
+            value={<>${(s.liveBankrollLo ?? 0).toFixed(2)} – ${(s.liveBankrollHi ?? 0).toFixed(2)}</>}
+          />
+        )}
+        <div style={{ marginTop: 12, padding: '10px 12px', background: 'var(--bg-base)', borderRadius: 8, fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
+          The bot logs its true Kalshi + Polymarket balance every cycle. We use
+          that log line as the authoritative bankroll. When unavailable (startup,
+          log rotation), we estimate from the daily snapshot + realized P&L since,
+          which is less accurate when trades close without a captured PnL.
+        </div>
       </Section>
 
       {/* Configuration (read-only) */}

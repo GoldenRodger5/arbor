@@ -146,6 +146,38 @@ function readJsonl(path) {
   } catch { return []; }
 }
 
+/**
+ * Read the most recent [portfolio] line from ai-out.log. The bot logs this
+ * each cycle with the authoritative Kalshi + Poly balances, so we use it
+ * as the source of truth for bankroll instead of the stale daily snapshot.
+ */
+function readLivePortfolio() {
+  try {
+    const LOG_FILE = join(__dirname, 'logs/ai-out.log');
+    if (!existsSync(LOG_FILE)) return null;
+    const stat = statSync(LOG_FILE);
+    const size = stat.size;
+    const chunk = Math.min(50_000, size);
+    const buf = readFileSync(LOG_FILE);
+    const slice = buf.subarray(Math.max(0, size - chunk)).toString('utf-8');
+    const lines = slice.split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const m = lines[i].match(/\[portfolio\] Kalshi: \$([\d.]+) cash \+ \$([\d.]+) positions \| Poly: \$([\d.]+)/);
+      if (m) {
+        const tsMatch = lines[i].match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
+        return {
+          kalshiCash: parseFloat(m[1]),
+          kalshiPositions: parseFloat(m[2]),
+          polyBalance: parseFloat(m[3]),
+          bankroll: parseFloat(m[1]) + parseFloat(m[2]) + parseFloat(m[3]),
+          at: tsMatch ? tsMatch[1] + 'Z' : null,
+        };
+      }
+    }
+    return null;
+  } catch { return null; }
+}
+
 function getSportFromTicker(ticker) {
   if (!ticker) return 'other';
   if (ticker.includes('MLB')) return 'mlb';
@@ -426,15 +458,13 @@ Write the recap.`
       json(res, filtered);
 
     } else if (path === '/api/positions') {
-      // Merge: JSONL open trades + match with Kalshi active positions for accuracy
+      // Only actually-open trades. 'closed-manual' means the bot confirmed the
+      // position is no longer on Kalshi (after a 15 min grace + 90s strike rule)
+      // — it's resolved, even if the PnL is unknown. Do not show as "open".
       const trades = readJsonl(TRADES_LOG);
       const exchangeFilter = url.searchParams.get('exchange') ?? 'kalshi';
       const open = trades.filter(t => {
-        if (t.status === 'testing-void') return false;
-        // Show 'open' AND 'closed-manual' that were placed today (likely still active on Kalshi)
-        const isToday = t.timestamp?.startsWith(new Date().toISOString().slice(0, 10));
-        const isActive = t.status === 'open' || (t.status === 'closed-manual' && isToday && t.exchange === 'kalshi');
-        if (!isActive) return false;
+        if (t.status !== 'open') return false;
         if (exchangeFilter !== 'all' && t.exchange !== exchangeFilter) return false;
         return true;
       });
@@ -454,6 +484,9 @@ Write the recap.`
 
       const settled = trades.filter(t => t.status === 'settled' || t.status?.startsWith('sold-'));
       const open = trades.filter(t => t.status === 'open');
+      // closed-manual = bot confirmed the position is gone from Kalshi but didn't
+      // capture a realized PnL. These are resolved but invisible to the PnL math.
+      const closedManual = trades.filter(t => t.status === 'closed-manual');
       const wins = settled.filter(t => (t.realizedPnL ?? 0) > 0);
       const losses = settled.filter(t => (t.realizedPnL ?? 0) < 0);
       const totalPnL = settled.reduce((s, t) => s + (t.realizedPnL ?? 0), 0);
@@ -535,19 +568,32 @@ Write the recap.`
         else break;
       }
 
-      // Live bankroll estimate: last snapshot + P&L since then
+      // Live bankroll — the bot logs authoritative Kalshi+Poly balances every
+      // cycle. Prefer that over the daily snapshot, which is stale for ~24h.
+      const livePortfolio = readLivePortfolio();
       const lastSnap = snapshots.length > 0 ? snapshots[snapshots.length - 1] : null;
       const openDeployed = open.reduce((s, t) => s + (t.deployCost ?? 0), 0);
 
-      // Calculate P&L settled AFTER the last snapshot
+      // P&L realized after the last snapshot, PLUS cost basis released by
+      // closed-manual trades whose realized PnL was never captured. Without
+      // this second term the bankroll stays inflated by the deployCost of
+      // any "unknown PnL" close — which is why the dashboard drifts.
       const snapTime = lastSnap?.timestamp ? new Date(lastSnap.timestamp).getTime() : 0;
       const pnlSinceSnap = settled
         .filter(t => t.settledAt && new Date(t.settledAt).getTime() > snapTime)
         .reduce((s, t) => s + (t.realizedPnL ?? 0), 0);
+      const closedManualSinceSnap = closedManual.filter(t =>
+        t.settledAt && new Date(t.settledAt).getTime() > snapTime
+      );
+      const closedManualCostSinceSnap = closedManualSinceSnap.reduce((s, t) => s + (t.deployCost ?? 0), 0);
 
-      const liveBankroll = lastSnap
-        ? lastSnap.bankroll + pnlSinceSnap
-        : openDeployed + totalPnL;
+      // Worst/best-case bounds for UI honesty when we fall back to snapshot+delta.
+      const liveBankrollLo = lastSnap ? lastSnap.bankroll + pnlSinceSnap - closedManualCostSinceSnap : totalPnL;
+      const liveBankrollHi = lastSnap ? lastSnap.bankroll + pnlSinceSnap + closedManualCostSinceSnap : totalPnL;
+      // Authoritative bankroll comes from the bot's latest [portfolio] log line.
+      // If that's missing (first boot, log rotated), fall back to the snapshot midpoint.
+      const liveBankroll = livePortfolio?.bankroll ?? (liveBankrollLo + liveBankrollHi) / 2;
+      const bankrollSource = livePortfolio ? 'live-portfolio' : lastSnap ? 'snapshot-estimate' : 'computed';
 
       json(res, {
         totalTrades: trades.length,
@@ -568,8 +614,15 @@ Write the recap.`
         strategyPerformance: Object.values(stratMap),
         calibration,
         latestSnapshot: lastSnap,
+        livePortfolio,
         liveBankroll: Math.round(liveBankroll * 100) / 100,
+        liveBankrollLo: Math.round(liveBankrollLo * 100) / 100,
+        liveBankrollHi: Math.round(liveBankrollHi * 100) / 100,
+        bankrollIsEstimated: bankrollSource !== 'live-portfolio' && closedManualSinceSnap.length > 0,
+        bankrollSource,
         openDeployed: Math.round(openDeployed * 100) / 100,
+        closedManualTrades: closedManual.length,
+        closedManualCost: Math.round(closedManualSinceSnap.reduce((s, t) => s + (t.deployCost ?? 0), 0) * 100) / 100,
         serverTime: new Date().toISOString(),
       });
 
