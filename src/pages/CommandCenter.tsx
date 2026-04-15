@@ -1,8 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useArbor } from '@/context/ArborContext';
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import Confetti from '@/components/Confetti';
 import Achievements from '@/components/Achievements';
+
+const MORE_NAV = [
+  { label: 'Analytics', path: '/analytics', icon: '📈', desc: 'Charts & calibration' },
+  { label: 'Trade Review', path: '/review', icon: '🧠', desc: 'AI-graded post-game' },
+  { label: 'Live Feed', path: '/live', icon: '📡', desc: 'Raw bot logs' },
+  { label: 'Settings', path: '/settings', icon: '⚙️', desc: 'Control the bot' },
+];
 
 function PnlColor({ value, prefix = '' }: { value: number; prefix?: string }) {
   const color = value >= 0 ? 'var(--green)' : 'var(--red)';
@@ -86,10 +94,10 @@ export default function CommandCenter() {
       <Confetti active={showConfetti} />
 
       {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <h1 style={{ fontSize: 24, fontWeight: 700, margin: 0 }}>Command Center</h1>
+            <h1 style={{ fontSize: 24, fontWeight: 700, margin: 0 }}>Overview</h1>
             <span style={{
               width: 8, height: 8, borderRadius: '50%',
               background: connected ? 'var(--green)' : 'var(--red)',
@@ -112,6 +120,23 @@ export default function CommandCenter() {
         >
           {refreshing ? 'Refreshing...' : 'Refresh'}
         </button>
+      </div>
+
+      {/* Quick nav (for mobile — More tab lands here) */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 8, marginBottom: 20 }}>
+        {MORE_NAV.map(item => (
+          <Link key={item.path} to={item.path} style={{
+            display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px',
+            background: 'var(--bg-surface)', border: '1px solid var(--border)',
+            borderRadius: 10, textDecoration: 'none', color: 'inherit',
+          }}>
+            <span style={{ fontSize: 20 }}>{item.icon}</span>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>{item.label}</div>
+              <div style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>{item.desc}</div>
+            </div>
+          </Link>
+        ))}
       </div>
 
       {/* Bankroll Hero */}

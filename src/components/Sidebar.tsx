@@ -2,7 +2,8 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import { useArbor } from '@/context/ArborContext';
 
 const navItems = [
-  { label: 'Command Center', path: '/', icon: '🏠' },
+  { label: 'Today', path: '/', icon: '🏠' },
+  { label: 'Overview', path: '/overview', icon: '🗂️' },
   { label: 'Positions', path: '/positions', icon: '📊' },
   { label: 'Trade History', path: '/history', icon: '📋' },
   { label: 'Analytics', path: '/analytics', icon: '📈' },

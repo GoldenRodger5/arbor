@@ -1,17 +1,22 @@
 import { useLocation, useNavigate } from 'react-router-dom';
+import { buzz } from '@/lib/notify';
 
 const tabs = [
-  { label: 'Home', path: '/', icon: '🏠' },
+  { label: 'Today', path: '/', icon: '🏠' },
   { label: 'Positions', path: '/positions', icon: '📊' },
-  { label: 'History', path: '/history', icon: '📋' },
-  { label: 'Analytics', path: '/analytics', icon: '📈' },
   { label: 'Games', path: '/games', icon: '🎮' },
-  { label: 'Live', path: '/live', icon: '📡' },
+  { label: 'History', path: '/history', icon: '📋' },
+  { label: 'More', path: '/overview', icon: '⋯' },
 ];
 
 export default function BottomTabs() {
   const location = useLocation();
   const navigate = useNavigate();
+
+  const go = (path: string) => {
+    buzz('light');
+    navigate(path);
+  };
 
   return (
     <nav style={{
@@ -25,7 +30,7 @@ export default function BottomTabs() {
         return (
           <button
             key={tab.path}
-            onClick={() => navigate(tab.path)}
+            onClick={() => go(tab.path)}
             style={{
               flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
               justifyContent: 'center', background: 'none', border: 'none',

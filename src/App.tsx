@@ -8,14 +8,18 @@ import SettingsPage from './pages/SettingsPage';
 import TradeReview from './pages/TradeReview';
 import LiveFeed from './pages/LiveFeed';
 import GamesPage from './pages/GamesPage';
+import TodayPage from './pages/TodayPage';
 import { ArborProvider } from './context/ArborContext';
+import { Toaster } from '@/components/ui/sonner';
+import InstallPrompt from './components/InstallPrompt';
 
 const App = () => (
   <ArborProvider>
     <BrowserRouter>
       <Layout>
         <Routes>
-          <Route path="/" element={<CommandCenter />} />
+          <Route path="/" element={<TodayPage />} />
+          <Route path="/overview" element={<CommandCenter />} />
           <Route path="/positions" element={<PositionsPage />} />
           <Route path="/history" element={<TradeHistory />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
@@ -25,6 +29,20 @@ const App = () => (
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </Layout>
+      <InstallPrompt />
+      <Toaster
+        position="top-center"
+        theme="dark"
+        richColors
+        closeButton
+        toastOptions={{
+          style: {
+            background: 'var(--bg-elevated)',
+            border: '1px solid var(--border)',
+            color: 'var(--text-primary)',
+          },
+        }}
+      />
     </BrowserRouter>
   </ArborProvider>
 );

@@ -6,20 +6,43 @@ const isDev = import.meta.env.DEV;
 const VPS_DIRECT = import.meta.env.VITE_API_URL ?? 'http://87.99.155.128:3456';
 const API_TOKEN = import.meta.env.VITE_API_TOKEN ?? 'arbor-2026';
 
-async function get<T>(apiPath: string): Promise<T> {
-  let url: string;
+function buildGetUrl(apiPath: string): string {
   if (isDev) {
-    // Dev: hit VPS directly (no HTTPS issues on localhost)
     const sep = apiPath.includes('?') ? '&' : '?';
-    url = `${VPS_DIRECT}${apiPath}${sep}token=${API_TOKEN}`;
-  } else {
-    // Production: use Vercel serverless proxy (HTTPS → HTTP)
-    url = `/api/proxy?path=${encodeURIComponent(apiPath)}`;
+    return `${VPS_DIRECT}${apiPath}${sep}token=${API_TOKEN}`;
   }
+  return `/api/proxy?path=${encodeURIComponent(apiPath)}`;
+}
 
-  const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+function buildPostUrl(apiPath: string): string {
+  if (isDev) {
+    const sep = apiPath.includes('?') ? '&' : '?';
+    return `${VPS_DIRECT}${apiPath}${sep}token=${API_TOKEN}`;
+  }
+  return `/api/proxy?path=${encodeURIComponent(apiPath)}`;
+}
+
+async function get<T>(apiPath: string): Promise<T> {
+  const res = await fetch(buildGetUrl(apiPath), { signal: AbortSignal.timeout(10000) });
   if (!res.ok) throw new Error(`API ${apiPath}: ${res.status}`);
   return res.json();
+}
+
+async function post<T>(apiPath: string, body: any = {}): Promise<T> {
+  const res = await fetch(buildPostUrl(apiPath), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`API ${apiPath}: ${res.status}`);
+  return res.json();
+}
+
+/** SSE URL — used by useRealtime. In prod adds &stream=1 so proxy knows to stream. */
+export function eventsUrl(): string {
+  if (isDev) return `${VPS_DIRECT}/api/events?token=${API_TOKEN}`;
+  return `/api/proxy?path=${encodeURIComponent('/api/events')}&stream=1`;
 }
 
 export const api = {
@@ -28,4 +51,11 @@ export const api = {
   getStats: () => get<any>('/api/stats'),
   getSnapshots: () => get<DailySnapshot[]>('/api/snapshots'),
   getGames: () => get<any[]>('/api/games'),
+  getControlStatus: () => get<{ paused: boolean; disabledStrategies: string[]; pausedReason?: string; updatedAt: string | null }>('/api/control/status'),
+  pause: (reason?: string) => post<any>('/api/control/pause', { reason }),
+  resume: () => post<any>('/api/control/resume'),
+  toggleStrategy: (strategy: string, action: 'enable' | 'disable') =>
+    post<any>('/api/control/strategy', { strategy, action }),
+  sellPosition: (args: { tradeId?: string; ticker?: string; reason?: string }) =>
+    post<any>('/api/control/sell', args),
 };

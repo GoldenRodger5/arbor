@@ -6,7 +6,7 @@
  * Default port: 3456
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, statSync, watchFile, unwatchFile } from 'fs';
 import { createServer } from 'http';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -17,6 +17,80 @@ const API_TOKEN = process.env.API_TOKEN ?? 'arbor-2026';
 const TRADES_LOG = join(__dirname, 'logs/trades.jsonl');
 const DAILY_LOG = join(__dirname, 'logs/daily-snapshots.jsonl');
 const SCREENS_LOG = join(__dirname, 'logs/screens.jsonl');
+const CONTROL_FILE = join(__dirname, 'logs/control.json');
+const SELL_REQUESTS_FILE = join(__dirname, 'logs/sell-requests.jsonl');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Control state — persisted to disk so ai-edge.mjs can read it each cycle
+// ─────────────────────────────────────────────────────────────────────────────
+function readControl() {
+  try {
+    if (!existsSync(CONTROL_FILE)) return { paused: false, disabledStrategies: [], updatedAt: null };
+    return JSON.parse(readFileSync(CONTROL_FILE, 'utf-8'));
+  } catch {
+    return { paused: false, disabledStrategies: [], updatedAt: null };
+  }
+}
+function writeControl(state) {
+  const next = { ...readControl(), ...state, updatedAt: new Date().toISOString() };
+  writeFileSync(CONTROL_FILE, JSON.stringify(next, null, 2));
+  return next;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SSE clients — each client is { res, id }. We fan out events on file changes.
+// ─────────────────────────────────────────────────────────────────────────────
+const sseClients = new Set();
+let sseClientId = 0;
+
+function sseSend(client, event, data) {
+  try {
+    client.res.write(`event: ${event}\n`);
+    client.res.write(`data: ${JSON.stringify(data)}\n\n`);
+  } catch { /* client disconnected */ }
+}
+function broadcast(event, data) {
+  for (const c of sseClients) sseSend(c, event, data);
+}
+
+// Watch trades.jsonl and screens.jsonl — broadcast newly-added lines.
+function tailWatcher(path, eventName) {
+  let lastSize = existsSync(path) ? statSync(path).size : 0;
+  watchFile(path, { interval: 1000 }, (curr, prev) => {
+    if (curr.size <= lastSize) { lastSize = curr.size; return; }
+    try {
+      const content = readFileSync(path, 'utf-8');
+      const newContent = content.slice(lastSize);
+      lastSize = curr.size;
+      const lines = newContent.split('\n').filter(l => l.trim());
+      for (const line of lines) {
+        try {
+          const data = JSON.parse(line);
+          broadcast(eventName, data);
+        } catch { /* ignore malformed */ }
+      }
+    } catch { /* ignore read errors */ }
+  });
+}
+tailWatcher(TRADES_LOG, 'trade');
+tailWatcher(SCREENS_LOG, 'screen');
+
+// Heartbeat every 25s so proxies/load-balancers don't close idle connections.
+setInterval(() => broadcast('ping', { t: Date.now() }), 25_000);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Read POST body as JSON
+// ─────────────────────────────────────────────────────────────────────────────
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', chunk => { data += chunk; if (data.length > 1e6) req.destroy(); });
+    req.on('end', () => {
+      try { resolve(data ? JSON.parse(data) : {}); } catch (e) { reject(e); }
+    });
+    req.on('error', reject);
+  });
+}
 
 function readJsonl(path) {
   if (!existsSync(path)) return [];
@@ -41,11 +115,11 @@ function getSportFromTicker(ticker) {
   return 'other';
 }
 
-function handleRequest(req, res) {
+async function handleRequest(req, res) {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
   // Simple token auth — pass ?token=xxx or Authorization: Bearer xxx
@@ -59,6 +133,70 @@ function handleRequest(req, res) {
   const path = url.pathname;
 
   try {
+    // ─── SSE stream ─────────────────────────────────────────────────────────
+    if (path === '/api/events') {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      const client = { res, id: ++sseClientId };
+      sseClients.add(client);
+      sseSend(client, 'hello', { id: client.id, serverTime: new Date().toISOString() });
+      req.on('close', () => { sseClients.delete(client); });
+      return;
+    }
+
+    // ─── Control endpoints ──────────────────────────────────────────────────
+    if (path === '/api/control/status') {
+      json(res, { ...readControl(), sseClients: sseClients.size });
+      return;
+    }
+    if (path === '/api/control/pause' && req.method === 'POST') {
+      const body = await readBody(req).catch(() => ({}));
+      const state = writeControl({ paused: true, pausedReason: body?.reason ?? 'manual' });
+      broadcast('control', state);
+      json(res, state);
+      return;
+    }
+    if (path === '/api/control/resume' && req.method === 'POST') {
+      const state = writeControl({ paused: false, pausedReason: null });
+      broadcast('control', state);
+      json(res, state);
+      return;
+    }
+    if (path === '/api/control/strategy' && req.method === 'POST') {
+      const body = await readBody(req).catch(() => ({}));
+      const current = readControl();
+      const disabled = new Set(current.disabledStrategies ?? []);
+      if (body?.action === 'disable' && body?.strategy) disabled.add(body.strategy);
+      if (body?.action === 'enable' && body?.strategy) disabled.delete(body.strategy);
+      const state = writeControl({ disabledStrategies: [...disabled] });
+      broadcast('control', state);
+      json(res, state);
+      return;
+    }
+    if (path === '/api/control/sell' && req.method === 'POST') {
+      const body = await readBody(req).catch(() => ({}));
+      if (!body?.tradeId && !body?.ticker) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'tradeId or ticker required' })); return;
+      }
+      const request = {
+        id: `sell-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        tradeId: body.tradeId ?? null,
+        ticker: body.ticker ?? null,
+        reason: body.reason ?? 'manual-ui',
+        requestedAt: new Date().toISOString(),
+        status: 'pending',
+      };
+      const fs = await import('fs');
+      fs.appendFileSync(SELL_REQUESTS_FILE, JSON.stringify(request) + '\n');
+      broadcast('sell-request', request);
+      json(res, request);
+      return;
+    }
+
     if (path === '/api/trades') {
       const trades = readJsonl(TRADES_LOG);
       const exchangeFilter = url.searchParams.get('exchange') ?? 'kalshi';

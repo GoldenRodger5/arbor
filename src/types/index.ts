@@ -28,6 +28,9 @@ export interface Trade {
   reviewGrade?: string;
   reviewText?: string;
   reviewedAt?: string;
+  // High-conviction tier marker (late-game near-certain plays)
+  highConviction?: boolean;
+  tier?: string;
 }
 
 export interface DailySnapshot {

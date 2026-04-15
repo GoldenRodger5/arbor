@@ -1,5 +1,6 @@
 import { useState, useMemo } from 'react';
 import { useArbor } from '@/context/ArborContext';
+import TradeSwiper from '@/components/TradeSwiper';
 
 function PnlBadge({ value }: { value: number | null }) {
   if (value == null) return <span className="font-mono" style={{ color: 'var(--text-tertiary)' }}>—</span>;
@@ -32,6 +33,7 @@ export default function TradeHistory() {
   const [filterResult, setFilterResult] = useState('all');
   const [filterStrategy, setFilterStrategy] = useState('all');
   const [filterDate, setFilterDate] = useState('all');
+  const [swipeOpen, setSwipeOpen] = useState(false);
 
   const sortedTrades = useMemo(() => [...trades].reverse(), [trades]);
 
@@ -76,9 +78,36 @@ export default function TradeHistory() {
   const totalPnL = settled.reduce((s, t) => s + (t.realizedPnL ?? 0), 0);
   const avgPnL = settled.length > 0 ? totalPnL / settled.length : 0;
 
+  if (swipeOpen) {
+    return (
+      <div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+          <h1 style={{ fontSize: 22, fontWeight: 700 }}>Swipe Reasoning</h1>
+          <button onClick={() => setSwipeOpen(false)} style={{
+            background: 'var(--bg-surface)', color: 'var(--text-secondary)',
+            border: '1px solid var(--border)', borderRadius: 8,
+            padding: '6px 10px', fontSize: 12, cursor: 'pointer',
+          }}>Back to list</button>
+        </div>
+        <TradeSwiper trades={filtered} onClose={() => setSwipeOpen(false)} />
+      </div>
+    );
+  }
+
   return (
     <div>
-      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 16 }}>Trade History</h1>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <h1 style={{ fontSize: 24, fontWeight: 700 }}>Trade History</h1>
+        {filtered.length > 0 && (
+          <button
+            onClick={() => setSwipeOpen(true)}
+            style={{
+              background: 'var(--accent)', color: 'white', border: 'none',
+              borderRadius: 8, padding: '8px 14px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+            }}
+          >📖 Swipe reasoning</button>
+        )}
+      </div>
 
       {/* Summary Bar */}
       <div style={{

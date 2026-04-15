@@ -61,6 +61,12 @@ body {
   scrollbar-color: var(--text-tertiary) transparent;
 }
 
+/* Spinner */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 /* Scan pulse */
 @keyframes pulse {
   0%, 100% { opacity: 1; }

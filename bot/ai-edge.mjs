@@ -687,7 +687,27 @@ function canDeployMore(tradeAmount) {
   return true;
 }
 
+// UI control state — read each call, written by api.mjs
+const CONTROL_FILE = './logs/control.json';
+function readUIControl() {
+  try {
+    if (!existsSync(CONTROL_FILE)) return { paused: false, disabledStrategies: [] };
+    return JSON.parse(readFileSync(CONTROL_FILE, 'utf-8'));
+  } catch { return { paused: false, disabledStrategies: [] }; }
+}
+function isStrategyDisabled(strategy) {
+  const ctrl = readUIControl();
+  return (ctrl.disabledStrategies ?? []).includes(strategy);
+}
+
 function canTrade() {
+  // UI pause overrides everything
+  const ctrl = readUIControl();
+  if (ctrl.paused) {
+    console.log(`[risk] UI PAUSED${ctrl.pausedReason ? ` — ${ctrl.pausedReason}` : ''}`);
+    return false;
+  }
+
   if (tradingHalted) {
     console.log(`[risk] HALTED: ${haltReason}`);
     return false;
@@ -3966,7 +3986,55 @@ function getExitThresholds(stage, entryPrice = 0.50) {
   return thresholds[tier][stage] ?? thresholds[tier].unknown;
 }
 
+// Process UI-requested manual sells (written by api.mjs to sell-requests.jsonl).
+// Marks each request as 'done' or 'failed' after processing so we don't retry.
+const SELL_REQUESTS_FILE = './logs/sell-requests.jsonl';
+async function processUISellRequests() {
+  if (!existsSync(SELL_REQUESTS_FILE)) return;
+  try {
+    const lines = readFileSync(SELL_REQUESTS_FILE, 'utf-8').split('\n').filter(l => l.trim());
+    const requests = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const pending = requests.filter(r => r.status === 'pending');
+    if (pending.length === 0) return;
+
+    const trades = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim())
+      .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+    for (const req of pending) {
+      const trade = trades.find(t =>
+        t.status === 'open' && t.exchange === 'kalshi' &&
+        ((req.tradeId && t.id === req.tradeId) || (req.ticker && t.ticker === req.ticker))
+      );
+      if (!trade) { req.status = 'failed'; req.error = 'trade not found or not open'; continue; }
+      try {
+        const data = await kalshiGet(`/markets/${trade.ticker}`);
+        const m = data.market ?? data;
+        const bid = parseFloat(m.yes_bid_dollars ?? m.yes_ask_dollars ?? '0');
+        const price = trade.side === 'yes' ? bid : (1 - parseFloat(m.yes_ask_dollars ?? '0'));
+        const result = await executeSell(trade, trade.quantity, price, req.reason ?? 'manual-ui');
+        req.status = result ? 'done' : 'failed';
+        req.executedAt = new Date().toISOString();
+        req.executedPrice = price;
+      } catch (e) {
+        req.status = 'failed';
+        req.error = e.message;
+      }
+    }
+
+    // Rewrite file with updated statuses + keep last 200
+    const all = [...requests.filter(r => r.status !== 'pending' || pending.find(p => p.id === r.id)), ...pending];
+    const merged = requests.map(r => pending.find(p => p.id === r.id) ?? r).slice(-200);
+    writeFileSync(SELL_REQUESTS_FILE, merged.map(r => JSON.stringify(r)).join('\n') + '\n');
+    void all;
+  } catch (e) {
+    console.error('[ui-sell] error:', e.message);
+  }
+}
+
 async function managePositions() {
+  // Process UI sell requests first (manual overrides from the web app)
+  await processUISellRequests();
+
   if (!existsSync(TRADES_LOG)) return;
   try {
     const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
