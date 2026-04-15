@@ -2200,7 +2200,8 @@ async function checkLiveScoreEdges() {
         }
 
         const livePrompt =
-          `You are a professional sports bettor. Your job: predict this game's outcome using the historical baseline below.\n\n` +
+          `You are a professional sports bettor. Your job is NOT to predict whether the leading team wins — the WE baseline already does that. Your job is to find a SPECIFIC, VERIFIABLE reason the market has this priced wrong.\n\n` +
+          `The DEFAULT answer is NO. The market has the same live score we do, plus more. If you cannot name one concrete fact that explains why the market is underpricing this team, say no.\n\n` +
           `═══ LIVE ${league.toUpperCase()} GAME ═══\n` +
           `${away.team?.displayName} (${awayRecord}${awayRoadRec ? ', ' + awayRoadRec + ' away' : ''}) ${awayScore}\n` +
           `  at\n` +
@@ -2223,14 +2224,27 @@ async function checkLiveScoreEdges() {
           `\n═══ STEP 1 — SEARCH FIRST, ANALYZE SECOND ═══\n` +
           `⚠️ RESEARCH RULES: Only state facts you found via web search. Never invent statistics, records, or lineup information. You may draw inferences from confirmed data (e.g., "team has clinched so they may be conserving energy") but flag all inferences explicitly. If you cannot confirm something, say so — do not guess.\n\n` +
           `Search in this order:\n` +
-          `A) STAKES FOR BOTH TEAMS: Search "[leading team] playoff standings 2026" and "[trailing team] playoff standings 2026". What does tonight mean for each team? Is either in a must-win? Already eliminated? Clinched and likely coasting? This context shapes everything below.\n` +
-          `B) LEADING TEAM LINEUP: Is the leading team resting or missing key players tonight? Search "[leading team] injury report tonight" or "[leading team] lineup [date]". Confirm starters are playing.\n` +
-          `C) ${league === 'mlb' ? `PITCHING: What is the starter's ERA and current pitch count? ${period >= 7 ? 'Also: is the closer available tonight (did he pitch in the last 24-48 hours)?' : ''}` : league === 'nhl' ? `GOALIE: What is the leading team's starting goalie SV% this season? Confirm they are starting tonight.` : `KEY PLAYERS: What is the leading team's star player status tonight? Any notable injuries or hot/cold streaks?`}\n` +
-          `D) H2H: What is the head-to-head record between these teams this season and last 2 seasons?\n\n` +
+          (league === 'mlb' ?
+            `A) BULLPEN/PITCHER (search first — this is the only thing that matters for MLB leads):\n` +
+            `   Search "${leadingAbbr} bullpen ERA last 10 days 2026" or "${leadingAbbr} relief pitchers 2026 stats".\n` +
+            `   - Is the starter still pitching? Check pitch count (above shows season ERA only).\n` +
+            `   - What is the leading team's bullpen ERA last 10 days? Who is available in their pen?\n` +
+            (period >= 7 ? `   - Is the closer available tonight (did he pitch in last 24-48 hours)? Search "${leadingAbbr} closer availability tonight".\n` : '') +
+            `   - If you CANNOT confirm bullpen quality — stop here and say NO (see Hard NOs below).\n` +
+            `B) LINEUP: Search "${leadingAbbr} lineup tonight" — are key bats resting?\n` +
+            `C) STAKES: Search "[leading team] playoff standings 2026" — is either team in a must-win or already eliminated/coasting?\n` +
+            `D) H2H: Head-to-head record this season and last 2 seasons.\n\n`
+          :
+            `A) STAKES FOR BOTH TEAMS: Search "[leading team] playoff standings 2026" and "[trailing team] playoff standings 2026". What does tonight mean for each team? Is either in a must-win? Already eliminated? Clinched and likely coasting? This context shapes everything below.\n` +
+            `B) LEADING TEAM LINEUP: Is the leading team resting or missing key players tonight? Search "[leading team] injury report tonight" or "[leading team] lineup [date]". Confirm starters are playing.\n` +
+            `C) ${league === 'nhl' ? `GOALIE: What is the leading team's starting goalie SV% this season? Confirm they are starting tonight.` : `KEY PLAYERS: What is the leading team's star player status tonight? Any notable injuries or hot/cold streaks?`}\n` +
+            `D) H2H: What is the head-to-head record between these teams this season and last 2 seasons?\n\n`
+          ) +
           `═══ STEP 2 — HARD NOs (if ANY apply, respond {"trade":false} immediately) ═══\n` +
           `❌ Leading team is resting 3+ key players → NO (not the same team that earned that record)\n` +
           `❌ Trailing team is in active playoff survival (must win or season ends) AND leading team is already mathematically eliminated OR confirmed rotating lineup/resting regulars → NO (motivation gap too large — urgency overcomes scoreboard)\n` +
           (league === 'mlb' ? `❌ Starter has 90+ pitches and bullpen ERA > 5.0 with 3+ innings left → NO (bullpen collapse risk)\n` : '') +
+          (league === 'mlb' && diff === 1 && period >= 7 ? `❌ MLB 1-RUN P${period}+ BULLPEN GATE: You must confirm the leading team's bullpen ERA (last 10 days or season) OR closer availability tonight. If your search returned no usable bullpen data — say NO immediately. The market has the same score we do; without bullpen state, you have no information edge and no business betting against it.\n` : '') +
           `❌ You find yourself saying "modest," "marginal," "just clears the bar," or "only X points of edge" → NO\n\n` +
           `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs triggered) ═══\n` +
           `Start from the historical baseline. Adjust based on what you found:\n` +
@@ -2271,7 +2285,7 @@ async function checkLiveScoreEdges() {
           `- Trailing team is at HOME with loud playoff/crucial crowd → DOWN 3-5% (home crowd lifts desperate teams)\n` +
           `- Time remaining: 3 min left with a lead ≠ 10 min left with same lead. Adjust accordingly.\n\n` +
           `═══ STEP 4 — DECISION ═══\n` +
-          (_weTargetPct != null ? `⚠️ CALIBRATION CHECK: The WE math says ${targetAbbr} wins ${_weTargetPct}% from here. Before you decide, verify your final confidence is within 12 points of this number. If it's not — name the single specific confirmed fact that justifies the deviation. "They're the better team" does not count.\n\n` : '') +
+          (_weTargetPct != null ? `⚠️ CALIBRATION CHECK: The WE math says ${targetAbbr} wins ${_weTargetPct}% from here. Your final confidence must be within 8 points of this number. If it's not — name the single specific confirmed fact that justifies the deviation. "They're the better team" does not count. A team's record is already in the WE baseline — it does not justify deviation on its own.\n\n` : '') +
           `BUY only if ALL three are true:\n` +
           `✓ Confidence ≥ 65%\n` +
           `✓ Confidence beats price by 3+ points for late-game strong leads (WE ≥ 80%, inning 7+ / P3 / Q4). 4+ points required for early game (Q1/P1/innings 1-5) or marginal leads under 80% WE.\n` +
@@ -2371,6 +2385,15 @@ async function checkLiveScoreEdges() {
             logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-1run-late', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr: leadingAbbr, reasoning: `MLB 1-run P${period}: ${leadingAbbr} @${(price*100).toFixed(0)}¢ needs ≤${((weBase-minEdge)*100).toFixed(0)}¢ (WE ${(weBase*100).toFixed(0)}% minus 15pt edge floor) — 1-run late-game leads are too volatile at thin edge` });
             continue;
           }
+        }
+
+        // Fast contra line movement → skip entirely. If the market is moving away from our
+        // target at 2+¢/min during a live game, that's sharp money reacting to something
+        // (bullpen change, injury, news) that we don't have yet. Not worth calling Sonnet.
+        if (_lineMove?.confirming === false && (_lineMove.velocity ?? 0) >= 2.0) {
+          console.log(`[live-edge] Skipping ${targetAbbr}: fast contra movement ${(_lineMove.velocity.toFixed(1))}¢/min — market actively moving away, likely has info we don't`);
+          logScreen({ stage: 'live-edge-skip', result: 'skip-contra-move', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `Fast contra movement ${(_lineMove.velocity.toFixed(1))}¢/min: market moved from ${(_lineMove.from*100).toFixed(0)}¢ to ${(_lineMove.to*100).toFixed(0)}¢ against ${targetAbbr} — sharp money reacting to something we don't have` });
+          continue;
         }
 
         // Collect for parallel Sonnet execution instead of calling sequentially
