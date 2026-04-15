@@ -1959,23 +1959,19 @@ async function checkLiveScoreEdges() {
         const gameMarkets = [...cachedPrices.entries()]
           .filter(([ticker, data]) => {
             if (data.yes < 0.01 || data.yes > 0.99) return false;
+            // HARD FILTER: live-edge only bets on TODAY's markets — never a future game's market.
+            // If ESPN shows a live game but Kalshi only has tomorrow's market for those teams,
+            // skip rather than bet on the wrong game. (KC@DET live vs tomorrow's pre-game = wrong.)
+            if (!isToday(ticker)) return false;
             return tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
           })
-          .sort(([tickerA, a], [tickerB, b]) => {
-            // Today's markets always before future markets
-            const aToday = isToday(tickerA);
-            const bToday = isToday(tickerB);
-            if (aToday && !bToday) return -1;
-            if (!aToday && bToday) return 1;
-            // Within same-day group: most decisive (furthest from 50¢) first
-            return Math.abs(b.yes - 0.50) - Math.abs(a.yes - 0.50);
-          })
+          .sort(([, a], [, b]) => Math.abs(b.yes - 0.50) - Math.abs(a.yes - 0.50)) // most decisive first
           .map(([ticker, data]) => ({
             ticker, title: data.title, yes_ask_dollars: String(data.yes), no_ask_dollars: String(data.no),
           }));
 
         if (gameMarkets.length === 0) {
-          console.log(`[live-edge] No Kalshi market found for ${awayAbbr}@${homeAbbr} on ${todayStr}${tonightStr ? '/' + tonightStr : ''}`);
+          console.log(`[live-edge] No TODAY market found for ${awayAbbr}@${homeAbbr} (${todayStr}${tonightStr ? '/' + tonightStr : ''}) — skipping to avoid wrong-game bet`);
           continue;
         }
 
