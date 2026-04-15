@@ -1916,7 +1916,7 @@ async function checkLiveScoreEdges() {
       const MIN_WE_FOR_SONNET = (() => {
         if (league === 'mlb') return 0.75;
         if (league === 'nhl' && diff === 1) return 0.75; // 1-goal P3=79% passes, P2=68% blocked
-        if (league === 'nba' && period === 3) return 0.73; // Q3 needs 8+ pt lead — 5-7pt too volatile
+        if (league === 'nba' && period <= 3) return 0.73; // Q1/Q2/Q3 needs 12pt+ lead — marginal early leads too volatile (POR/PHX Q2 8pt, MIA/CHA Q3 5pt)
         return 0.65;
       })();
       if (baseWE < MIN_WE_FOR_SONNET) {
