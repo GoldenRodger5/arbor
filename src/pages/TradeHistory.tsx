@@ -35,7 +35,13 @@ export default function TradeHistory() {
   const [filterDate, setFilterDate] = useState('all');
   const [swipeOpen, setSwipeOpen] = useState(false);
 
-  const sortedTrades = useMemo(() => [...trades].reverse(), [trades]);
+  // Hide closed-manual trades — these are positions the bot lost track of
+  // (Kalshi confirmed them gone but the PnL was never captured). They'd just
+  // show as '—' in the list with no useful info.
+  const sortedTrades = useMemo(
+    () => [...trades].reverse().filter(t => t.status !== 'closed-manual'),
+    [trades]
+  );
 
   const sportOf = (t: any) => {
     const tk = (t.ticker ?? '').toUpperCase();
