@@ -2359,6 +2359,20 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
+        // MLB 1-run lead P7+ minimum edge guard.
+        // A 1-run lead in innings 7–9 has ~76–77% WE but is extremely volatile —
+        // one hit ties the game. Only enter if market is ≥15pt below WE (≤62¢).
+        // This blocked KC (65¢) and MIA/ATL (64¢) Apr 14 — both lost.
+        if (league === 'mlb' && diff === 1 && period >= 7) {
+          const weBase = getWinExpectancy('mlb', 1, period) ?? 0.76;
+          const minEdge = 0.15;
+          if (price > weBase - minEdge) {
+            console.log(`[live-edge] Skipping MLB 1-run P${period}: ${leadingAbbr} @${(price*100).toFixed(0)}¢ — need ≤${((weBase-minEdge)*100).toFixed(0)}¢ (WE ${(weBase*100).toFixed(0)}% - 15pt min edge), too close to fair value`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-1run-late', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr: leadingAbbr, reasoning: `MLB 1-run P${period}: ${leadingAbbr} @${(price*100).toFixed(0)}¢ needs ≤${((weBase-minEdge)*100).toFixed(0)}¢ (WE ${(weBase*100).toFixed(0)}% minus 15pt edge floor) — 1-run late-game leads are too volatile at thin edge` });
+            continue;
+          }
+        }
+
         // Collect for parallel Sonnet execution instead of calling sequentially
         sonnetCallsThisCycle++;
         sonnetQueue.push({
@@ -3997,6 +4011,29 @@ async function managePositions() {
           const ourWE = ctx.leading === ourTeam ? ctx.baselineWE : (1 - ctx.baselineWE);
           if (ourWE <= 0.30) {
             console.log(`[exit] 🔄 WE-REVERSAL (${(ourWE*100).toFixed(0)}% WE ≤30%): ${trade.ticker} — game reversed, selling at ${(currentPrice*100).toFixed(0)}¢`);
+            const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
+            if (result) anyUpdated = true;
+            continue;
+          }
+        }
+
+        // WE-DROP SELL — catches slow deterioration that WE-reversal misses.
+        // When the game ties (50% WE) we don't sell — but then if opponent takes the lead
+        // we're already at 25-30% WE and the price has collapsed. This fires earlier.
+        // Rule: if our current WE has dropped ≥35pt from the WE when we entered, sell.
+        // Example: entered ARI with 76% WE (5-4 lead P7), game ties → ARI WE=50%,
+        //   drop = 26pt (no fire). BAL takes lead → ARI WE=24%, drop = 52pt → SELL.
+        //   With 60s polling the tie-then-reversal fires ~1 cycle after the lead changes,
+        //   catching it faster than waiting for the ≤30% threshold.
+        // Note: weAtEntry stored on trade at entry time (null for pre-game or old trades).
+        if (ctx?.baselineWE != null && trade.weAtEntry != null) {
+          const ourTeam = trade.ticker?.split('-').pop() ?? '';
+          // Handle tied game (diff=0): WE = 50%
+          const ourCurrentWE = ctx.diff === 0 ? 0.50 :
+            (ctx.leading === ourTeam ? ctx.baselineWE : (1 - ctx.baselineWE));
+          const weDrop = trade.weAtEntry - ourCurrentWE;
+          if (weDrop >= 0.35) {
+            console.log(`[exit] 📉 WE-DROP (dropped ${(weDrop*100).toFixed(0)}pt from ${(trade.weAtEntry*100).toFixed(0)}% entry → ${(ourCurrentWE*100).toFixed(0)}%): ${trade.ticker} — position deteriorating, selling at ${(currentPrice*100).toFixed(0)}¢`);
             const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
             if (result) anyUpdated = true;
             continue;
