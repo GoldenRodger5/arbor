@@ -1951,7 +1951,25 @@ async function checkLiveScoreEdges() {
           if (!m) return true; // no embedded time (NHL-style tickers) — allow through
           return parseInt(m[1]) < 800; // 0000–0759 UTC = started after 8pm ET same night
         };
-        const isToday = (ticker) => ticker.includes(todayStr) || (tonightStr && ticker.includes(tonightStr) && tonightStarted(ticker));
+        // Extra guard: reject any market whose embedded UTC start time is more than 6 hours
+        // in the future. A genuinely live game must have already started. This catches cases
+        // where ESPN returns stale "in progress" scores and the bot matches them to tonight's
+        // pre-game markets (e.g. ESPN shows TEX@ATH still live but Kalshi only has tomorrow's 21:40 UTC market).
+        const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+        const tickerHasStarted = (ticker) => {
+          const m = ticker.match(/(\d{2})([A-Z]{3})(\d{2})(\d{4})/);
+          if (!m) return true; // no datetime in ticker, allow through
+          const [, yy, mon, dd, hhmm] = m;
+          const mo = MONTHS.indexOf(mon);
+          if (mo < 0) return true;
+          const scheduledUTC = new Date(Date.UTC(2000 + parseInt(yy), mo, parseInt(dd),
+            parseInt(hhmm.slice(0,2)), parseInt(hhmm.slice(2,4))));
+          return scheduledUTC.getTime() <= Date.now() + 6 * 60 * 60 * 1000; // must start within 6h
+        };
+        const isToday = (ticker) => {
+          if (!tickerHasStarted(ticker)) return false; // reject future markets regardless of date
+          return ticker.includes(todayStr) || (tonightStr && ticker.includes(tonightStr) && tonightStarted(ticker));
+        };
         const gameMarkets = [...cachedPrices.entries()]
           .filter(([ticker, data]) => {
             if (data.yes < 0.01 || data.yes > 0.99) return false;
@@ -2573,6 +2591,10 @@ let preGameTradesDate = '';         // reset counter on new day
 const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
 
 async function checkPreGamePredictions() {
+  // Pre-game betting disabled — only live in-game edge bets allowed
+  console.log('[pre-game] Disabled — live-edge only mode');
+  return;
+
   if (Date.now() - lastPreGameScan < PREGAME_SCAN_INTERVAL) return;
   lastPreGameScan = Date.now();
   if (!canTrade()) return;
