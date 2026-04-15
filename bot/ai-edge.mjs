@@ -1131,16 +1131,7 @@ async function refreshPortfolio() {
             continue; // don't close yet, wait for next sync to confirm
           }
           if (Date.now() - firstMissing < 90 * 1000) continue; // wait at least 90s between strikes
-          // Estimate P&L from cached market price at exit time
-          const cachedPrice = cachedPrices?.get(t.ticker);
-          const exitPrice = cachedPrice?.yes ?? null;
-          if (exitPrice != null && t.entryPrice != null && t.quantity != null) {
-            // realizedPnL = (exitPrice - entryPrice) × qty  (sold before settlement)
-            t.realizedPnL = parseFloat(((exitPrice - t.entryPrice) * t.quantity).toFixed(2));
-            t.exitPrice = exitPrice;
-          } else {
-            t.realizedPnL = t.realizedPnL ?? null; // unknown — don't zero it out
-          }
+          t.realizedPnL = t.realizedPnL ?? null; // unknown — don't zero it out
           t.status = 'closed-manual';
           t.settledAt = new Date().toISOString();
           synced = true;
