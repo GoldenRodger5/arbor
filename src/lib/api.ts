@@ -27,4 +27,5 @@ export const api = {
   getPositions: () => get<Trade[]>('/api/positions'),
   getStats: () => get<any>('/api/stats'),
   getSnapshots: () => get<DailySnapshot[]>('/api/snapshots'),
+  getGames: () => get<any[]>('/api/games'),
 };

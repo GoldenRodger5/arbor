@@ -1880,6 +1880,7 @@ async function checkLiveScoreEdges() {
       })();
       if (baseWE < MIN_WE_FOR_SONNET) {
         console.log(`[live-edge] Skipping low-WE: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} ${diff}-${league === 'nba' ? 'pt' : league === 'mlb' ? 'run' : 'goal'} lead P${period}, WE=${(baseWE*100).toFixed(0)}% (need ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%+ for ${league.toUpperCase()} ${diff === 1 ? '1-goal' : ''})`);
+        logScreen({ stage: 'live-edge-skip', result: 'skip-we-floor', league, homeAbbr: home.team?.abbreviation ?? '', awayAbbr: away.team?.abbreviation ?? '', homeScore, awayScore, diff, period, winExpectancy: baseWE, reasoning: `WE=${(baseWE*100).toFixed(0)}% is below the ${(MIN_WE_FOR_SONNET*100).toFixed(0)}% floor for ${league.toUpperCase()}${diff === 1 && league === 'nhl' ? ' 1-goal leads' : ''} — need stronger lead or later period to justify analysis` });
         continue;
       }
     }
@@ -2274,6 +2275,7 @@ async function checkLiveScoreEdges() {
         if (hasPosition) {
           if (!canScaleInto(gameBase, price)) {
             console.log(`[live-edge] Already have position on ${homeAbbr}@${awayAbbr}, skipping`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-has-position', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, reasoning: `Already holding a position on ${homeAbbr}@${awayAbbr} — scale-in conditions not met at ${(price*100).toFixed(0)}¢` });
             continue;
           }
           console.log(`[live-edge] 📈 Scale-in: ${homeAbbr}@${awayAbbr} price dropped to ${(price*100).toFixed(0)}¢`);
@@ -2293,6 +2295,7 @@ async function checkLiveScoreEdges() {
         }
         if (price >= sportMaxPrice) {
           console.log(`[live-edge] Skipping: ${leadingAbbr} @${(price*100).toFixed(0)}¢ (above ${(sportMaxPrice*100).toFixed(0)}¢ ceiling for ${league.toUpperCase()} P${period})`);
+          logScreen({ stage: 'live-edge-skip', result: 'skip-price-ceiling', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr: leadingAbbr, reasoning: `${leadingAbbr} YES @${(price*100).toFixed(0)}¢ exceeds the ${(sportMaxPrice*100).toFixed(0)}¢ price ceiling for ${league.toUpperCase()} P${period} — market has already priced in the lead` });
           continue;
         }
 
@@ -2340,7 +2343,7 @@ async function checkLiveScoreEdges() {
 
         if (!decision.trade) {
           console.log(`[live-edge] Claude says NO on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): conf=${((decision.confidence ?? 0)*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ | ${decision.reasoning?.slice(0, 80)}`);
-          logScreen({ stage: 'live-edge', ticker, result: 'pass', confidence: decision.confidence, price, reasoning: decision.reasoning });
+          logScreen({ stage: 'live-edge', ticker, result: 'pass', confidence: decision.confidence, price, reasoning: decision.reasoning, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, gameDetail, targetAbbr });
           continue;
         }
 
@@ -2349,6 +2352,7 @@ async function checkLiveScoreEdges() {
         const sportMinConf = CAL.minConfidenceLive?.[league] ?? MIN_CONFIDENCE;
         if (confidence < sportMinConf) {
           console.log(`[live-edge] Confidence too low on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(confidence*100).toFixed(0)}% < ${(sportMinConf*100).toFixed(0)}%${CAL.minConfidenceLive?.[league] ? ' [calibrated]' : ''}`);
+          logScreen({ stage: 'live-edge-skip', result: 'skip-conf-low', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, confidence: decision.confidence, targetAbbr, reasoning: `Claude wanted to trade ${targetAbbr} at ${(confidence*100).toFixed(0)}% confidence but floor is ${(sportMinConf*100).toFixed(0)}%${CAL.minConfidenceLive?.[league] ? ' (calibrated)' : ''} — ${decision.reasoning?.slice(0, 120) ?? ''}` });
           continue;
         }
 
@@ -2447,7 +2451,7 @@ async function checkLiveScoreEdges() {
         console.log(`[live-edge] 🎯 ${hcLabel}TRADE on ${platformLabel}: ${ticker} ${targetAbbr} YES @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
         console.log(`  Score: ${awayAbbr} ${awayScore} @ ${homeAbbr} ${homeScore} (${gameDetail})`);
         console.log(`  Reason: ${decision.reasoning}`);
-        logScreen({ stage: 'live-edge', ticker, result: 'TRADE', confidence, price: bestPrice, platform: best.platform, reasoning: decision.reasoning });
+        logScreen({ stage: 'live-edge', ticker, result: 'TRADE', confidence, price: bestPrice, platform: best.platform, reasoning: decision.reasoning, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, gameDetail, targetAbbr });
 
         tradeCooldowns.set(ticker, Date.now());
         tradeCooldowns.set(gameBase, Date.now());

@@ -7,6 +7,7 @@ import AnalyticsPage from './pages/AnalyticsPage';
 import SettingsPage from './pages/SettingsPage';
 import TradeReview from './pages/TradeReview';
 import LiveFeed from './pages/LiveFeed';
+import GamesPage from './pages/GamesPage';
 import { ArborProvider } from './context/ArborContext';
 
 const App = () => (
@@ -20,6 +21,7 @@ const App = () => (
           <Route path="/analytics" element={<AnalyticsPage />} />
           <Route path="/review" element={<TradeReview />} />
           <Route path="/live" element={<LiveFeed />} />
+          <Route path="/games" element={<GamesPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </Layout>

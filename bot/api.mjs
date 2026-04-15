@@ -226,6 +226,83 @@ function handleRequest(req, res) {
       // Return last 100
       json(res, screens.slice(-100));
 
+    } else if (path === '/api/games') {
+      const screens = readJsonl(SCREENS_LOG);
+      // Last 8 hours of live-edge decisions
+      const cutoff = Date.now() - 8 * 60 * 60 * 1000;
+      const relevant = screens.filter(s => {
+        if (!['live-edge', 'live-edge-skip'].includes(s.stage)) return false;
+        return new Date(s.timestamp).getTime() >= cutoff;
+      });
+
+      // Group by game key (awayAbbr@homeAbbr)
+      const gameMap = new Map();
+      for (const s of relevant) {
+        let key = null;
+        if (s.homeAbbr && s.awayAbbr) {
+          key = `${s.awayAbbr}@${s.homeAbbr}`;
+        } else if (s.ticker) {
+          // fallback: use ticker base as key
+          const lastH = s.ticker.lastIndexOf('-');
+          key = lastH > 0 ? s.ticker.slice(0, lastH) : s.ticker;
+        }
+        if (!key) continue;
+
+        if (!gameMap.has(key)) {
+          gameMap.set(key, {
+            gameKey: key,
+            league: s.league ?? null,
+            homeAbbr: s.homeAbbr ?? null,
+            awayAbbr: s.awayAbbr ?? null,
+            lastSeen: s.timestamp,
+            lastScore: null,
+            lastDetail: null,
+            decisions: [],
+          });
+        }
+
+        const game = gameMap.get(key);
+        // Update metadata from most recent entry
+        if (s.timestamp > game.lastSeen) {
+          game.lastSeen = s.timestamp;
+          if (s.league) game.league = s.league;
+          if (s.homeAbbr) game.homeAbbr = s.homeAbbr;
+          if (s.awayAbbr) game.awayAbbr = s.awayAbbr;
+        }
+        if (s.homeScore != null && s.awayScore != null) {
+          // Update if this is the most recent score we've seen
+          const curTs = game.lastScoreTs ?? '';
+          if (s.timestamp >= curTs) {
+            game.lastScore = `${s.awayAbbr} ${s.awayScore} – ${s.homeAbbr} ${s.homeScore}`;
+            game.lastDetail = s.gameDetail ?? (s.period != null ? `P${s.period}` : null);
+            game.lastScoreTs = s.timestamp;
+          }
+        }
+
+        game.decisions.push({
+          timestamp: s.timestamp,
+          result: s.result,
+          reasoning: s.reasoning ?? null,
+          confidence: s.confidence ?? null,
+          price: s.price ?? null,
+          winExpectancy: s.winExpectancy ?? null,
+          targetAbbr: s.targetAbbr ?? null,
+          homeScore: s.homeScore ?? null,
+          awayScore: s.awayScore ?? null,
+          period: s.period ?? null,
+          gameDetail: s.gameDetail ?? null,
+        });
+      }
+
+      // Remove internal timestamp tracker
+      for (const g of gameMap.values()) delete g.lastScoreTs;
+
+      // Sort games by lastSeen desc
+      const games = [...gameMap.values()].sort((a, b) =>
+        new Date(b.lastSeen).getTime() - new Date(a.lastSeen).getTime()
+      );
+      json(res, games);
+
     } else if (path === '/api/live-feed') {
       // Tail the last N lines of ai-out.log for real-time feed
       const LOG_FILE = join(__dirname, 'logs/ai-out.log');
