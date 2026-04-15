@@ -62,6 +62,33 @@ export const api = {
     get<{ summary: string; generatedAt: string | null; lines?: number; hours?: number }>(`/api/summary?hours=${hours}`),
   getRecap: (period: 'daily' | 'weekly' = 'daily') =>
     get<RecapData>(`/api/recap?period=${period}`),
+  getLiveInsight: () =>
+    get<LiveInsightData>('/api/live-insight'),
+};
+
+export type LiveInsightGame = {
+  gameKey: string;
+  league: string | null;
+  away: string;
+  home: string;
+  score: string | null;
+  gameDetail: string | null;
+  period: number | null;
+  targetAbbr: string | null;
+  price: number | null;
+  winExpectancy: number | null;
+  confidence: number | null;
+  result: string;
+  reasoning: string | null;
+  updatedAt: string;
+  cycleCount: number;
+};
+
+export type LiveInsightData = {
+  games: LiveInsightGame[];
+  insight: string | null;
+  generatedAt: string;
+  windowMinutes: number;
 };
 
 export type RecapData = {

@@ -252,6 +252,103 @@ async function handleRequest(req, res) {
       json(res, state);
       return;
     }
+    // ─── Live scouting — what the bot is watching right now ────────────────
+    // Pulls the last ~5 minutes of live-edge decisions, groups per game, and
+    // asks Sonnet to write a short "what's on the board right now" note.
+    if (path === '/api/live-insight') {
+      const screens = readJsonl(SCREENS_LOG);
+      const windowMs = 6 * 60 * 1000;
+      const cutoff = Date.now() - windowMs;
+      const recent = screens.filter(s =>
+        (s.stage === 'live-edge' || s.stage === 'live-edge-skip') &&
+        new Date(s.timestamp).getTime() >= cutoff
+      );
+
+      // Group by game
+      const gameMap = new Map();
+      for (const s of recent) {
+        const key = (s.homeAbbr && s.awayAbbr) ? `${s.awayAbbr}@${s.homeAbbr}` : s.ticker;
+        if (!key) continue;
+        const game = gameMap.get(key) ?? {
+          key, league: s.league, homeAbbr: s.homeAbbr, awayAbbr: s.awayAbbr,
+          latest: null, decisions: [],
+        };
+        if (!game.latest || s.timestamp > game.latest.timestamp) game.latest = s;
+        game.decisions.push(s);
+        gameMap.set(key, game);
+      }
+
+      // Build compact game cards
+      const games = [...gameMap.values()].map(g => {
+        const d = g.latest ?? {};
+        return {
+          gameKey: g.key,
+          league: g.league ?? null,
+          away: g.awayAbbr,
+          home: g.homeAbbr,
+          score: (d.homeScore != null && d.awayScore != null) ? `${d.awayAbbr} ${d.awayScore} – ${d.homeAbbr} ${d.homeScore}` : null,
+          gameDetail: d.gameDetail ?? (d.period != null ? `P${d.period}` : null),
+          period: d.period ?? null,
+          targetAbbr: d.targetAbbr ?? null,
+          price: d.price != null ? Math.round(d.price * 100) : null,
+          winExpectancy: d.winExpectancy != null ? Math.round(d.winExpectancy * 100) : null,
+          confidence: d.confidence != null ? Math.round(d.confidence * 100) : null,
+          result: d.result,
+          reasoning: d.reasoning ?? null,
+          updatedAt: d.timestamp,
+          cycleCount: g.decisions.length,
+        };
+      }).sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''));
+
+      if (games.length === 0) {
+        json(res, {
+          games: [],
+          insight: 'Nothing live right now. Bot is idle, scanning for opportunities.',
+          generatedAt: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Ask Sonnet for the "what's on the board" take
+      const compact = games.slice(0, 6).map(g => {
+        const parts = [
+          `[${g.league?.toUpperCase() ?? '?'}] ${g.score ?? `${g.away}@${g.home}`} ${g.gameDetail ?? ''}`,
+          g.targetAbbr ? `target=${g.targetAbbr}` : '',
+          g.price != null ? `price=${g.price}¢` : '',
+          g.winExpectancy != null ? `WE=${g.winExpectancy}%` : '',
+          g.confidence != null ? `conf=${g.confidence}%` : '',
+          `result=${g.result}`,
+          g.reasoning ? `reason="${g.reasoning.slice(0, 180)}"` : '',
+        ].filter(Boolean);
+        return '• ' + parts.join(' · ');
+      }).join('\n');
+
+      const cacheKey = `live:${games[0]?.updatedAt ?? ''}:${games.length}`;
+      let insight = null;
+      try {
+        insight = await cachedLLM(cacheKey, {
+          model: 'claude-sonnet-4-6',
+          maxTokens: 450,
+          system:
+            `You are explaining to the bot operator what their live-edge trading bot is currently watching and why it's not acting. The reader sees the raw game cards above your text — your job is to add the ONE short pattern observation they can't derive at a glance.
+
+Format: 2-3 short sentences. No bullets, no headings, no preamble.
+
+Be specific about the rule (e.g. "MLB 1-run leads in innings <=6 only 58% WE, below our 75% floor") and what would unlock action (e.g. "a 3+ run lead in the 7th at <78¢ would qualify"). If it's a pattern of market overpricing, say so.`,
+          user:
+            `Current live-edge candidates (last 6 min):\n\n${compact}\n\nExplain in 2-3 sentences why the bot is holding off and what condition would make it act.`
+        });
+      } catch (e) { insight = null; }
+
+      json(res, {
+        games,
+        insight,
+        generatedAt: new Date().toISOString(),
+        windowMinutes: windowMs / 60_000,
+      });
+      return;
+    }
+
     // ─── Live-feed LLM summary ─────────────────────────────────────────────
     if (path === '/api/summary') {
       const hours = Math.min(6, parseInt(url.searchParams.get('hours') ?? '1'));

@@ -7,6 +7,7 @@ import { buzz, notificationPermission, requestNotificationPermission } from '@/l
 import { useEffect, useState } from 'react';
 import AnimatedNumber from '@/components/AnimatedNumber';
 import RecapBanner from '@/components/RecapBanner';
+import LiveScouting from '@/components/LiveScouting';
 
 function sportOf(ticker?: string, strategy?: string): string {
   const tk = (ticker ?? '').toUpperCase();
@@ -177,6 +178,9 @@ export default function TodayPage() {
           )}
         </div>
       </div>
+
+      {/* Live scouting — what bot is watching right now */}
+      <LiveScouting />
 
       {/* Recap banner (first open of day / week) */}
       <RecapBanner />
