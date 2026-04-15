@@ -1808,9 +1808,20 @@ async function checkLiveScoreEdges() {
           else drawProb = 0;
         }
 
+        // Red card guard — our minute-based tables assume 11v11. A red card changes
+        // the entire game dynamic in ways our tables don't model. Skip draw bet if detected.
+        // ESPN uses 'RC' for red cards in the statistics array. lastPlay check catches
+        // same-moment red cards. Defensive: if stat not found, defaults to 0 (safe).
+        const rcStat = (team) => parseInt(team.statistics?.find(s => s.abbreviation === 'RC')?.displayValue ?? '0') || 0;
+        const hasRedCard = rcStat(home) > 0 || rcStat(away) > 0 ||
+          (comp.situation?.lastPlay?.text ?? '').toLowerCase().includes('red card');
+        if (hasRedCard) {
+          console.log(`[draw-bet] Skipping ${homeAbbr} vs ${awayAbbr}: red card detected — minute tables invalid for 10v11`);
+        }
+
         // Bet draws when probability is meaningful (>42% for 0-0 late, >47% for scored ties)
         // Lower threshold allows earlier entries when market is cheap
-        if (drawProb >= 0.42) {
+        if (!hasRedCard && drawProb >= 0.42) {
           // Find the TIE market from cached prices (instant, no API call)
           const tieEntry = [...cachedPrices.entries()].find(([t]) =>
             t.includes('-TIE') && tickerHasTeam(t, homeAbbr) && tickerHasTeam(t, awayAbbr)
@@ -1901,14 +1912,16 @@ async function checkLiveScoreEdges() {
     //   - NHL P1: BLOCKED entirely — 40 min remaining, even 2-goal leads can reverse (PIT/STL)
     //   - NHL 1-goal leads: 75% floor (1-goal P2 = 68% WE, too volatile)
     //     Only 1-goal P3 (79% WE) and all 2-goal+ leads in P2/P3 qualify
-    //   - NHL 2-goal+ P2/P3: 65% floor (80%+ WE)
+    //   - NHL 2-goal+ any period: 65% floor (80%+ WE); 1-goal P1 blocked, 1-goal P2 blocked (68%)
     //   - NBA Q3: 73% floor — requires 8+ pt lead (5-7pt Q3 is too volatile, MIA/CHA proved it)
     //   - NBA/Soccer: 65% floor otherwise
     {
-      // NHL P1 block — too early, too much game remaining for any lead size
-      if (league === 'nhl' && period === 1) {
-        console.log(`[live-edge] Skipping NHL P1: ${away.team?.abbreviation}@${home.team?.abbreviation} — P1 has 40min remaining, not enough edge vs variance`);
-        logScreen({ stage: 'live-edge-skip', result: 'skip-we-floor', league, homeAbbr: home.team?.abbreviation ?? '', awayAbbr: away.team?.abbreviation ?? '', homeScore, awayScore, diff, period, winExpectancy: 0, reasoning: 'NHL P1 blocked — 40 minutes remaining, lead variance too high' });
+      // NHL 1-goal P1 block — 62% WE is too low with 40min remaining. High variance,
+      // a single bounce goal erases it. 2+ goal P1 leads (80%/92%) pass through to the
+      // standard WE floor below — 2-goal P1 is real edge; market often prices at 70-74¢.
+      if (league === 'nhl' && period === 1 && diff === 1) {
+        console.log(`[live-edge] Skipping NHL 1-goal P1: ${away.team?.abbreviation}@${home.team?.abbreviation} — 62% WE with 40min remaining, too early for 1-goal leads`);
+        logScreen({ stage: 'live-edge-skip', result: 'skip-we-floor', league, homeAbbr: home.team?.abbreviation ?? '', awayAbbr: away.team?.abbreviation ?? '', homeScore, awayScore, diff, period, winExpectancy: 0.62, reasoning: 'NHL 1-goal P1 blocked — 62% WE with 40 minutes remaining. 2+ goal P1 leads are allowed (80%+ WE).' });
         continue;
       }
 
@@ -2255,6 +2268,7 @@ async function checkLiveScoreEdges() {
             `+ Dominant starter still pitching (ERA < 3.0, under 80 pitches) → UP 5-8%\n` +
             `+ Strong bullpen ERA < 3.5 about to enter → UP 2-4%\n` +
             `- Starter at 80+ pitches — bullpen transition coming → DOWN 3-5%\n` +
+            `⚠️ INNING HALF: The "Status" line shows "Top" (away batting) or "Bot" (home batting). If the trailing team is batting RIGHT NOW, you're at maximum live risk — a single run ties it and the price will collapse before the next bot cycle (60s). Do not enter mid at-bat with runners on base unless edge is very large. If it says "Mid" or "End", the half-inning is over — the immediate scoring threat has passed.\n` +
             `- SITUATION ALERT: Check the "Situation" line above. Runners in scoring position (2nd or 3rd) with 0-1 outs for the TRAILING team → DOWN 6-10%. This is live — a single or sac fly ties or cuts the lead immediately.\n` +
             `- BATTING ORDER ALERT: The "At bat" line shows the current batter. Search "[batter name] batting order [team] 2025" to determine lineup position. Cleanup hitters (3-4-5) at the plate with runners on = HIGH danger. Leadoff/bottom-order hitters (1-2, 7-9) at the plate = lower threat. A #4 hitter with runners on is 2-3x more dangerous than a #8 hitter in the same situation.\n` +
             `- POWER HITTER ALERT: If trailing team has 25+ HR hitters coming up WITH RUNNERS ON BASE → DOWN 5-8%. A 3-run HR erases any lead in one pitch. This is the single biggest MLB risk.\n` +
@@ -2266,6 +2280,8 @@ async function checkLiveScoreEdges() {
             `- Trailing team star player getting hot (last 2 quarters) → DOWN 3-6%\n` +
             `- Leading team on second game of back-to-back → DOWN 2-4%\n` +
             `- 15-pt comebacks happen 13% in the 3-point era. 10-pt leads in Q3 are NOT safe. Only Q4 10-pt leads are reliable (86% WE).\n` +
+            `⚠️ FOUL TROUBLE (Q3/Q4 only): If the leading team's best player has 4+ fouls, they will likely sit at the start of Q4 to avoid fouling out. That changes the entire game plan. Check a live box score in your search results if available — foul trouble on a star player → DOWN 4-6%.\n` +
+            `📍 Q4 TIME CONTEXT: The WE baseline uses full-quarter averages. With 3+ minutes left in Q4, trust the table. With under 90 seconds and a 10pt+ lead, the game is nearly sealed — your confidence can be 3-5% above the table number. With under 90 seconds and a 5pt lead, be careful — a quick foul sequence can still flip it.\n` +
             `⚠️ SLUMP/RETURN WARNING: If you are tempted to call a team "in bad form," first confirm their key players were healthy during that stretch. A team returning stars from injury tonight has a RESET baseline — their recent results without those players do not predict tonight's performance.\n`
           : league === 'nhl' ?
             `+ 2-goal lead (any period): much more reliable than 1-goal. 2-goal P3 = 93% WE. Trust the math.\n` +
