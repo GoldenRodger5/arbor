@@ -1941,12 +1941,17 @@ async function checkLiveScoreEdges() {
         const etTmrwLE = new Date(etNowLE.getTime() + 24 * 60 * 60 * 1000);
         const tonightStr = etHourLE >= 22 ? toShortLE(etTmrwLE) : null;
 
-        // Filter cached prices for THIS game — find by team abbreviations, pick most live market.
-        // PRIMARY sort: prefer today's date in ticker (prevents betting tomorrow's market).
-        // TIEBREAK: distance from 50¢ — the live in-progress market is more decisive.
-        // This handles cases like: today's PHI live @58¢ vs tomorrow's PHI favored @65¢ pre-game.
-        // Without date preference the sort would pick tomorrow's 65¢ first — wrong game.
-        const isToday = (ticker) => ticker.includes(todayStr) || (tonightStr && ticker.includes(tonightStr));
+        // For tonightStr markets (next-day UTC date): only accept if the game's start time
+        // embedded in the ticker is before 08:00 UTC. Games that started after 8pm ET on the
+        // current day have UTC start times of 00:xx–07:xx. Pre-game markets for tomorrow's
+        // games have start times like 13:xx, 18:xx, 19:xx, 20:xx — those are future games.
+        // This prevents matching ESPN live games (stale/delayed feed) to tomorrow's pre-game markets.
+        const tonightStarted = (ticker) => {
+          const m = ticker.match(/\d{2}[A-Z]{3}\d{2}(\d{4})/); // e.g. 26APR15 + 0105
+          if (!m) return true; // no embedded time (NHL-style tickers) — allow through
+          return parseInt(m[1]) < 800; // 0000–0759 UTC = started after 8pm ET same night
+        };
+        const isToday = (ticker) => ticker.includes(todayStr) || (tonightStr && ticker.includes(tonightStr) && tonightStarted(ticker));
         const gameMarkets = [...cachedPrices.entries()]
           .filter(([ticker, data]) => {
             if (data.yes < 0.01 || data.yes > 0.99) return false;
