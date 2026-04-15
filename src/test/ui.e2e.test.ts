@@ -25,7 +25,7 @@ test.describe('Arbor UI smoke', () => {
 
   test('Analytics page shows timeframe pills + drill-down opens sheet', async ({ page }) => {
     await page.goto(`${BASE}/analytics`);
-    await expect(page.getByText('Analytics')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Analytics' })).toBeVisible();
     await expect(page.getByRole('button', { name: /7 days/i })).toBeVisible();
     // Click 30d pill
     await page.getByRole('button', { name: /30 days/i }).click();
@@ -46,8 +46,9 @@ test.describe('Arbor UI smoke', () => {
 
   test('Settings page shows control UI', async ({ page }) => {
     await page.goto(`${BASE}/settings`);
-    await expect(page.getByText('Settings & Control')).toBeVisible();
-    await expect(page.getByText(/Running|Paused/i)).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Settings & Control' })).toBeVisible();
+    // Status indicator is a span next to the animated dot; exact-match avoids the help text below
+    await expect(page.locator('span').filter({ hasText: /^(Running|Paused)$/ }).first()).toBeVisible();
     // Strategy toggles present
     await expect(page.getByText(/Live edge/i)).toBeVisible();
     await expect(page.getByText(/Pre-game predictions/i)).toBeVisible();
@@ -56,10 +57,8 @@ test.describe('Arbor UI smoke', () => {
   test('Positions page renders (empty or populated)', async ({ page }) => {
     await page.goto(`${BASE}/positions`);
     await expect(page.locator('h1', { hasText: /Positions/ })).toBeVisible();
-    // Must show either "No open positions" or at least one position
-    const empty = page.getByText('No open positions');
-    const filter = page.getByRole('button', { name: /^all$/i });
-    await expect(empty.or(filter)).toBeVisible();
+    // Deployed total is always visible regardless of empty state
+    await expect(page.locator('text=/\\$\\d.*deployed/')).toBeVisible();
   });
 
   test('Trade history loads + swipe button appears when trades exist', async ({ page }) => {
