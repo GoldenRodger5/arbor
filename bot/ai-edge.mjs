@@ -1898,15 +1898,25 @@ async function checkLiveScoreEdges() {
     //   - 15-pt NBA Q1 (70% WE) → analyze
     // Sport-specific WE floors based on actual trade data and variance research:
     //   - MLB: 75% floor (HR can erase any lead instantly)
-    //   - NHL 1-goal leads: 75% floor (1-goal P2 = 68% WE, too volatile — OTT@NJ proved it)
-    //     Only 1-goal P3 (79% WE) and all 2-goal+ leads (80%+ WE) qualify
-    //   - NHL 2-goal+ leads: 65% floor (80%+ WE from P1 = solid)
-    //   - NBA/Soccer: 65% floor
+    //   - NHL P1: BLOCKED entirely — 40 min remaining, even 2-goal leads can reverse (PIT/STL)
+    //   - NHL 1-goal leads: 75% floor (1-goal P2 = 68% WE, too volatile)
+    //     Only 1-goal P3 (79% WE) and all 2-goal+ leads in P2/P3 qualify
+    //   - NHL 2-goal+ P2/P3: 65% floor (80%+ WE)
+    //   - NBA Q3: 73% floor — requires 8+ pt lead (5-7pt Q3 is too volatile, MIA/CHA proved it)
+    //   - NBA/Soccer: 65% floor otherwise
     {
+      // NHL P1 block — too early, too much game remaining for any lead size
+      if (league === 'nhl' && period === 1) {
+        console.log(`[live-edge] Skipping NHL P1: ${away.team?.abbreviation}@${home.team?.abbreviation} — P1 has 40min remaining, not enough edge vs variance`);
+        logScreen({ stage: 'live-edge-skip', result: 'skip-we-floor', league, homeAbbr: home.team?.abbreviation ?? '', awayAbbr: away.team?.abbreviation ?? '', homeScore, awayScore, diff, period, winExpectancy: 0, reasoning: 'NHL P1 blocked — 40 minutes remaining, lead variance too high' });
+        continue;
+      }
+
       const baseWE = getWinExpectancy(league, diff, period) ?? 0.50;
       const MIN_WE_FOR_SONNET = (() => {
         if (league === 'mlb') return 0.75;
         if (league === 'nhl' && diff === 1) return 0.75; // 1-goal P3=79% passes, P2=68% blocked
+        if (league === 'nba' && period === 3) return 0.73; // Q3 needs 8+ pt lead — 5-7pt too volatile
         return 0.65;
       })();
       if (baseWE < MIN_WE_FOR_SONNET) {
@@ -3975,6 +3985,22 @@ async function managePositions() {
           const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
           if (result) anyUpdated = true;
           continue;
+        }
+
+        // WE-REVERSAL SELL — when the game situation has fully flipped against us.
+        // If our team's current win expectancy has dropped to ≤30%, the thesis is dead.
+        // Sell immediately — no Claude, no cooldown. Fills the gap between claudeStop
+        // (~55¢) and nuclear (~16¢) where we were bleeding out on reversed games.
+        // Example: KC P7 we bet at 65¢, DET took a 3-run lead → KC WE drops to ~15% → sell.
+        if (ctx?.diff > 0 && ctx.baselineWE != null) {
+          const ourTeam = trade.ticker?.split('-').pop() ?? '';
+          const ourWE = ctx.leading === ourTeam ? ctx.baselineWE : (1 - ctx.baselineWE);
+          if (ourWE <= 0.30) {
+            console.log(`[exit] 🔄 WE-REVERSAL (${(ourWE*100).toFixed(0)}% WE ≤30%): ${trade.ticker} — game reversed, selling at ${(currentPrice*100).toFixed(0)}¢`);
+            const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
+            if (result) anyUpdated = true;
+            continue;
+          }
         }
 
         // === TIER 2: Claude evaluates ALL losing positions ===
