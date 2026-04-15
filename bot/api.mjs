@@ -146,6 +146,32 @@ function readJsonl(path) {
   } catch { return []; }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// America/New_York day boundaries — the bot operates on US sports markets
+// that run on ET, so "today"/"yesterday" should match ET, not UTC. Without
+// this, dashboard stats lag by 4-5 hours and attribute trades to the wrong day.
+// ─────────────────────────────────────────────────────────────────────────────
+function etMidnightUTC(daysBack = 0) {
+  const now = new Date();
+  const dateParts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(now).map(p => [p.type, p.value])
+  );
+  const offsetStr = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    timeZoneName: 'shortOffset',
+  }).formatToParts(now).find(p => p.type === 'timeZoneName')?.value ?? 'GMT-5';
+  const offsetHours = parseInt(offsetStr.replace('GMT', '')) || -5;
+  const utcMidnight = Date.UTC(
+    parseInt(dateParts.year),
+    parseInt(dateParts.month) - 1,
+    parseInt(dateParts.day),
+  ) - offsetHours * 3600_000;
+  return new Date(utcMidnight - daysBack * 86_400_000);
+}
+
 /**
  * Read the most recent [portfolio] line from ai-out.log. The bot logs this
  * each cycle with the authoritative Kalshi + Poly balances, so we use it
@@ -427,12 +453,14 @@ Rules:
       const period = raw === 'weekly' ? 'weekly' : 'daily';
       const trades = readJsonl(TRADES_LOG).filter(t => t.status !== 'testing-void' && t.exchange === 'kalshi');
 
+      // ET day boundaries — so "yesterday" means the ET day, not UTC.
       const now = new Date();
-      const periodMs = period === 'weekly' ? 7 * 864e5 : 1 * 864e5;
       const start = period === 'weekly'
-        ? now.getTime() - periodMs
-        : (() => { const d = new Date(now); d.setDate(d.getDate() - 1); d.setHours(0, 0, 0, 0); return d.getTime(); })();
-      const end = period === 'weekly' ? now.getTime() : (() => { const d = new Date(now); d.setHours(0, 0, 0, 0); return d.getTime(); })();
+        ? now.getTime() - 7 * 864e5
+        : etMidnightUTC(1).getTime();
+      const end = period === 'weekly'
+        ? now.getTime()
+        : etMidnightUTC(0).getTime();
 
       const settled = trades.filter(t => {
         const at = new Date(t.settledAt ?? t.timestamp).getTime();
@@ -588,8 +616,8 @@ Write the recap.`
       const losses = settled.filter(t => (t.realizedPnL ?? 0) < 0);
       const totalPnL = settled.reduce((s, t) => s + (t.realizedPnL ?? 0), 0);
 
-      // Today's trades
-      const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+      // Today's trades — ET boundary (not UTC) so numbers match the user's day.
+      const todayStart = etMidnightUTC(0);
       const todayTrades = trades.filter(t => new Date(t.timestamp) >= todayStart);
       const todaySettled = todayTrades.filter(t => t.status === 'settled' || t.status?.startsWith('sold-'));
       const todayPnL = todaySettled.reduce((s, t) => s + (t.realizedPnL ?? 0), 0);

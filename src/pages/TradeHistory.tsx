@@ -54,7 +54,7 @@ export default function TradeHistory() {
     return 'even';
   };
 
-  const dateOf = (t: any) => new Date(t.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  const dateOf = (t: any) => new Date(t.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/New_York' });
 
   // Unique values for filters
   const sports = useMemo(() => ['all', ...new Set(sortedTrades.map(sportOf))], [sortedTrades]);
@@ -151,7 +151,7 @@ export default function TradeHistory() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {filtered.map(t => {
           const isExpanded = expanded === t.id;
-          const date = new Date(t.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+          const date = new Date(t.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/New_York' });
           const time = new Date(t.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
           const sport = sportOf(t);
           const isHC = t.highConviction || t.strategy === 'high-conviction';

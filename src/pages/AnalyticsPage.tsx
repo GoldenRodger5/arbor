@@ -19,9 +19,27 @@ const TIMEFRAMES: { key: Timeframe; label: string }[] = [
   { key: 'all', label: 'All' },
 ];
 
+// "Today" means America/New_York today — the user operates on ET, not UTC.
+function etMidnightTodayMs(): number {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(new Date()).map(p => [p.type, p.value])
+  );
+  const offsetStr = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    timeZoneName: 'shortOffset',
+  }).formatToParts(new Date()).find(p => p.type === 'timeZoneName')?.value ?? 'GMT-5';
+  const offsetHours = parseInt(offsetStr.replace('GMT', '')) || -5;
+  return Date.UTC(
+    parseInt(parts.year), parseInt(parts.month) - 1, parseInt(parts.day),
+  ) - offsetHours * 3600_000;
+}
+
 function tfStart(tf: Timeframe): number {
   const now = new Date();
-  if (tf === 'today') { const d = new Date(now); d.setHours(0, 0, 0, 0); return d.getTime(); }
+  if (tf === 'today') return etMidnightTodayMs();
   if (tf === '7d') return now.getTime() - 7 * 864e5;
   if (tf === '30d') return now.getTime() - 30 * 864e5;
   return 0;
