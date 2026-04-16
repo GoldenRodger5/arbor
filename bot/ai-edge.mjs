@@ -3397,7 +3397,7 @@ async function checkPreGamePredictions() {
         `A) CONFIRMED GOALIES — MANDATORY FIRST SEARCH: Search "[team1] starting goalie tonight" and "[team2] starting goalie tonight". You must confirm BOTH starters by name before proceeding. "Expected" or "likely" is not enough — if any source says "unconfirmed" or you find conflicting info, treat as unconfirmed.\n` +
         `B) GOALIE QUALITY: What is each confirmed starter's season SV% and GAA? Any bad recent form (GAA > 3.0 in last 5 starts)? Search "[goalie name] stats 2025-26".\n` +
         `C) SCHEDULE/FATIGUE: Is either team on a back-to-back or playing their 3rd game in 4 nights?\n` +
-        `D) STAKES FOR BOTH TEAMS: What does tonight mean for each team? Search "[team1] playoff standings 2026" and "[team2] playoff standings 2026". Is either team in a must-win? Clinched and likely coasting? Already eliminated? A team fighting for a playoff spot plays harder — a clinched/eliminated team may rotate skaters.\n\n` +
+        `D) STAKES FOR BOTH TEAMS: What does tonight mean for each team? Search "[team1] playoff standings 2026" and "[team2] playoff standings 2026". Specifically: Is either team fighting for HOME ICE ADVANTAGE throughout the playoffs (top seed in conference or division)? Is either in a must-win bubble game? Clinched and likely coasting? Already eliminated? Home ice in NHL playoffs is worth 15-20% series win probability — a team actively protecting it plays with maximum intensity and will not rest starters.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Starting goalie for the team you want to bet is NOT confirmed → NO (you don't know what you're betting)\n` +
         `❌ Team you want to bet ON is resting 3+ skaters (confirmed in search) → NO\n` +
@@ -3405,7 +3405,8 @@ async function checkPreGamePredictions() {
         `❌ Your team is on their 3rd game in 4 nights AND opponent is rested → NO (severe fatigue)\n\n` +
         `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs) ═══\n` +
         `Start from 59% home / 41% away baseline. Adjust only based on confirmed research:\n` +
-        `+ Your team in a must-win, clinching, or playoff seeding-critical game (confirmed) → UP 3-4% (urgency drives compete level)\n` +
+        `+ Your team is actively protecting HOME ICE ADVANTAGE throughout the playoffs (confirmed top seed, games still matter for seeding) → UP 5-7% (home ice worth ~15-20% series win probability — team will play starters hard and protect the lead)\n` +
+        `+ Your team in a must-win or clinching game (not yet seeded) → UP 3-4% (urgency drives compete level)\n` +
         `+ Elite goalie starting (SV% > .920) → UP 4-6%\n` +
         `+ Your team has better power play % AND penalty kill % → UP 2-4%\n` +
         `+ Opponent on back-to-back or 3rd in 4 nights → UP 3-5%\n` +
