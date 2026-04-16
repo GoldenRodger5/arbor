@@ -3397,16 +3397,18 @@ async function checkPreGamePredictions() {
         `A) CONFIRMED GOALIES — MANDATORY FIRST SEARCH: Search "[team1] starting goalie tonight" and "[team2] starting goalie tonight". You must confirm BOTH starters by name before proceeding. "Expected" or "likely" is not enough — if any source says "unconfirmed" or you find conflicting info, treat as unconfirmed.\n` +
         `B) GOALIE QUALITY: What is each confirmed starter's season SV% and GAA? Any bad recent form (GAA > 3.0 in last 5 starts)? Search "[goalie name] stats 2025-26".\n` +
         `C) SCHEDULE/FATIGUE: Is either team on a back-to-back or playing their 3rd game in 4 nights?\n` +
-        `D) STAKES FOR BOTH TEAMS: What does tonight mean for each team? Search "[team1] playoff standings 2026" and "[team2] playoff standings 2026". Specifically: Is either team fighting for HOME ICE ADVANTAGE throughout the playoffs (top seed in conference or division)? Is either in a must-win bubble game? Clinched and likely coasting? Already eliminated? Home ice in NHL playoffs is worth 15-20% series win probability — a team actively protecting it plays with maximum intensity and will not rest starters.\n\n` +
+        `D) STAKES FOR BOTH TEAMS: What does tonight mean for each team? Search "[team1] playoff standings 2026" and "[team2] playoff standings 2026". Specifically: (1) Is this the LAST game of the regular season? If so — has the team already clinched home ice and their seed? If yes, coaches almost always rest their top players and starting goalie tonight to keep them fresh for the playoffs. This is not speculation — it is standard NHL practice. You must search "[team] lineup tonight" or "[team] rest starters" to confirm. (2) Is either team still fighting for home ice or a playoff spot? (3) Is either team eliminated?\n` +
+        `⚠️ LAST GAME OF REGULAR SEASON WARNING: If today is the final day of the NHL regular season AND a team has already clinched home ice throughout the playoffs — assume they are resting starters unless you find explicit confirmation they are playing their full lineup. The goalie and offensive edge you identified may not exist tonight.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Starting goalie for the team you want to bet is NOT confirmed → NO (you don't know what you're betting)\n` +
         `❌ Team you want to bet ON is resting 3+ skaters (confirmed in search) → NO\n` +
+        `❌ This is the last game of the regular season AND the team has already clinched home ice AND you cannot confirm their full lineup is playing → NO (rest game — your edge disappears)\n` +
         `❌ Opponent is in active playoff survival (must win or season ends) AND your team is already mathematically eliminated OR confirmed resting regulars → NO (motivation gap too large)\n` +
         `❌ Your team is on their 3rd game in 4 nights AND opponent is rested → NO (severe fatigue)\n\n` +
         `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs) ═══\n` +
         `Start from 59% home / 41% away baseline. Adjust only based on confirmed research:\n` +
         `+ Your team is actively protecting HOME ICE ADVANTAGE throughout the playoffs (confirmed top seed, games still matter for seeding) → UP 5-7% (home ice worth ~15-20% series win probability — team will play starters hard and protect the lead)\n` +
-        `+ Your team in a must-win or clinching game (not yet seeded) → UP 3-4% (urgency drives compete level)\n` +
+        `+ Your team in a must-win or clinching game (not yet seeded) → UP 3-4% (urgency drives compete level)\n`
         `+ Elite goalie starting (SV% > .920) → UP 4-6%\n` +
         `+ Your team has better power play % AND penalty kill % → UP 2-4%\n` +
         `+ Opponent on back-to-back or 3rd in 4 nights → UP 3-5%\n` +
