@@ -2305,8 +2305,11 @@ async function checkLiveScoreEdges() {
             `D) H2H: What is the head-to-head record between these teams this season and last 2 seasons?\n\n`
           ) +
           `═══ STEP 2 — HARD NOs (if ANY apply, respond {"trade":false} immediately) ═══\n` +
-          `❌ Leading team is resting 3+ key players → NO (not the same team that earned that record)\n` +
-          `❌ Trailing team is in active playoff survival (must win or season ends) AND leading team is already mathematically eliminated OR confirmed rotating lineup/resting regulars → NO (motivation gap too large — urgency overcomes scoreboard)\n` +
+          (league === 'nba' ? `❌ Leading team is resting 3+ key players tonight (confirmed load management, not just lineup rotation) → NO. This is NBA-specific — in the NBA, 3 resters = a fundamentally different team's talent level.\n` : '') +
+          (league !== 'nba' ? `❌ Leading team has confirmed ≥3 STAR players ruled out tonight (not just backups or rotation) → NO. Routine rotation/rest does NOT qualify.\n` : '') +
+          `❌ Trailing team is in active playoff survival (must win or season ends) AND the leading team is confirmed to be resting multiple starters OR rotating their lineup tonight → NO. NOTE: "already eliminated" alone is NOT enough — eliminated teams often still play hard for pride/contracts. The roster decision is the signal, not the standings.\n` +
+          (league === 'nba' ? `❌ NBA STAR-FOUL HARD NO: Leading team's top scorer (highest PPG on roster) has 5 personal fouls AND period ≥ 3 AND lead ≤ 10 pts → NO. Check a live box score in your search. 5 fouls means he's either pinned to the bench or must play cautious on defense — that's a 10-15pt WE swing not captured by our baseline.\n` : '') +
+          (isSoccer ? `❌ SOCCER LATE-DRAW HARD NO: Leading team's season draw rate > 35% AND lead = 1 goal AND minute ≥ 75 → NO. Draw-prone teams protecting a 1-0 late don't win — they draw, which loses a YES on the WIN contract.\n` : '') +
           (league === 'mlb' ?
             (leadingBullpenTier === 'poor' && diff <= 2 && period >= 5
               ? `❌ MLB BULLPEN HARD NO: Leading team's bullpen is tier='poor' (ERA ≥ 5.0, L30D) and the lead is only ${diff} run${diff === 1 ? '' : 's'} in inning ${period}. A poor pen can't protect a thin lead — market often lags this 1-2 innings. Respond {"trade":false}.\n`
@@ -2320,6 +2323,7 @@ async function checkLiveScoreEdges() {
           `Start from the historical baseline. Adjust based on what you found:\n` +
           `+ Leading team clearly better (record, talent, home) → UP 2-5%\n` +
           `+ Leading team is in a must-win, clinching, or playoff seeding-critical game (confirmed by standings) → UP 3-5% (urgency sharpens play and lead defense)\n` +
+          (league !== 'nba' ? `- Leading team is resting 1-2 rotation players (not stars) → DOWN 2-4%. Routine rotation, not catastrophic.\n` : '') +
           `- Leading team mathematically eliminated AND confirmed coasting (search found they are rotating lineup or resting regulars tonight) → DOWN 4-6% (effort level is genuinely diminished)\n` +
           (league === 'mlb' ?
             `+ Dominant starter still pitching (ERA < 3.0, under 80 pitches) → UP 5-8%\n` +
@@ -2449,16 +2453,85 @@ async function checkLiveScoreEdges() {
         }
 
         // MLB 1-run lead P7+ minimum edge guard.
-        // A 1-run lead in innings 7–9 has ~76–77% WE but is extremely volatile —
-        // one hit ties the game. Only enter if market is ≥15pt below WE (≤62¢).
-        // This blocked KC (65¢) and MIA/ATL (64¢) Apr 14 — both lost.
+        // Graduated by bullpen tier: elite/good bullpens need only 10pt edge;
+        // average/below/poor/unknown still require 15pt. This opens up EV in
+        // situations where the leading team's bullpen is genuinely closing-ready
+        // (e.g., ATL's 2.85 season ERA) without relaxing protection elsewhere.
         if (league === 'mlb' && diff === 1 && period >= 7) {
           const weBase = getWinExpectancy('mlb', 1, period) ?? 0.76;
-          const minEdge = 0.15;
+          const minEdge = (leadingBullpenTier === 'elite' || leadingBullpenTier === 'good') ? 0.10 : 0.15;
           if (price > weBase - minEdge) {
-            console.log(`[live-edge] Skipping MLB 1-run P${period}: ${leadingAbbr} @${(price*100).toFixed(0)}¢ — need ≤${((weBase-minEdge)*100).toFixed(0)}¢ (WE ${(weBase*100).toFixed(0)}% - 15pt min edge), too close to fair value`);
-            logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-1run-late', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr: leadingAbbr, reasoning: `MLB 1-run P${period}: ${leadingAbbr} @${(price*100).toFixed(0)}¢ needs ≤${((weBase-minEdge)*100).toFixed(0)}¢ (WE ${(weBase*100).toFixed(0)}% minus 15pt edge floor) — 1-run late-game leads are too volatile at thin edge` });
+            const edgePts = (minEdge * 100).toFixed(0);
+            console.log(`[live-edge] Skipping MLB 1-run P${period}: ${leadingAbbr} @${(price*100).toFixed(0)}¢ — need ≤${((weBase-minEdge)*100).toFixed(0)}¢ (WE ${(weBase*100).toFixed(0)}% - ${edgePts}pt min edge, pen tier=${leadingBullpenTier})`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-1run-late', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr: leadingAbbr, reasoning: `MLB 1-run P${period}: ${leadingAbbr} @${(price*100).toFixed(0)}¢ needs ≤${((weBase-minEdge)*100).toFixed(0)}¢ (WE ${(weBase*100).toFixed(0)}% minus ${edgePts}pt edge; pen tier=${leadingBullpenTier}) — 1-run late leads too volatile at thin edge` });
             continue;
+          }
+        }
+
+        // MLB scoring-threat Hard NO: bases loaded or RISP with 0 outs AND lead ≤ 2.
+        // Bases loaded with 0 outs → ~85% chance of ≥1 run scoring. Runners on
+        // 2nd+3rd with 0 outs → ~75% chance. With a 1-2 run lead, that's lights out.
+        if (league === 'mlb' && diff <= 2 && comp.situation) {
+          const sit = comp.situation;
+          const outs = sit.outs ?? 0;
+          const basesLoaded = !!(sit.onFirst && sit.onSecond && sit.onThird);
+          const risp23Empty0Out = !!(sit.onSecond && sit.onThird && !sit.onFirst && outs === 0);
+          const trailingBatting = targetIsHome ? (gameDetail?.startsWith('Top') || gameDetail?.startsWith('Mid')) : (gameDetail?.startsWith('Bot') || gameDetail?.startsWith('End'));
+          if (trailingBatting && (basesLoaded || risp23Empty0Out)) {
+            const situation = basesLoaded ? 'bases loaded' : 'runners on 2nd+3rd';
+            console.log(`[live-edge] Skipping MLB scoring threat: ${situation}, ${outs} out${outs !== 1 ? 's' : ''}, lead ${diff} run${diff === 1 ? '' : 's'} — trailing team at max leverage`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-scoring-threat', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr: leadingAbbr, reasoning: `Scoring threat: ${situation} with ${outs} out and only ${diff}-run lead. Single hit ties or wins it for trailing team.` });
+            continue;
+          }
+        }
+
+        // Soccer red-card Hard NO: leading team has been shown a red card → skip WIN bet.
+        // 10+ vs 11 drops the leading team's WIN probability by ~15-20pts — far more
+        // than any WE adjustment can fairly model mid-game.
+        if (isSoccer) {
+          const rcOf = (team) => parseInt(team.statistics?.find(s => s.abbreviation === 'RC')?.displayValue ?? '0') || 0;
+          const leadingTeam = leadingAbbr === homeAbbr ? home : away;
+          const leadingRedCards = rcOf(leadingTeam);
+          const lastPlayRedText = (comp.situation?.lastPlay?.text ?? '').toLowerCase().includes('red card');
+          if (leadingRedCards > 0 || lastPlayRedText) {
+            console.log(`[live-edge] Skipping ${leadingAbbr}: leading team has red card — soccer 10v11 → large WE drop`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-red-card', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr: leadingAbbr, reasoning: `${leadingAbbr} has been shown a red card (RC=${leadingRedCards}). Playing 10v11 drops win probability by ~15-20pts — too large to model around.` });
+            continue;
+          }
+        }
+
+        // NHL 5-on-3 power-play Hard NO: 2-man advantage scores ~50% of the time
+        // vs ~20% on a regular 5-on-4. If the leading team is up 1 goal and facing
+        // a 5-on-3 right now, the lead is in serious jeopardy.
+        if (league === 'nhl' && diff === 1) {
+          const lastPlay = (comp.situation?.lastPlay?.text ?? '').toLowerCase();
+          const strength = (comp.situation?.strength ?? '').toString().toLowerCase();
+          const is5on3 = /(^|\s)5[-\s]?on[-\s]?3|5v3|two[-\s]man advantage/i.test(lastPlay)
+            || /(^|\s)5[-\s]?on[-\s]?3|5v3/i.test(strength);
+          if (is5on3) {
+            console.log(`[live-edge] Skipping ${leadingAbbr}: trailing team on 5-on-3 PP with 1-goal lead`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-5on3', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr: leadingAbbr, reasoning: `Trailing team on a 5-on-3 power play with a 1-goal lead. 5-on-3 converts ~50% per minute — the lead probably dies.` });
+            continue;
+          }
+        }
+
+        // NBA comeback-momentum Hard NO: if the trailing team outscored the
+        // leading team in the MOST RECENTLY COMPLETED quarter by 6+, AND the
+        // lead is now ≤ 10, the game is actively reversing. Don't chase.
+        if (league === 'nba' && diff <= 10 && period >= 2) {
+          const homeLines = (home.linescores ?? []).map(l => parseInt(l.displayValue ?? l.value ?? '0') || 0);
+          const awayLines = (away.linescores ?? []).map(l => parseInt(l.displayValue ?? l.value ?? '0') || 0);
+          const completed = Math.min(homeLines.length, awayLines.length);
+          if (completed >= 2) {
+            const lastIdx = Math.min(completed, period) - 1;
+            const trailingPts = leadingAbbr === homeAbbr ? awayLines[lastIdx] : homeLines[lastIdx];
+            const leadingPts = leadingAbbr === homeAbbr ? homeLines[lastIdx] : awayLines[lastIdx];
+            const swing = trailingPts - leadingPts;
+            if (swing >= 6) {
+              console.log(`[live-edge] Skipping NBA ${leadingAbbr}: trailing team outscored leader ${trailingPts}-${leadingPts} in Q${lastIdx + 1}, lead now ${diff}pt — active comeback`);
+              logScreen({ stage: 'live-edge-skip', result: 'skip-nba-momentum', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr: leadingAbbr, reasoning: `Active comeback: trailing team won Q${lastIdx + 1} by ${swing} (${trailingPts}-${leadingPts}) and the lead is now only ${diff}pt. Market often lags this.` });
+              continue;
+            }
           }
         }
 
