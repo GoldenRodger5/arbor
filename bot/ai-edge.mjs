@@ -3119,7 +3119,7 @@ async function checkLiveScoreEdges() {
 // lastPreGameScan declared at top (before loadState) to avoid TDZ
 const PREGAME_SCAN_INTERVAL = 15 * 60 * 1000; // every 15 min
 const MAX_PREGAME_PER_CYCLE = 4;   // Paper mode: more coverage per scan
-const MAX_PREGAME_PAPER_PER_DAY = 10; // Paper mode: log up to 10 paper picks/day for calibration
+const MAX_PREGAME_PAPER_PER_DAY = 999; // Paper mode: no real cap — log every qualifying pick for calibration
 let preGameTradesToday = 0;
 let preGameTradesDate = '';         // reset counter on new day
 const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
