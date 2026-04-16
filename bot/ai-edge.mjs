@@ -1911,7 +1911,18 @@ async function checkLiveScoreEdges() {
                     writeFileSync(TRADES_LOG, freshPgTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
                   }
                   console.log(`[pg-profit] ${trade.ticker} SELLING ${sellQty}/${qty} contracts @ ${Math.round(currentPricePg*100)}¢ | ${sellReason} | gain=$${(gainCents*sellQty).toFixed(2)}`);
-                  await tg(`📈 <b>Pre-game profit take</b>\n${trade.title ?? trade.ticker}\n${sellReason}\nSelling ${sellQty}/${qty} @ ${Math.round(currentPricePg*100)}¢ | +$${(gainCents*sellQty).toFixed(2)}`);
+                  await tg(
+                    `📈 <b>PRE-GAME PROFIT TAKE</b>\n\n` +
+                    `📋 <b>POSITION</b>\n` +
+                    `${trade.title ?? trade.ticker}\n\n` +
+                    `📊 <b>METRICS</b>\n` +
+                    `Selling ${sellQty}/${qty} contracts @ ${Math.round(currentPricePg*100)}¢\n` +
+                    `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${Math.round(currentPricePg*100)}¢ (+${Math.round(gainCents*100)}¢)\n` +
+                    `Profit this sale: <b>+$${(gainCents*sellQty).toFixed(2)}</b>\n` +
+                    `${qty - sellQty > 0 ? `Holding ${qty - sellQty} contracts remaining` : 'Full position closed'}\n\n` +
+                    `💬 <b>REASON</b>\n` +
+                    sellReason
+                  );
                   await executeSell(trade, sellQty, currentPricePg, sellReason);
                   if (remaining >= 1) {
                     console.log(`[pg-profit] ${remaining} contracts remain — riding to ${stage === 'early' ? 'mid-game' : 'settlement'}`);
@@ -2037,7 +2048,17 @@ async function checkLiveScoreEdges() {
 
               if (d.action === 'sell_all' || d.action === 'sell') {
                 console.log(`[pg-guard] 🧠 SELL ALL (${thesisTag}): ${trade.ticker} | ${d.reasoning?.slice(0, 100)}`);
-                await tg(`⚠️ Pre-game exit — ${thesisTag}: ${trade.title?.slice(0, 50)} | WE ${(ourWE*100).toFixed(0)}% | ${d.reasoning?.slice(0, 80)}`);
+                await tg(
+                  `⚠️ <b>PRE-GAME EXIT</b>\n\n` +
+                  `📋 <b>POSITION</b>\n` +
+                  `${trade.title}\n\n` +
+                  `📊 <b>METRICS</b>\n` +
+                  `Sold all contracts @ ${Math.round(currentPrice*100)}¢\n` +
+                  `Entry: ${Math.round(entryPrice*100)}¢ | Win expectancy: ${(ourWE*100).toFixed(0)}%\n` +
+                  `Tag: ${thesisTag}\n\n` +
+                  `💬 <b>REASON</b>\n` +
+                  (d.reasoning ?? 'Thesis broken')
+                );
                 const freshLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
                 const freshTrades = freshLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
                 const freshTrade = freshTrades.find(t => t.id === trade.id);
@@ -2050,7 +2071,17 @@ async function checkLiveScoreEdges() {
                 }
               } else if (d.action === 'sell_half') {
                 console.log(`[pg-guard] 🧠 SELL HALF (${thesisTag}): ${trade.ticker} | selling ${halfSellQty}/${qty} | ${d.reasoning?.slice(0, 80)}`);
-                await tg(`⚠️ Pre-game sell half — ${thesisTag}: ${trade.title?.slice(0, 50)} | WE ${(ourWE*100).toFixed(0)}% | ${d.reasoning?.slice(0, 80)}`);
+                await tg(
+                  `⚠️ <b>PRE-GAME SELL HALF</b>\n\n` +
+                  `📋 <b>POSITION</b>\n` +
+                  `${trade.title}\n\n` +
+                  `📊 <b>METRICS</b>\n` +
+                  `Selling half @ ${Math.round(currentPrice*100)}¢\n` +
+                  `Entry: ${Math.round(entryPrice*100)}¢ | Win expectancy: ${(ourWE*100).toFixed(0)}%\n` +
+                  `Tag: ${thesisTag}\n\n` +
+                  `💬 <b>REASON</b>\n` +
+                  (d.reasoning ?? 'Partial exit on deteriorating thesis')
+                );
                 if (halfSellQty < qty) {
                   const freshLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
                   const freshTrades = freshLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
@@ -3339,18 +3370,21 @@ async function checkLiveScoreEdges() {
           });
 
           const savedMsg = best.platform === 'polymarket' ? `\n💡 Bought on Poly (${(price*100).toFixed(0)}¢ Kalshi → ${priceInCents}¢ Poly)` : '';
-          const hcMsg = hcCheck.isHighConv ? `\n🔥 <b>HIGH CONVICTION</b> — ${hcCheck.reason}` : '';
+          const hcMsg = hcCheck.isHighConv ? `\n🔥 HIGH CONVICTION — ${hcCheck.reason}` : '';
           const betLabel = hcCheck.isHighConv ? '🔥 HIGH CONVICTION' :
             targetAbbr === leadingAbbr ? '🎯 PREDICTION' : '🐕 UNDERDOG';
           await tg(
             `<b>${betLabel} BET — ${best.platform.toUpperCase()}</b>\n\n` +
-            `<b>${title}</b>\n` +
-            `Team: <b>${targetAbbr}</b> | Score: ${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore}\n` +
-            `Status: ${gameDetail}\n\n` +
-            `BUY @ ${priceInCents}¢ × ${actualFill} = <b>$${actualDeployed.toFixed(2)}</b>\n` +
-            `Confidence: <b>${(confidence*100).toFixed(0)}%</b> vs price ${priceInCents}¢\n` +
-            `Potential profit: <b>$${(actualFill * (1 - bestPrice)).toFixed(2)}</b>${savedMsg}${hcMsg}\n\n` +
-            `🧠 <i>${decision.reasoning}</i>`
+            `📋 <b>GAME</b>\n` +
+            `${title}\n` +
+            `Score: ${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore} | ${gameDetail}\n\n` +
+            `📊 <b>METRICS</b>\n` +
+            `Team: <b>${targetAbbr}</b> YES @ ${priceInCents}¢ × ${actualFill} = <b>$${actualDeployed.toFixed(2)}</b>\n` +
+            `Confidence: <b>${(confidence*100).toFixed(0)}%</b> | Edge: <b>+${Math.round((confidence - bestPrice) * 100)}pts</b>\n` +
+            `Win expectancy: ${weAtEntry !== null ? `${(weAtEntry*100).toFixed(0)}%` : 'N/A'} | Period: ${period}\n` +
+            `Stop-loss: ~${Math.round(bestPrice * 100 * 0.86)}¢ | Max profit: <b>$${(actualFill * (1 - bestPrice)).toFixed(2)}</b>${savedMsg}${hcMsg}\n\n` +
+            `🧠 <b>REASONING</b>\n` +
+            `${decision.reasoning}`
           );
         } else {
           console.error(`[live-edge] Order failed:`, result.status, JSON.stringify(result.data));
@@ -3901,7 +3935,19 @@ async function checkPreGamePredictions() {
               wouldQty: pgFill, reasoning: decision.reasoning, exitScenario: decision.exitScenario ?? null,
               pgBaseline: pgTargetBaseline,
             });
-            await tg(`🎯 <b>Pre-game BET placed</b>\n${market.title}\nTeam: ${matchedSide.team} YES @${pgPriceInCents}¢ × ${pgFill}\nConf=${Math.round(confidence*100)}% | Edge=+${Math.round(edge*100)}pts | $${pgDeployed.toFixed(2)}\n\n${decision.reasoning ? decision.reasoning.slice(0, 400) : 'No reasoning'}`);
+            await tg(
+              `🎯 <b>PRE-GAME BET — KALSHI</b>\n\n` +
+              `📋 <b>GAME</b>\n` +
+              `${market.title}\n` +
+              `Sport: ${pgSportKey.toUpperCase()} | Strategy: Buy early, sell on +12¢ spike\n\n` +
+              `📊 <b>METRICS</b>\n` +
+              `Team: <b>${matchedSide.team}</b> YES @ ${pgPriceInCents}¢ × ${pgFill} = <b>$${pgDeployed.toFixed(2)}</b>\n` +
+              `Confidence: <b>${Math.round(confidence*100)}%</b> | Edge: <b>+${Math.round(edge*100)}pts</b>\n` +
+              `Baseline: ${Math.round(pgTargetBaseline*100)}% | Exit target: ${pgPriceInCents + 12}¢ (+12¢)\n` +
+              `Max profit (at exit): <b>$${(pgFill * 0.12).toFixed(2)}</b> | Max loss: $${pgDeployed.toFixed(2)}\n\n` +
+              `🧠 <b>REASONING</b>\n` +
+              `${decision.reasoning ?? 'No reasoning returned'}`
+            );
             console.log(`[pre-game] ✅ Filled ${pgFill}/${betQty} @ ${pgPriceInCents}¢ deployed=$${pgDeployed.toFixed(2)}`);
           }
         } else {
@@ -4882,7 +4928,17 @@ async function managePositions() {
             const gainPct = Math.round((profitPerContract / entryPrice) * 100);
             const sportLabel = isSoccer ? 'first-goal spike' : isNHL ? 'first-goal' : 'early lead';
             console.log(`[exit] 💰 PRE-GAME PROFIT-LOCK (${sportKey} ${sportLabel}): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% → selling ${sellQty}/${qty} (${Math.round(exitFraction*100)}%) at ${(currentPrice*100).toFixed(0)}¢, locking ~$${(sellQty * profitPerContract).toFixed(2)}`);
-            await tg(`💰 Pre-game profit-lock (${sportLabel}): ${trade.title?.slice(0,50)} up ${(profitPerContract*100).toFixed(0)}¢ (+${gainPct}%) — selling ${Math.round(exitFraction*100)}% at ${(currentPrice*100).toFixed(0)}¢${remaining > 0 ? `, holding ${remaining}` : ''}`);
+            await tg(
+              `💰 <b>PRE-GAME PROFIT LOCK</b>\n\n` +
+              `📋 <b>POSITION</b>\n` +
+              `${trade.title}\n` +
+              `Sport: ${sportLabel.toUpperCase()}\n\n` +
+              `📊 <b>METRICS</b>\n` +
+              `Selling ${Math.round(exitFraction*100)}% (${sellQty} contracts) @ ${(currentPrice*100).toFixed(0)}¢\n` +
+              `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
+              `Profit this sale: <b>+$${(profitPerContract * sellQty).toFixed(2)}</b>\n` +
+              `${remaining > 0 ? `Holding ${remaining} contracts — riding for more` : 'Full position closed'}`
+            );
             const result = await executeSell(trade, sellQty, currentPrice, 'pre-game-profit-lock');
             if (result) {
               trade.partialTakeAt = new Date().toISOString();
@@ -4902,7 +4958,15 @@ async function managePositions() {
             (currentPrice - entryPrice) <= -0.20) {
           const dropCents = Math.round((entryPrice - currentPrice) * 100);
           console.log(`[exit] ⚠️ PRE-GAME PRICE DROP (pre-start): ${trade.ticker} dropped ${dropCents}¢ before game start — lineup/news change likely, exiting`);
-          await tg(`⚠️ Pre-game exit: ${trade.title?.slice(0, 50)} dropped ${dropCents}¢ before game start — possible lineup change`);
+          await tg(
+            `⚠️ <b>PRE-GAME EXIT (pre-start)</b>\n\n` +
+            `📋 <b>POSITION</b>\n` +
+            `${trade.title}\n\n` +
+            `📊 <b>METRICS</b>\n` +
+            `Entry: ${Math.round((trade.entryPrice ?? 0)*100)}¢ → Now: ${Math.round(currentPrice*100)}¢ (−${dropCents}¢)\n\n` +
+            `💬 <b>REASON</b>\n` +
+            `Price dropped ${dropCents}¢ before game start — likely lineup change or injury news`
+          );
           const result = await executeSell(trade, qty, currentPrice, 'pre-game-news-exit');
           if (result) anyUpdated = true;
           continue;
@@ -5131,13 +5195,24 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
     reason === 'scale-out' ? 'SCALED OUT (half)' : reason === 'claude-sell' ? 'SMART EXIT' :
     reason === 'claude-scale' ? 'SMART SCALE-OUT' : reason.toUpperCase();
 
+  const exitReasonText = reason === 'stop-loss' ? 'Price hit stop-loss floor' :
+    reason === 'claude-stop' ? 'Claude re-evaluated — thesis broke' :
+    reason === 'profit-take' ? 'Profit target reached' :
+    reason === 'scale-out' ? 'Partial scale-out' :
+    reason === 'claude-sell' ? 'Claude: full exit' :
+    reason === 'claude-scale' ? 'Claude: partial exit' : reason;
   await tg(
     `${icon} <b>${label}</b>\n\n` +
-    `<b>${trade.title}</b>\n` +
+    `📋 <b>POSITION</b>\n` +
+    `${trade.title}\n` +
+    `Strategy: ${trade.strategy ?? 'live-prediction'}\n\n` +
+    `📊 <b>METRICS</b>\n` +
     `${sellQty < totalQty ? `Sold ${sellQty}/${totalQty} contracts` : `Sold all ${sellQty} contracts`}\n` +
-    `Entry: ${(entryPrice*100).toFixed(0)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢\n` +
+    `Entry: ${(entryPrice*100).toFixed(0)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (${currentPrice >= entryPrice ? '+' : ''}${((currentPrice - entryPrice)*100).toFixed(0)}¢)\n` +
     `P&L: <b>${profitStr}</b>\n` +
-    `${sellQty < totalQty ? `Remaining: ${totalQty - sellQty} contracts still open` : 'Position closed'}`
+    `${sellQty < totalQty ? `Remaining: ${totalQty - sellQty} contracts still open` : 'Position closed'}\n\n` +
+    `💬 <b>REASON</b>\n` +
+    exitReasonText
   );
 
   logScreen({ stage: 'exit', ticker: trade.ticker, reason, sellQty, totalQty, entryPrice, exitPrice: currentPrice, profit });
@@ -5351,11 +5426,14 @@ async function checkSettlements() {
 
       const pnlStr = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
       await tg(
-        `${icon} <b>SETTLED${won ? ' — WIN' : ' — LOSS'}</b>\n\n` +
-        `<b>${trade.title ?? trade.ticker}</b>\n` +
-        `Bought ${trade.side?.toUpperCase()} @ ${((trade.entryPrice ?? 0)*100).toFixed(0)}¢ × ${qty}\n` +
+        `${icon} <b>SETTLED — ${won ? 'WIN ✅' : 'LOSS ❌'}</b>\n\n` +
+        `📋 <b>POSITION</b>\n` +
+        `${trade.title ?? trade.ticker}\n` +
+        `Strategy: ${trade.strategy ?? 'live-prediction'}\n\n` +
+        `📊 <b>METRICS</b>\n` +
+        `Bought ${trade.side?.toUpperCase()} @ ${((trade.entryPrice ?? 0)*100).toFixed(0)}¢ × ${qty} = $${((trade.entryPrice ?? 0) * qty).toFixed(2)}\n` +
         `Result: <b>${settlement.market_result?.toUpperCase()}</b>\n` +
-        `P&L: <b>${pnlStr}</b>`
+        `P&L: <b>${pnlStr}</b> | ROI: ${((pnl / ((trade.entryPrice ?? 1) * qty)) * 100).toFixed(0)}%`
       );
     }
 
@@ -5806,7 +5884,15 @@ async function main() {
             const sellQty = Math.max(1, Math.floor(qty * 0.90));
             const gainCents = Math.round(profitPerContract * 100);
             console.log(`[soccer-exit] ⚡ FAST SPIKE EXIT: ${trade.ticker} up ${gainCents}¢ — selling ${sellQty}/${qty} @ ${Math.round(currentPrice*100)}¢ (first-goal spike)`);
-            await tg(`⚡ Soccer first-goal spike: ${trade.title?.slice(0, 50)} +${gainCents}¢ — selling 90% at ${Math.round(currentPrice*100)}¢`);
+            await tg(
+              `⚡ <b>SOCCER FIRST-GOAL SPIKE</b>\n\n` +
+              `📋 <b>POSITION</b>\n` +
+              `${trade.title}\n\n` +
+              `📊 <b>METRICS</b>\n` +
+              `Entry: ${Math.round((trade.entryPrice ?? 0)*100)}¢ → Now: ${Math.round(currentPrice*100)}¢ (+${gainCents}¢)\n` +
+              `Selling 90% (${sellQty} contracts) — first goal scored, exit triggered\n` +
+              `Profit this sale: <b>+$${(gainCents * sellQty / 100).toFixed(2)}</b>`
+            );
 
             // Re-read fresh to avoid stale state
             const freshLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
