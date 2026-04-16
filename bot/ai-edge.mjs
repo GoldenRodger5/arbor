@@ -64,6 +64,13 @@ if (DRY_RUN) console.log('🧪 DRY RUN MODE — no real orders will be placed');
 const KALSHI_ONLY = process.env.KALSHI_ONLY !== 'false'; // default: true
 if (KALSHI_ONLY) console.log('📊 KALSHI ONLY — Polymarket trading disabled');
 
+// PRE-GAME LIVE MODE: When true, pre-game picks place real Kalshi orders.
+// When false (default), all pre-game picks are paper-logged only (calibration mode).
+// To activate: set PREGAME_LIVE=true in .env or PM2 config and restart.
+const PREGAME_LIVE = process.env.PREGAME_LIVE === 'true';
+if (PREGAME_LIVE) console.log('🎯 PRE-GAME LIVE — real pre-game orders enabled');
+else console.log('📋 PRE-GAME PAPER — pre-game picks are paper-only (calibration mode)');
+
 const MIN_CONFIDENCE = 0.65;      // Claude must be ≥65% confident to trade
 const CONFIDENCE_MARGIN = 0.03;   // LEGACY flat margin — only used for draw bets + fallback
 
@@ -1817,6 +1824,82 @@ async function checkLiveScoreEdges() {
         const theirScore = isOurTeamHome ? game.awayScore : game.homeScore;
         const deficit = theirScore - ourScore;
 
+        // ── WINNING BRANCH: dynamic WE-triggered profit sell ──────────────────────
+        // When our pre-game team is LEADING, sell into price strength based on
+        // game stage + WE. The thesis: we bought pre-game at a discount; once the
+        // price reflects reality, lock gains rather than gambling on the full win.
+        if (deficit < 0) { // our team is WINNING (deficit negative = we're ahead)
+          const lead = Math.abs(deficit);
+          const league = game.league;
+          const stage = league === 'mlb' ? (game.period <= 4 ? 'early' : game.period <= 6 ? 'mid' : 'late')
+            : league === 'nba' ? (game.period <= 2 ? 'early' : game.period === 3 ? 'mid' : 'late')
+            : league === 'nhl' ? (game.period === 1 ? 'early' : game.period === 2 ? 'mid' : 'late')
+            : game.period === 1 ? 'early' : 'late';
+          const isOurTeamHomeWin = tickerHasTeam(ourTeam, homeAbbr);
+          const weWinning = getWinExpectancy(league, lead, game.period, isOurTeamHomeWin) ?? 0;
+
+          // Only act when WE crosses meaningful thresholds AND we've gained at least 8¢
+          const pgWinKey = 'pg-win:' + trade.ticker;
+          const winCooldown = tradeCooldowns.get(pgWinKey) ?? 0;
+          if (Date.now() - winCooldown < 5 * 60 * 1000) { /* skip — checked recently */ }
+          else {
+            let currentPricePg = 0;
+            try {
+              const mktPg = await kalshiGet(`/markets/${trade.ticker}`);
+              currentPricePg = parseFloat((mktPg.market ?? mktPg).yes_ask_dollars ?? '0');
+            } catch {}
+
+            if (currentPricePg > 0) {
+              const entryPg = trade.entryPrice ?? 0;
+              const gainCents = currentPricePg - entryPg;
+              const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / entryPg);
+
+              // Dynamic sell target by stage + WE:
+              // Early game (WE 65%+, 10¢+ gain) → sell 33% — lock a slice, keep upside
+              // Mid game  (WE 72%+, 15¢+ gain) → sell 50% — meaningful profit secured
+              // Late game (WE 80%+, 20¢+ gain) → sell 75% — near certainty, take it
+              // Late game (WE 88%+, any gain)  → sell all  — game is essentially over
+              let sellFraction = 0;
+              let sellReason = '';
+              if (stage === 'late' && weWinning >= 0.88) {
+                sellFraction = 1.0; sellReason = `pg-profit-late-dominant (WE=${Math.round(weWinning*100)}%)`;
+              } else if (stage === 'late' && weWinning >= 0.80 && gainCents >= 0.20) {
+                sellFraction = 0.75; sellReason = `pg-profit-late-strong (WE=${Math.round(weWinning*100)}% +${Math.round(gainCents*100)}¢)`;
+              } else if (stage === 'mid' && weWinning >= 0.72 && gainCents >= 0.15) {
+                sellFraction = 0.50; sellReason = `pg-profit-mid (WE=${Math.round(weWinning*100)}% +${Math.round(gainCents*100)}¢)`;
+              } else if (stage === 'early' && weWinning >= 0.65 && gainCents >= 0.10) {
+                sellFraction = 0.33; sellReason = `pg-profit-early (WE=${Math.round(weWinning*100)}% +${Math.round(gainCents*100)}¢)`;
+              }
+
+              if (sellFraction > 0 && !trade.pgProfitSold) {
+                const sellQty = Math.max(1, Math.floor(qty * sellFraction));
+                const remaining = qty - sellQty;
+                if (sellQty >= 1) {
+                  tradeCooldowns.set(pgWinKey, Date.now());
+                  trade.pgProfitSold = new Date().toISOString();
+                  console.log(`[pg-profit] ${trade.ticker} SELLING ${sellQty}/${qty} contracts @ ${Math.round(currentPricePg*100)}¢ | ${sellReason} | gain=$${(gainCents*sellQty).toFixed(2)}`);
+                  await sendTelegram(`📈 <b>Pre-game profit take</b>\n${trade.title ?? trade.ticker}\n${sellReason}\nSelling ${sellQty}/${qty} @ ${Math.round(currentPricePg*100)}¢ | +$${(gainCents*sellQty).toFixed(2)}`);
+                  await executeSell(trade, sellQty, currentPricePg, sellReason);
+                  if (remaining >= 1) {
+                    console.log(`[pg-profit] ${remaining} contracts remain — riding to ${stage === 'early' ? 'mid-game' : 'settlement'}`);
+                  }
+                }
+              } else if (sellFraction > 0 && trade.pgProfitSold) {
+                // Already took profit once — only sell remaining on dominant late WE
+                if (stage === 'late' && weWinning >= 0.88) {
+                  const remaining = qty - Math.floor(qty * (trade._pgFirstSellFraction ?? 0.5));
+                  if (remaining >= 1) {
+                    tradeCooldowns.set(pgWinKey, Date.now());
+                    console.log(`[pg-profit] ${trade.ticker} FINAL SELL ${remaining} remaining @ ${Math.round(currentPricePg*100)}¢ | game essentially over`);
+                    await executeSell(trade, remaining, currentPricePg, 'pg-profit-final');
+                  }
+                }
+              }
+            }
+          }
+          continue; // winning branch handled — don't fall through to loss logic
+        }
+
         // Only evaluate if our team is LOSING (deficit > 0)
         if (deficit <= 0) continue;
 
@@ -2765,10 +2848,9 @@ async function checkLiveScoreEdges() {
           } catch {}
         }
 
-        // Also check paper trades for same-game awareness. Pre-game is currently paper-only,
-        // so we don't block real live bets on paper picks — but we log the conflict so we can
-        // see when live-edge disagrees with pre-game analysis (useful calibration signal).
-        // When pre-game goes live (real money), change the inner console.log to `hasPosition = true`.
+        // Check paper/real pre-game trades for same-game conflict.
+        // In PAPER mode: log only (calibration signal — no real money at stake).
+        // In LIVE mode: block live-edge from betting the other side of an active pre-game position.
         if (!hasPosition && existsSync(PAPER_TRADES_LOG)) {
           try {
             const pgDupStartMs = new Date(etNow().toISOString().slice(0,10) + 'T04:00:00Z').getTime();
@@ -2783,9 +2865,15 @@ async function checkLiveScoreEdges() {
                 if (tickerHasTeam(pticker, homeAbbr) && tickerHasTeam(pticker, awayAbbr)) {
                   const paperTeam = (pt.teamAbbr ?? pt.ticker?.split('-').pop() ?? '?').toUpperCase();
                   if (paperTeam !== targetAbbr?.toUpperCase()) {
-                    console.log(`[live-edge] ⚠️ PAPER/LIVE CONFLICT on ${homeAbbr}@${awayAbbr}: paper pre-game picked ${paperTeam}, live-edge favoring ${targetAbbr} — proceeding with live bet (paper is not real money)`);
+                    if (PREGAME_LIVE) {
+                      // Real pre-game position exists on the other side — block the live bet
+                      hasPosition = true;
+                      console.log(`[live-edge] 🚫 BLOCKED: pre-game bet on ${paperTeam}, live-edge wants ${targetAbbr} on same game — refusing both-sides bet`);
+                    } else {
+                      console.log(`[live-edge] ⚠️ PAPER/LIVE CONFLICT on ${homeAbbr}@${awayAbbr}: paper pre-game picked ${paperTeam}, live-edge favoring ${targetAbbr} — proceeding (paper is not real money)`);
+                    }
                   } else {
-                    console.log(`[live-edge] ✅ PAPER/LIVE AGREE on ${homeAbbr}@${awayAbbr}: both pre-game paper and live-edge favor ${targetAbbr} — conviction confirmed`);
+                    console.log(`[live-edge] ✅ PRE-GAME/LIVE AGREE on ${homeAbbr}@${awayAbbr}: both favor ${targetAbbr} — conviction confirmed`);
                   }
                   break;
                 }
@@ -3655,54 +3743,76 @@ async function checkPreGamePredictions() {
       continue;
     }
 
-    // PAPER MODE: skip real order placement. Compute what we would have bet, then log.
-    if (preGameTradesToday >= MAX_PREGAME_PAPER_PER_DAY) { console.log(`[pre-game] Paper daily limit reached`); continue; }
-    if (preGameBetGames.has(market.base)) { console.log(`[pre-game] Already logged paper trade for ${market.base} today`); continue; }
-
-    // Check paper-trades.jsonl for duplicate (survives restarts)
+    // Duplicate guard — one bet per game per day (survives restarts via JSONL)
+    if (preGameBetGames.has(market.base)) { console.log(`[pre-game] Already bet ${market.base} today`); continue; }
+    const todayDateStr2 = etNow.toISOString().slice(0, 10);
     if (existsSync(PAPER_TRADES_LOG)) {
-      const todayDateStr2 = etNow.toISOString().slice(0, 10);
       const paperLines = readFileSync(PAPER_TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
       const hasPaperToday = paperLines.some(l => {
-        try {
-          const t = JSON.parse(l);
-          return t.strategy === 'pre-game-paper' && t.timestamp?.startsWith(todayDateStr2) && t.marketBase === market.base;
-        } catch { return false; }
+        try { const t = JSON.parse(l); return t.timestamp?.startsWith(todayDateStr2) && t.marketBase === market.base; } catch { return false; }
       });
-      if (hasPaperToday) { console.log(`[pre-game] Already logged paper trade for ${market.base} today (JSONL)`); continue; }
+      if (hasPaperToday) { console.log(`[pre-game] Already logged trade for ${market.base} today (JSONL)`); continue; }
     }
 
-    // Simulate position size using same formula as real trades
     const edge = confidence - price;
-    const wouldBetAmount = Math.min(getPositionSize('kalshi', edge), getDynamicMaxTrade());
-    const wouldQty = wouldBetAmount >= 1 ? Math.max(1, Math.floor(wouldBetAmount / price)) : 0;
-    if (wouldBetAmount < 1) continue; // wouldn't meet minimum — skip
+    const betAmount = Math.min(getPositionSize('kalshi', edge), getDynamicMaxTrade());
+    const betQty = betAmount >= 1 ? Math.max(1, Math.floor(betAmount / price)) : 0;
+    if (betAmount < 1) continue;
 
     preGameTradesToday++;
     preGameTradesThisCycle++;
     preGameBetGames.add(market.base);
 
-    logPaperTrade({
-      sport: pgSportKey,
-      marketBase: market.base,
-      ticker: matchedSide.ticker, // the specific team's YES market — used for settlement lookup
-      teamAbbr: matchedSide.team,
-      teamName: bettingOnTeam,
-      opponentAbbr: otherSide.team,
-      opponentName: otherSide.teamName,
-      marketTitle: market.title,
-      confidence,
-      price,
-      edge: Math.round(edge * 1000) / 10, // store as percentage points (e.g. 5.2)
-      wouldBetAmount: Math.round(wouldBetAmount * 100) / 100,
-      wouldQty,
-      reasoning: decision.reasoning,
-      // Calibration metadata
-      pgBaseline: pgTargetBaseline,
-    });
+    if (PREGAME_LIVE) {
+      // ── LIVE MODE: place a real Kalshi order ──────────────────────────────
+      const MAX_PREGAME_LIVE_PER_DAY = 3; // conservative limit while we calibrate
+      if (preGameTradesToday > MAX_PREGAME_LIVE_PER_DAY) {
+        console.log(`[pre-game] Daily live limit (${MAX_PREGAME_LIVE_PER_DAY}) reached — skipping ${market.base}`);
+        preGameTradesToday--; preGameTradesThisCycle--; preGameBetGames.delete(market.base);
+        continue;
+      }
+      console.log(`[pre-game] 🎯 LIVE BET: ${market.base} → ${matchedSide.team} @${Math.round(price*100)}¢ conf=${Math.round(confidence*100)}% bet=$${betAmount.toFixed(2)} qty=${betQty}`);
+      try {
+        await executeOrder({
+          ticker: matchedSide.ticker,
+          side: 'yes',
+          count: betQty,
+          type: 'limit',
+          yes_price: Math.round(price * 100), // Kalshi uses cents integer
+          strategy: 'pre-game-prediction',
+          confidence,
+          edge: Math.round(edge * 1000) / 10,
+          reasoning: decision.reasoning,
+          pgBaseline: pgTargetBaseline,
+        });
+        // Also log to paper-trades.jsonl so the conflict detector finds it
+        logPaperTrade({
+          sport: pgSportKey, marketBase: market.base, ticker: matchedSide.ticker,
+          teamAbbr: matchedSide.team, teamName: bettingOnTeam,
+          opponentAbbr: otherSide.team, opponentName: otherSide.teamName,
+          marketTitle: market.title, confidence, price,
+          edge: Math.round(edge * 1000) / 10, wouldBetAmount: betAmount,
+          wouldQty: betQty, reasoning: decision.reasoning, pgBaseline: pgTargetBaseline,
+        });
+      } catch (err) {
+        console.log(`[pre-game] LIVE order failed for ${market.base}: ${err.message}`);
+      }
+      logScreen({ stage: 'pre-game-live', ticker: market.base, result: 'LIVE', confidence, price, reasoning: decision.reasoning });
 
-    logScreen({ stage: 'pre-game-paper', ticker: market.base, result: 'PAPER', confidence, price, reasoning: decision.reasoning });
-    console.log(`[pre-game] 📋 PAPER: ${market.base} → ${matchedSide.team} @${Math.round(price*100)}¢ conf=${Math.round(confidence*100)}% wouldBet=$${wouldBetAmount.toFixed(2)} (${preGameTradesToday}/${MAX_PREGAME_PAPER_PER_DAY} today)`);
+    } else {
+      // ── PAPER MODE: log only, no real order ──────────────────────────────
+      if (preGameTradesToday > MAX_PREGAME_PER_CYCLE * 10) { console.log(`[pre-game] Paper daily limit reached`); continue; }
+      logPaperTrade({
+        sport: pgSportKey, marketBase: market.base, ticker: matchedSide.ticker,
+        teamAbbr: matchedSide.team, teamName: bettingOnTeam,
+        opponentAbbr: otherSide.team, opponentName: otherSide.teamName,
+        marketTitle: market.title, confidence, price,
+        edge: Math.round(edge * 1000) / 10, wouldBetAmount: Math.round(betAmount * 100) / 100,
+        wouldQty: betQty, reasoning: decision.reasoning, pgBaseline: pgTargetBaseline,
+      });
+      logScreen({ stage: 'pre-game-paper', ticker: market.base, result: 'PAPER', confidence, price, reasoning: decision.reasoning });
+      console.log(`[pre-game] 📋 PAPER: ${market.base} → ${matchedSide.team} @${Math.round(price*100)}¢ conf=${Math.round(confidence*100)}% wouldBet=$${betAmount.toFixed(2)} (${preGameTradesToday} today)`);
+    }
     }
   }
 }
