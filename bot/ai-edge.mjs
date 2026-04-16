@@ -1920,7 +1920,7 @@ async function checkLiveScoreEdges() {
                     `${trade.title ?? trade.ticker}\n\n` +
                     `📊 <b>METRICS</b>\n` +
                     `Selling ${sellQty}/${qty} contracts @ ${Math.round(currentPricePg*100)}¢\n` +
-                    `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${Math.round(currentPricePg*100)}¢ (+${Math.round(gainCents*100)}¢)\n` +
+                    `Entry: ${Math.round(entryPg*100)}¢ → Now: ${Math.round(currentPricePg*100)}¢ (+${Math.round(gainCents*100)}¢)\n` +
                     `Profit this sale: <b>+$${(gainCents*sellQty).toFixed(2)}</b>\n` +
                     `${qty - sellQty > 0 ? `Holding ${qty - sellQty} contracts remaining` : 'Full position closed'}\n\n` +
                     `💬 <b>REASON</b>\n` +
@@ -2621,7 +2621,7 @@ async function checkLiveScoreEdges() {
           const outs = sit.outs ?? 3;
           const runnersOn = (sit.onFirst ? 1 : 0) + (sit.onSecond ? 1 : 0) + (sit.onThird ? 1 : 0);
           const batterName = sit.batter?.athlete?.displayName ?? '';
-          if (runnersOn >= 1 && outs <= 1 && !hasPosition) {
+          if (runnersOn >= 1 && outs <= 1) {
             console.log(`[live-edge] ⏳ Threat-wait: ${targetAbbr} — ${runnersOn} runner(s) on, ${outs} out(s), P${period}${batterName ? ` (${batterName} up)` : ''} — waiting for inning to clear before entry`);
             logScreen({ stage: 'live-edge-skip', result: 'skip-active-threat', league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `Active threat: ${runnersOn} runner(s) on base, ${outs} out(s) in inning ${period} — market price is temporarily depressed by at-bat risk, not structural mispricing. Re-evaluates next cycle once inning resolves.` });
             continue;
