@@ -501,6 +501,7 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
 
 let lastHighConvictionAt = 0;      // timestamp of last high-conviction bet
 let highConvictionDeployed = 0;    // total $ in active high-conviction bets
+let lastHCLossAt = 0;              // timestamp of most recent HC loss (triggers 24h HC cooldown)
 
 // Scan timer state — declared here (before loadState) to avoid TDZ errors on startup
 let lastBroadScan = 0;     // moved from line ~2981
@@ -520,6 +521,7 @@ function saveState() {
       lastUFCScan,
       lastHighConvictionAt,
       highConvictionDeployed,
+      lastHCLossAt,
       savedAt: Date.now(),
     }));
   } catch (e) { console.error('[state] save error:', e.message); }
@@ -539,6 +541,7 @@ function loadState() {
     if (s.lastUFCScan) lastUFCScan = s.lastUFCScan;
     if (s.lastHighConvictionAt) lastHighConvictionAt = s.lastHighConvictionAt;
     if (s.highConvictionDeployed) highConvictionDeployed = s.highConvictionDeployed;
+    if (s.lastHCLossAt) lastHCLossAt = s.lastHCLossAt;
     const broadWait = Math.max(0, Math.round((s.lastBroadScan + 1800000 - Date.now()) / 1000));
     const preWait = Math.max(0, Math.round((s.lastPreGameScan + 900000 - Date.now()) / 1000));
     console.log(`[state] Restored — broad scan in ${broadWait}s, pre-game in ${preWait}s`);
@@ -573,10 +576,13 @@ try {
         // e.g. KXNHLGAME-26APR13DALTOR-DAL and KXNHLGAME-26APR13DALTOR-TOR both use "KXNHLGAME-26APR13DALTOR"
         const base = ticker.lastIndexOf('-') > 0 ? ticker.slice(0, ticker.lastIndexOf('-')) : ticker;
         if (base) {
-          const entry = gameEntries.get(base) ?? { count: 0, lastPrice: 0, totalDeployed: 0 };
+          const entry = gameEntries.get(base) ?? { count: 0, lastPrice: 0, totalDeployed: 0, lastScoreKey: null };
           entry.count++;
           entry.lastPrice = t.entryPrice ?? 0;
           entry.totalDeployed += t.deployCost ?? 0;
+          // Parse "HOM 2 - AWA 1" (or similar) from liveScore to restore the score state
+          const m = (t.liveScore ?? '').match(/[A-Z]{2,3}\s+(\d+)\s*[-–]\s*[A-Z]{2,3}\s+(\d+)/);
+          if (m) entry.lastScoreKey = `${m[1]}-${m[2]}`;
           gameEntries.set(base, entry);
         }
 
@@ -598,9 +604,24 @@ try {
 // Load persisted scan timers and high-conviction state
 loadState();
 
-// Smart cooldown: allow adding to position IF price improved, block if same/worse
+// Score-state helper — a compact "home-away" key so we can detect whether the
+// score has changed between scale-in cycles. If it has, the game state is
+// genuinely different (not "same asset cheaper") and we should NOT average down.
+function scoreKey(home, away) {
+  if (home == null || away == null) return null;
+  return `${away}-${home}`;
+}
+
+// Smart cooldown: allow adding to position IF price improved AND score is
+// unchanged, block otherwise.
+//
+// Why score-gate: a 3¢ price drop because the trailing team just scored is
+// a genuinely worse thesis, not a buying opportunity. Averaging down in that
+// situation is the gambler's fallacy. Price-drop alone is too weak a signal.
+//
 // proposedAmount: optional — if provided, checks whether current + proposed would exceed cap
-function canScaleInto(gameKey, currentPrice, proposedAmount = 0) {
+// currentScoreKey: optional — scoreKey(home, away) at the moment of this check
+function canScaleInto(gameKey, currentPrice, proposedAmount = 0, currentScoreKey = null) {
   const entry = gameEntries.get(gameKey);
   if (!entry) return true; // first entry — always allowed
 
@@ -610,18 +631,27 @@ function canScaleInto(gameKey, currentPrice, proposedAmount = 0) {
   // Block if total exposure (including proposed new bet) would exceed bankroll cap
   if (entry.totalDeployed + proposedAmount >= getBankroll() * MAX_GAME_EXPOSURE_PCT) return false;
 
-  // Allow if price is BETTER (lower) than last entry — we're averaging down
-  if (currentPrice < entry.lastPrice - 0.02) return true; // at least 2¢ cheaper
+  // Score-state gate: if the score has changed since our last entry, the game
+  // is different now — skip scale-in regardless of price movement. Only applies
+  // when we have score data for both entries; otherwise fall through (non-sports markets).
+  if (currentScoreKey && entry.lastScoreKey && currentScoreKey !== entry.lastScoreKey) {
+    return false;
+  }
 
-  // Block if price is same or worse — nothing changed, don't add
+  // Allow if price is MEANINGFULLY better (lower) than last entry — 4¢+ clears the
+  // noise floor. 2¢ was catching bid/ask spread widening rather than real moves.
+  if (currentPrice < entry.lastPrice - 0.04) return true;
+
+  // Block if price is same or only marginally better — nothing concrete changed
   return false;
 }
 
-function recordGameEntry(gameKey, price, deployed) {
-  const entry = gameEntries.get(gameKey) ?? { count: 0, lastPrice: 0, totalDeployed: 0 };
+function recordGameEntry(gameKey, price, deployed, scoreKeyValue = null) {
+  const entry = gameEntries.get(gameKey) ?? { count: 0, lastPrice: 0, totalDeployed: 0, lastScoreKey: null };
   entry.count++;
   entry.lastPrice = price;
   entry.totalDeployed += deployed;
+  if (scoreKeyValue) entry.lastScoreKey = scoreKeyValue;
   gameEntries.set(gameKey, entry);
 }
 let kalshiBalance = 0;
@@ -768,8 +798,19 @@ function canTrade() {
 
 // High-conviction tier — detects near-certain late-game situations
 // Returns { isHighConv: true, tier: '30%'/'25%'/'20%', reason: '...' } or { isHighConv: false }
-function checkHighConviction(confidence, league, stage, diff, period) {
+function checkHighConviction(confidence, league, stage, diff, period, price = null) {
   if (confidence < 0.90 || stage !== 'late') return { isHighConv: false };
+
+  // EV gate: a 90% confidence bet at 95¢ is +0¢ edge per $1. Sizing 25-30% of
+  // bankroll on near-fair bets is variance exposure without expected return.
+  // Require the edge (conf - price) to be at least 7¢ — ties HC size to real
+  // EV rather than confidence alone.
+  if (price != null && confidence - price < 0.07) return { isHighConv: false };
+
+  // Drawdown cooldown: if the most recent HC bet was a loss, pause HC for 24h.
+  // Rare-event losses are a possible calibration signal; going back in bigger
+  // is exactly how you cascade a bad day into a bad week.
+  if (Date.now() - lastHCLossAt < 24 * 60 * 60 * 1000) return { isHighConv: false };
 
   // Safety rails: max 1 per hour, max 40% of bankroll in high-conviction
   if (Date.now() - lastHighConvictionAt < 60 * 60 * 1000) return { isHighConv: false };
@@ -2450,13 +2491,19 @@ async function checkLiveScoreEdges() {
 
         // Block if we already have a position on this game — prevents duplicate buys and both-sides bets
         // Use ticker BASE as canonical game key (consistent regardless of which team side we bet)
+        const currentScoreKey = scoreKey(homeScore, awayScore);
         if (hasPosition) {
-          if (!canScaleInto(gameBase, price)) {
-            console.log(`[live-edge] Already have position on ${homeAbbr}@${awayAbbr}, skipping`);
-            logScreen({ stage: 'live-edge-skip', result: 'skip-has-position', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, reasoning: `Already holding a position on ${homeAbbr}@${awayAbbr} — scale-in conditions not met at ${(price*100).toFixed(0)}¢` });
+          if (!canScaleInto(gameBase, price, 0, currentScoreKey)) {
+            const existingEntry = gameEntries.get(gameBase);
+            const scoreChanged = existingEntry?.lastScoreKey && currentScoreKey && existingEntry.lastScoreKey !== currentScoreKey;
+            const reason = scoreChanged
+              ? `score changed since last entry (${existingEntry.lastScoreKey} → ${currentScoreKey}) — game state is different, not averaging down on a deteriorated thesis`
+              : `scale-in conditions not met at ${(price*100).toFixed(0)}¢ (need ≥4¢ price improvement + unchanged score)`;
+            console.log(`[live-edge] Already have position on ${homeAbbr}@${awayAbbr}, skipping: ${reason}`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-has-position', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, reasoning: `Already holding a position on ${homeAbbr}@${awayAbbr} — ${reason}` });
             continue;
           }
-          console.log(`[live-edge] 📈 Scale-in: ${homeAbbr}@${awayAbbr} price dropped to ${(price*100).toFixed(0)}¢`);
+          console.log(`[live-edge] 📈 Scale-in: ${homeAbbr}@${awayAbbr} price dropped to ${(price*100).toFixed(0)}¢ (score ${currentScoreKey} unchanged)`);
         }
 
         // Smart cooldown: base 5min between new entries (use gameBase as canonical key)
@@ -2689,7 +2736,7 @@ async function checkLiveScoreEdges() {
           league === 'nba' ? (period <= 2 ? 'early' : period === 3 ? 'mid' : 'late') :
           league === 'nhl' ? (period === 1 ? 'early' : period === 2 ? 'mid' : 'late') :
           period === 1 ? 'early' : 'late';
-        const hcCheck = checkHighConviction(confidence, league, liveStage, diff, period);
+        const hcCheck = checkHighConviction(confidence, league, liveStage, diff, period, bestPrice);
         const maxBetLE = hcCheck.isHighConv
           ? getPositionSize(best.platform, bestEdge, hcCheck.tier)
           : getPositionSize(best.platform, bestEdge);
@@ -2702,9 +2749,9 @@ async function checkLiveScoreEdges() {
         if (!canDeployMore(safeBet)) { console.log(`[live-edge] BLOCKED ${targetAbbr}: deployment cap (safeBet=$${safeBet.toFixed(2)})`); continue; }
 
         // Scale-in cap re-check with actual bet size — prevents stacking beyond MAX_GAME_EXPOSURE_PCT
-        if (hasPosition && !canScaleInto(gameBase, bestPrice, safeBet)) {
+        if (hasPosition && !canScaleInto(gameBase, bestPrice, safeBet, currentScoreKey)) {
           const gameExp = gameEntries.get(gameBase);
-          console.log(`[live-edge] BLOCKED ${targetAbbr}: scale-in would exceed game cap ($${(gameExp?.totalDeployed ?? 0).toFixed(2)} + $${safeBet.toFixed(2)} > $${(getBankroll() * MAX_GAME_EXPOSURE_PCT).toFixed(2)} cap)`);
+          console.log(`[live-edge] BLOCKED ${targetAbbr}: scale-in would exceed game cap ($${(gameExp?.totalDeployed ?? 0).toFixed(2)} + $${safeBet.toFixed(2)} > $${(getBankroll() * MAX_GAME_EXPOSURE_PCT).toFixed(2)} cap) or score changed`);
           continue;
         }
 
@@ -2751,7 +2798,7 @@ async function checkLiveScoreEdges() {
           }
           const actualDeployed = actualFill * bestPrice;
           stats.tradesPlaced++;
-          recordGameEntry(gameBase, bestPrice, actualDeployed); // use ticker base as canonical key
+          recordGameEntry(gameBase, bestPrice, actualDeployed, currentScoreKey); // use ticker base as canonical key, store score for scale-in gate
 
           logTrade({
             exchange: best.platform,
@@ -4396,6 +4443,14 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
     trade.exitPrice = currentPrice;
     trade.realizedPnL = Math.round(profit * 100) / 100;
     trade.settledAt = new Date().toISOString();
+    // HC cooldown: if a high-conviction bet exited at a loss, pause HC for 24h.
+    // Rare-event losses on 90%+ conf bets are a calibration signal; going back
+    // bigger after one is how bad days become bad weeks.
+    if (trade.highConviction && trade.realizedPnL < 0) {
+      lastHCLossAt = Date.now();
+      saveState();
+      console.log(`[exit] 🔒 HC LOSS detected on ${trade.ticker} — HC locked for 24h`);
+    }
     // After any stop-loss, lock out re-entry on this game for 30 min
     // Prevents "revenge trading" — if we stopped out the game is going against us
     if (isStopLoss) {
@@ -4595,6 +4650,12 @@ async function checkSettlements() {
       trade.settledAt = settlement.settled_time ?? new Date().toISOString();
       trade.result = settlement.market_result;
       updated = true;
+      // HC cooldown on natural-settlement losses too
+      if (trade.highConviction && trade.realizedPnL < 0) {
+        lastHCLossAt = Date.now();
+        saveState();
+        console.log(`[pnl] 🔒 HC LOSS on settlement: ${trade.ticker} — HC locked for 24h`);
+      }
 
       const icon = pnl >= 0 ? '✅' : '❌';
       console.log(`[pnl] SETTLED: ${trade.ticker} ${trade.side} → ${settlement.market_result} | P&L: ${icon} $${pnl.toFixed(2)}`);
