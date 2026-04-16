@@ -5698,11 +5698,38 @@ async function checkSettlements() {
       const exitPrice = won ? 1.0 : 0.0;
       const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / (trade.entryPrice || 1));
 
+      // If this was already fully sold before settlement (closed-manual with partial sells),
+      // use the accumulated partial P&L instead of computing from settlement qty.
+      // This prevents phantom settlement P&L when position was closed mid-game.
+      if (trade.status === 'closed-manual' && trade.partialTakeAt && (trade.partialProfitTaken != null)) {
+        // The position was already fully exited via partial sells — settlement payout = $0
+        const totalPartialProfit = trade.partialProfitTaken;
+        trade.status = 'settled';
+        trade.exitPrice = exitPrice;
+        trade.realizedPnL = Math.round(totalPartialProfit * 100) / 100;
+        trade.settledAt = settlement.settled_time ?? new Date().toISOString();
+        trade.result = settlement.market_result;
+        updated = true;
+        const icon = totalPartialProfit >= 0 ? '✅' : '❌';
+        const pnlStr = totalPartialProfit >= 0 ? `+$${totalPartialProfit.toFixed(2)}` : `-$${Math.abs(totalPartialProfit).toFixed(2)}`;
+        console.log(`[pnl] SETTLED (pre-sold): ${trade.ticker} ${trade.side} → ${settlement.market_result} | P&L: ${icon} $${totalPartialProfit.toFixed(2)} (from partial sells)`);
+        await tg(
+          `${icon} <b>SETTLED — ${won ? 'WIN ✅' : 'LOSS ❌'} (pre-sold)</b>\n\n` +
+          `📋 <b>POSITION</b>\n` +
+          `${trade.title ?? trade.ticker}\n` +
+          `Strategy: ${trade.strategy ?? 'live-prediction'}\n\n` +
+          `📊 <b>METRICS</b>\n` +
+          `Sold before settlement via partial exits\n` +
+          `P&L: <b>${pnlStr}</b>`
+        );
+        continue;
+      }
+
       // Use Kalshi's actual revenue if available (includes accurate fill count)
+      // Note: revenue is computed from fills in dollar terms (price * count), NOT cents
       let pnl;
       if (settlement.revenue && settlement.revenue > 0) {
-        const revenueDollars = settlement.revenue / 100; // Kalshi returns cents
-        pnl = revenueDollars - (trade.deployCost ?? 0);
+        pnl = settlement.revenue - (trade.deployCost ?? 0);
       } else {
         pnl = (qty * exitPrice) - (trade.deployCost ?? 0);
       }
