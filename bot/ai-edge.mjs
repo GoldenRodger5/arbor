@@ -2171,6 +2171,10 @@ async function checkLiveScoreEdges() {
         const etHourLE = etNowLE.getHours();
         const etTmrwLE = new Date(etNowLE.getTime() + 24 * 60 * 60 * 1000);
         const tonightStr = etHourLE >= 22 ? toShortLE(etTmrwLE) : null;
+        // Early morning (midnight–4am ET): also accept yesterday's date — late-night games
+        // started yesterday ET still have APR15-style tickers even though it's now APR16 ET.
+        const etYestLE = new Date(etNowLE.getTime() - 24 * 60 * 60 * 1000);
+        const yesterdayStr = etHourLE < 4 ? toShortLE(etYestLE) : null;
 
         // For tonightStr markets (next-day UTC date): only accept if the game's start time
         // embedded in the ticker is before 08:00 UTC. Games that started after 8pm ET on the
@@ -2199,7 +2203,9 @@ async function checkLiveScoreEdges() {
         };
         const isToday = (ticker) => {
           if (!tickerHasStarted(ticker)) return false; // reject future markets regardless of date
-          return ticker.includes(todayStr) || (tonightStr && ticker.includes(tonightStr) && tonightStarted(ticker));
+          return ticker.includes(todayStr) ||
+            (tonightStr && ticker.includes(tonightStr) && tonightStarted(ticker)) ||
+            (yesterdayStr && ticker.includes(yesterdayStr)); // midnight–4am ET: yesterday's games still live
         };
         const gameMarkets = [...cachedPrices.entries()]
           .filter(([ticker, data]) => {
@@ -4806,7 +4812,8 @@ async function checkSettlements() {
     }
 
     for (const trade of trades) {
-      if (trade.status !== 'open' || trade.exchange !== 'kalshi') continue;
+      if ((trade.status !== 'open' && trade.status !== 'closed-manual') || trade.exchange !== 'kalshi') continue;
+      if (trade.realizedPnL != null) continue; // already settled, don't overwrite
       const settlement = settlementMap.get(trade.ticker);
       if (!settlement || !settlement.market_result) continue;
 
