@@ -3406,6 +3406,213 @@ async function checkLiveScoreEdges() {
       }
     }
   }
+
+  // === PHASE 5: Comeback candidates ============================================
+  // Buy the TRAILING team when their ace is still on the mound in innings 2-5.
+  // Logic: a 1-2 run deficit in early innings with an elite pitcher still going
+  // is structurally mispriced. The market overweights the current score and
+  // underweights (a) how many innings remain and (b) that the ace will keep it
+  // close while the lineup has time to respond. We buy the dip and sell when
+  // the team ties or leads — we don't need them to win the full game.
+  //
+  // Filters: MLB only | innings 2-5 | deficit 1-2 | trailing ERA < 3.5 |
+  //          ace confirmed still on mound | price 10-44¢ | no existing position
+  if (cachedPrices.size > 0) {
+    for (const g of liveGames) {
+      try {
+        if (g.league !== 'mlb') continue;
+        if (g.diff < 1 || g.diff > 2) continue;
+        if (g.period < 2 || g.period > 5) continue;
+
+        const trailingIsHome = g.homeScore < g.awayScore;
+        const trailingTeam  = trailingIsHome ? g.home : g.away;
+        const leadingTeam   = trailingIsHome ? g.away : g.home;
+        const trailingAbbr  = trailingTeam.team?.abbreviation ?? '';
+        const leadingAbbr   = leadingTeam.team?.abbreviation ?? '';
+        if (!trailingAbbr || !leadingAbbr) continue;
+
+        // Need confirmed starter data for trailing team
+        const trailingProb = trailingTeam.probables?.[0];
+        if (!trailingProb) continue;
+        const trailingStarterERA = parseFloat(
+          trailingProb.statistics?.find(s => s.abbreviation === 'ERA')?.displayValue ?? '99'
+        );
+        if (isNaN(trailingStarterERA) || trailingStarterERA > 3.5) continue;
+        const trailingStarterName = trailingProb.athlete?.displayName ?? '';
+
+        // Confirm ace is still on mound (match last name)
+        const currentPitcherName = g.comp.situation?.pitcher?.athlete?.displayName ?? '';
+        const trailingLast = trailingStarterName.split(' ').pop() ?? '';
+        if (trailingLast && currentPitcherName && !currentPitcherName.includes(trailingLast)) {
+          console.log(`[comeback] Skipping ${trailingAbbr}: ${trailingStarterName} pulled, ${currentPitcherName} now in`);
+          continue;
+        }
+
+        // Find trailing team's Kalshi ticker in cached prices
+        const trailingTicker = [...cachedPrices.keys()].find(t => {
+          const suffix = t.split('-').pop()?.toUpperCase() ?? '';
+          return suffix === trailingAbbr.toUpperCase() &&
+                 tickerHasTeam(t.toLowerCase(), trailingAbbr) &&
+                 tickerHasTeam(t.toLowerCase(), leadingAbbr);
+        });
+        if (!trailingTicker) continue;
+
+        const trailingPrice = cachedPrices.get(trailingTicker)?.yes ?? 0;
+        if (trailingPrice <= 0.10 || trailingPrice > 0.44) continue;
+
+        const trailingBase = trailingTicker.lastIndexOf('-') > 0
+          ? trailingTicker.slice(0, trailingTicker.lastIndexOf('-'))
+          : trailingTicker;
+
+        // Stop-lock check
+        const lockUntil = stopLocks.get(trailingBase);
+        if (lockUntil && Date.now() < lockUntil) continue;
+
+        // Existing position check (portfolio + JSONL)
+        const hasPortfolioPos = openPositions.some(p => {
+          const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
+          return pBase === trailingBase;
+        });
+        if (hasPortfolioPos) continue;
+
+        let hasJsonlPos = false;
+        if (existsSync(TRADES_LOG)) {
+          try {
+            const dupStart = new Date(etNow().toISOString().slice(0,10) + 'T04:00:00Z').getTime();
+            const jLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+            for (const l of jLines) {
+              try {
+                const jt = JSON.parse(l);
+                if (jt.status === 'testing-void') continue;
+                const jtMs = jt.timestamp ? Date.parse(jt.timestamp) : 0;
+                if (jtMs < dupStart) continue;
+                if (tickerHasTeam((jt.ticker ?? '').toLowerCase(), trailingAbbr) &&
+                    tickerHasTeam((jt.ticker ?? '').toLowerCase(), leadingAbbr)) {
+                  hasJsonlPos = true; break;
+                }
+              } catch {}
+            }
+          } catch {}
+        }
+        if (hasJsonlPos) continue;
+
+        // Cooldown: re-evaluate same comeback candidate at most every 8 min
+        const cbKey = 'comeback:' + trailingBase;
+        if (Date.now() - (tradeCooldowns.get(cbKey) ?? 0) < 8 * 60 * 1000) continue;
+        tradeCooldowns.set(cbKey, Date.now());
+
+        const leadingProb       = leadingTeam.probables?.[0];
+        const leadingStarterName = leadingProb?.athlete?.displayName ?? 'unknown';
+        const leadingStarterERA  = parseFloat(
+          leadingProb?.statistics?.find(s => s.abbreviation === 'ERA')?.displayValue ?? '3.5'
+        );
+        const inningsLeft = 9 - g.period + 1;
+        const comebackWinPct = Math.round(
+          (1 - (getWinExpectancy('mlb', g.diff, g.period, !trailingIsHome) ?? 0.65)) * 100
+        );
+
+        console.log(`[comeback] 🔄 Candidate: ${trailingAbbr} trailing ${g.awayScore}-${g.homeScore} inn${g.period} | ${trailingStarterName} (${trailingStarterERA} ERA) still on | ${inningsLeft} innings left | ${Math.round(trailingPrice*100)}¢ (model ${comebackWinPct}%)`);
+
+        // Sonnet evaluation — lightweight, no web search needed
+        const cbPrompt =
+          `You are a baseball swing trader evaluating a mid-game comeback bet.\n\n` +
+          `GAME: ${trailingAbbr} trailing ${leadingAbbr} | Score: ${g.awayScore}-${g.homeScore} | Inning: ${g.period} of 9\n` +
+          `Innings remaining: ~${inningsLeft}\n` +
+          `Market prices ${trailingAbbr} YES at ${Math.round(trailingPrice*100)}¢ (implies ${Math.round(trailingPrice*100)}% win probability)\n` +
+          `Statistical comeback rate for this deficit/inning: ${comebackWinPct}%\n\n` +
+          `PITCHER DATA (ESPN confirmed):\n` +
+          `${trailingAbbr} starter: ${trailingStarterName} — ERA ${trailingStarterERA} (still on mound)\n` +
+          `${leadingAbbr} starter: ${leadingStarterName} — ERA ${leadingStarterERA}\n\n` +
+          `STRATEGY: We buy the trailing team NOW and SELL when they tie or take the lead — price spikes from ${Math.round(trailingPrice*100)}¢ back to 48-56¢. We do NOT hold to settlement.\n\n` +
+          `HARD NOs:\n` +
+          `❌ ${inningsLeft} innings remaining is not realistically enough for a ${g.diff}-run comeback given lineup quality → NO\n` +
+          `❌ Leading team has a dominant closer (ERA < 2.0) who will enter in the 8th/9th regardless → NO if inning ≥ 5\n` +
+          `❌ The ${comebackWinPct}% comeback rate is already priced in at ${Math.round(trailingPrice*100)}¢ (gap < 5pts) → NO\n\n` +
+          `BUY if: ace keeping it close + innings available + market underprice vs base rate ≥ 5pts + no dominant closer looming\n\n` +
+          `JSON only:\n` +
+          `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
+          `{"trade":true,"confidence":0.XX,"reasoning":"one sentence — the specific reason the comeback is likely"}`;
+
+        const cbText = await claudeSonnet(cbPrompt, { maxTokens: 250, timeout: 15000 });
+        if (!cbText) continue;
+        const cbMatch = extractJSON(cbText);
+        if (!cbMatch) continue;
+        let cbDecision;
+        try { cbDecision = JSON.parse(cbMatch); } catch { continue; }
+
+        const cbConf = cbDecision.confidence ?? 0;
+        const cbEdge = cbConf - trailingPrice;
+
+        if (!cbDecision.trade || cbConf < 0.62 || cbEdge < 0.05) {
+          console.log(`[comeback] ❌ Pass on ${trailingAbbr}: conf=${Math.round(cbConf*100)}% edge=${Math.round(cbEdge*100)}pts | ${cbDecision.reasoning?.slice(0,80)}`);
+          continue;
+        }
+
+        console.log(`[comeback] ✅ BUY ${trailingAbbr} @ ${Math.round(trailingPrice*100)}¢ | conf=${Math.round(cbConf*100)}% edge=+${Math.round(cbEdge*100)}pts | ${cbDecision.reasoning?.slice(0,80)}`);
+
+        // Size conservatively — comeback has higher variance than leading-team bets
+        const cbMaxTrade = Math.min(getBankroll() * 0.08, getAvailableCash('kalshi'));
+        const cbQty = Math.max(1, Math.round(Math.min(getPositionSize('kalshi', cbEdge) * 0.60, cbMaxTrade) / trailingPrice));
+        const cbBetAmount = cbQty * trailingPrice;
+        if (cbBetAmount < 5) { console.log(`[comeback] Bet too small ($${cbBetAmount.toFixed(2)}), skipping`); continue; }
+
+        const priceInCents = Math.round(trailingPrice * 100);
+        const cbResult = await kalshiPost('/portfolio/orders', {
+          ticker: trailingTicker,
+          action: 'buy',
+          side: 'yes',
+          count: cbQty,
+          yes_price: Math.min(99, priceInCents + 2),
+        });
+
+        if (cbResult.ok) {
+          const cbOrder = cbResult.data?.order ?? {};
+          const cbFill = cbOrder.count ?? cbQty;
+          const cbDeployed = Math.round(cbFill * trailingPrice * 100) / 100;
+
+          const cbTrade = {
+            id: cbOrder.order_id ?? `cb-${Date.now()}`,
+            timestamp: new Date().toISOString(),
+            strategy: 'comeback-buy',
+            exchange: 'kalshi',
+            ticker: trailingTicker,
+            title: cachedPrices.get(trailingTicker)?.title ?? `${trailingAbbr} vs ${leadingAbbr}`,
+            side: 'yes',
+            entryPrice: trailingPrice,
+            quantity: cbFill,
+            deployCost: cbDeployed,
+            confidence: cbConf,
+            reasoning: cbDecision.reasoning,
+            status: 'open',
+          };
+
+          appendFileSync(TRADES_LOG, JSON.stringify(cbTrade) + '\n');
+          openPositions.push(cbTrade);
+          gameEntries.set(trailingBase, { ticker: trailingTicker, price: trailingPrice, lastScoreKey: scoreKey(g.awayScore, g.homeScore) });
+          tradeCooldowns.set(trailingBase, Date.now());
+
+          await tg(
+            `🔄 <b>COMEBACK BUY — KALSHI</b>\n\n` +
+            `📋 <b>GAME</b>\n` +
+            `${cachedPrices.get(trailingTicker)?.title ?? trailingTicker}\n` +
+            `Score: ${g.awayScore}-${g.homeScore} (${trailingAbbr} trailing) | Inning ${g.period}\n\n` +
+            `📊 <b>METRICS</b>\n` +
+            `Bought ${trailingAbbr} YES @ ${priceInCents}¢ × ${cbFill} = <b>$${cbDeployed.toFixed(2)}</b>\n` +
+            `Confidence: <b>${Math.round(cbConf*100)}%</b> | Edge: +${Math.round(cbEdge*100)}pts vs market\n` +
+            `Statistical comeback rate: ${comebackWinPct}% | Market priced: ${priceInCents}%\n` +
+            `Ace: ${trailingStarterName} (${trailingStarterERA} ERA) still on mound | ${inningsLeft} innings left\n` +
+            `Exit: sell when ${trailingAbbr} ties or leads (price ~50¢+)\n\n` +
+            `🧠 <b>REASONING</b>\n` +
+            `${cbDecision.reasoning}`
+          );
+        } else {
+          console.error(`[comeback] Order failed:`, cbResult.status, JSON.stringify(cbResult.data));
+        }
+      } catch (e) {
+        console.error(`[comeback] Error for game:`, e.message);
+      }
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
