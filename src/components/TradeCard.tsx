@@ -104,8 +104,62 @@ export default function TradeCard({ trade, compact = false }: { trade: Trade; co
         {trade.strategy && <span style={{ marginLeft: 'auto' }}>{trade.strategy}</span>}
       </div>
 
-      {/* Reasoning — the hero of the card */}
-      {trade.reasoning && !compact && (
+      {/* Reasoning — structured when available, free-text fallback */}
+      {!compact && trade.reasoningStructured && (
+        <div style={{
+          paddingTop: 8, borderTop: '1px solid var(--border)',
+          display: 'flex', flexDirection: 'column', gap: 8,
+        }}>
+          {trade.reasoningStructured.edge_source && (
+            <div style={{
+              alignSelf: 'flex-start',
+              fontSize: 10, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase',
+              color: 'var(--accent)', background: 'rgba(99,102,241,0.1)',
+              padding: '3px 8px', borderRadius: 4,
+            }}>
+              EDGE · {trade.reasoningStructured.edge_source.replace(/_/g, ' ')}
+            </div>
+          )}
+          {trade.reasoningStructured.edge_argument && (
+            <div style={{ fontSize: 13, color: 'var(--text-primary)', lineHeight: 1.55 }}>
+              <span style={{ fontWeight: 600, color: 'var(--green)', marginRight: 6 }}>→</span>
+              {trade.reasoningStructured.edge_argument}
+            </div>
+          )}
+          {trade.reasoningStructured.steel_man && (
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5, fontStyle: 'italic' }}>
+              <span style={{ fontWeight: 600, color: 'var(--text-tertiary)', marginRight: 6 }}>Sharp money:</span>
+              {trade.reasoningStructured.steel_man}
+            </div>
+          )}
+          {Array.isArray(trade.reasoningStructured.key_facts) && trade.reasoningStructured.key_facts.length > 0 && (
+            <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.55 }}>
+              {trade.reasoningStructured.key_facts.map((f, i) => (
+                <li key={i} style={{ marginBottom: 2 }}>{f}</li>
+              ))}
+            </ul>
+          )}
+          {trade.reasoningStructured.top_risk && (
+            <div style={{
+              fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5,
+              padding: '6px 10px', borderRadius: 6,
+              background: 'rgba(239,68,68,0.06)', border: '1px solid rgba(239,68,68,0.15)',
+            }}>
+              <span style={{ fontWeight: 600, color: 'var(--red)', marginRight: 6 }}>Key risk:</span>
+              {trade.reasoningStructured.top_risk}
+            </div>
+          )}
+          {trade.reasoningStructured.conviction && (
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+              <span style={{ fontWeight: 600, color: 'var(--accent)', marginRight: 6 }}>Conviction:</span>
+              {trade.reasoningStructured.conviction}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Fallback for trades without structured reasoning (older or PASS trades) */}
+      {!compact && !trade.reasoningStructured && trade.reasoning && (
         <div style={{
           fontSize: 14, color: 'var(--text-secondary)', lineHeight: 1.6,
           paddingTop: 4, fontStyle: 'italic',

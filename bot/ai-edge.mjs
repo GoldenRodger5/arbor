@@ -612,6 +612,24 @@ function scoreKey(home, away) {
   return `${away}-${home}`;
 }
 
+// Render a structured reasoning object (as returned by Sonnet in the new schema)
+// into a human-readable string. The structured form stays in the trade log under
+// reasoningStructured for programmatic analysis / calibration. The rendered string
+// is what the UI and legacy consumers see.
+function renderStructuredReasoning(r) {
+  if (!r || typeof r !== 'object') return '';
+  const parts = [];
+  if (r.steel_man)        parts.push(`STEEL-MAN: ${r.steel_man}`);
+  if (r.edge_source)      parts.push(`EDGE SOURCE: ${r.edge_source}`);
+  if (r.edge_argument)    parts.push(`WHY MARKET IS WRONG: ${r.edge_argument}`);
+  if (Array.isArray(r.key_facts) && r.key_facts.length > 0) {
+    parts.push(`KEY FACTS: ${r.key_facts.filter(Boolean).join('; ')}`);
+  }
+  if (r.top_risk)         parts.push(`KEY RISK: ${r.top_risk}`);
+  if (r.conviction)       parts.push(`CONVICTION: ${r.conviction}`);
+  return parts.join(' | ');
+}
+
 // Smart cooldown: allow adding to position IF price improved AND score is
 // unchanged, block otherwise.
 //
@@ -2441,9 +2459,20 @@ async function checkLiveScoreEdges() {
             `  • If the price is already reflecting smart money, you have NO edge — say NO.\n` +
             `  • If you cannot name ONE specific, verifiable fact (not "they're the better team") that overrides the deficit — say NO.\n` : ''}` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
-          `RESPOND WITH JSON ONLY:\n` +
-          `{"trade": false, "confidence": 0.XX, "reasoning": "why market is right / what disqualified this"}\n` +
-          `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "STEEL-MAN: [sharp money's argument for the current price]. WHY MARKET IS WRONG: [what you found that beats the steel-man]. KEY RISK: [what could still beat you]. CONVICTION: [the specific factor that pushed you over threshold]."}`;
+          `RESPOND WITH JSON ONLY:\n\n` +
+          `PASS response:\n` +
+          `{"trade": false, "confidence": 0.XX, "reasoning": "why market is right / what disqualified this"}\n\n` +
+          `TRADE response — reasoning MUST be a structured object (not a string):\n` +
+          `{"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N,\n` +
+          ` "reasoning": {\n` +
+          `   "steel_man": "sharp money's argument for the current price, in one sentence",\n` +
+          `   "edge_source": "one tag from this list: bullpen_mismatch | starter_dominance | lineup_cold | market_lag | star_injury | goalie_mismatch | pace_mismatch | schedule_spot | motivation | other",\n` +
+          `   "edge_argument": "our concrete reason the market is wrong, in one sentence",\n` +
+          `   "key_facts": ["verifiable fact 1", "verifiable fact 2", "verifiable fact 3"],\n` +
+          `   "top_risk": "what could still beat us, in one sentence",\n` +
+          `   "conviction": "the single factor that pushed you over threshold"\n` +
+          ` }}\n\n` +
+          `Every TRADE response MUST follow this exact schema. Do not substitute a string for the reasoning object.`;
         // Block if we already have a position on this game (check BOTH platforms)
         const ticker = targetMarket.ticker;
         const lastH = ticker.lastIndexOf('-');
@@ -2660,6 +2689,18 @@ async function checkLiveScoreEdges() {
         let decision;
         try { decision = JSON.parse(jsonMatch); } catch (e) { console.log(`[live-edge] JSON parse failed for ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${e.message}`); continue; }
 
+        // Normalize reasoning: accept structured object (new format) OR string (fallback).
+        // For TRADE responses we want the structured object; we'll also render it to a
+        // readable string so the existing UI and logs keep working unchanged.
+        const reasoningStructured = (typeof decision.reasoning === 'object' && decision.reasoning !== null)
+          ? decision.reasoning
+          : null;
+        const reasoningStr = reasoningStructured
+          ? renderStructuredReasoning(reasoningStructured)
+          : (typeof decision.reasoning === 'string' ? decision.reasoning : '');
+        decision.reasoning = reasoningStr;
+        decision.reasoningStructured = reasoningStructured;
+
         if (!decision.trade) {
           console.log(`[live-edge] Claude says NO on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): conf=${((decision.confidence ?? 0)*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ | ${decision.reasoning?.slice(0, 80)}`);
           logScreen({ stage: 'live-edge', ticker, result: 'pass', confidence: decision.confidence, price, reasoning: decision.reasoning, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, gameDetail, targetAbbr });
@@ -2811,6 +2852,7 @@ async function checkLiveScoreEdges() {
             orderId: (result.data?.order ?? result.data)?.order_id ?? result.data?.id ?? null,
             edge: bestEdge * 100, confidence,
             reasoning: decision.reasoning,
+            reasoningStructured: decision.reasoningStructured ?? null,
             liveScore: `${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore} (${gameDetail})`,
             otherPlatformPrice: best.platform === 'polymarket' ? price : (polyMatch?.s0Price ?? null),
             // Calibration fields — used by calibrate.mjs to measure prediction accuracy

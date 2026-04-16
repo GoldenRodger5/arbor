@@ -16,6 +16,14 @@ export interface Trade {
   edge: number;
   confidence: number;
   reasoning: string;
+  reasoningStructured?: {
+    steel_man?: string;
+    edge_source?: string;
+    edge_argument?: string;
+    key_facts?: string[];
+    top_risk?: string;
+    conviction?: string;
+  } | null;
   liveScore?: string;
   otherPlatformPrice?: number;
   status: 'open' | 'settled' | 'sold-stop-loss' | 'sold-claude-stop' | 'sold-claude-sell' | 'closed-manual' | string;
