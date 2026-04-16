@@ -3439,14 +3439,11 @@ async function checkLiveScoreEdges() {
         );
         if (isNaN(trailingStarterERA) || trailingStarterERA > 3.5) continue;
         const trailingStarterName = trailingProb.athlete?.displayName ?? '';
-
-        // Confirm ace is still on mound (match last name)
-        const currentPitcherName = g.comp.situation?.pitcher?.athlete?.displayName ?? '';
-        const trailingLast = trailingStarterName.split(' ').pop() ?? '';
-        if (trailingLast && currentPitcherName && !currentPitcherName.includes(trailingLast)) {
-          console.log(`[comeback] Skipping ${trailingAbbr}: ${trailingStarterName} pulled, ${currentPitcherName} now in`);
-          continue;
-        }
+        // Note: situation.pitcher is the FIELDING team's pitcher (whoever is on the mound),
+        // NOT necessarily the trailing team's pitcher. In innings 2-5 with ERA < 3.5 and
+        // only a 1-2 run deficit, starters almost never get pulled — the inning + ERA
+        // filter is sufficient assurance. Explicit pitch-count data isn't in the ESPN
+        // probables endpoint, so we skip the unreliable name-match check here.
 
         // Find trailing team's Kalshi ticker in cached prices
         const trailingTicker = [...cachedPrices.keys()].find(t => {
@@ -3511,7 +3508,7 @@ async function checkLiveScoreEdges() {
           (1 - (getWinExpectancy('mlb', g.diff, g.period, !trailingIsHome) ?? 0.65)) * 100
         );
 
-        console.log(`[comeback] 🔄 Candidate: ${trailingAbbr} trailing ${g.awayScore}-${g.homeScore} inn${g.period} | ${trailingStarterName} (${trailingStarterERA} ERA) still on | ${inningsLeft} innings left | ${Math.round(trailingPrice*100)}¢ (model ${comebackWinPct}%)`);
+        console.log(`[comeback] 🔄 Candidate: ${trailingAbbr} trailing ${g.awayScore}-${g.homeScore} inn${g.period} | ace ${trailingStarterName} (${trailingStarterERA} ERA) | opp ${leadingStarterName} (${leadingStarterERA} ERA) | ${inningsLeft} innings left | ${Math.round(trailingPrice*100)}¢ vs model ${comebackWinPct}%`);
 
         // Sonnet evaluation — lightweight, no web search needed
         const cbPrompt =
@@ -3521,7 +3518,7 @@ async function checkLiveScoreEdges() {
           `Market prices ${trailingAbbr} YES at ${Math.round(trailingPrice*100)}¢ (implies ${Math.round(trailingPrice*100)}% win probability)\n` +
           `Statistical comeback rate for this deficit/inning: ${comebackWinPct}%\n\n` +
           `PITCHER DATA (ESPN confirmed):\n` +
-          `${trailingAbbr} starter: ${trailingStarterName} — ERA ${trailingStarterERA} (still on mound)\n` +
+          `${trailingAbbr} starter: ${trailingStarterName} — ERA ${trailingStarterERA} (innings 2-5, expected still on mound)\n` +
           `${leadingAbbr} starter: ${leadingStarterName} — ERA ${leadingStarterERA}\n\n` +
           `STRATEGY: We buy the trailing team NOW and SELL when they tie or take the lead — price spikes from ${Math.round(trailingPrice*100)}¢ back to 48-56¢. We do NOT hold to settlement.\n\n` +
           `HARD NOs:\n` +
@@ -3600,7 +3597,7 @@ async function checkLiveScoreEdges() {
             `Bought ${trailingAbbr} YES @ ${priceInCents}¢ × ${cbFill} = <b>$${cbDeployed.toFixed(2)}</b>\n` +
             `Confidence: <b>${Math.round(cbConf*100)}%</b> | Edge: +${Math.round(cbEdge*100)}pts vs market\n` +
             `Statistical comeback rate: ${comebackWinPct}% | Market priced: ${priceInCents}%\n` +
-            `Ace: ${trailingStarterName} (${trailingStarterERA} ERA) still on mound | ${inningsLeft} innings left\n` +
+            `Ace: ${trailingStarterName} (${trailingStarterERA} ERA) | Opp: ${leadingStarterName} (${leadingStarterERA} ERA) | ${inningsLeft} innings left\n` +
             `Exit: sell when ${trailingAbbr} ties or leads (price ~50¢+)\n\n` +
             `🧠 <b>REASONING</b>\n` +
             `${cbDecision.reasoning}`
