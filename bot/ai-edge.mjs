@@ -2559,6 +2559,21 @@ async function checkLiveScoreEdges() {
           }
         }
 
+        // Active-threat gate (MLB only) — don't enter with runners on base + ≤1 out in innings 6+.
+        // The market drop during an active at-bat threat is transient, not a real mispricing.
+        // We lose ~6¢ of entry edge by waiting, but avoid buying at peak variance when a single
+        // play can immediately invalidate the thesis. Wait for the inning to clear.
+        if (league === 'mlb' && period >= 6 && sit) {
+          const outs = sit.outs ?? 3;
+          const runnersOn = (sit.onFirst ? 1 : 0) + (sit.onSecond ? 1 : 0) + (sit.onThird ? 1 : 0);
+          const batterName = sit.batter?.athlete?.displayName ?? '';
+          if (runnersOn >= 1 && outs <= 1 && !hasPosition) {
+            console.log(`[live-edge] ⏳ Threat-wait: ${targetAbbr} — ${runnersOn} runner(s) on, ${outs} out(s), P${period}${batterName ? ` (${batterName} up)` : ''} — waiting for inning to clear before entry`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-active-threat', league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `Active threat: ${runnersOn} runner(s) on base, ${outs} out(s) in inning ${period} — market price is temporarily depressed by at-bat risk, not structural mispricing. Re-evaluates next cycle once inning resolves.` });
+            continue;
+          }
+        }
+
         // Time remaining (critical for NBA/NHL — "3:21 in 2nd" vs just "2nd quarter")
         let timeRemaining = '';
         const statusDetail = comp.status?.type?.shortDetail ?? '';
