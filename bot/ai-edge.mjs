@@ -2363,6 +2363,11 @@ async function checkLiveScoreEdges() {
           `- Leading team win rate below 35% → DOWN 6-10% (weak teams protect leads less reliably)\n` +
           `- Trailing team is at HOME with loud playoff/crucial crowd → DOWN 3-5% (home crowd lifts desperate teams)\n` +
           `- Time remaining: 3 min left with a lead ≠ 10 min left with same lead. Adjust accordingly.\n\n` +
+          `═══ STEP 3.5 — STEEL-MAN THE MARKET ═══\n` +
+          `Before deciding, you MUST answer in one sentence: what does a SHARP BETTOR see at this price that you don't?\n` +
+          `The market is ${(price*100).toFixed(0)}¢ for a reason. Sharp money — professional bettors, syndicates, market makers — has the same score and timeline we do, plus information we often can't see (specific reliever warming, bench injuries reported to beat writers, in-venue observations, weather micro-shifts). If they're pricing this team at ${(price*100).toFixed(0)}¢, what's their thesis?\n` +
+          `Put that thesis in your reasoning field as "STEEL-MAN: [their argument in one sentence]". Then answer: does your edge-reason beat their thesis, or is it just different?\n` +
+          `If you cannot articulate a real counter-argument — if you catch yourself dismissing the market as "wrong" without naming what they see — pass. A pro bettor who can't steel-man the other side hasn't done the work.\n\n` +
           `═══ STEP 4 — DECISION ═══\n` +
           (_weTargetPct != null ? `⚠️ CALIBRATION CHECK: The WE math says ${targetAbbr} wins ${_weTargetPct}% from here. Your final confidence must be within 8 points of this number. If it's not — name the single specific confirmed fact that justifies the deviation. "They're the better team" does not count. A team's record is already in the WE baseline — it does not justify deviation on its own.\n\n` : '') +
           `BUY only if ALL three are true:\n` +
@@ -2377,7 +2382,7 @@ async function checkLiveScoreEdges() {
           `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
           `RESPOND WITH JSON ONLY:\n` +
           `{"trade": false, "confidence": 0.XX, "reasoning": "why market is right / what disqualified this"}\n` +
-          `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "WHY MARKET IS WRONG: [what you found]. KEY RISK: [what could beat you]. CONVICTION: [the specific factor that pushed you over threshold]."}`;
+          `OR {"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N, "reasoning": "STEEL-MAN: [sharp money's argument for the current price]. WHY MARKET IS WRONG: [what you found that beats the steel-man]. KEY RISK: [what could still beat you]. CONVICTION: [the specific factor that pushed you over threshold]."}`;
         // Block if we already have a position on this game (check BOTH platforms)
         const ticker = targetMarket.ticker;
         const lastH = ticker.lastIndexOf('-');
