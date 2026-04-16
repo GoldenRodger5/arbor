@@ -135,8 +135,12 @@ function getRequiredMargin(price, { sport = '', live = false, scoreChanged = fal
 const MAX_PRICE = 0.75;           // Default ceiling — use getMaxPrice(league, period) for sport-specific limits
 
 // Sport-specific price ceiling based on variance research:
-// MLB: 78¢ — raised from 75¢ to capture mid-game situations (inning 7-8) where real edge exists
-// NHL P3: 82¢ — 2-goal leads with <10min left are genuinely 93%+ WE, market at 80¢ has real edge
+// MLB: tiered by run differential — same logic as NHL/NBA
+//   1-run:  78¢ — thin margin, one swing ties it
+//   2-run:  82¢ — 2-run late (P5+) = 85-88% WE, real edge at 79-82¢
+//   3-run:  86¢ — 3-run P7+ = 90-92% WE, ATL-type situations with elite bullpen
+//   4+ run: 88¢ — 93-95% WE, only catastrophic collapses flip these
+// NHL P3: 82¢ — 2-goal leads with <10min left are genuinely 93%+ WE
 // NHL P1/P2: tiered by goal differential (a 2-goal P2 lead is 82-85% WE, very different from 1-goal 68%)
 //   1-goal:   75¢ — blocked by low-WE floor anyway, keep defensive
 //   2-goal:   78¢ — 82-85% WE, real edge exists at 76-78¢ prices for elite teams
@@ -150,7 +154,12 @@ const MAX_PRICE = 0.75;           // Default ceiling — use getMaxPrice(league,
 // diff (optional) = score differential in the sport's native units (runs/goals/pts).
 // When omitted, falls back to the conservative (1-point) value.
 function getMaxPrice(league, period, diff = 1) {
-  if (league === 'mlb') return 0.78;
+  if (league === 'mlb') {
+    if (diff >= 4) return 0.88;
+    if (diff >= 3) return 0.86;
+    if (diff >= 2) return 0.82;
+    return 0.78;
+  }
   if (league === 'nhl') {
     if (period >= 3) return 0.82;
     // P1/P2
