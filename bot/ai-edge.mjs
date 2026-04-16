@@ -184,7 +184,8 @@ function getMaxPrice(league, period, diff = 1) {
   if (['mls', 'epl', 'laliga'].includes(league)) return 0.75;
   return MAX_PRICE;
 }
-const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — base fraction
+const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — live-edge base fraction
+const PRE_GAME_TRADE_FRACTION = 0.15; // 15% for pre-game — structural edge is larger, compound-friendly
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 5 * 60 * 1000;  // 5 min base cooldown (can be bypassed for better prices)
 const MAX_GAME_EXPOSURE_PCT = 0.08; // Max 8% of bankroll on one game (was 15% — too concentrated at small bankroll)
@@ -3831,7 +3832,8 @@ async function checkPreGamePredictions() {
     }
 
     const edge = confidence - price;
-    const betAmount = Math.min(getPositionSize('kalshi', edge), getDynamicMaxTrade());
+    const pgMaxTrade = Math.min(getBankroll() * PRE_GAME_TRADE_FRACTION, getAvailableCash('kalshi'));
+    const betAmount = Math.min(getPositionSize('kalshi', edge), pgMaxTrade);
     const betQty = betAmount >= 1 ? Math.max(1, Math.floor(betAmount / price)) : 0;
     if (betAmount < 1) continue;
 
