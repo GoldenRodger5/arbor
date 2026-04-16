@@ -1435,6 +1435,105 @@ function getWinExpectancy(league, lead, period, isHome = null) {
   return base;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Time-within-period WE adjustment.
+// Our WE tables use PERIOD as the finest grain. But within each period, WE
+// varies substantially by how much time is left. A 5-point NBA lead at 11:35
+// in Q4 is ~70%, not the table's period-average 77%. This function computes
+// a linear adjustment so the prompt gives Sonnet the right anchor.
+//
+// Returns { adjustment: number, minutesLeft: number|null, label: string }
+//   adjustment = additive WE correction (negative = table is optimistic)
+//   minutesLeft = parsed clock for logging
+//   label = human-readable time context for prompt
+// ─────────────────────────────────────────────────────────────────────────────
+function timeAdjustWE(league, period, gameDetail, diff = 1) {
+  const none = { adjustment: 0, minutesLeft: null, label: '' };
+
+  if (league === 'nba') {
+    // Parse "11:35 - 4th" or "3:21 - 2nd" → minutes.fraction
+    const m = (gameDetail ?? '').match(/(\d+):(\d+)/);
+    if (!m) return none;
+    const mins = parseInt(m[1]) + parseInt(m[2]) / 60;
+    const periodLen = 12; // NBA quarter = 12 min
+    const frac = mins / periodLen; // 0=period ending, 1=period starting
+
+    let adj = 0;
+    if (period === 4 || period > 4) {
+      // Q4 / OT — time is critical
+      if (frac > 0.50) adj = -0.05;       // >6 min left: table is optimistic
+      else if (frac > 0.25) adj = -0.02;   // 3-6 min: slightly optimistic
+      else if (frac < 0.15 && diff >= 5) adj = +0.04; // <2 min, 5+ pt lead: nearly sealed
+    } else {
+      // Q1-Q3: long game ahead, table is always optimistic early in period
+      if (frac > 0.60) adj = -0.03;
+    }
+    const label = `${mins.toFixed(1)} min left in Q${period}`;
+    return { adjustment: adj, minutesLeft: mins, label };
+  }
+
+  if (league === 'nhl') {
+    const m = (gameDetail ?? '').match(/(\d+):(\d+)/);
+    if (!m) return none;
+    const mins = parseInt(m[1]) + parseInt(m[2]) / 60;
+    const periodLen = 20;
+    const frac = mins / periodLen;
+
+    let adj = 0;
+    if (period === 3) {
+      if (frac > 0.50) adj = -0.04;       // >10 min: still a full period feel
+      else if (frac > 0.25) adj = -0.01;   // 5-10 min
+      else if (frac < 0.15 && diff >= 2) adj = +0.03; // <3 min, 2+ goal: locked
+    } else {
+      if (frac > 0.50) adj = -0.03;        // early in P1/P2
+    }
+    const label = `${mins.toFixed(1)} min left in P${period}`;
+    return { adjustment: adj, minutesLeft: mins, label };
+  }
+
+  if (league === 'mlb') {
+    // MLB has no clock — use inning half as proxy.
+    // "Top 7th" = leading team batting (or about to), trailing hasn't hit yet this inning
+    // "Bot 7th" = trailing team batting RIGHT NOW = max live risk
+    // "Mid/End" = between half-innings = brief neutral state
+    const detail = (gameDetail ?? '').toLowerCase();
+    let adj = 0;
+    let label = '';
+    if (detail.startsWith('bot') || detail.startsWith('bottom')) {
+      adj = -0.04; // trailing team at bat = active threat, table is optimistic
+      label = 'trailing team batting — active scoring threat';
+    } else if (detail.startsWith('top')) {
+      adj = -0.01; // leading team at bat — less immediate risk but inning not over
+      label = 'leading team batting';
+    } else {
+      label = 'between half-innings';
+    }
+    // Late-inning amplifier: bot 9th with 0-1 outs is more dangerous than bot 7th
+    if (period >= 9 && diff <= 2 && (detail.startsWith('bot') || detail.startsWith('bottom'))) {
+      adj -= 0.02; // extra penalty for trailing team batting in 9th with close game
+      label = 'trailing team batting in 9th — maximum live risk';
+    }
+    return { adjustment: adj, minutesLeft: null, label };
+  }
+
+  if (['mls', 'epl', 'laliga'].includes(league)) {
+    // Parse minute from "72'" or "2nd - 72'" or just a number
+    const minMatch = (gameDetail ?? '').match(/(\d+)/);
+    if (!minMatch) return none;
+    const minute = parseInt(minMatch[1]);
+    const effective = period === 2 ? Math.max(minute, 45) : minute;
+
+    let adj = 0;
+    if (effective < 70) adj = -0.06;         // lots of match left
+    else if (effective < 80) adj = -0.02;    // settling but not locked
+    else if (effective >= 85) adj = +0.04;   // park-the-bus zone
+    const label = `${effective}' of match`;
+    return { adjustment: adj, minutesLeft: 90 - effective, label };
+  }
+
+  return none;
+}
+
 function getWinExpectancyText(league, lead, period, isHome) {
   const adjusted = getWinExpectancy(league, lead, period, isHome);
   if (!adjusted) return '';
@@ -2295,6 +2394,13 @@ async function checkLiveScoreEdges() {
         const _weTarget = _weAdj != null ? (targetAbbr === leadingAbbr ? _weAdj : (1 - _weAdj)) : null;
         const _weTargetPct = _weTarget != null ? (_weTarget * 100).toFixed(0) : null;
 
+        // Time-within-period WE adjustment — the table gives period averages,
+        // but 11:35 left in Q4 ≠ 1:30 left in Q4. Compute the correction and
+        // pass BOTH raw and adjusted to Sonnet so it anchors on the right number.
+        const _timeAdj = timeAdjustWE(league, period, gameDetail, diff);
+        const _weTimeAdj = _weTarget != null ? Math.max(0.01, Math.min(0.99, _weTarget + _timeAdj.adjustment)) : null;
+        const _weTimeAdjPct = _weTimeAdj != null ? (_weTimeAdj * 100).toFixed(0) : null;
+
         // MLB bullpen context — pulled from the MLB Stats API, not web search.
         // Gives us authoritative season/L30D/L7D bullpen ERA for both teams
         // so the prompt no longer has to say "search for bullpen ERA" and
@@ -2373,9 +2479,10 @@ async function checkLiveScoreEdges() {
           (_lineMove?.confirming === true  ? `📈 LINE MOVEMENT (CONFIRMING${_lineMove.crossConfirmed ? ', CROSS-CONFIRMED' : ''}): Market moved TOWARD ${targetAbbr}: ${(_lineMove.from*100).toFixed(0)}¢ → ${(_lineMove.to*100).toFixed(0)}¢ in ${_lineMove.minutesAgo}min (${(_lineMove.velocity ?? 0).toFixed(1)}¢/min). Market agrees — edge window closing.\n` : '') +
           (_lineMove?.confirming === false ? `⚠️ CONTRA LINE MOVEMENT: Market moved AGAINST ${targetAbbr}: ${(_lineMove.from*100).toFixed(0)}¢ → ${(_lineMove.to*100).toFixed(0)}¢ in ${_lineMove.minutesAgo}min (${(_lineMove.velocity ?? 0).toFixed(1)}¢/min). Investigate why before betting — possible injury, scoring run, or news.\n` : '') +
           `\n═══ STEP 0 — MARKET EFFICIENCY GATE (CHECK FIRST) ═══\n` +
-          `The WE baseline shown above is ${_weTargetPct != null ? _weTargetPct + '%' : 'computed'} for ${targetAbbr}. Market price is ${(price*100).toFixed(0)}¢.\n` +
-          `Edge = WE% − price%. If |edge| < 4 points → respond {"trade":false} immediately with reason "market efficient". Do not run the rest of the analysis.\n` +
-          `This gate catches cases where the market has the same information we do; no amount of starter/bullpen/lineup research will create edge that isn't there.\n\n` +
+          (_weTimeAdjPct != null && _weTimeAdjPct !== _weTargetPct
+            ? `The WE baseline is ${_weTargetPct}% (period average) → **${_weTimeAdjPct}%** (adjusted for ${_timeAdj.label}). USE ${_weTimeAdjPct}% as your anchor — the period average overstates early-period situations.\n`
+            : `The WE baseline is ${_weTargetPct != null ? _weTargetPct + '%' : 'computed'} for ${targetAbbr}.\n`) +
+          `Market price is ${(price*100).toFixed(0)}¢. Edge = adjusted WE% − price%. If |edge| < 4 points → respond {"trade":false} immediately with reason "market efficient".\n\n` +
           `═══ STEP 1 — SEARCH FIRST, ANALYZE SECOND ═══\n` +
           `⚠️ RESEARCH RULES: Only state facts you found via web search. Never invent statistics, records, or lineup information. You may draw inferences from confirmed data (e.g., "team has clinched so they may be conserving energy") but flag all inferences explicitly. If you cannot confirm something, say so — do not guess.\n\n` +
           `Search in this order:\n` +
@@ -2432,13 +2539,13 @@ async function checkLiveScoreEdges() {
             `- Leading team on second game of back-to-back → DOWN 2-4%\n` +
             `- 15-pt comebacks happen 13% in the 3-point era. 10-pt leads in Q3 are NOT safe. Only Q4 10-pt leads are reliable (86% WE).\n` +
             `⚠️ FOUL TROUBLE (Q3/Q4 only): If the leading team's best player has 4+ fouls, they will likely sit at the start of Q4 to avoid fouling out. That changes the entire game plan. Check a live box score in your search results if available — foul trouble on a star player → DOWN 4-6%.\n` +
-            `📍 Q4 TIME CONTEXT: The WE baseline uses full-quarter averages. With 3+ minutes left in Q4, trust the table. With under 90 seconds and a 10pt+ lead, the game is nearly sealed — your confidence can be 3-5% above the table number. With under 90 seconds and a 5pt lead, be careful — a quick foul sequence can still flip it.\n` +
+            `📍 Q4 TIME CONTEXT: The time-adjusted WE above already accounts for how much of Q4 remains — use it, not the raw period average. Under 90s with a 10pt+ lead: game is nearly sealed, +3% above adjusted is OK. Under 90s with a 5pt lead: still dangerous, a quick foul sequence can still flip it.\n` +
             `⚠️ SLUMP/RETURN WARNING: If you are tempted to call a team "in bad form," first confirm their key players were healthy during that stretch. A team returning stars from injury tonight has a RESET baseline — their recent results without those players do not predict tonight's performance.\n`
           : league === 'nhl' ?
             `+ 2-goal lead (any period): much more reliable than 1-goal. 2-goal P3 = 93% WE. Trust the math.\n` +
             `+ Elite goalie (SV% > .920) → UP 3-5%\n` +
             `- Leading goalie SV% .895-.910 → DOWN 4-6%\n` +
-            `- OT RISK (1-goal lead in P3, check the clock): 10-14 min remaining → OT probability ~20%, reduce confidence 2-3%. Under 10 min → OT probability ~25-30%, reduce 3-5%. Under 5 min → reduce 2-3% (teams lock down, go defensive). IMPORTANT: OT is NOT a coin flip — team OT win rates span 29% to 60%+. Search "[team] NHL OT record 2024-25" before finalizing confidence. Elite OT teams (Colorado, LA Kings ~60%+) justify less reduction; poor OT teams (Detroit ~29%) justify more. Under 2 min P3 with 1-goal lead, also search "[trailing team] shootout record 2024-25" — some teams are elite in shootouts (30%+ extra risk).\n` +
+            `- OT RISK (1-goal lead in P3): The time-adjusted WE above already reduces for early-P3 situations. For 1-goal leads ALSO consider: OT is NOT a coin flip — team OT win rates span 29% to 60%+. Search "[team] NHL OT record 2024-25" before finalizing confidence. Elite OT teams (60%+) justify less reduction; poor OT teams (29%) justify more. Under 2 min P3 with 1-goal lead, also search "[trailing team] shootout record 2024-25".\n` +
             `- Trailing team on power play right now → DOWN 8-12% until it's resolved\n`
           : `+ Strong home record for leading team → UP 2-3%\n` +
             `- DRAWS happen 24-30% of games. 1-goal lead means draw is still very possible. Draw = contract LOSES.\n` +
@@ -2457,7 +2564,9 @@ async function checkLiveScoreEdges() {
           `Put that thesis in your reasoning field as "STEEL-MAN: [their argument in one sentence]". Then answer: does your edge-reason beat their thesis, or is it just different?\n` +
           `If you cannot articulate a real counter-argument — if you catch yourself dismissing the market as "wrong" without naming what they see — pass. A pro bettor who can't steel-man the other side hasn't done the work.\n\n` +
           `═══ STEP 4 — DECISION ═══\n` +
-          (_weTargetPct != null ? `⚠️ CALIBRATION CHECK: The WE math says ${targetAbbr} wins ${_weTargetPct}% from here. Your final confidence must be within 8 points of this number. If it's not — name the single specific confirmed fact that justifies the deviation. "They're the better team" does not count. A team's record is already in the WE baseline — it does not justify deviation on its own.\n\n` : '') +
+          (_weTimeAdjPct != null
+            ? `⚠️ CALIBRATION CHECK: Time-adjusted WE = ${_weTimeAdjPct}% for ${targetAbbr}${_weTimeAdjPct !== _weTargetPct ? ` (period average was ${_weTargetPct}%, adjusted for ${_timeAdj.label})` : ''}. Your final confidence must be within 6 points of the TIME-ADJUSTED number — not the period average. If it's not, name the single specific confirmed fact that justifies the deviation. "They're the better team" does not count.\n\n`
+            : _weTargetPct != null ? `⚠️ CALIBRATION CHECK: WE = ${_weTargetPct}% for ${targetAbbr}. Your final confidence must be within 8 points of this number.\n\n` : '') +
           `BUY only if ALL three are true:\n` +
           `✓ Confidence ≥ 65%\n` +
           `✓ Confidence beats price by 3+ points for late-game strong leads (WE ≥ 80%, inning 7+ / P3 / Q4). 4+ points required for early game (Q1/P1/innings 1-5) or marginal leads under 80% WE.\n` +
