@@ -2502,12 +2502,12 @@ async function checkLiveScoreEdges() {
             : `The WE baseline is ${_weTargetPct != null ? _weTargetPct + '%' : 'computed'} for ${targetAbbr}.\n`) +
           `Market price is ${(price*100).toFixed(0)}¢. Edge = adjusted WE% − price%. If |edge| < 4 points → respond {"trade":false} immediately with reason "market efficient".\n\n` +
           `═══ STEP 1 — SEARCH FIRST, ANALYZE SECOND ═══\n` +
-          `⚠️ RESEARCH RULES: Only state facts you found via web search. Never invent statistics, records, or lineup information. You may draw inferences from confirmed data (e.g., "team has clinched so they may be conserving energy") but flag all inferences explicitly. If you cannot confirm something, say so — do not guess.\n\n` +
+          `⚠️ RESEARCH RULES: Only state facts you found via web search. Never invent statistics, records, or lineup information. You may draw inferences from confirmed data (e.g., "team has clinched so they may be conserving energy") but flag all inferences explicitly. IMPORTANT: "Cannot confirm" is NOT a Hard NO and is NOT a reason to pass. If a stat is unavailable, apply a bounded uncertainty penalty (max −3%) and continue your analysis. The only things that block a trade are the Hard NOs listed in Step 2 — uncertainty about a secondary stat is not one of them.\n\n` +
           `Search in this order:\n` +
           (league === 'mlb' ?
             `A) STARTER STATE: Search "${leadingAbbr} starting pitcher tonight pitch count" — is the starter still in? Above what pitch count? Who is warming?\n` +
-            `   The BULLPEN section above shows the team's authoritative relief ERA (season / L30D / L7D) from the MLB Stats API. Do NOT web-search for bullpen ERA — use the numbers above. ${leadingBullpenTier !== 'unknown' ? `Leading team tier = ${leadingBullpenTier}.` : 'Bullpen data unavailable for this team — treat as average.'}\n` +
-            (period >= 7 ? `B) CLOSER AVAILABILITY: Search "${leadingAbbr} closer usage last 3 days" — if the closer pitched back-to-back or 3-of-4, he may be unavailable tonight, which is a real edge the market often lags on.\n` : '') +
+            `   The BULLPEN section above shows the team's authoritative relief ERA (season / L30D / L7D) from the MLB Stats API. Do NOT web-search for bullpen ERA — use the numbers above. ${leadingBullpenTier !== 'unknown' ? `Leading team tier = ${leadingBullpenTier}.` : 'Bullpen data unavailable for this team — treat as average-tier (no penalty, no Hard NO).'}\n` +
+            (period >= 5 ? `B) CLOSER STATS: Search "${leadingAbbr} closer 2026 ERA saves" — get the specific closer's season ERA and save record. An elite closer (ERA < 2.0 in 2026) is a major risk-reducer and can override the team's broader bullpen tier. Also check "${leadingAbbr} closer usage last 3 days" — back-to-back appearances may mean he's unavailable, which is real market lag.\n` : '') +
             `C) LINEUP: Search "${leadingAbbr} lineup tonight" — are key bats resting?\n` +
             `D) STAKES: Search "${leadingAbbr} playoff standings 2026" — must-win, coasting, or eliminated?\n` +
             `E) H2H: Head-to-head record this season and last 2 seasons.\n\n`
@@ -2525,10 +2525,10 @@ async function checkLiveScoreEdges() {
           (isSoccer ? `❌ SOCCER LATE-DRAW HARD NO: Leading team's season draw rate > 35% AND lead = 1 goal AND minute ≥ 75 → NO. Draw-prone teams protecting a 1-0 late don't win — they draw, which loses a YES on the WIN contract.\n` : '') +
           (league === 'mlb' ?
             (leadingBullpenTier === 'poor' && diff <= 2 && period >= 5
-              ? `❌ MLB BULLPEN HARD NO: Leading team's bullpen is tier='poor' (ERA ≥ 5.0, L30D) and the lead is only ${diff} run${diff === 1 ? '' : 's'} in inning ${period}. A poor pen can't protect a thin lead — market often lags this 1-2 innings. Respond {"trade":false}.\n`
+              ? `❌ MLB BULLPEN HARD NO: Leading team's bullpen is tier='poor' (ERA ≥ 5.0, L30D) and the lead is only ${diff} run${diff === 1 ? '' : 's'} in inning ${period}. A poor team pen ERA can't reliably protect a thin lead — Respond {"trade":false}. CLOSER EXCEPTION: If in your Step B search you confirmed the specific closer has a 2026 ERA below 2.0 and is not fatigued (no back-to-back), downgrade this to a −5% adjustment instead of Hard NO. The closer's individual stats override the team bullpen average in late-game situations.\n`
               : '')
             + (leadingBullpenTier === 'below' && diff === 1 && period >= 7
-              ? `❌ MLB BULLPEN HARD NO: 1-run lead in the ${period}th with a below-average bullpen (ERA 4.5-5.0). Margin of safety too thin. Respond {"trade":false}.\n`
+              ? `❌ MLB BULLPEN HARD NO: 1-run lead in the ${period}th with a below-average bullpen (ERA 4.5-5.0). Margin of safety too thin — Respond {"trade":false}. CLOSER EXCEPTION: Confirmed elite closer (2026 ERA < 2.0, available) → treat as −3% adjustment, not Hard NO.\n`
               : '')
           : '') +
           `❌ You find yourself saying "modest," "marginal," "just clears the bar," or "only X points of edge" → NO\n\n` +
@@ -2542,9 +2542,11 @@ async function checkLiveScoreEdges() {
             `+ Dominant starter still pitching (ERA < 3.0, under 80 pitches) → UP 5-8%\n` +
             `+ Bullpen tier is 'elite' (ERA < 3.5) and lead is 1-3 runs → UP 3-5%\n` +
             `+ Bullpen tier is 'good' (3.5-4.0) → UP 1-2%\n` +
+            `+ Confirmed elite closer (ERA < 2.0, available) even if team pen tier is 'poor' or 'below' → UP 2-3% (closer ERA is what matters in the 9th, not the whole pen's average)\n` +
             `- Bullpen tier is 'below' (4.5-5.0) AND lead is 1-2 runs → DOWN 3-5%\n` +
             `- Bullpen tier is 'poor' (≥5.0) AND lead is 3+ runs → DOWN 2-3% (not a Hard NO at this lead size, but real risk)\n` +
             `- Starter at 80+ pitches — bullpen transition coming, weight by bullpen tier above → DOWN 3-5%\n` +
+            `⚠️ BULLPEN RULE: These are confidence ADJUSTMENTS, not vetoes. If no Hard NO fired in Step 2, a poor bullpen reduces your confidence number — it does NOT disqualify the trade. Repeatedly seeing a bad bullpen ERA and refusing to bet is wrong: the WE baseline already accounts for average bullpen performance, and the market has the same bullpen data you do. Your edge comes from mismatches between WE and market price, not from deciding the game is "too risky."\n` +
             `⚠️ INNING HALF: The "Status" line shows "Top" (away batting) or "Bot" (home batting). If the trailing team is batting RIGHT NOW, you're at maximum live risk — a single run ties it and the price will collapse before the next bot cycle (60s). Do not enter mid at-bat with runners on base unless edge is very large. If it says "Mid" or "End", the half-inning is over — the immediate scoring threat has passed.\n` +
             `- SITUATION ALERT: Check the "Situation" line above. Runners in scoring position (2nd or 3rd) with 0-1 outs for the TRAILING team → DOWN 6-10%. This is live — a single or sac fly ties or cuts the lead immediately.\n` +
             `- BATTING ORDER ALERT: The "At bat" line shows the current batter. Search "[batter name] batting order [team] 2025" to determine lineup position. Cleanup hitters (3-4-5) at the plate with runners on = HIGH danger. Leadoff/bottom-order hitters (1-2, 7-9) at the plate = lower threat. A #4 hitter with runners on is 2-3x more dangerous than a #8 hitter in the same situation.\n` +
