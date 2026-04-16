@@ -697,7 +697,7 @@ let haltReason = '';
 let lastHaltCheck = 0;
 
 function getBankroll() {
-  return kalshiBalance + kalshiPositionValue + polyBalance;
+  return kalshiBalance + kalshiPositionValue;
 }
 
 // [REMOVED: Fee-gating functions — replaced by confidence-based prediction engine]
@@ -5561,7 +5561,6 @@ async function main() {
     `Mode: ${KALSHI_ONLY ? 'Kalshi only' : 'Kalshi + Poly'} | ${DRY_RUN ? 'DRY RUN' : 'LIVE TRADING'}\n` +
     `Sonnet + web search | Live-edge: every 60s\n\n` +
     `💰 Kalshi: $${kalshiBalance.toFixed(2)} cash + $${kalshiPositionValue.toFixed(2)} positions\n` +
-    `💰 Polymarket: $${polyBalance.toFixed(2)}\n` +
     `💰 Total bankroll: <b>$${bankroll.toFixed(2)}</b>`
   );
 

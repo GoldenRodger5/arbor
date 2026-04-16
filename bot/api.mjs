@@ -197,7 +197,7 @@ function readLivePortfolio() {
           kalshiCash: parseFloat(m[1]),
           kalshiPositions: parseFloat(m[2]),
           polyBalance: parseFloat(m[3]),
-          bankroll: parseFloat(m[1]) + parseFloat(m[2]) + parseFloat(m[3]),
+          bankroll: parseFloat(m[1]) + parseFloat(m[2]),
           at: tsMatch ? tsMatch[1] + 'Z' : null,
         };
       }
