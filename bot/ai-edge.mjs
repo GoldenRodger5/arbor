@@ -4146,11 +4146,27 @@ async function checkPreGamePredictions() {
     }
 
     const pgReqMargin = getRequiredMargin(price, { sport: pgSportKey, live: false });
-    // Sport-specific minimum confidence (early-event probability, not win probability):
-    // MLB: 65% — early-scoring sub-event is more predictable than full-game outcome
-    // Soccer: 65% — first-goal probability; draws don't hurt us since we exit on the spike
-    // NBA/NHL: 70% — early-lead/first-goal baselines are already high, need real edge above them
-    const PRE_GAME_MIN_CONF = (pgSportKey === 'mlb' || pgSportKey === 'mls' || pgSportKey === 'epl' || pgSportKey === 'laliga') ? 0.65 : 0.70;
+    // Price-tiered minimum confidence — the required certainty scales with entry price.
+    // Buying a 70¢ favorite requires high confidence (market has priced it well, little margin for error).
+    // Buying a 47¢ underdog only needs 63% — the market is already pricing in the uncertainty,
+    // and a 14-point edge at that price has strong EV even without near-certainty.
+    //
+    // Tiers (NHL/NBA):
+    //   Under 50¢:  63% — underdog entries, market already discounted, edge is EV-positive
+    //   50–65¢:     70% — mid-range, standard floor
+    //   Above 65¢:  72% — expensive favorites, need strong conviction
+    //
+    // Tiers (MLB/Soccer):
+    //   Under 50¢:  65% — unchanged (MLB already allows 65% flat)
+    //   50–65¢:     67% — slight lift for mid-range
+    //   Above 65¢:  70% — expensive favorites
+    const isSoccer = pgSportKey === 'mls' || pgSportKey === 'epl' || pgSportKey === 'laliga';
+    const isNhlNba = pgSportKey === 'nhl' || pgSportKey === 'nba';
+    const PRE_GAME_MIN_CONF = isNhlNba
+      ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.70 : 0.72)
+      : (pgSportKey === 'mlb' || isSoccer)
+        ? (price < 0.50 ? 0.65 : price <= 0.65 ? 0.67 : 0.70)
+        : 0.65; // fallback for other sports
     if (confidence < PRE_GAME_MIN_CONF || (confidence - price) < pgReqMargin) {
       console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${((confidence-price)*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% min=${(PRE_GAME_MIN_CONF*100).toFixed(0)}% (${pgSportKey})`);
       continue;
