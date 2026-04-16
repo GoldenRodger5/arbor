@@ -1233,6 +1233,18 @@ async function refreshPortfolio() {
           if (Date.now() - placedAt < 15 * 60 * 1000) continue;
           // 2-strike rule: must be absent from Kalshi for 2+ consecutive sync cycles (~2 min)
           // before we close it. A single API miss (empty response, lag) won't kill a real position.
+          //
+          // MASS-DISAPPEARANCE GUARD: if ALL open Kalshi positions went missing simultaneously,
+          // treat it as a Kalshi API outage/glitch — not a manual cashout. This prevents a single
+          // bad API response from wiping all tracked positions. Only close individual positions when
+          // a subset disappears (implying user action), not the whole portfolio at once.
+          const openKalshiCount = trades.filter(t2 => t2.status === 'open' && t2.exchange === 'kalshi').length;
+          const missingCount = trades.filter(t2 => t2.status === 'open' && t2.exchange === 'kalshi' && !([...kalshiTickers].some(kt => t2.ticker === kt || t2.ticker.startsWith(kt + '-') || kt.startsWith(t2.ticker + '-')))).length;
+          if (missingCount >= openKalshiCount && openKalshiCount >= 2) {
+            // All positions vanished — almost certainly a Kalshi API blip, not mass manual cashout
+            console.log(`[sync] ALL ${openKalshiCount} Kalshi positions absent simultaneously — likely API glitch, NOT marking cashout`);
+            break; // skip cashout logic for this sync cycle
+          }
           const firstMissing = missingFromKalshi.get(t.id);
           if (!firstMissing) {
             missingFromKalshi.set(t.id, Date.now());
@@ -2171,8 +2183,7 @@ async function checkLiveScoreEdges() {
         const etHourLE = etNowLE.getHours();
         const etTmrwLE = new Date(etNowLE.getTime() + 24 * 60 * 60 * 1000);
         const tonightStr = etHourLE >= 22 ? toShortLE(etTmrwLE) : null;
-        // Early morning (midnight–4am ET): also accept yesterday's date — late-night games
-        // started yesterday ET still have APR15-style tickers even though it's now APR16 ET.
+        // Early morning (midnight-4am ET): also accept yesterday date for late-night games still live
         const etYestLE = new Date(etNowLE.getTime() - 24 * 60 * 60 * 1000);
         const yesterdayStr = etHourLE < 4 ? toShortLE(etYestLE) : null;
 
@@ -2203,9 +2214,7 @@ async function checkLiveScoreEdges() {
         };
         const isToday = (ticker) => {
           if (!tickerHasStarted(ticker)) return false; // reject future markets regardless of date
-          return ticker.includes(todayStr) ||
-            (tonightStr && ticker.includes(tonightStr) && tonightStarted(ticker)) ||
-            (yesterdayStr && ticker.includes(yesterdayStr)); // midnight–4am ET: yesterday's games still live
+          return ticker.includes(todayStr) || (tonightStr && ticker.includes(tonightStr) && tonightStarted(ticker)) || (yesterdayStr && ticker.includes(yesterdayStr));
         };
         const gameMarkets = [...cachedPrices.entries()]
           .filter(([ticker, data]) => {
@@ -2287,7 +2296,10 @@ async function checkLiveScoreEdges() {
           }
         }
 
-        if (!targetMarket) continue;
+        if (!targetMarket) {
+          console.log("[live-edge] No viable market for " + awayAbbr + "@" + homeAbbr + ": lead market at/above price ceiling");
+          continue;
+        }
         const title = targetMarket.title ?? '';
 
         console.log(`[live-edge] Found market: ${targetMarket.ticker} "${title}" ${targetAbbr} YES=$${price.toFixed(2)}`);
@@ -2778,6 +2790,7 @@ async function checkLiveScoreEdges() {
           prompt: livePrompt, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period,
           leadingAbbr, gameDetail, price, ticker, gameBase, title, targetAbbr, targetTeam,
           targetIsHome: targetAbbr === homeAbbr, leading, hasPosition,
+          currentScoreKey,
           _lineMove, _scoreChanged,
         });
 
@@ -2805,7 +2818,7 @@ async function checkLiveScoreEdges() {
 
       // Destructure back the context we need
       const { league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, leadingAbbr,
-              gameDetail, price, ticker, gameBase, title, targetAbbr, hasPosition } = item;
+              gameDetail, price, ticker, gameBase, title, targetAbbr, hasPosition, currentScoreKey } = item;
 
       try {
         const jsonMatch = extractJSON(cText);
@@ -4793,10 +4806,34 @@ async function checkSettlements() {
         const mktData = await kalshiGet(`/markets/${trade.ticker}`);
         const market = mktData?.market ?? mktData;
         if (market?.result) {
+          // Try to get actual fills for accurate P&L including fees and early sells
+          let revenue = null;
+          try {
+            const fillsData = await kalshiGet(`/portfolio/fills?ticker=${trade.ticker}&limit=50`);
+            const fills = fillsData?.fills ?? [];
+            if (fills.length > 0) {
+              let totalSellProceeds = 0;
+              let totalBuyCost = 0;
+              for (const fill of fills) {
+                const count = parseFloat(fill.count_fp ?? 0);
+                const fee = parseFloat(fill.fee_cost ?? 0);
+                if (fill.action === "sell") {
+                  const price = parseFloat(fill.yes_price_dollars ?? 0);
+                  totalSellProceeds += count * price - fee;
+                } else if (fill.action === "buy") {
+                  const price = parseFloat(fill.yes_price_dollars ?? 0);
+                  totalBuyCost += count * price + fee;
+                }
+              }
+              if (totalSellProceeds > 0 || totalBuyCost > 0) {
+                revenue = Math.round((totalSellProceeds - totalBuyCost) * 100) / 100;
+              }
+            }
+          } catch { /* fills not available — fall back to quantity calc */ }
           settlements.push({
             ticker: trade.ticker,
             market_result: market.result,
-            revenue: null, // not available from market endpoint — calculate from result + qty
+            revenue,
             settled_time: market.close_time ?? null,
           });
         }
@@ -4813,10 +4850,19 @@ async function checkSettlements() {
 
     for (const trade of trades) {
       if ((trade.status !== 'open' && trade.status !== 'closed-manual') || trade.exchange !== 'kalshi') continue;
-      if (trade.realizedPnL != null) continue; // already settled, don't overwrite
+      if (trade.realizedPnL != null) continue;
       const settlement = settlementMap.get(trade.ticker);
       if (!settlement || !settlement.market_result) continue;
 
+      // Skip phantom trades that were placed but never filled (e.g. pre-game resting limit orders)
+      if ((trade.filled ?? 1) === 0) {
+        trade.status = "testing-void";
+        trade.realizedPnL = 0;
+        trade.settledAt = new Date().toISOString();
+        updated = true;
+        console.log("[pnl] VOID (never filled): " + trade.ticker + " — market settled but we never bought");
+        continue;
+      }
       // P&L from Kalshi's revenue field (actual payout in cents → dollars)
       // revenue = total payout received. cost = deployCost. pnl = revenue - cost.
       // Fallback: calculate from market_result and qty if revenue is missing.
