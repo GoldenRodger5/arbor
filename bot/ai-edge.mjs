@@ -1877,13 +1877,16 @@ async function checkLiveScoreEdges() {
               const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / entryPg);
 
               // Dynamic sell target by stage + WE:
+              // Large gain (≥30¢ profit/contract)  → sell ALL — lock the windfall, don't give it back
               // Early game (WE 65%+, 10¢+ gain) → sell 33% — lock a slice, keep upside
               // Mid game  (WE 72%+, 15¢+ gain) → sell 50% — meaningful profit secured
               // Late game (WE 80%+, 20¢+ gain) → sell 75% — near certainty, take it
               // Late game (WE 88%+, any gain)  → sell all  — game is essentially over
               let sellFraction = 0;
               let sellReason = '';
-              if (stage === 'late' && weWinning >= 0.88) {
+              if (gainCents >= 0.30) {
+                sellFraction = 1.0; sellReason = `pg-profit-large-gain (+${Math.round(gainCents*100)}¢ — locking windfall)`;
+              } else if (stage === 'late' && weWinning >= 0.88) {
                 sellFraction = 1.0; sellReason = `pg-profit-late-dominant (WE=${Math.round(weWinning*100)}%)`;
               } else if (stage === 'late' && weWinning >= 0.80 && gainCents >= 0.20) {
                 sellFraction = 0.75; sellReason = `pg-profit-late-strong (WE=${Math.round(weWinning*100)}% +${Math.round(gainCents*100)}¢)`;
@@ -1928,12 +1931,21 @@ async function checkLiveScoreEdges() {
                     console.log(`[pg-profit] ${remaining} contracts remain — riding to ${stage === 'early' ? 'mid-game' : 'settlement'}`);
                   }
                 }
-              } else if (sellFraction > 0 && trade.partialTakeAt) {
+              } else if (sellFraction > 0 && trade.partialTakeAt && !trade.pgFinalSellAt) {
                 // Already took profit once — only sell remaining on dominant late WE
                 if (stage === 'late' && weWinning >= 0.88) {
                   const remaining = qty - Math.floor(qty * (trade._pgFirstSellFraction ?? 0.5));
                   if (remaining >= 1) {
                     tradeCooldowns.set(pgWinKey, Date.now());
+                    // Persist pgFinalSellAt immediately so next cycle doesn't double-sell
+                    trade.pgFinalSellAt = new Date().toISOString();
+                    const freshPgLines2 = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+                    const freshPgTrades2 = freshPgLines2.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+                    const freshPgTrade2 = freshPgTrades2.find(t => t.id === trade.id);
+                    if (freshPgTrade2) {
+                      freshPgTrade2.pgFinalSellAt = trade.pgFinalSellAt;
+                      writeFileSync(TRADES_LOG, freshPgTrades2.map(t => JSON.stringify(t)).join('\n') + '\n');
+                    }
                     console.log(`[pg-profit] ${trade.ticker} FINAL SELL ${remaining} remaining @ ${Math.round(currentPricePg*100)}¢ | game essentially over`);
                     await executeSell(trade, remaining, currentPricePg, 'pg-profit-final');
                   }
@@ -5187,6 +5199,21 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
     trade.deployCost = Math.round(remainQty * entryPrice * 100) / 100;
     // Log the partial profit separately
     trade.partialProfitTaken = (trade.partialProfitTaken ?? 0) + Math.round(profit * 100) / 100;
+    // Persist updated quantity to JSONL so the next cycle sees the correct count
+    // (prevents the "Sold 13/49" display bug where stale totalQty is re-used)
+    if (existsSync(TRADES_LOG)) {
+      try {
+        const pLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+        const pTrades = pLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        const pTrade = pTrades.find(t => t.id === trade.id);
+        if (pTrade) {
+          pTrade.quantity = remainQty;
+          pTrade.deployCost = trade.deployCost;
+          pTrade.partialProfitTaken = trade.partialProfitTaken;
+          writeFileSync(TRADES_LOG, pTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
+        }
+      } catch (e) { console.error(`[exit] Failed to persist partial qty for ${trade.ticker}:`, e.message); }
+    }
   }
 
   const profitStr = profit >= 0 ? `+$${profit.toFixed(2)}` : `-$${Math.abs(profit).toFixed(2)}`;
