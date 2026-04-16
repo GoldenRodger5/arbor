@@ -2249,7 +2249,7 @@ async function checkLiveScoreEdges() {
 
   // === PHASE 3: Analyze candidates in priority order — best opportunity first ===
   let sonnetCallsThisCycle = 0;
-  const MAX_SONNET_PER_CYCLE = 6; // Increased from 3 — more games analyzed = more edge found
+  const MAX_SONNET_PER_CYCLE = 8; // Up from 6 — covers peak playoff hours with 8+ live games
 
   // Collect Sonnet work items for parallel execution
   const sonnetQueue = [];
@@ -3619,7 +3619,7 @@ async function checkLiveScoreEdges() {
 
 // lastPreGameScan declared at top (before loadState) to avoid TDZ
 const PREGAME_SCAN_INTERVAL = 15 * 60 * 1000; // every 15 min
-const MAX_PREGAME_PER_CYCLE = 4;   // Paper mode: more coverage per scan
+const MAX_PREGAME_PER_CYCLE = 8;   // Analyze up to 8 markets per scan cycle
 const MAX_PREGAME_PAPER_PER_DAY = 999; // Paper mode: no real cap — log every qualifying pick for calibration
 let preGameTradesToday = 0;
 let preGameTradesDate = '';         // reset counter on new day
