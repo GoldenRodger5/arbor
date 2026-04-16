@@ -137,14 +137,34 @@ const MAX_PRICE = 0.75;           // Default ceiling — use getMaxPrice(league,
 // Sport-specific price ceiling based on variance research:
 // MLB: 78¢ — raised from 75¢ to capture mid-game situations (inning 7-8) where real edge exists
 // NHL P3: 82¢ — 2-goal leads with <10min left are genuinely 93%+ WE, market at 80¢ has real edge
-// NHL P1/P2: 75¢ — still 40+ min of hockey left, comebacks very possible
+// NHL P1/P2: tiered by goal differential (a 2-goal P2 lead is 82-85% WE, very different from 1-goal 68%)
+//   1-goal:   75¢ — blocked by low-WE floor anyway, keep defensive
+//   2-goal:   78¢ — 82-85% WE, real edge exists at 76-78¢ prices for elite teams
+//   3+ goal:  82¢ — 90%+ WE even mid-game, only overwhelming comebacks flip these
 // NBA Q4: 80¢ — 15-pt comeback in Q4 happens only 8%, 20-pt is <2%
-// NBA Q1-Q3: 75¢ — modern NBA 3-pt era, big swings happen fast
+// NBA Q1-Q3: tiered by point differential
+//   1-9 pt:   75¢ — swingy modern NBA, keep the blanket cap
+//   10-14 pt: 78¢ — comeback rate 13%, real edge at 75-78¢ for dominant teams
+//   15+ pt:   82¢ — 15pt+ comebacks are ~4%, tables say 90%+ WE
 // Soccer: 75¢ always — draws kill contracts, never overpay for a lead
-function getMaxPrice(league, period) {
+// diff (optional) = score differential in the sport's native units (runs/goals/pts).
+// When omitted, falls back to the conservative (1-point) value.
+function getMaxPrice(league, period, diff = 1) {
   if (league === 'mlb') return 0.78;
-  if (league === 'nhl') return period >= 3 ? 0.82 : 0.75;
-  if (league === 'nba') return period >= 4 ? 0.80 : 0.75;
+  if (league === 'nhl') {
+    if (period >= 3) return 0.82;
+    // P1/P2
+    if (diff >= 3) return 0.82;
+    if (diff >= 2) return 0.78;
+    return 0.75;
+  }
+  if (league === 'nba') {
+    if (period >= 4) return 0.80;
+    // Q1/Q2/Q3
+    if (diff >= 15) return 0.82;
+    if (diff >= 10) return 0.78;
+    return 0.75;
+  }
   if (['mls', 'epl', 'laliga'].includes(league)) return 0.75;
   return MAX_PRICE;
 }
@@ -2445,8 +2465,10 @@ async function checkLiveScoreEdges() {
           continue; // within cooldown and no existing position to scale into
         }
 
-        // Price filter — sport-specific ceiling (NHL P3 allows 82¢, MLB always caps at 75¢)
-        const sportMaxPrice = getMaxPrice(league, period);
+        // Price filter — sport-specific ceiling, tiered by score differential where relevant.
+        // NHL P1/P2: 75¢ default, 78¢ for 2-goal, 82¢ for 3+ goal.
+        // NBA Q1-Q3: 75¢ default, 78¢ for 10-14pt, 82¢ for 15pt+.
+        const sportMaxPrice = getMaxPrice(league, period, diff);
         if (price <= 0.05) {
           console.log(`[live-edge] Skipping: ${leadingAbbr} @${(price*100).toFixed(0)}¢ (lottery ticket)`);
           continue;
