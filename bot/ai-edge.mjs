@@ -4813,17 +4813,28 @@ async function managePositions() {
           continue;
         }
 
-        // PRE-GAME PROFIT-LOCK — sell 50% when up ≥15¢ from entry, any stage.
-        // Pre-game bets were placed on full-game thesis before any live info existed.
-        // Once the price has risen 15¢+ (23%+ ROI at a 65¢ entry), we've captured
-        // the edge we identified. Selling half locks the gain; holding half still
-        // participates if the game goes our way. No bankroll gate — this is smart at any size.
-        if (trade.strategy === 'pre-game-prediction' && profitPerContract >= 0.15 && !trade.partialTakeAt) {
-          const sellQty = Math.max(1, Math.floor(qty * 0.50));
-          if (qty - sellQty >= 1) {
+        // PRE-GAME PROFIT-LOCK — sport-specific exit % when up ≥12¢ from entry.
+        // Strategy is sell-into-lead: we exit when the price spike from the early event occurs.
+        // Soccer/NHL: the spike is temporary — sell most/all immediately.
+        // MLB/NBA: the game has more time; hold a portion to participate in further upside.
+        //
+        // Exit % by sport:
+        //   Soccer (MLS/EPL/La Liga): 90% — first-goal spike is brief; game can draw and price drifts back
+        //   NHL: 75% — first-goal is strong signal; hold 25% in case team keeps scoring
+        //   MLB: 50% — early lead; 6 innings left, worth holding half
+        //   NBA: 50% — first-half lead; second half is the real game
+        if (trade.strategy === 'pre-game-prediction' && profitPerContract >= 0.12 && !trade.partialTakeAt) {
+          const sportKey = (trade.sport ?? '').toLowerCase();
+          const isSoccer = sportKey === 'mls' || sportKey === 'epl' || sportKey === 'laliga';
+          const isNHL = sportKey === 'nhl';
+          const exitFraction = isSoccer ? 0.90 : isNHL ? 0.75 : 0.50;
+          const sellQty = Math.max(1, Math.floor(qty * exitFraction));
+          const remaining = qty - sellQty;
+          if (sellQty >= 1) {
             const gainPct = Math.round((profitPerContract / entryPrice) * 100);
-            console.log(`[exit] 💰 PRE-GAME PROFIT-LOCK (${stage}): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% (${(entryPrice*100).toFixed(0)}¢ → ${(currentPrice*100).toFixed(0)}¢) → selling ${sellQty}/${qty} at ${(currentPrice*100).toFixed(0)}¢, locking ~$${(sellQty * profitPerContract).toFixed(2)}`);
-            await tg(`💰 Pre-game profit-lock: ${trade.title?.slice(0,50)} up ${(profitPerContract*100).toFixed(0)}¢ (+${gainPct}%) — selling 50% at ${(currentPrice*100).toFixed(0)}¢`);
+            const sportLabel = isSoccer ? 'first-goal spike' : isNHL ? 'first-goal' : 'early lead';
+            console.log(`[exit] 💰 PRE-GAME PROFIT-LOCK (${sportKey} ${sportLabel}): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% → selling ${sellQty}/${qty} (${Math.round(exitFraction*100)}%) at ${(currentPrice*100).toFixed(0)}¢, locking ~$${(sellQty * profitPerContract).toFixed(2)}`);
+            await tg(`💰 Pre-game profit-lock (${sportLabel}): ${trade.title?.slice(0,50)} up ${(profitPerContract*100).toFixed(0)}¢ (+${gainPct}%) — selling ${Math.round(exitFraction*100)}% at ${(currentPrice*100).toFixed(0)}¢${remaining > 0 ? `, holding ${remaining}` : ''}`);
             const result = await executeSell(trade, sellQty, currentPrice, 'pre-game-profit-lock');
             if (result) {
               trade.partialTakeAt = new Date().toISOString();
@@ -5708,6 +5719,62 @@ async function main() {
     setTimeout(settlementLoop, 5 * 60 * 1000);
   }
   setTimeout(settlementLoop, 2 * 60 * 1000); // first run after 2 min
+
+  // Fast soccer exit loop — every 30 seconds.
+  // Soccer first-goal price spikes are brief: the market reprices immediately on a goal
+  // then drifts back as draw risk reasserts. The standard 5-min managePositions cycle is
+  // too slow — we need to catch and sell the spike within 30 seconds of it occurring.
+  // Only runs when there are open pre-game soccer positions to avoid unnecessary API calls.
+  async function soccerExitLoop() {
+    try {
+      if (!existsSync(TRADES_LOG)) { setTimeout(soccerExitLoop, 30 * 1000); return; }
+      const sLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      const soccerOpen = sLines
+        .map(l => { try { return JSON.parse(l); } catch { return null; } })
+        .filter(t => t && t.status === 'open' && t.exchange === 'kalshi' &&
+          t.strategy === 'pre-game-prediction' &&
+          ['mls', 'epl', 'laliga'].includes((t.sport ?? '').toLowerCase()));
+
+      if (soccerOpen.length > 0) {
+        for (const trade of soccerOpen) {
+          try {
+            if (trade.partialTakeAt) continue; // already took profit
+            const mktData = await kalshiGet(`/markets/${trade.ticker}`);
+            const m = mktData.market ?? mktData;
+            const currentPrice = parseFloat(m.yes_ask_dollars ?? '0');
+            if (currentPrice <= 0) continue;
+            const entryPrice = trade.entryPrice ?? 0;
+            const profitPerContract = currentPrice - entryPrice;
+            if (profitPerContract < 0.12) continue; // no spike yet
+
+            const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / entryPrice);
+            if (qty <= 0) continue;
+
+            // Soccer: sell 90% on first-goal spike. Same exit fraction as managePositions
+            // but fires 10x faster — catches the spike before it drifts back.
+            const sellQty = Math.max(1, Math.floor(qty * 0.90));
+            const gainCents = Math.round(profitPerContract * 100);
+            console.log(`[soccer-exit] ⚡ FAST SPIKE EXIT: ${trade.ticker} up ${gainCents}¢ — selling ${sellQty}/${qty} @ ${Math.round(currentPrice*100)}¢ (first-goal spike)`);
+            await tg(`⚡ Soccer first-goal spike: ${trade.title?.slice(0, 50)} +${gainCents}¢ — selling 90% at ${Math.round(currentPrice*100)}¢`);
+
+            // Re-read fresh to avoid stale state
+            const freshLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+            const freshTrades = freshLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            const freshTrade = freshTrades.find(t => t.id === trade.id);
+            if (freshTrade && freshTrade.status === 'open' && !freshTrade.partialTakeAt) {
+              const result = await executeSell(freshTrade, sellQty, currentPrice, 'pre-game-profit-lock');
+              if (result) {
+                freshTrade.partialTakeAt = new Date().toISOString();
+                writeFileSync(TRADES_LOG, freshTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
+              }
+            }
+          } catch { /* skip individual trade errors */ }
+        }
+      }
+    } catch (e) { console.error('[soccer-exit] error:', e.message); }
+    setTimeout(soccerExitLoop, 30 * 1000);
+  }
+  setTimeout(soccerExitLoop, 30 * 1000); // starts 30s after bot init
 
   // Calibration engine — runs once per day at 6am ET (after overnight settlements)
   let lastCalibration = '';
