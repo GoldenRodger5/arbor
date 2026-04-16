@@ -1889,7 +1889,7 @@ async function checkLiveScoreEdges() {
                     writeFileSync(TRADES_LOG, freshPgTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
                   }
                   console.log(`[pg-profit] ${trade.ticker} SELLING ${sellQty}/${qty} contracts @ ${Math.round(currentPricePg*100)}¢ | ${sellReason} | gain=$${(gainCents*sellQty).toFixed(2)}`);
-                  await sendTelegram(`📈 <b>Pre-game profit take</b>\n${trade.title ?? trade.ticker}\n${sellReason}\nSelling ${sellQty}/${qty} @ ${Math.round(currentPricePg*100)}¢ | +$${(gainCents*sellQty).toFixed(2)}`);
+                  await tg(`📈 <b>Pre-game profit take</b>\n${trade.title ?? trade.ticker}\n${sellReason}\nSelling ${sellQty}/${qty} @ ${Math.round(currentPricePg*100)}¢ | +$${(gainCents*sellQty).toFixed(2)}`);
                   await executeSell(trade, sellQty, currentPricePg, sellReason);
                   if (remaining >= 1) {
                     console.log(`[pg-profit] ${remaining} contracts remain — riding to ${stage === 'early' ? 'mid-game' : 'settlement'}`);
@@ -3853,7 +3853,7 @@ async function checkPreGamePredictions() {
               wouldQty: pgFill, reasoning: decision.reasoning, exitScenario: decision.exitScenario ?? null,
               pgBaseline: pgTargetBaseline,
             });
-            await sendTelegram(`🎯 <b>Pre-game BET placed</b>\n${market.title}\n${matchedSide.team} YES @${pgPriceInCents}¢ × ${pgFill}\nConf=${Math.round(confidence*100)}% | Edge=+${Math.round(edge*100)}pts | $${pgDeployed.toFixed(2)}`);
+            await tg(`🎯 <b>Pre-game BET placed</b>\n${market.title}\n${matchedSide.team} YES @${pgPriceInCents}¢ × ${pgFill}\nConf=${Math.round(confidence*100)}% | Edge=+${Math.round(edge*100)}pts | $${pgDeployed.toFixed(2)}`);
             console.log(`[pre-game] ✅ Filled ${pgFill}/${betQty} @ ${pgPriceInCents}¢ deployed=$${pgDeployed.toFixed(2)}`);
           }
         } else {
