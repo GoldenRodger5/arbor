@@ -2609,8 +2609,13 @@ async function checkLiveScoreEdges() {
           return false;
         });
 
-        // Also check JSONL for ANY trade today on this game (any team, any status except testing-void)
-        // This catches: closed-manual positions, pre-game bets on the OTHER team, etc.
+        // Also check JSONL for ANY trade today on this game — ANY status (open, closed-manual,
+        // settled, sold-*). This prevents the critical bug where a pre-game bet on Team A
+        // (later marked closed-manual) was invisible to the live-edge check, allowing the
+        // bot to bet Team B on the SAME game. Never bet both sides of a game.
+        //
+        // The old code had `if (jt.status !== 'open') continue;` which skipped closed-manual
+        // trades. That's what let the ORL pre-game + PHI live double-entry happen.
         if (!hasPosition && existsSync(TRADES_LOG)) {
           try {
             const dupStartMs = new Date(etNow().toISOString().slice(0,10) + 'T04:00:00Z').getTime();
@@ -2619,14 +2624,10 @@ async function checkLiveScoreEdges() {
             for (const l of jLines) {
               try {
                 const jt = JSON.parse(l);
-                // Only block re-entry if the trade is still OPEN — not if cashed out or settled
-                // If a position was closed/settled/sold, allow re-betting the same game
-                if (jt.status !== 'open') continue;
                 if (jt.status === 'testing-void') continue;
                 const jtMs = jt.timestamp ? Date.parse(jt.timestamp) : 0;
                 if (jtMs < dupStartMs || jtMs >= dupEndMs) continue;
                 const jticker = (jt.ticker ?? '').toLowerCase();
-                // Check if this trade is for the same game (either team)
                 if (tickerHasTeam(jticker, homeAbbr) && tickerHasTeam(jticker, awayAbbr)) {
                   hasPosition = true;
                   break;
@@ -2926,17 +2927,15 @@ async function checkLiveScoreEdges() {
 
         const hcLabel = hcCheck.isHighConv ? '🔥 HIGH CONVICTION ' : '';
         const platformLabel = best.platform === 'polymarket' ? `POLY (${(price*100).toFixed(0)}¢ Kalshi → ${priceInCents}¢ Poly, saved ${((price-bestPrice)*100).toFixed(0)}¢)` : 'KALSHI';
-        console.log(`[live-edge] 🎯 ${hcLabel}TRADE on ${platformLabel}: ${ticker} ${targetAbbr} YES @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}%`);
-        console.log(`  Score: ${awayAbbr} ${awayScore} @ ${homeAbbr} ${homeScore} (${gameDetail})`);
-        console.log(`  Reason: ${decision.reasoning}`);
-        logScreen({ stage: 'live-edge', ticker, result: 'TRADE', confidence, price: bestPrice, platform: best.platform, reasoning: decision.reasoning, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, gameDetail, targetAbbr });
 
+        // Set cooldowns BEFORE order so a restart mid-execution doesn't lose them
         tradeCooldowns.set(ticker, Date.now());
         tradeCooldowns.set(gameBase, Date.now());
         const matchupKeyCooldown = `game:${homeAbbr}@${awayAbbr}`;
         tradeCooldowns.set(matchupKeyCooldown, Date.now());
         tradeCooldowns.set(`game:${awayAbbr}@${homeAbbr}`, Date.now());
 
+        // Execute the order
         let result, deployed;
         if (best.platform === 'polymarket' && best.slug) {
           result = await polymarketPost(best.slug, best.intent, bestPrice + 0.02, qty);
@@ -2957,6 +2956,13 @@ async function checkLiveScoreEdges() {
           }
           const actualDeployed = actualFill * bestPrice;
           stats.tradesPlaced++;
+
+          // Log TRADE only AFTER confirmed fill — prevents phantom trades in the
+          // live scouting display when orders fail (503, no liquidity, etc.)
+          console.log(`[live-edge] 🎯 ${hcLabel}TRADE on ${platformLabel}: ${ticker} ${targetAbbr} YES @${priceInCents}¢ × ${actualFill} conf=${(confidence*100).toFixed(0)}%`);
+          console.log(`  Score: ${awayAbbr} ${awayScore} @ ${homeAbbr} ${homeScore} (${gameDetail})`);
+          console.log(`  Reason: ${decision.reasoning}`);
+          logScreen({ stage: 'live-edge', ticker, result: 'TRADE', confidence, price: bestPrice, platform: best.platform, reasoning: decision.reasoning, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, gameDetail, targetAbbr });
           recordGameEntry(gameBase, bestPrice, actualDeployed, currentScoreKey); // use ticker base as canonical key, store score for scale-in gate
 
           logTrade({
