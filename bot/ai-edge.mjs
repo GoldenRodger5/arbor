@@ -1785,12 +1785,22 @@ async function checkLiveScoreEdges() {
     }
   }
 
-  // Update active-live-games set so pre-game scanner skips in-progress matchups
+  // Update active-live-games set so pre-game scanner skips in-progress matchups.
+  // IMPORTANT: must be built from ALL in-progress ESPN games — including tied games that
+  // live-edge skips for betting (diff===0 above). A tied game is still LIVE and the
+  // pre-game scanner must not place a "pre-game" bet on it.
   activeLiveGames.clear();
-  for (const g of liveGames) {
-    const ha = (g.home.team?.abbreviation ?? '').toUpperCase();
-    const aa = (g.away.team?.abbreviation ?? '').toUpperCase();
-    if (ha && aa) activeLiveGames.add([ha, aa].sort().join('|'));
+  for (const result of espnResults) {
+    if (result.status !== 'fulfilled' || !result.value?.data) continue;
+    for (const ev of result.value.data.events ?? []) {
+      const comp = ev.competitions?.[0];
+      if (!comp || comp.status?.type?.state !== 'in') continue;
+      const home = comp.competitors?.find(c => c.homeAway === 'home');
+      const away = comp.competitors?.find(c => c.homeAway === 'away');
+      const ha = (home?.team?.abbreviation ?? '').toUpperCase();
+      const aa = (away?.team?.abbreviation ?? '').toUpperCase();
+      if (ha && aa) activeLiveGames.add([ha, aa].sort().join('|'));
+    }
   }
 
   // === PRE-GAME POSITION GUARDIAN ===
@@ -3891,7 +3901,7 @@ async function checkPreGamePredictions() {
               wouldQty: pgFill, reasoning: decision.reasoning, exitScenario: decision.exitScenario ?? null,
               pgBaseline: pgTargetBaseline,
             });
-            await tg(`🎯 <b>Pre-game BET placed</b>\n${market.title}\n${matchedSide.team} YES @${pgPriceInCents}¢ × ${pgFill}\nConf=${Math.round(confidence*100)}% | Edge=+${Math.round(edge*100)}pts | $${pgDeployed.toFixed(2)}`);
+            await tg(`🎯 <b>Pre-game BET placed</b>\n${market.title}\nTeam: ${matchedSide.team} YES @${pgPriceInCents}¢ × ${pgFill}\nConf=${Math.round(confidence*100)}% | Edge=+${Math.round(edge*100)}pts | $${pgDeployed.toFixed(2)}\n\n${decision.reasoning ? decision.reasoning.slice(0, 400) : 'No reasoning'}`);
             console.log(`[pre-game] ✅ Filled ${pgFill}/${betQty} @ ${pgPriceInCents}¢ deployed=$${pgDeployed.toFixed(2)}`);
           }
         } else {
