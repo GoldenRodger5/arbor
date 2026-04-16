@@ -1838,22 +1838,7 @@ async function checkLiveScoreEdges() {
         const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / entryPrice);
         const pctChange = (currentPrice - entryPrice) / entryPrice;
 
-        // Stage-aware threshold — early games have high variance, don't panic-sell on normal scoring.
-        // A 1-run deficit in inning 2 moves price ~-10% but changes win prob minimally.
-        // We want Claude's opinion only when the deficit is substantial for the game state.
-        //   early (MLB inn 1-4 / NHL P1 / NBA Q1): require -25% before calling Claude
-        //   mid   (MLB inn 5-7 / NHL P2 / NBA Q2-Q3): require -15%
-        //   late  (MLB inn 8+ / NHL P3 / NBA Q4): require -10% (game nearly over, every point matters)
-        const PG_CLAUDE_THRESHOLD = stage === 'early' ? -0.25 : stage === 'mid' ? -0.15 : -0.10;
-        if (pctChange >= PG_CLAUDE_THRESHOLD) {
-          // Down but not enough to evaluate yet — just log
-          if (pctChange < 0) {
-            console.log(`[pg-guard] ${ticker} our team trailing ${ourScore}-${theirScore} (${game.detail}) | stage=${stage} threshold=${Math.round(PG_CLAUDE_THRESHOLD*100)}% | price ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%), watching...`);
-          }
-          continue;
-        }
-
-        // Determine sport + game context
+        // Determine sport + game context FIRST — needed for stage-aware thresholds below
         const league = game.league;
         const sport = league === 'nhl' ? 'NHL' : league === 'nba' ? 'NBA' : league === 'mlb' ? 'MLB' :
           ['mls', 'epl', 'laliga'].includes(league) ? 'Soccer' : 'Sport';
@@ -1865,6 +1850,29 @@ async function checkLiveScoreEdges() {
         const we = getWinExpectancy(league, deficit, game.period, !isOurTeamHome) ?? 0;
         const ourWE = 1 - we; // we're the trailing team
 
+        // Stage-aware price threshold — early games have high variance, don't panic-sell on normal scoring.
+        //   early (MLB inn 1-4 / NHL P1 / NBA Q1): require -25% before calling Claude
+        //   mid   (MLB inn 5-7 / NHL P2 / NBA Q2-Q3): require -15%
+        //   late  (MLB inn 8+ / NHL P3 / NBA Q4): require -10%
+        const PG_CLAUDE_THRESHOLD = stage === 'early' ? -0.25 : stage === 'mid' ? -0.15 : -0.10;
+
+        // WE-based trigger — also fire when game situation has deteriorated significantly
+        // even if price hasn't moved enough. Markets can lag WE shifts by 1-2 cycles.
+        //   Mid game + WE ≤ 45%: pre-game thesis at 65% conf → 20pt WE drop is meaningful
+        //   Late game + WE ≤ 50%: trailing at all in late game = urgent
+        const weTrigger = (stage === 'late' && ourWE <= 0.50) || (stage === 'mid' && ourWE <= 0.45);
+
+        if (pctChange >= PG_CLAUDE_THRESHOLD && !weTrigger) {
+          if (pctChange < 0) {
+            console.log(`[pg-guard] ${ticker} trailing ${ourScore}-${theirScore} (${game.detail}) | ${stage} threshold=${Math.round(PG_CLAUDE_THRESHOLD*100)}% WE=${(ourWE*100).toFixed(0)}% | price ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%), watching...`);
+          }
+          continue;
+        }
+
+        const triggerReason = weTrigger
+          ? `WE-trigger (WE=${(ourWE*100).toFixed(0)}%, stage=${stage})`
+          : `price-trigger (${(pctChange*100).toFixed(0)}%, threshold=${Math.round(PG_CLAUDE_THRESHOLD*100)}%)`;
+
         const comebackContext = {
           NHL: 'NHL: 1-goal comebacks happen 30%. 2-goal comebacks ~15%. 3-goal comebacks ~5%. Down 3+ in the 3rd = essentially over.',
           NBA: 'NBA: 15-point comebacks happen 13% in the 3-point era. 20-point comebacks happen 4%. 25+ is essentially over (<1%).',
@@ -1874,44 +1882,73 @@ async function checkLiveScoreEdges() {
         }[sport] ?? '';
 
         const profitPerContract = currentPrice - entryPrice;
+        const lossAmt = Math.abs(qty * profitPerContract);
+        const halfSellQty = Math.max(1, Math.floor(qty * 0.5));
 
-        console.log(`[pg-guard] ⚠️ PRE-GAME BET LOSING: ${trade.title} | ${ourTeam} trailing ${ourScore}-${theirScore} (${game.detail}) | ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%) | WE: ${(ourWE*100).toFixed(0)}%`);
+        console.log(`[pg-guard] ⚠️ PRE-GAME BET LOSING: ${trade.title} | ${ourTeam} trailing ${ourScore}-${theirScore} (${game.detail}) | ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%) | WE: ${(ourWE*100).toFixed(0)}% | ${triggerReason}`);
 
         const pgPrompt =
           `You placed a PRE-GAME bet on ${sport} team ${ourTeam} to win at ${(entryPrice*100).toFixed(0)}¢. The game has started and YOUR TEAM IS LOSING.\n\n` +
-          `POSITION: Bought YES at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}% loss, -$${Math.abs(qty * profitPerContract).toFixed(2)}).\n` +
+          `POSITION: Bought YES at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}% loss, -$${lossAmt.toFixed(2)}).\n` +
           `Game: ${trade.title}\n` +
           `LIVE SCORE: ${awayAbbr} ${game.awayScore} @ ${homeAbbr} ${game.homeScore} | ${game.detail}\n` +
-          `Game stage: ${stage.toUpperCase()} | Your team's win expectancy: ${(ourWE*100).toFixed(0)}%\n\n` +
+          `Game stage: ${stage.toUpperCase()} | Win expectancy for ${ourTeam}: ${(ourWE*100).toFixed(0)}%\n\n` +
           `ORIGINAL THESIS: "${trade.reasoning}"\n\n` +
           `${comebackContext}\n\n` +
-          `THIS IS A PRE-GAME BET — it was placed BEFORE the game started. The current score is NEW information.\n` +
-          `Is your original thesis still intact? Or has the game already proven it wrong?\n\n` +
-          `A) SELL: Lock in loss of $${Math.abs(qty * profitPerContract).toFixed(2)}. Free up $${(qty * currentPrice).toFixed(2)} capital for better opportunities.\n` +
-          `B) HOLD: If ${ourTeam} wins → +$${(qty * (1 - entryPrice)).toFixed(2)}. If loses → -$${(qty * entryPrice).toFixed(2)}.\n\n` +
-          `JSON ONLY: {"action": "sell"/"hold", "reasoning": "why — reference the original thesis"}`;
+          `THIS IS A PRE-GAME BET — placed BEFORE the game started. Score is NEW information.\n\n` +
+          `THESIS INVALIDATION CHECK — answer this first:\n` +
+          `Did something happen that DIRECTLY contradicts the specific reason this bet was made?\n` +
+          `  → INVALIDATED examples: starting pitcher was knocked out early, key player injured/ejected, goalie pulled\n` +
+          `  → INTACT examples: team trailing due to normal variance, close game, deficit is small relative to time remaining\n\n` +
+          `OPTIONS:\n` +
+          `A) sell_all — thesis is DEAD or WE < 25%. Lock loss of $${lossAmt.toFixed(2)}, recover $${(qty * currentPrice).toFixed(2)}.\n` +
+          `B) sell_half — thesis UNCERTAIN (WE 30-50%, close game). Sell ${halfSellQty}/${qty} contracts, hold rest for comeback.\n` +
+          `C) hold — thesis INTACT. Normal game variance. Upside: +$${(qty * (1 - entryPrice)).toFixed(2)} if wins.\n\n` +
+          `RULES:\n` +
+          `- WE < 25%: say sell_all — math doesn't support holding\n` +
+          `- Thesis directly invalidated (starter out, key injury): say sell_all\n` +
+          `- WE 30-50%, thesis intact but uncertain: say sell_half\n` +
+          `- Early game trailing by 1, thesis intact: say hold\n\n` +
+          `JSON ONLY: {"action": "sell_all"/"sell_half"/"hold", "thesis_intact": true/false, "reasoning": "one sentence referencing original thesis"}`;
 
-        const pgGuardText = await claudeSonnet(pgPrompt, { maxTokens: 400, timeout: 20000 });
+        const pgGuardText = await claudeSonnet(pgPrompt, { maxTokens: 500, timeout: 20000 });
         if (pgGuardText) {
           try {
             const match = extractJSON(pgGuardText);
             if (match) {
               const d = JSON.parse(match);
-              if (d.action === 'sell') {
-                console.log(`[pg-guard] 🧠 SELL: ${trade.ticker} | ${d.reasoning?.slice(0, 80)}`);
-                // Read fresh trades, find this trade, execute sell
+              const thesisTag = d.thesis_intact ? '✅ thesis intact' : '❌ thesis dead';
+
+              if (d.action === 'sell_all' || d.action === 'sell') {
+                console.log(`[pg-guard] 🧠 SELL ALL (${thesisTag}): ${trade.ticker} | ${d.reasoning?.slice(0, 100)}`);
+                await tg(`⚠️ Pre-game exit — ${thesisTag}: ${trade.title?.slice(0, 50)} | WE ${(ourWE*100).toFixed(0)}% | ${d.reasoning?.slice(0, 80)}`);
                 const freshLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
                 const freshTrades = freshLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
                 const freshTrade = freshTrades.find(t => t.id === trade.id);
                 if (freshTrade && freshTrade.status === 'open') {
-                  const result = await executeSell(freshTrade, qty, currentPrice, 'claude-stop');
+                  const result = await executeSell(freshTrade, qty, currentPrice, 'pre-game-claude-stop');
                   if (result) {
                     writeFileSync(TRADES_LOG, freshTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
-                    console.log(`[pg-guard] Pre-game position closed: ${trade.ticker}`);
+                    console.log(`[pg-guard] Pre-game position fully closed: ${trade.ticker}`);
+                  }
+                }
+              } else if (d.action === 'sell_half') {
+                console.log(`[pg-guard] 🧠 SELL HALF (${thesisTag}): ${trade.ticker} | selling ${halfSellQty}/${qty} | ${d.reasoning?.slice(0, 80)}`);
+                await tg(`⚠️ Pre-game sell half — ${thesisTag}: ${trade.title?.slice(0, 50)} | WE ${(ourWE*100).toFixed(0)}% | ${d.reasoning?.slice(0, 80)}`);
+                if (halfSellQty < qty) {
+                  const freshLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+                  const freshTrades = freshLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+                  const freshTrade = freshTrades.find(t => t.id === trade.id);
+                  if (freshTrade && freshTrade.status === 'open') {
+                    const result = await executeSell(freshTrade, halfSellQty, currentPrice, 'pre-game-partial-stop');
+                    if (result) {
+                      writeFileSync(TRADES_LOG, freshTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
+                      console.log(`[pg-guard] Pre-game position halved: ${trade.ticker} (${halfSellQty} sold, ${qty - halfSellQty} holding)`);
+                    }
                   }
                 }
               } else {
-                console.log(`[pg-guard] 🧠 HOLD: ${trade.ticker} (${stage}, WE ${(ourWE*100).toFixed(0)}%) | ${d.reasoning?.slice(0, 80)}`);
+                console.log(`[pg-guard] 🧠 HOLD (${thesisTag}): ${trade.ticker} (${stage}, WE ${(ourWE*100).toFixed(0)}%) | ${d.reasoning?.slice(0, 80)}`);
               }
             }
           } catch { /* skip */ }
@@ -4632,6 +4669,16 @@ async function managePositions() {
             }
             continue;
           }
+        }
+
+        // PRE-GAME NUCLEAR STOP — fires at -50%, earlier than the general nuclear.
+        // Pre-game bets entered at 65% confidence; at -50% price drop WE is ~20-25%.
+        // WE-REVERSAL (≤30%) usually fires first, but this is the hard safety net.
+        if (trade.strategy === 'pre-game-prediction' && pctChange < -0.50) {
+          console.log(`[exit] 🛑 PRE-GAME NUCLEAR (${stage}, entry ${(entryPrice*100).toFixed(0)}¢): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — hard floor hit`);
+          const result = await executeSell(trade, qty, currentPrice, 'pre-game-nuclear');
+          if (result) anyUpdated = true;
+          continue;
         }
 
         // NUCLEAR STOP — absolute floor, no Claude, just get out
