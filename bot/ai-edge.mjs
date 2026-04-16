@@ -538,6 +538,7 @@ function saveState() {
       lastHighConvictionAt,
       highConvictionDeployed,
       lastHCLossAt,
+      stopLocks: Object.fromEntries([...stopLocks.entries()].filter(([, v]) => v > Date.now())),
       savedAt: Date.now(),
     }));
   } catch (e) { console.error('[state] save error:', e.message); }
@@ -558,12 +559,22 @@ function loadState() {
     if (s.lastHighConvictionAt) lastHighConvictionAt = s.lastHighConvictionAt;
     if (s.highConvictionDeployed) highConvictionDeployed = s.highConvictionDeployed;
     if (s.lastHCLossAt) lastHCLossAt = s.lastHCLossAt;
+    if (s.stopLocks) {
+      for (const [base, unlockMs] of Object.entries(s.stopLocks)) {
+        if (unlockMs > Date.now()) {
+          stopLocks.set(base, unlockMs);
+          tradeCooldowns.set(base, unlockMs - COOLDOWN_MS);
+          console.log(`[state] Restored stop-lock on ${base} — expires in ${Math.round((unlockMs - Date.now()) / 60000)}min`);
+        }
+      }
+    }
     const broadWait = Math.max(0, Math.round((s.lastBroadScan + 1800000 - Date.now()) / 1000));
     const preWait = Math.max(0, Math.round((s.lastPreGameScan + 900000 - Date.now()) / 1000));
     console.log(`[state] Restored — broad scan in ${broadWait}s, pre-game in ${preWait}s`);
   } catch (e) { console.error('[state] load error:', e.message); }
 }
 const tradeCooldowns = new Map(); // ticker → lastTradedMs
+const stopLocks = new Map();      // gameBase → unlockTimestampMs (persisted across restarts)
 const lastGameStates = new Map(); // "ATH@NYM" → "1-0-5" (score-period, for change detection)
 const gameEntries = new Map();    // "game:ATH@NYM" → { count: 2, lastPrice: 0.62, totalDeployed: 24.36 }
 const lastSeenPrices = new Map(); // ticker → { price, ts } for line movement detection
@@ -3183,6 +3194,16 @@ async function checkLiveScoreEdges() {
         // Risk checks
         if (!canTrade()) { console.log(`[live-edge] BLOCKED ${targetAbbr}: canTrade() failed`); continue; }
 
+        // Stop-lock check — blocks BOTH sides of a game for 30 min after any stop-loss.
+        // Persisted across restarts so a quick bot restart doesn't clear the protection.
+        const liveEdgeBase = ticker.lastIndexOf('-') > 0 ? ticker.slice(0, ticker.lastIndexOf('-')) : ticker;
+        const lockUntil = stopLocks.get(liveEdgeBase);
+        if (lockUntil && Date.now() < lockUntil) {
+          const minsLeft = Math.ceil((lockUntil - Date.now()) / 60000);
+          console.log(`[live-edge] 🔒 BLOCKED ${targetAbbr}: stop-lock on ${liveEdgeBase} — ${minsLeft}min remaining (no re-entry either side after stop)`);
+          continue;
+        }
+
         // === CROSS-PLATFORM PRICE CHECK — buy on cheaper platform ===
         const polyMoneylines = await getPolyMoneylines();
         const polyMatch = findPolyMarketForGame(homeAbbr, awayAbbr, polyMoneylines, league);
@@ -5055,15 +5076,18 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
       saveState();
       console.log(`[exit] 🔒 HC LOSS detected on ${trade.ticker} — HC locked for 24h`);
     }
-    // After any stop-loss, lock out re-entry on this game for 30 min
-    // Prevents "revenge trading" — if we stopped out the game is going against us
+    // After any stop-loss, lock out re-entry on this game for 30 min (BOTH sides).
+    // Persisted in state.json so restarts don't clear the lock.
     if (isStopLoss) {
       const stoppedBase = trade.ticker.lastIndexOf('-') > 0
         ? trade.ticker.slice(0, trade.ticker.lastIndexOf('-'))
         : trade.ticker;
       const STOP_REENTRY_COOLDOWN = 30 * 60 * 1000;
-      tradeCooldowns.set(stoppedBase, Date.now() + STOP_REENTRY_COOLDOWN - COOLDOWN_MS);
-      console.log(`[exit] 🔒 Re-entry locked on ${stoppedBase} for 30 min after stop`);
+      const unlockAt = Date.now() + STOP_REENTRY_COOLDOWN;
+      stopLocks.set(stoppedBase, unlockAt);
+      tradeCooldowns.set(stoppedBase, unlockAt - COOLDOWN_MS);
+      saveState();
+      console.log(`[exit] 🔒 Re-entry locked on ${stoppedBase} for 30 min after stop (persisted)`);
     }
   } else {
     // Partial exit — update quantity and cost, keep open
