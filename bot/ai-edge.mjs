@@ -3290,8 +3290,8 @@ async function checkPreGamePredictions() {
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"reasoning":"one sentence"}`
 
-      : /* NHL */
-        `You are a professional NHL bettor. Predict who wins this game being played TODAY, ${todayDate}.\n\n` +
+      : sport === 'NHL'
+      ? `You are a professional NHL bettor. Predict who wins this game being played TODAY, ${todayDate}.\n\n` +
         `⚠️ RESEARCH RULES: Only state facts you confirmed via web search. Never invent goalie starters, SV%, injury status, or standings. You may infer from confirmed data (e.g., "clinched team may rest starters") but flag all inferences explicitly. If you cannot confirm something critical (especially goalies), say NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
