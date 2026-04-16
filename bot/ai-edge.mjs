@@ -2742,6 +2742,29 @@ async function checkLiveScoreEdges() {
           }
         }
 
+        // MARKET DISSENT GUARD: if the market prices a large-lead late-game situation
+        // 40+ points below WE, sharp money is actively pricing a specific collapse —
+        // not lagging the score. A 99% WE at 45¢ means professionals have seen or
+        // heard something (wild reliever entering, lineup surge incoming, park factor)
+        // that our model doesn't capture. Real example: MIN up 6-0 in P8, market at 45¢ —
+        // Aroldis Chapman entered and imploded, BOS came back. We would have lost $67+
+        // holding to settlement. The market was right, not wrong.
+        //
+        // Threshold: gap > 40pts AND diff >= 4 AND period >= 7.
+        // Does NOT block:
+        //   - CLE@STL (gap 22pts) — well below threshold, correct bet
+        //   - TEX@ATH (gap 34pts, diff=1) — lead too small to trigger
+        //   - ARI@BAL (gap 11pts) — clearly below threshold
+        if (league === 'mlb' && diff >= 4 && period >= 7) {
+          const weBase = getWinExpectancy('mlb', diff, period) ?? 0;
+          const marketGap = weBase - price;
+          if (marketGap >= 0.40) {
+            console.log(`[live-edge] Skipping ${leadingAbbr}: market dissent guard — WE=${(weBase*100).toFixed(0)}% vs market=${(price*100).toFixed(0)}¢ (${(marketGap*100).toFixed(0)}pt gap). Sharp money is pricing a specific collapse, not lagging the score.`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-market-dissent', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr: leadingAbbr, reasoning: `Market dissent: WE=${(weBase*100).toFixed(0)}% but market=${(price*100).toFixed(0)}¢ (${(marketGap*100).toFixed(0)}pt gap) with ${diff}-run lead in P${period}. This gap is not market lag — sharp money has specific information about a collapse. Do not fade professionals with a 40pt+ discount on a large late lead.` });
+            continue;
+          }
+        }
+
         // NHL 5-on-3 power-play Hard NO: 2-man advantage scores ~50% of the time
         // vs ~20% on a regular 5-on-4. If the leading team is up 1 goal and facing
         // a 5-on-3 right now, the lead is in serious jeopardy.
