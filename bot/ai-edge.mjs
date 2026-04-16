@@ -1997,9 +1997,11 @@ async function checkLiveScoreEdges() {
 
         // WE-based trigger — also fire when game situation has deteriorated significantly
         // even if price hasn't moved enough. Markets can lag WE shifts by 1-2 cycles.
-        //   Mid game + WE ≤ 45%: pre-game thesis at 65% conf → 20pt WE drop is meaningful
+        //   Mid game + WE ≤ 40%: 25pt WE drop from a typical 65%-conf thesis is meaningful,
+        //     but 45% was too aggressive — a 1-run deficit in inning 5 easily hits 44% WE.
+        //     We want Claude to evaluate real deterioration, not normal early variance.
         //   Late game + WE ≤ 50%: trailing at all in late game = urgent
-        const weTrigger = (stage === 'late' && ourWE <= 0.50) || (stage === 'mid' && ourWE <= 0.45);
+        const weTrigger = (stage === 'late' && ourWE <= 0.50) || (stage === 'mid' && ourWE <= 0.40);
 
         if (pctChange >= PG_CLAUDE_THRESHOLD && !weTrigger) {
           if (pctChange < 0) {
@@ -2037,17 +2039,23 @@ async function checkLiveScoreEdges() {
           `THIS IS A PRE-GAME BET — placed BEFORE the game started. Score is NEW information.\n\n` +
           `THESIS INVALIDATION CHECK — answer this first:\n` +
           `Did something happen that DIRECTLY contradicts the specific reason this bet was made?\n` +
-          `  → INVALIDATED examples: starting pitcher was knocked out early, key player injured/ejected, goalie pulled\n` +
-          `  → INTACT examples: team trailing due to normal variance, close game, deficit is small relative to time remaining\n\n` +
+          `  → INVALIDATED: starting pitcher knocked out with damage (4+ ER), key player injured/ejected, goalie pulled after giving up goals\n` +
+          `  → INTACT: team trailing due to normal variance, thesis factor hasn't faced its test yet (e.g. opposing weak starter hasn't faced our lineup), small deficit early\n\n` +
+          `CRITICAL DISTINCTION — "thesis not yet tested" vs "thesis failed":\n` +
+          `If the bet thesis was about exploiting a WEAK OPPOSING STARTER or BACKUP GOALIE and:\n` +
+          `  → that player is still in the game and hasn't faced our lineup yet: thesis is INTACT, not failed\n` +
+          `  → our own team scored against them first (we're winning): thesis already worked\n` +
+          `  → the weak player got pulled without being exposed: thesis is DEAD, sell\n\n` +
           `OPTIONS:\n` +
           `A) sell_all — thesis is DEAD or WE < 25%. Lock loss of $${lossAmt.toFixed(2)}, recover $${(qty * currentPrice).toFixed(2)}.\n` +
-          `B) sell_half — thesis UNCERTAIN (WE 30-50%, close game). Sell ${halfSellQty}/${qty} contracts, hold rest for comeback.\n` +
-          `C) hold — thesis INTACT. Normal game variance. Upside: +$${(qty * (1 - entryPrice)).toFixed(2)} if wins.\n\n` +
+          `B) sell_half — thesis UNCERTAIN (WE 30-40%, deficit growing, mid/late game). Sell ${halfSellQty}/${qty} contracts, hold rest.\n` +
+          `C) hold — thesis INTACT. Normal game variance or thesis hasn't been tested yet. Upside: +$${(qty * (1 - entryPrice)).toFixed(2)} if wins.\n\n` +
           `RULES:\n` +
-          `- WE < 25%: say sell_all — math doesn't support holding\n` +
-          `- Thesis directly invalidated (starter out, key injury): say sell_all\n` +
-          `- WE 30-50%, thesis intact but uncertain: say sell_half\n` +
-          `- Early game trailing by 1, thesis intact: say hold\n\n` +
+          `- WE < 25%: say sell_all — math doesn't support holding regardless of thesis\n` +
+          `- Thesis directly invalidated (starter KO'd with 4+ ER, key injury, goalie pulled after goals): say sell_all\n` +
+          `- Early game (MLB inn 1-4 / NHL P1), trailing by 1-2, thesis not yet tested: say hold — too early, high variance\n` +
+          `- WE 30-40%, thesis uncertain, mid/late game: say sell_half\n` +
+          `- WE > 40%, thesis intact, any stage: say hold\n\n` +
           `JSON ONLY: {"action": "sell_all"/"sell_half"/"hold", "thesis_intact": true/false, "reasoning": "one sentence referencing original thesis"}`;
 
         const pgGuardText = await claudeSonnet(pgPrompt, { maxTokens: 500, timeout: 20000 });
@@ -5293,11 +5301,19 @@ async function managePositions() {
         // Sell immediately — no Claude, no cooldown. Fills the gap between claudeStop
         // (~55¢) and nuclear (~16¢) where we were bleeding out on reversed games.
         // Example: KC P7 we bet at 65¢, DET took a 3-run lead → KC WE drops to ~15% → sell.
+        //
+        // PRE-GAME EXCEPTION: Don't fire WE-REVERSAL on pre-game bets in early/mid game.
+        // The Pre-Game Guardian (pg-guard) runs every 60s with full thesis-aware Claude
+        // evaluation. Blunt WE-REVERSAL here would cancel positions before the thesis
+        // has even been tested — e.g. COL down 2-0 in inning 2 while Weiss hasn't imploded yet.
+        // Only allow WE-REVERSAL on pre-game bets in late game (or at a deeper floor: ≤20%).
         if (ctx?.diff > 0 && ctx.baselineWE != null) {
           const ourTeam = trade.ticker?.split('-').pop() ?? '';
           const ourWE = ctx.leading === ourTeam ? ctx.baselineWE : (1 - ctx.baselineWE);
-          if (ourWE <= 0.30) {
-            console.log(`[exit] 🔄 WE-REVERSAL (${(ourWE*100).toFixed(0)}% WE ≤30%): ${trade.ticker} — game reversed, selling at ${(currentPrice*100).toFixed(0)}¢`);
+          const isPreGame = trade.strategy === 'pre-game-prediction';
+          const weFloor = isPreGame && stage !== 'late' ? 0.20 : 0.30;
+          if (ourWE <= weFloor) {
+            console.log(`[exit] 🔄 WE-REVERSAL (${(ourWE*100).toFixed(0)}% WE ≤${Math.round(weFloor*100)}%${isPreGame ? ' pre-game' : ''}): ${trade.ticker} — game reversed, selling at ${(currentPrice*100).toFixed(0)}¢`);
             const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
             if (result) anyUpdated = true;
             continue;
