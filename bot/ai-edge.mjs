@@ -4171,12 +4171,6 @@ async function checkPreGamePredictions() {
 
     if (PREGAME_LIVE) {
       // ── LIVE MODE: place a real Kalshi order ──────────────────────────────
-      const MAX_PREGAME_LIVE_PER_DAY = 3; // conservative limit while calibrating
-      if (preGameTradesToday > MAX_PREGAME_LIVE_PER_DAY) {
-        console.log(`[pre-game] Daily live limit (${MAX_PREGAME_LIVE_PER_DAY}) reached — skipping ${market.base}`);
-        preGameTradesToday--; preGameTradesThisCycle--; preGameBetGames.delete(market.base);
-        continue;
-      }
       const pgPriceInCents = Math.round(price * 100);
       console.log(`[pre-game] 🎯 LIVE BET: ${market.base} → ${matchedSide.team} @${pgPriceInCents}¢ conf=${Math.round(confidence*100)}% bet=$${betAmount.toFixed(2)} qty=${betQty}`);
       try {
