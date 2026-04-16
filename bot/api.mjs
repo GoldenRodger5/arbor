@@ -609,7 +609,13 @@ Write the recap.`
         return true;
       });
 
-      const settled = trades.filter(t => t.status === 'settled' || t.status?.startsWith('sold-'));
+      // 'sold-sync-bug' and 'failed-bug' are technical artifacts — not real game outcomes.
+      // Exclude them from all win/loss/PnL stats so they don't pollute the record.
+      const settled = trades.filter(t =>
+        (t.status === 'settled' || t.status?.startsWith('sold-')) &&
+        t.status !== 'sold-sync-bug' &&
+        t.status !== 'failed-bug'
+      );
       const open = trades.filter(t => t.status === 'open');
       // closed-manual = bot confirmed the position is gone from Kalshi but didn't
       // capture a realized PnL. These are resolved but invisible to the PnL math.
@@ -649,7 +655,8 @@ Write the recap.`
         const strat = t.strategy ?? 'unknown';
         if (!stratMap[strat]) stratMap[strat] = { strategy: strat, trades: 0, settled: 0, wins: 0, losses: 0, pnl: 0 };
         stratMap[strat].trades++;
-        if (t.status === 'settled' || t.status?.startsWith('sold-')) {
+        if ((t.status === 'settled' || t.status?.startsWith('sold-')) &&
+            t.status !== 'sold-sync-bug' && t.status !== 'failed-bug') {
           stratMap[strat].settled++;
           if ((t.realizedPnL ?? 0) > 0) stratMap[strat].wins++;
           else stratMap[strat].losses++;
