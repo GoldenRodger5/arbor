@@ -3459,173 +3459,162 @@ async function checkPreGamePredictions() {
       tk.includes('MLB') ? 'MLB' : tk.includes('MLS') ? 'MLS' :
       tk.includes('EPL') ? 'EPL' : tk.includes('LALIGA') ? 'La Liga' : 'Sport';
 
-    const sportBaseline = {
-      MLB: 'MLB home team wins 54%. Top pitcher (ERA<3.0) adds +10-15%. FIP is better predictor than ERA. Look up starting pitchers, recent form, bullpen ERA.',
-      NBA: 'NBA home team wins 63%. Star player out = -10%. Back-to-back team = -3-5%. Look up injuries, recent form, playoff seeding.',
-      NHL: 'NHL home team wins 59%. Scoring first = 70% win rate. Goalie SV% is key factor. Look up goalie matchup, recent form, special teams.',
-      MLS: 'MLS home team wins 49%, draw 24%, away 27%. DRAW = contract LOSES. Look up form, key injuries. Only bet if confident in WIN not draw.',
-      EPL: 'EPL home 45%, draw 28%, away 27%. DRAW = contract LOSES. Look up league position, form, injuries.',
-      'La Liga': 'La Liga home ~47%, draw ~26%, away ~27%. DRAW = contract LOSES. Look up form table, injuries.',
-    }[sport] ?? 'Home team wins ~55%. Look up records, injuries, recent form.';
-
     const pgPromptText = sport === 'NBA'
-      ? `You are a professional NBA bettor. Predict who wins this game being played TODAY, ${todayDate}.\n\n` +
-        `⚠️ RESEARCH RULES: Only state facts you confirmed via web search. Never invent injury status, records, or lineup info. You may infer from data (e.g., "team clinched — likely resting") but flag it as an inference. If you cannot confirm something critical, say NO.\n\n` +
+      ? `You are a professional NBA swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
+        `STRATEGY: We buy pre-game and SELL when the price rises — we do NOT hold to settlement. Our exit is when the contract price reaches our entry + 12¢ at any point during the game. This means your confidence should reflect: "how likely is this team to be LEADING by 8+ points at some point in the first half?" — NOT "do they win the full game." A team that builds a 10-point first-quarter lead and then loses still pays us if we sell during that lead. Your job is to find early-lead catalysts, not final-score predictions.\n\n` +
+        `⚠️ RESEARCH RULES: Only state facts you confirmed via web search. Never invent injury status, records, or lineup info. Flag all inferences. If you cannot confirm something critical, say NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
-        `BASELINE: NBA home team wins 63%. Back-to-back team loses 3-5% WR. Star player out = -10%.\n\n` +
+        `EARLY-LEAD BASELINE: NBA teams build an 8+ point lead at some point in the first half ~72% of home games. This is higher than their 63% win rate. Your adjusted confidence should reflect early-lead probability, not win probability.\n\n` +
         `═══ STEP 1 — RESEARCH (search in this order) ═══\n` +
-        `A) CONFIRMED ROSTERS: Search "[team1] injury report ${todayDate}" and "[team2] injury report ${todayDate}". Who is OUT, who is back, who is questionable? List confirmed starters. Do NOT assume injury status — look it up.\n` +
-        `B) BACK-TO-BACK: Did either team play yesterday? Check yesterday's schedule.\n` +
-        `C) RECORDS: What is each team's overall, home, and away record this season?\n` +
-        `D) SEASON CONTEXT & MOTIVATION: Search "[team1] standings 2026" and "[team2] standings 2026". Understand what tonight means for EACH team. Ask: (1) Is either team in a must-win — fighting for a playoff spot, fighting for seeding, or one game back? (2) Has either team already locked in their seed with no upside from winning? NBA teams aggressively rest stars (load management) when games are meaningless — this is league-wide practice. (3) Is either team eliminated and tanking for draft position — actively losing on purpose? (4) Any rivalry or nationally broadcast angle that makes resting politically costly? Search "[team] lineup tonight" or "[team] load management [date]" to check for confirmed rest decisions. An NBA game with a clinched team vs an eliminated team can be unwatchable — do NOT bet it without confirmed rosters.\n\n` +
+        `A) CONFIRMED ROSTERS: Search "[team1] injury report ${todayDate}" and "[team2] injury report ${todayDate}". Who is OUT tonight? List confirmed starters. Do NOT assume — look it up.\n` +
+        `B) BACK-TO-BACK: Did either team play yesterday? Fatigue kills first-half intensity.\n` +
+        `C) MOTIVATION: Search "[team1] standings 2026" and "[team2] standings 2026". Is either team in a must-win, fighting for seeding, or already clinched and resting? NBA teams rest stars in meaningless games — confirmed rest = NO trade.\n` +
+        `D) PACE & STYLE: Does this team start fast? Search "[team] first quarter scoring 2026". High first-quarter teams create early leads more reliably.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
-        `❌ Team you want to bet ON is resting 3+ starters tonight (confirmed load management) → NO\n` +
-        `❌ Your team has clinched their seeding AND the game carries no standings implications AND you cannot confirm their stars are playing full minutes tonight → NO (load management risk — your edge may not be on the court)\n` +
-        `❌ Opponent is in a must-win/playoff survival situation AND your team is already eliminated or confirmed resting → NO (motivation gap too large)\n` +
-        `❌ Your team on back-to-back AND star player is DOUBTFUL or OUT → NO (compounding risk)\n\n` +
-        `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs) ═══\n` +
-        `Start from 63% home / 37% away baseline. Adjust only based on what you confirmed in Step 1:\n` +
-        `+ Your team in a must-win, clinching, or playoff seeding-critical game → UP 3-5% (urgency drives performance)\n` +
-        `+ Your team has 2+ days rest vs opponent on back-to-back → UP 3-5%\n` +
-        `+ Star player back from injury tonight AND playing full minutes → UP 4-7% (roster upgrade; reset baseline from their absence games)\n` +
-        `+ Opponent confirmed eliminated/tanking (search shows rotating lineup, resting regulars) → UP 5-8%\n` +
-        `+ Strong home record (60%+ at home) vs weak away record for opponent → UP 2-4%\n` +
-        `- Your team already eliminated OR clinched comfortable position AND confirmed resting key players tonight → DOWN 5-8%\n` +
-        `- Star player (15+ ppg) officially OUT tonight → DOWN 8-12%\n` +
-        `- Your team on back-to-back (second game) → DOWN 3-5%\n` +
-        `- Opponent star on confirmed hot streak (above season avg last 5, verified) → DOWN 3-5%\n` +
-        `- Your team lost 3+ straight → DOWN 3-5% ONLY if their key players were healthy during that stretch. If stars were injured and are returning tonight, this adjustment does NOT apply — the roster change resets the baseline.\n` +
-        `- Opponent plays at a significantly faster pace → DOWN 2-4%\n` +
-        `- H2H: opponent won 10+ of last 15 meetings → DOWN 4-6%\n\n` +
+        `❌ Team you want to bet is resting 2+ starters tonight (confirmed load management) → NO\n` +
+        `❌ Team has clinched seeding AND cannot confirm stars playing full minutes → NO\n` +
+        `❌ Team on back-to-back AND star player is DOUBTFUL or OUT → NO\n` +
+        `❌ No specific early-lead catalyst — just "better team overall" → NO (that's already priced in)\n\n` +
+        `═══ STEP 3 — EARLY-LEAD EDGE ANALYSIS ═══\n` +
+        `Start from 72% early-lead baseline (home) / 55% (away). Adjust based on confirmed research:\n` +
+        `+ Opponent confirmed resting stars / eliminated / tanking → UP 8-12% (intensity gap shows up immediately in first quarter)\n` +
+        `+ Your team in must-win / seeding-critical game vs rested but less motivated opponent → UP 5-8%\n` +
+        `+ Your team leads first-quarter scoring stats (top-5 in league) → UP 3-5%\n` +
+        `+ Opponent back-to-back fatigue → UP 4-6% (slower first quarter)\n` +
+        `+ Star player back from injury tonight → UP 4-6%\n` +
+        `- Your team on back-to-back → DOWN 5-8% (first half energy conserved)\n` +
+        `- Star player (15+ ppg) OUT → DOWN 10-15% (offense stalls, no early run creator)\n` +
+        `- Your team slow starters (bottom-5 in first-quarter scoring) → DOWN 4-6%\n` +
+        `- Opponent elite defense → DOWN 3-5%\n\n` +
         `═══ STEP 4 — DECISION ═══\n` +
-        `BUY only if ALL three are true:\n` +
-        `✓ Confidence ≥ 70% (higher bar than live — no score anchor)\n` +
-        `✓ Confidence beats price by 4+ points\n` +
-        `✓ You have a specific confirmed reason — not "they're the better team" or a narrative built from unverified claims\n` +
+        `REMEMBER: confidence = P(team builds 8+ point lead at some point in first half). This is higher than win probability.\n` +
+        `BUY only if ALL are true:\n` +
+        `✓ Confidence ≥ 70% (early-lead probability, not win probability)\n` +
+        `✓ Confidence beats current price by 4+ points\n` +
+        `✓ You have a SPECIFIC confirmed early-lead catalyst (not just "they're better")\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
-        `JSON ONLY:\n` +
+        `JSON ONLY — include exitScenario (the specific event that causes the price spike):\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"reasoning":"one sentence"}`
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific event e.g. team builds 10-pt Q1 lead on opponent missing 2 starters","reasoning":"one sentence"}`
 
       : sport === 'NHL'
-      ? `You are a professional NHL bettor. Predict who wins this game being played TODAY, ${todayDate}.\n\n` +
-        `⚠️ RESEARCH RULES: Only state facts you confirmed via web search. Never invent goalie starters, SV%, injury status, or standings. You may infer from confirmed data (e.g., "clinched team may rest starters") but flag all inferences explicitly. If you cannot confirm something critical (especially goalies), say NO.\n\n` +
+      ? `You are a professional NHL swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
+        `STRATEGY: We buy pre-game and SELL when price rises — we do NOT hold to settlement. Our exit triggers when this team SCORES FIRST and the contract reprices upward. In NHL, the team that scores first wins ~70% of games — when that first goal goes in, the contract price spikes immediately from ~55¢ to ~70¢+. That spike is our exit. We never need to hold through OT or a comeback. Your confidence = "how likely is this team to score the first goal?"\n\n` +
+        `⚠️ RESEARCH RULES: Only state confirmed facts. Never invent goalie starters, SV%, standings. Flag all inferences. If starting goalie is unconfirmed, say NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
-        `BASELINE: NHL home team wins 59%. Goalie is the single most important factor. Scoring first = 70% win rate.\n\n` +
+        `FIRST-GOAL BASELINE: NHL home team scores first ~56% of games. Elite goalie matchup advantage, power play edge, and opponent fatigue are the primary drivers. A team with a clear goalie/power-play edge scores first 60-65% of games.\n\n` +
         `═══ STEP 1 — RESEARCH (search in this order) ═══\n` +
-        `A) CONFIRMED GOALIES — MANDATORY FIRST SEARCH: Search "[team1] starting goalie tonight" and "[team2] starting goalie tonight". You must confirm BOTH starters by name before proceeding. "Expected" or "likely" is not enough — if any source says "unconfirmed" or you find conflicting info, treat as unconfirmed.\n` +
-        `B) GOALIE QUALITY: What is each confirmed starter's season SV% and GAA? Any bad recent form (GAA > 3.0 in last 5 starts)? Search "[goalie name] stats 2025-26".\n` +
-        `C) SCHEDULE/FATIGUE: Is either team on a back-to-back or playing their 3rd game in 4 nights?\n` +
-        `D) SEASON CONTEXT & MOTIVATION: Search "[team1] standings 2026" and "[team2] standings 2026". You must understand what tonight means for EACH team before betting. Ask yourself: Does this team have a real reason to win tonight? Consider: (1) Are they in a must-win playoff race or fighting for seeding/home ice? (2) Have they already clinched everything — division, seed, home ice throughout? If so, coaches routinely rest starters for playoff prep, regardless of whether it's the last game or not. (3) Are they eliminated with nothing to play for? (4) Are they in a losing streak fighting for jobs/contracts? (5) Is this a rivalry or high-profile game that would prevent resting? Search "[team] lineup tonight" or "[team] rest starters [date]" to check for confirmed lineup decisions. A team with no stakes and everything clinched is a fundamentally different betting proposition — the players and coach you're counting on may not be on the ice.\n\n` +
+        `A) CONFIRMED GOALIES — MANDATORY: Search "[team1] starting goalie tonight" and "[team2] starting goalie tonight". Must confirm BOTH by name. "Expected" or "likely" is not enough.\n` +
+        `B) GOALIE QUALITY: Season SV% and GAA for each confirmed starter? Recent form (last 5 starts)? Search "[goalie name] stats 2025-26".\n` +
+        `C) SPECIAL TEAMS: Search "[team1] power play % 2026" and "[team2] power play % 2026". PP goals happen early and drive first-goal probability.\n` +
+        `D) FATIGUE: Back-to-back or 3rd in 4 nights? Fatigued teams are slower in period 1.\n` +
+        `E) MOTIVATION: Search "[team1] standings 2026" and "[team2] standings 2026". Playoff race, seeding fights, or clinched/eliminated — this affects first-period intensity.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
-        `❌ Starting goalie for the team you want to bet is NOT confirmed → NO (you don't know what you're betting)\n` +
-        `❌ Team you want to bet ON is resting 3+ skaters (confirmed in search) → NO\n` +
-        `❌ Your team has clinched their seed/position AND the game carries no seeding implications AND you cannot confirm their full lineup and starting goalie are playing → NO (edge built on players who may not dress)\n` +
-        `❌ Opponent is in active playoff survival (must win or season ends) AND your team is already mathematically eliminated OR confirmed resting regulars → NO (motivation gap too large)\n` +
-        `❌ Your team is on their 3rd game in 4 nights AND opponent is rested → NO (severe fatigue)\n\n` +
-        `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs) ═══\n` +
-        `Start from 59% home / 41% away baseline. Adjust only based on confirmed research:\n` +
-        `+ Your team is actively protecting HOME ICE ADVANTAGE throughout the playoffs (confirmed top seed, games still matter for seeding) → UP 5-7% (home ice worth ~15-20% series win probability — team will play starters hard and protect the lead)\n` +
-        `+ Your team in a must-win or clinching game (not yet seeded) → UP 3-4% (urgency drives compete level)\n`
-        `+ Elite goalie starting (SV% > .920) → UP 4-6%\n` +
-        `+ Your team has better power play % AND penalty kill % → UP 2-4%\n` +
-        `+ Opponent on back-to-back or 3rd in 4 nights → UP 3-5%\n` +
-        `+ Your team won 4 of last 5 → UP 2-3% (form/momentum is real in NHL)\n` +
-        `- Your team already clinched comfortable position AND confirmed resting key skaters or backup goalie tonight → DOWN 4-6%\n` +
-        `- Goalie GAA > 3.5 in last 5 starts → DOWN 8-12% (check opponent quality — not all GAA is equal)\n` +
-        `- Goalie SV% .895-.910 → DOWN 4-6%\n` +
-        `- Goalie SV% below .895 → DOWN 6-8%\n` +
-        `- Your team on back-to-back (second game) → DOWN 3-5%\n` +
-        `- Opponent's PP% is top-10 AND your PK% is bottom-10 → DOWN 3-5%\n` +
-        `- Your team lost 3+ straight → DOWN 3-5%\n` +
-        `- H2H: opponent won 10+ of last 15 meetings → DOWN 4-6%\n` +
-        `- NOTE: If this game goes to OT, it is a 3v3 near-coin-flip. Factor this in for any expected tight 1-goal matchup.\n\n` +
+        `❌ Starting goalie for the team you want to bet is NOT confirmed → NO\n` +
+        `❌ Team has clinched everything AND cannot confirm starting goalie and top line → NO\n` +
+        `❌ Team on 3rd game in 4 nights AND opponent is rested → NO\n` +
+        `❌ No first-goal catalyst — just "better team overall" → NO (already priced in)\n\n` +
+        `═══ STEP 3 — FIRST-GOAL EDGE ANALYSIS ═══\n` +
+        `Start from 56% first-goal baseline (home) / 44% (away). Adjust based on confirmed research:\n` +
+        `+ Elite goalie (SV% > .920) vs below-average opponent goalie (SV% < .905) → UP 5-8% (gives up fewer early goals, team stays motivated to push)\n` +
+        `+ Your team top-5 power play AND opponent bottom-5 penalty kill → UP 4-6% (PP goals are first-goal candidates)\n` +
+        `+ Opponent on back-to-back → UP 4-5% (slower first period)\n` +
+        `+ Your team in must-win (seeding, playoff survival) vs lower-stakes opponent → UP 3-5%\n` +
+        `+ Your team won 4 of last 5 with strong first-period stats → UP 2-3%\n` +
+        `- Backup goalie starting for your team → DOWN 6-10%\n` +
+        `- Your goalie SV% below .900 → DOWN 5-8%\n` +
+        `- Your team on back-to-back → DOWN 4-6%\n` +
+        `- Opponent elite PP (top-5) AND your PK bottom-10 → DOWN 4-6%\n\n` +
         `═══ STEP 4 — DECISION ═══\n` +
-        `BUY only if ALL three are true:\n` +
-        `✓ Confidence ≥ 70% (higher bar than live — no score anchor)\n` +
-        `✓ Confidence beats price by 4+ points\n` +
-        `✓ Goalie is confirmed, stakes are understood, and you have a specific reason — not just "better team"\n` +
-        `JSON ONLY:\n` +
+        `REMEMBER: confidence = P(this team scores first goal). This is separable from P(team wins full game including OT).\n` +
+        `BUY only if ALL are true:\n` +
+        `✓ Confidence ≥ 70% (first-goal probability)\n` +
+        `✓ Confidence beats current price by 4+ points\n` +
+        `✓ Goalie is confirmed AND you have a specific first-goal catalyst\n` +
+        `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"reasoning":"one sentence"}`
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific event e.g. team scores first goal — elite goalie SV .928 vs backup .891","reasoning":"one sentence"}`
 
       : /* MLB */
       sport === 'MLB'
-      ? `You are a professional MLB bettor. Predict who wins this game being played TODAY, ${todayDate}.\n\n` +
-        `⚠️ RESEARCH RULES: Only state facts you confirmed via web search. Never invent starting pitchers, ERAs, or lineup info. Flag all inferences explicitly. If you cannot confirm the starting pitcher, say NO.\n\n` +
+      ? `You are a professional MLB swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
+        `STRATEGY: We buy pre-game and SELL when price rises — we do NOT hold to settlement. We exit when the contract price reaches our entry + 12¢, which typically happens when this team scores 2+ runs in the first 3-4 innings. We never need the team to win the full game. Your confidence = "how likely is this team to score 2+ runs in the first 3-4 innings?" — not "do they win 9 innings?" An ace pitcher limiting the opponent while his offense scores early is a profitable trade even if they blow it in the 7th. We're trading the first act.\n\n` +
+        `⚠️ RESEARCH RULES: Only state confirmed facts. Never invent starting pitchers, ERAs, lineup info. Flag all inferences. If starting pitcher is unconfirmed, say NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
-        `BASELINE: MLB home team wins 54%. Starting pitcher quality is the single biggest factor.\n\n` +
+        `EARLY-SCORING BASELINE: A team facing a weak starter (ERA > 4.5) scores 2+ in the first 3 innings ~45% of games. With an elite opponent starter (ERA < 3.0), that drops to ~25%. The gap between these is your edge window.\n\n` +
         `═══ STEP 1 — RESEARCH (search in this order) ═══\n` +
-        `A) STARTING PITCHERS — MANDATORY: Search "[team1] starting pitcher today ${todayDate}" and "[team2] starting pitcher today". Confirm BOTH starters by name. If either is unconfirmed, say NO.\n` +
-        `B) PITCHER QUALITY: What is each starter's 2026 ERA and WHIP? Recent form (last 3 starts)? Search "[pitcher name] stats 2026".\n` +
-        `C) BULLPEN: Search "[team] bullpen ERA 2026" for each team. Note if a team's closer has ERA < 2.5 or > 4.5 — that matters for close games.\n` +
-        `D) LINEUP/INJURIES: Any star hitter (MVP-caliber, .300+) confirmed OUT today?\n\n` +
+        `A) STARTING PITCHERS — MANDATORY: Search "[team1] starting pitcher today ${todayDate}" and "[team2] starting pitcher today". Confirm BOTH by name. Unconfirmed = NO.\n` +
+        `B) PITCHER QUALITY: Each starter's 2026 ERA, WHIP, K/9? Recent form (last 3 starts)? Search "[pitcher name] stats 2026". An ace (ERA < 2.5) limits opponent early scoring. A weak starter (ERA > 4.5) gives up early runs.\n` +
+        `C) LINEUP POWER: Does this team have top-5 run scorers? Any cleanup hitter (30+ HR, .300+) OUT today? Strong lineups score early more often.\n` +
+        `D) PARK FACTOR: Is this a hitter's park (Coors, Fenway, Great American)? Hitter's parks increase early scoring probability for BOTH teams.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Starting pitcher for the team you want to bet is NOT confirmed → NO\n` +
-        `❌ Team you want to bet has ERA > 5.5 starter going against ERA < 3.0 opponent → NO (mismatch too large)\n` +
-        `❌ Star cleanup hitter (confirmed .300+, 30+ HR pace) is OUT AND the matchup is otherwise close → NO\n\n` +
-        `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs) ═══\n` +
-        `Start from 54% home / 46% away baseline. Adjust only based on confirmed research:\n` +
-        `+ Elite starter (ERA < 2.5, WHIP < 1.0) going tonight → UP 8-12%\n` +
-        `+ Good starter (ERA 2.5-3.5) → UP 3-6%\n` +
-        `+ Opponent starter ERA > 5.0 → UP 5-8% (weak opposition)\n` +
-        `+ Strong bullpen (ERA < 3.5 team) in a projected close game → UP 2-3%\n` +
-        `+ Team won 5 of last 7 → UP 2-3% (hot streak)\n` +
-        `- Below-average starter (ERA 4.5-5.5) → DOWN 5-8%\n` +
-        `- Poor bullpen (ERA > 4.8) if game likely goes to extras → DOWN 3-5%\n` +
-        `- Opponent elite starter (ERA < 2.5) → DOWN 8-12%\n` +
-        `- Team lost 5 of last 7 → DOWN 3-4%\n` +
-        `- Road team at a pitcher's park (Coors Field reversed = hitter's park → ignore if at COL) → DOWN 1-2%\n\n` +
+        `❌ Your team's starter is ERA > 5.0 (they'll fall behind early, not score early) → NO\n` +
+        `❌ Opponent starter is ERA < 2.5 AND WHIP < 1.0 → NO (will limit your team's early scoring)\n\n` +
+        `═══ STEP 3 — EARLY-SCORING EDGE ANALYSIS ═══\n` +
+        `Start from 45% early-scoring baseline (2+ runs in first 3 innings). Adjust based on confirmed research:\n` +
+        `+ Opponent starter ERA > 5.0 → UP 8-12% (weak starters give up early runs consistently)\n` +
+        `+ Opponent starter ERA 4.0-5.0 → UP 4-7%\n` +
+        `+ Your team top-5 in first-inning runs scored this season → UP 4-6%\n` +
+        `+ Hitter's park (Coors, Fenway, Great American Ball Park) → UP 3-5%\n` +
+        `+ Your starter ERA < 2.5 → UP 3-4% (confident offense, keeps game close early)\n` +
+        `- Opponent starter ERA < 3.0 AND WHIP < 1.1 → DOWN 8-12% (will suppress your early scoring)\n` +
+        `- Pitcher's park (Oracle, Dodger Stadium) → DOWN 2-3%\n` +
+        `- Your team's top run-producer confirmed OUT → DOWN 4-6%\n\n` +
         `═══ STEP 4 — DECISION ═══\n` +
-        `NOTE: MLB is highly random game-to-game. Only recommend if you have a clear pitching advantage OR a specific confirmed edge. If it's a coin flip, say so.\n` +
-        `BUY only if ALL three are true:\n` +
-        `✓ Confidence ≥ 70%\n` +
-        `✓ Confidence beats price by 4+ points\n` +
-        `✓ Both starters are confirmed AND you have a specific researched reason\n` +
-        `JSON ONLY:\n` +
+        `REMEMBER: confidence = P(team scores 2+ runs in first 3-4 innings). This is NOT the same as P(team wins). MLB games are random over 9 innings — but early-inning scoring against a weak starter is more predictable.\n` +
+        `BUY only if ALL are true:\n` +
+        `✓ Confidence ≥ 65% (early-scoring probability — lower bar than NBA/NHL because this is a more precise sub-event)\n` +
+        `✓ Confidence beats current price by 4+ points\n` +
+        `✓ Both starters confirmed AND there's a clear pitching mismatch driving early-scoring edge\n` +
+        `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"reasoning":"one sentence"}`
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific event e.g. team scores 2+ in first 3 innings vs ERA 5.2 starter","reasoning":"one sentence"}`
 
       : /* Soccer (MLS / EPL / La Liga) */
-      `You are a professional soccer bettor. Predict who wins this game being played TODAY, ${todayDate}.\n\n` +
-        `⚠️ CRITICAL — DRAWS LOSE: This market is "team wins outright." A DRAW means the contract LOSES regardless of which team you bet. Factor in the draw probability when setting confidence — if a draw is likely (>25%), your true win probability is lower than it appears.\n\n` +
+      `You are a professional soccer swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
+        `STRATEGY: We buy pre-game and SELL when the price rises — we do NOT care about the final score. Our exit is when this team SCORES FIRST and the contract reprices upward. When a team scores the first goal in soccer, their price spikes immediately — from 45¢ to 65¢+. We sell into that spike and we're done. Whether the game ends 1-1, 1-0, or 2-1 is IRRELEVANT. A draw does NOT hurt us because we exit before the game ends. Your confidence = "how likely is this team to score the first goal?" — not "do they win outright?"\n\n` +
         `⚠️ RESEARCH RULES: Only state confirmed facts. Flag inferences. If you cannot confirm key lineup or form data, say NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
-        `BASELINE: ${sportBaseline}\n\n` +
+        `FIRST-GOAL BASELINE: Home teams score first ~55% of soccer games. Strong attacking teams with high shots-on-target rates score first more often regardless of eventual match result. Draw probability is irrelevant to us.\n\n` +
         `═══ STEP 1 — RESEARCH ═══\n` +
-        `A) FORM: Search "[team1] last 5 results ${todayDate}" and "[team2] last 5 results". What is each team's recent form (W/D/L)?\n` +
-        `B) KEY INJURIES: Any first-choice striker or central defender OUT today?\n` +
-        `C) TABLE POSITION: What are both teams' league positions and points? Is either in a must-win situation (relegation, title race, European qualification)?\n` +
-        `D) HEAD TO HEAD: Recent H2H — how have these teams matched up in the last 3 meetings?\n\n` +
-        `═══ STEP 2 — HARD NOs ═══\n` +
-        `❌ Draw probability is above 35% AND no clear advantage for either team → NO (draw risk too high for moneyline)\n` +
-        `❌ Team you want to bet has lost 4 of last 5 → NO\n` +
-        `❌ Key striker confirmed OUT and opponent is defensively strong → NO\n\n` +
-        `═══ STEP 3 — EDGE ANALYSIS ═══\n` +
-        `Start from home/away baseline for this league. Adjust only based on confirmed research:\n` +
-        `+ Team in must-win situation (confirmed: relegation battle, title clincher, cup spot) → UP 4-6%\n` +
-        `+ Strong recent form (4W in last 5) vs poor form opponent (1W in last 5) → UP 5-8%\n` +
-        `+ Home team with 65%+ home win rate this season → UP 3-5%\n` +
-        `+ H2H dominant (won last 3 meetings) → UP 3-4%\n` +
-        `- Draw-heavy team (D in 3 of last 5) → DOWN 5-8% (reduces win probability even in favorable matchups)\n` +
-        `- Key striker confirmed OUT → DOWN 5-7%\n` +
-        `- Away team with strong away record (40%+ WR away) → DOWN 3-5%\n\n` +
+        `A) ATTACK QUALITY: Search "[team1] goals scored per game 2026" and "[team2] goals per game 2026". High-scoring teams score first more often.\n` +
+        `B) KEY INJURIES: Is the first-choice striker confirmed OUT? A missing #9 significantly reduces first-goal probability.\n` +
+        `C) FORM: Search "[team1] last 5 results ${todayDate}". Teams in good form score early more often — confidence, pressing intensity.\n` +
+        `D) MOTIVATION: Is either team in a must-win (relegation, title, European qualification)? High-stakes teams press harder from kickoff and score first more often.\n` +
+        `E) OPPONENT DEFENSE: Is the opponent's defense porous (conceding 2+ per game) or elite (under 1 per game)? Weak defenses give up first goals early.\n\n` +
+        `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
+        `❌ Your team's first-choice striker is confirmed OUT AND opponent defense is strong → NO\n` +
+        `❌ Both teams are defensive/low-scoring (under 1 goal per game each) → NO (first goal may not come)\n` +
+        `❌ No specific first-goal catalyst — just "better team" → NO (already priced in)\n\n` +
+        `═══ STEP 3 — FIRST-GOAL EDGE ANALYSIS ═══\n` +
+        `Start from 55% first-goal baseline (home) / 45% (away). Adjust based on confirmed research:\n` +
+        `+ Your team scores 2+ per game AND opponent defense concedes 1.5+ per game → UP 6-10% (prolific attack vs leaky defense = early goals)\n` +
+        `+ Your team in must-win (confirmed: relegation, title run, Europa/Champions League spot) → UP 4-7% (high-press from kickoff)\n` +
+        `+ Opponent missing key central defender → UP 4-6%\n` +
+        `+ Your team won last 3 head-to-heads scoring first each time → UP 3-5%\n` +
+        `+ Strong home record with early goals (60%+ scoring in first 30 min at home) → UP 3-4%\n` +
+        `- Your team's starting striker confirmed OUT → DOWN 8-12%\n` +
+        `- Opponent elite defense (conceding under 0.8 per game) → DOWN 5-8%\n` +
+        `- Your team low-scoring (under 1.2 goals per game) → DOWN 4-6%\n` +
+        `- Away team historically suppresses first goal (plays 0-0 for long periods) → DOWN 3-5%\n\n` +
         `═══ STEP 4 — DECISION ═══\n` +
-        `BUY only if ALL three are true:\n` +
-        `✓ Confidence ≥ 70% (must account for draw probability — if you think team wins 60% but draws 25%, true win% = ~60/75 = 80% of non-draw... but contract loses on draw, so state confidence in OUTRIGHT WIN)\n` +
-        `✓ Confidence beats price by 4+ points\n` +
-        `✓ You have confirmed form/stakes data — not just "better team on paper"\n` +
-        `JSON ONLY:\n` +
+        `REMEMBER: confidence = P(this team scores the first goal of the match). Draws, final scores, and second-half results are all irrelevant — we exit on the first goal spike.\n` +
+        `BUY only if ALL are true:\n` +
+        `✓ Confidence ≥ 65% (first-goal probability)\n` +
+        `✓ Confidence beats current price by 4+ points\n` +
+        `✓ You have a specific confirmed first-goal catalyst (attack quality, defensive weakness, motivation)\n` +
+        `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"reasoning":"one sentence"}`;
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific event e.g. team scores first goal — prolific attack vs defense conceding 1.8/game","reasoning":"one sentence"}`;
 
     return {
       market,
@@ -3750,21 +3739,23 @@ async function checkPreGamePredictions() {
 
     let confidence = decision.confidence ?? 0;
 
-    // HARD CAP: Pre-game confidence capped at baseline + 15%
-    // Home team baseline: MLB 54%, NBA 63%, NHL 59%, Soccer 45-49%
-    // Without a live score to anchor, Claude can hallucinate 90%+ confidence
+    // HARD CAP: Pre-game confidence capped at early-event baseline + sport-specific bonus.
+    // Baselines are now EARLY-EVENT probabilities (first-goal / early-lead / early-scoring),
+    // not full-game win rates. These are higher than win rates because we only need a
+    // price spike at any point during the game, not the final outcome.
+    // MLB: early-scoring baseline ~45% (scores 2+ in first 3 innings)
+    // NBA: early-lead baseline ~72% home (builds 8+ pt lead at some point in first half)
+    // NHL: first-goal baseline ~56% home
+    // Soccer: first-goal baseline ~55% home — draws are irrelevant, we exit on first goal
     const pgSportKey = expectedSport.toLowerCase();
-    const preGameBaselines = { mlb: 0.54, nba: 0.63, nhl: 0.59, mls: 0.49, epl: 0.45, laliga: 0.45 };
+    const preGameBaselines = { mlb: 0.45, nba: 0.72, nhl: 0.56, mls: 0.55, epl: 0.55, laliga: 0.55 };
     const pgBaseline = preGameBaselines[pgSportKey] ?? 0.55;
-    // Sport-specific cap: how far above baseline Claude can go pre-game.
-    // Strategy is sell-into-lead, not predict winner — so we care about "will price
-    // move up" not "will team win". MLB pre-game is viable on pitching mismatches
-    // because a team with an ace scores 2+ runs early more often than market prices.
-    // MLB: +15% (54% + 15% = 69%) — only exceptional pitching mismatches pass
-    // NBA: +20% (63% + 20% = 83%) — injuries/load mgmt create real edges
-    // NHL: +15% (59% + 15% = 74%) — goalie matchup is the edge
-    // Soccer: +8% — draws make it too risky, keep blocked
-    const sportCapBonus = { mlb: 0.15, nba: 0.20, nhl: 0.15, mls: 0.08, epl: 0.08, laliga: 0.08 }[pgSportKey] ?? 0.15;
+    // Cap: how far above early-event baseline Claude can go.
+    // MLB: +20% (45% + 20% = 65% max) — pitching mismatch can push early-scoring to 65%
+    // NBA: +15% (72% + 15% = 87% max) — dominant mismatch e.g. opponent resting all starters
+    // NHL: +18% (56% + 18% = 74% max) — elite goalie vs backup + PP edge
+    // Soccer: +15% (55% + 15% = 70% max) — opens soccer since we exit on first goal (draws irrelevant)
+    const sportCapBonus = { mlb: 0.20, nba: 0.15, nhl: 0.18, mls: 0.15, epl: 0.15, laliga: 0.15 }[pgSportKey] ?? 0.15;
     const pgTargetBaseline = pick.side === 'yes' ? pgBaseline : (1 - pgBaseline);
     const pgMaxAllowed = Math.min(0.85, pgTargetBaseline + sportCapBonus);
     if (confidence > pgMaxAllowed) {
@@ -3782,9 +3773,11 @@ async function checkPreGamePredictions() {
     }
 
     const pgReqMargin = getRequiredMargin(price, { sport: pgSportKey, live: false });
-    // Sport-specific minimum confidence — MLB is lower (67%) because sell-into-lead
-    // doesn't require predicting a winner, just a price movement opportunity.
-    const PRE_GAME_MIN_CONF = pgSportKey === 'mlb' ? 0.67 : 0.70;
+    // Sport-specific minimum confidence (early-event probability, not win probability):
+    // MLB: 65% — early-scoring sub-event is more predictable than full-game outcome
+    // Soccer: 65% — first-goal probability; draws don't hurt us since we exit on the spike
+    // NBA/NHL: 70% — early-lead/first-goal baselines are already high, need real edge above them
+    const PRE_GAME_MIN_CONF = (pgSportKey === 'mlb' || pgSportKey === 'mls' || pgSportKey === 'epl' || pgSportKey === 'laliga') ? 0.65 : 0.70;
     if (confidence < PRE_GAME_MIN_CONF || (confidence - price) < pgReqMargin) {
       console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${((confidence-price)*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% min=${(PRE_GAME_MIN_CONF*100).toFixed(0)}% (${pgSportKey})`);
       continue;
@@ -3846,6 +3839,7 @@ async function checkPreGamePredictions() {
               edge: Math.round(edge * 1000) / 10,
               confidence,
               reasoning: decision.reasoning,
+              exitScenario: decision.exitScenario ?? null,
               pgBaseline: pgTargetBaseline,
               sport: pgSportKey,
             });
@@ -3856,7 +3850,8 @@ async function checkPreGamePredictions() {
               opponentAbbr: otherSide.team, opponentName: otherSide.teamName,
               marketTitle: market.title, confidence, price,
               edge: Math.round(edge * 1000) / 10, wouldBetAmount: pgDeployed,
-              wouldQty: pgFill, reasoning: decision.reasoning, pgBaseline: pgTargetBaseline,
+              wouldQty: pgFill, reasoning: decision.reasoning, exitScenario: decision.exitScenario ?? null,
+              pgBaseline: pgTargetBaseline,
             });
             await sendTelegram(`🎯 <b>Pre-game BET placed</b>\n${market.title}\n${matchedSide.team} YES @${pgPriceInCents}¢ × ${pgFill}\nConf=${Math.round(confidence*100)}% | Edge=+${Math.round(edge*100)}pts | $${pgDeployed.toFixed(2)}`);
             console.log(`[pre-game] ✅ Filled ${pgFill}/${betQty} @ ${pgPriceInCents}¢ deployed=$${pgDeployed.toFixed(2)}`);
@@ -3878,7 +3873,8 @@ async function checkPreGamePredictions() {
         opponentAbbr: otherSide.team, opponentName: otherSide.teamName,
         marketTitle: market.title, confidence, price,
         edge: Math.round(edge * 1000) / 10, wouldBetAmount: Math.round(betAmount * 100) / 100,
-        wouldQty: betQty, reasoning: decision.reasoning, pgBaseline: pgTargetBaseline,
+        wouldQty: betQty, reasoning: decision.reasoning, exitScenario: decision.exitScenario ?? null,
+        pgBaseline: pgTargetBaseline,
       });
       logScreen({ stage: 'pre-game-paper', ticker: market.base, result: 'PAPER', confidence, price, reasoning: decision.reasoning });
       console.log(`[pre-game] 📋 PAPER: ${market.base} → ${matchedSide.team} @${Math.round(price*100)}¢ conf=${Math.round(confidence*100)}% wouldBet=$${betAmount.toFixed(2)} (${preGameTradesToday} today)`);
