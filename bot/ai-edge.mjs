@@ -971,6 +971,10 @@ const TRADES_LOG = './logs/trades.jsonl';
 const DAILY_LOG = './logs/daily-snapshots.jsonl';
 const SCREENS_LOG = './logs/screens.jsonl';
 const PAPER_TRADES_LOG = './logs/paper-trades.jsonl';
+
+// Games currently in progress — populated by checkLiveScoreEdges each cycle.
+// Key: "ABBR1|ABBR2" (sorted, upper-case). Lets pre-game scanner skip live games.
+const activeLiveGames = new Set();
 if (!existsSync('./logs')) mkdirSync('./logs', { recursive: true });
 
 // Kalshi parabolic fee: 7% × price × (1 - price). Max at 50¢ (1.75¢), zero at 0 or 100¢.
@@ -1762,6 +1766,14 @@ async function checkLiveScoreEdges() {
     }
   }
 
+  // Update active-live-games set so pre-game scanner skips in-progress matchups
+  activeLiveGames.clear();
+  for (const g of liveGames) {
+    const ha = (g.home.team?.abbreviation ?? '').toUpperCase();
+    const aa = (g.away.team?.abbreviation ?? '').toUpperCase();
+    if (ha && aa) activeLiveGames.add([ha, aa].sort().join('|'));
+  }
+
   // === PRE-GAME POSITION GUARDIAN ===
   // Check every 60s (not every 5min like managePositions) if any pre-game bets are going wrong.
   // Pre-game bets were placed BEFORE the game started — any adverse score change is NEW info
@@ -1826,13 +1838,17 @@ async function checkLiveScoreEdges() {
         const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / entryPrice);
         const pctChange = (currentPrice - entryPrice) / entryPrice;
 
-        // Pre-game positions get TIGHTER thresholds: evaluate at just -10% (vs -25% for live bets)
-        // because every adverse score is NEW information the pre-game thesis didn't account for
-        const PG_CLAUDE_THRESHOLD = -0.10;
+        // Stage-aware threshold — early games have high variance, don't panic-sell on normal scoring.
+        // A 1-run deficit in inning 2 moves price ~-10% but changes win prob minimally.
+        // We want Claude's opinion only when the deficit is substantial for the game state.
+        //   early (MLB inn 1-4 / NHL P1 / NBA Q1): require -25% before calling Claude
+        //   mid   (MLB inn 5-7 / NHL P2 / NBA Q2-Q3): require -15%
+        //   late  (MLB inn 8+ / NHL P3 / NBA Q4): require -10% (game nearly over, every point matters)
+        const PG_CLAUDE_THRESHOLD = stage === 'early' ? -0.25 : stage === 'mid' ? -0.15 : -0.10;
         if (pctChange >= PG_CLAUDE_THRESHOLD) {
           // Down but not enough to evaluate yet — just log
           if (pctChange < 0) {
-            console.log(`[pg-guard] ${ticker} our team trailing ${ourScore}-${theirScore} (${game.detail}), price ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%), watching...`);
+            console.log(`[pg-guard] ${ticker} our team trailing ${ourScore}-${theirScore} (${game.detail}) | stage=${stage} threshold=${Math.round(PG_CLAUDE_THRESHOLD*100)}% | price ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%), watching...`);
           }
           continue;
         }
@@ -2712,6 +2728,35 @@ async function checkLiveScoreEdges() {
           } catch {}
         }
 
+        // Also check paper trades for same-game awareness. Pre-game is currently paper-only,
+        // so we don't block real live bets on paper picks — but we log the conflict so we can
+        // see when live-edge disagrees with pre-game analysis (useful calibration signal).
+        // When pre-game goes live (real money), change the inner console.log to `hasPosition = true`.
+        if (!hasPosition && existsSync(PAPER_TRADES_LOG)) {
+          try {
+            const pgDupStartMs = new Date(etNow().toISOString().slice(0,10) + 'T04:00:00Z').getTime();
+            const pgDupEndMs = pgDupStartMs + 24 * 60 * 60 * 1000;
+            const paperLines = readFileSync(PAPER_TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+            for (const l of paperLines) {
+              try {
+                const pt = JSON.parse(l);
+                const ptMs = pt.timestamp ? Date.parse(pt.timestamp) : 0;
+                if (ptMs < pgDupStartMs || ptMs >= pgDupEndMs) continue;
+                const pticker = (pt.ticker ?? '').toLowerCase();
+                if (tickerHasTeam(pticker, homeAbbr) && tickerHasTeam(pticker, awayAbbr)) {
+                  const paperTeam = (pt.teamAbbr ?? pt.ticker?.split('-').pop() ?? '?').toUpperCase();
+                  if (paperTeam !== targetAbbr?.toUpperCase()) {
+                    console.log(`[live-edge] ⚠️ PAPER/LIVE CONFLICT on ${homeAbbr}@${awayAbbr}: paper pre-game picked ${paperTeam}, live-edge favoring ${targetAbbr} — proceeding with live bet (paper is not real money)`);
+                  } else {
+                    console.log(`[live-edge] ✅ PAPER/LIVE AGREE on ${homeAbbr}@${awayAbbr}: both pre-game paper and live-edge favor ${targetAbbr} — conviction confirmed`);
+                  }
+                  break;
+                }
+              } catch {}
+            }
+          } catch {}
+        }
+
         // Block if we already have a position on this game — prevents duplicate buys and both-sides bets
         // Use ticker BASE as canonical game key (consistent regardless of which team side we bet)
         const currentScoreKey = scoreKey(homeScore, awayScore);
@@ -3131,13 +3176,10 @@ async function checkPreGamePredictions() {
   lastPreGameScan = Date.now();
   if (!canTrade()) return;
 
-  // Pre-game shuts off at 6pm ET — once live games start, live-edge takes over
+  // No hard time cutoff — skip individual games that are already live instead.
+  // This lets west-coast NHL/MLB games (9-10pm ET) get pre-game analysis
+  // while still ignoring any game that ESPN confirms is already in progress.
   const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const etHourPG = etNow.getHours();
-  if (etHourPG >= 18) {
-    console.log(`[pre-game] After 6pm ET — pre-game disabled, live-edge handles games now`);
-    return;
-  }
 
   // Daily paper limit — restore from paper-trades.jsonl (survives restarts)
   const todayDateStr = etNow.toISOString().slice(0, 10);
@@ -3204,6 +3246,23 @@ async function checkPreGamePredictions() {
     });
     if (hasPos) continue;
     if (Date.now() - (tradeCooldowns.get(base) ?? 0) < COOLDOWN_MS) continue;
+
+    // Skip if this game is already live — ESPN confirmed it's in progress.
+    // activeLiveGames is updated each live-edge cycle. If both teams from a live
+    // game pair appear in the Kalshi ticker, the game has started → skip pre-game analysis.
+    if (activeLiveGames.size > 0) {
+      const gameIsLive = game.tickers.some(t => {
+        const ticker = t.ticker.toLowerCase();
+        return [...activeLiveGames].some(pair => {
+          const [a, b] = pair.split('|');
+          return tickerHasTeam(ticker, a) && tickerHasTeam(ticker, b);
+        });
+      });
+      if (gameIsLive) {
+        console.log(`[pre-game] Skipping ${base} — game already in progress (live-edge handles it)`);
+        continue;
+      }
+    }
 
     // Both teams with prices — filter out TIE tickers (soccer has 3: team1, team2, tie)
     const realTeams = game.tickers.filter(t => t.team.toUpperCase() !== 'TIE');
@@ -4538,7 +4597,27 @@ async function managePositions() {
           continue;
         }
 
-        // PARTIAL PROFIT-TAKE — sell 25% when up ≥15¢, late game only.
+        // PRE-GAME PROFIT-LOCK — sell 50% when up ≥15¢ from entry, any stage.
+        // Pre-game bets were placed on full-game thesis before any live info existed.
+        // Once the price has risen 15¢+ (23%+ ROI at a 65¢ entry), we've captured
+        // the edge we identified. Selling half locks the gain; holding half still
+        // participates if the game goes our way. No bankroll gate — this is smart at any size.
+        if (trade.strategy === 'pre-game-prediction' && profitPerContract >= 0.15 && !trade.partialTakeAt) {
+          const sellQty = Math.max(1, Math.floor(qty * 0.50));
+          if (qty - sellQty >= 1) {
+            const gainPct = Math.round((profitPerContract / entryPrice) * 100);
+            console.log(`[exit] 💰 PRE-GAME PROFIT-LOCK (${stage}): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% (${(entryPrice*100).toFixed(0)}¢ → ${(currentPrice*100).toFixed(0)}¢) → selling ${sellQty}/${qty} at ${(currentPrice*100).toFixed(0)}¢, locking ~$${(sellQty * profitPerContract).toFixed(2)}`);
+            await tg(`💰 Pre-game profit-lock: ${trade.title?.slice(0,50)} up ${(profitPerContract*100).toFixed(0)}¢ (+${gainPct}%) — selling 50% at ${(currentPrice*100).toFixed(0)}¢`);
+            const result = await executeSell(trade, sellQty, currentPrice, 'pre-game-profit-lock');
+            if (result) {
+              trade.partialTakeAt = new Date().toISOString();
+              anyUpdated = true;
+            }
+            continue;
+          }
+        }
+
+        // PARTIAL PROFIT-TAKE (live bets) — sell 25% when up ≥15¢, late game only.
         // BANKROLL-GATED: only fires at $1K+. At small bankroll, full winners
         // need to compound — leaving 17% of profit on the table costs more in
         // growth than the variance protection saves. Revisit at $1K+.
