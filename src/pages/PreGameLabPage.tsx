@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, type PaperTrade, type PaperStats } from '@/lib/api';
+import { useArbor } from '@/context/ArborContext';
 
 const SPORT_COLOR: Record<string, string> = {
   mlb: '#002d72', nba: '#c9082a', nhl: '#0066cc',
@@ -172,8 +173,12 @@ function CalibrationTable({ stats }: { stats: PaperStats }) {
 }
 
 export default function PreGameLabPage() {
+  const { trades: allTrades } = useArbor();
   const [trades, setTrades] = useState<PaperTrade[]>([]);
   const [stats, setStats] = useState<PaperStats | null>(null);
+
+  // If any real pre-game bets have ever been placed, the strategy is live
+  const isLive = allTrades.some(t => t.strategy === 'pre-game-prediction');
   const [view, setView] = useState<'today' | 'all'>('today');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -214,8 +219,10 @@ export default function PreGameLabPage() {
           <span style={{
             fontSize: 10, fontWeight: 700, letterSpacing: '0.08em',
             padding: '3px 8px', borderRadius: 4,
-            background: '#1a1a2e', color: '#6b7dff', border: '1px solid #2d2d5e',
-          }}>PAPER ONLY</span>
+            background: isLive ? 'rgba(34,197,94,0.15)' : '#1a1a2e',
+            color: isLive ? 'var(--green)' : '#6b7dff',
+            border: isLive ? '1px solid rgba(34,197,94,0.3)' : '1px solid #2d2d5e',
+          }}>{isLive ? 'LIVE' : 'PAPER ONLY'}</span>
         </div>
         <p style={{ fontSize: 13, color: 'var(--text-secondary)', margin: 0, lineHeight: 1.5 }}>
           Simulated pre-game picks — no real money. Tracking calibration data to decide if pre-game should go live.

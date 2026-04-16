@@ -7,14 +7,17 @@ const LEAGUE_COLOR: Record<string, string> = {
 };
 
 const RESULT_META: Record<string, { label: string; color: string; bg: string }> = {
-  'TRADE':               { label: '🎯 TRADED', color: '#fff', bg: 'var(--green)' },
-  'pass':                { label: 'PASSED',    color: 'var(--red)', bg: 'rgba(239,68,68,0.12)' },
-  'skip-we-floor':       { label: 'WE LOW',    color: 'var(--amber)', bg: 'rgba(245,158,11,0.12)' },
-  'skip-price-ceiling':  { label: 'PRICE HIGH', color: 'var(--amber)', bg: 'rgba(245,158,11,0.12)' },
-  'skip-has-position':   { label: 'HELD',      color: 'var(--accent)', bg: 'rgba(99,102,241,0.12)' },
-  'skip-conf-low':       { label: 'LOW CONF',  color: 'var(--amber)', bg: 'rgba(245,158,11,0.12)' },
-  'skip-contra-move':    { label: 'CONTRA',    color: 'var(--red)', bg: 'rgba(239,68,68,0.12)' },
-  'skip-mlb-1run-late':  { label: 'EDGE THIN', color: 'var(--amber)', bg: 'rgba(245,158,11,0.12)' },
+  'TRADE':               { label: '🎯 TRADED',   color: '#fff', bg: 'var(--green)' },
+  'TRADE-comeback':      { label: '🔄 COMEBACK',  color: '#fff', bg: '#7c3aed' },
+  'pass':                { label: 'PASSED',       color: 'var(--red)', bg: 'rgba(239,68,68,0.12)' },
+  'skip-we-floor':       { label: 'WE LOW',       color: 'var(--amber)', bg: 'rgba(245,158,11,0.12)' },
+  'skip-price-ceiling':  { label: 'PRICE HIGH',   color: 'var(--amber)', bg: 'rgba(245,158,11,0.12)' },
+  'skip-has-position':   { label: 'HELD',         color: 'var(--accent)', bg: 'rgba(99,102,241,0.12)' },
+  'skip-conf-low':       { label: 'LOW CONF',     color: 'var(--amber)', bg: 'rgba(245,158,11,0.12)' },
+  'skip-contra-move':    { label: 'CONTRA',       color: 'var(--red)', bg: 'rgba(239,68,68,0.12)' },
+  'skip-mlb-1run-late':  { label: 'EDGE THIN',   color: 'var(--amber)', bg: 'rgba(245,158,11,0.12)' },
+  'skip-comeback-score': { label: 'SCORE MOVED',  color: 'var(--amber)', bg: 'rgba(245,158,11,0.12)' },
+  'skip-comeback-inning':{ label: 'INNING OUT',   color: 'var(--text-tertiary)', bg: 'var(--bg-elevated)' },
 };
 
 export default function LiveScouting() {

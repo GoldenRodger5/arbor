@@ -8,6 +8,7 @@ import { useEffect, useState } from 'react';
 import AnimatedNumber from '@/components/AnimatedNumber';
 import RecapBanner from '@/components/RecapBanner';
 import LiveScouting from '@/components/LiveScouting';
+import PreGameStrip from '@/components/PreGameStrip';
 
 function sportOf(ticker?: string, strategy?: string): string {
   const tk = (ticker ?? '').toUpperCase();
@@ -26,6 +27,15 @@ const SPORT_COLOR: Record<string, string> = {
   MLS: '#005293', EPL: '#3d195b', 'La Liga': '#ff4b00',
   UFC: '#d20a0a', Other: '#4B4B5E',
 };
+
+function strategyTag(strategy?: string): { label: string; color: string; bg: string } | null {
+  if (!strategy) return null;
+  if (strategy === 'pre-game-prediction') return { label: 'PRE-GAME', color: '#60a5fa', bg: 'rgba(29,78,216,0.15)' };
+  if (strategy === 'comeback-buy')        return { label: 'COMEBACK', color: '#a78bfa', bg: 'rgba(124,58,237,0.15)' };
+  if (strategy.includes('live') || strategy.includes('edge') || strategy.includes('broad'))
+    return { label: 'LIVE-EDGE', color: 'var(--green)', bg: 'rgba(34,197,94,0.12)' };
+  return null;
+}
 
 export default function TodayPage() {
   const { stats, positions, trades, control, realtime, connected, refresh, refreshing, loading } = useArbor();
@@ -182,6 +192,9 @@ export default function TodayPage() {
       {/* Live scouting — what bot is watching right now */}
       <LiveScouting />
 
+      {/* Pre-game picks today — real bets + paper analysis */}
+      <PreGameStrip />
+
       {/* Recap banner (first open of day / week) */}
       <RecapBanner />
 
@@ -218,9 +231,10 @@ export default function TodayPage() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {positions.slice(0, 5).map(p => {
               const sport = sportOf(p.ticker, p.strategy);
+              const stag = strategyTag(p.strategy);
               return (
                 <Link key={p.id} to="/positions" style={{
-                  display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px',
+                  display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px',
                   background: 'var(--bg-base)', borderRadius: 8, textDecoration: 'none',
                   color: 'inherit',
                 }}>
@@ -228,6 +242,12 @@ export default function TodayPage() {
                     fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 4,
                     background: SPORT_COLOR[sport] ?? 'var(--bg-elevated)', color: '#fff', flexShrink: 0,
                   }}>{sport}</span>
+                  {stag && (
+                    <span style={{
+                      fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 4,
+                      background: stag.bg, color: stag.color, letterSpacing: '0.04em', flexShrink: 0,
+                    }}>{stag.label}</span>
+                  )}
                   <span style={{ flex: 1, fontSize: 13, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {p.title}
                   </span>
