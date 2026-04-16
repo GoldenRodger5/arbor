@@ -64,6 +64,46 @@ export const api = {
     get<RecapData>(`/api/recap?period=${period}`),
   getLiveInsight: () =>
     get<LiveInsightData>('/api/live-insight'),
+  getPaperTrades: (date?: string) =>
+    get<PaperTrade[]>(`/api/paper-trades${date ? `?date=${date}` : ''}`),
+  getPaperStats: () =>
+    get<PaperStats>('/api/paper-stats'),
+};
+
+export type PaperTrade = {
+  id: string;
+  timestamp: string;
+  strategy: 'pre-game-paper';
+  sport: string;
+  marketBase: string;
+  ticker: string;
+  teamAbbr: string;
+  teamName: string;
+  opponentAbbr: string;
+  opponentName: string;
+  marketTitle: string;
+  confidence: number;
+  price: number;
+  edge: number;
+  wouldBetAmount: number;
+  wouldQty: number;
+  reasoning: string;
+  pgBaseline: number;
+  status: 'pending' | 'won' | 'lost';
+  outcome: 'correct' | 'incorrect' | null;
+  settledAt: string | null;
+  paperPnL: number | null;
+};
+
+export type PaperStats = {
+  total: number;
+  pending: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  impliedPnL: number;
+  bySport: { sport: string; total: number; wins: number; winRate: number | null; impliedPnL: number }[];
+  byConfidence: { label: string; total: number; wins: number; winRate: number | null; impliedPnL: number }[];
 };
 
 export type LiveInsightGame = {

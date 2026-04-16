@@ -20,6 +20,7 @@ const API_TOKEN = process.env.API_TOKEN ?? 'arbor-2026';
 const TRADES_LOG = join(__dirname, 'logs/trades.jsonl');
 const DAILY_LOG = join(__dirname, 'logs/daily-snapshots.jsonl');
 const SCREENS_LOG = join(__dirname, 'logs/screens.jsonl');
+const PAPER_TRADES_LOG = join(__dirname, 'logs/paper-trades.jsonl');
 const CONTROL_FILE = join(__dirname, 'logs/control.json');
 const SELL_REQUESTS_FILE = join(__dirname, 'logs/sell-requests.jsonl');
 
@@ -77,6 +78,7 @@ function tailWatcher(path, eventName) {
 }
 tailWatcher(TRADES_LOG, 'trade');
 tailWatcher(SCREENS_LOG, 'screen');
+tailWatcher(PAPER_TRADES_LOG, 'paper-trade');
 
 // Heartbeat every 25s so proxies/load-balancers don't close idle connections.
 setInterval(() => broadcast('ping', { t: Date.now() }), 25_000);
@@ -871,6 +873,68 @@ Write the recap.`
       } catch (e) {
         json(res, []);
       }
+
+    } else if (path === '/api/paper-trades') {
+      const paperTrades = readJsonl(PAPER_TRADES_LOG);
+      const dateFilter = url.searchParams.get('date'); // 'today' or YYYY-MM-DD
+      if (dateFilter === 'today') {
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+        json(res, paperTrades.filter(t => (t.timestamp ?? '').startsWith(todayStr)));
+      } else if (dateFilter) {
+        json(res, paperTrades.filter(t => (t.timestamp ?? '').startsWith(dateFilter)));
+      } else {
+        json(res, paperTrades);
+      }
+
+    } else if (path === '/api/paper-stats') {
+      const paperTrades = readJsonl(PAPER_TRADES_LOG);
+      const settled = paperTrades.filter(t => t.status === 'won' || t.status === 'lost');
+
+      // By sport
+      const bySport = {};
+      for (const t of settled) {
+        const s = t.sport ?? 'other';
+        if (!bySport[s]) bySport[s] = { sport: s, total: 0, wins: 0, impliedPnL: 0 };
+        bySport[s].total++;
+        if (t.status === 'won') bySport[s].wins++;
+        bySport[s].impliedPnL += t.paperPnL ?? 0;
+      }
+      for (const s of Object.values(bySport)) {
+        s.winRate = s.total > 0 ? Math.round(100 * s.wins / s.total) : null;
+        s.impliedPnL = Math.round(s.impliedPnL * 100) / 100;
+      }
+
+      // By confidence bucket
+      const buckets = [
+        { label: '70-75%', min: 0.70, max: 0.75 },
+        { label: '75-80%', min: 0.75, max: 0.80 },
+        { label: '80%+',   min: 0.80, max: 1.01 },
+      ];
+      const byConfidence = buckets.map(b => {
+        const group = settled.filter(t => (t.confidence ?? 0) >= b.min && (t.confidence ?? 0) < b.max);
+        const wins = group.filter(t => t.status === 'won').length;
+        return {
+          label: b.label,
+          total: group.length,
+          wins,
+          winRate: group.length > 0 ? Math.round(100 * wins / group.length) : null,
+          impliedPnL: Math.round(group.reduce((s, t) => s + (t.paperPnL ?? 0), 0) * 100) / 100,
+        };
+      });
+
+      const totalPnL = Math.round(settled.reduce((s, t) => s + (t.paperPnL ?? 0), 0) * 100) / 100;
+      const totalWins = settled.filter(t => t.status === 'won').length;
+
+      json(res, {
+        total: settled.length,
+        pending: paperTrades.filter(t => t.status === 'pending').length,
+        wins: totalWins,
+        losses: settled.length - totalWins,
+        winRate: settled.length > 0 ? Math.round(100 * totalWins / settled.length) : null,
+        impliedPnL: totalPnL,
+        bySport: Object.values(bySport).sort((a, b) => b.total - a.total),
+        byConfidence,
+      });
 
     } else {
       res.writeHead(404);

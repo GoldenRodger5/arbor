@@ -970,6 +970,7 @@ function resetDailyTracking() {
 const TRADES_LOG = './logs/trades.jsonl';
 const DAILY_LOG = './logs/daily-snapshots.jsonl';
 const SCREENS_LOG = './logs/screens.jsonl';
+const PAPER_TRADES_LOG = './logs/paper-trades.jsonl';
 if (!existsSync('./logs')) mkdirSync('./logs', { recursive: true });
 
 // Kalshi parabolic fee: 7% × price × (1 - price). Max at 50¢ (1.75¢), zero at 0 or 100¢.
@@ -1026,6 +1027,60 @@ function logTrade(entry) {
     console.error('[pnl] Failed to log trade:', e.message);
   }
   return record.id;
+}
+
+// Log a paper (simulated) pre-game trade — no real money, for calibration
+function logPaperTrade(entry) {
+  const record = {
+    id: `paper-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+    strategy: 'pre-game-paper',
+    status: 'pending',       // pending → won | lost (updated by settlePaperTrades)
+    outcome: null,
+    settledAt: null,
+    paperPnL: null,
+    ...entry,
+  };
+  try {
+    appendFileSync(PAPER_TRADES_LOG, JSON.stringify(record) + '\n');
+    console.log(`[paper] Logged paper trade: ${record.sport?.toUpperCase()} ${record.marketBase} → ${record.teamAbbr} @${Math.round((record.price??0)*100)}¢ conf=${Math.round((record.confidence??0)*100)}%`);
+  } catch (e) {
+    console.error('[paper] Failed to log paper trade:', e.message);
+  }
+}
+
+// Settle pending paper trades against Kalshi market outcomes
+async function settlePaperTrades() {
+  if (!existsSync(PAPER_TRADES_LOG)) return;
+  const lines = readFileSync(PAPER_TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+  const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  const pending = trades.filter(t => t.status === 'pending' && t.ticker);
+  if (pending.length === 0) return;
+
+  let updated = false;
+  for (const t of pending) {
+    try {
+      const market = await kalshiGet(`/markets/${t.ticker}`);
+      if (!market?.market?.result) continue; // not settled yet
+      const result = market.market.result; // 'yes' or 'no'
+      const won = result === 'yes'; // we always log the YES side (the team we picked)
+      t.status = won ? 'won' : 'lost';
+      t.outcome = won ? 'correct' : 'incorrect';
+      t.settledAt = market.market.close_time ?? new Date().toISOString();
+      const stake = t.wouldBetAmount ?? 5;
+      t.paperPnL = won
+        ? Math.round(stake * ((1 / (t.price ?? 0.7)) - 1) * 100) / 100
+        : -stake;
+      updated = true;
+      console.log(`[paper] Settled ${t.marketBase}: ${t.teamAbbr} ${t.status} | paperPnL=$${t.paperPnL?.toFixed(2)}`);
+    } catch { /* market not found or not settled — skip */ }
+  }
+
+  if (!updated) return;
+  // Rewrite file with updated records
+  const allById = new Map(trades.map(t => [t.id, t]));
+  for (const t of pending) allById.set(t.id, t);
+  writeFileSync(PAPER_TRADES_LOG, [...allById.values()].map(t => JSON.stringify(t)).join('\n') + '\n');
 }
 
 // Log screening decisions for analysis: what Haiku flagged, what Sonnet decided
@@ -3062,18 +3117,16 @@ async function checkLiveScoreEdges() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // lastPreGameScan declared at top (before loadState) to avoid TDZ
-const PREGAME_SCAN_INTERVAL = 15 * 60 * 1000; // every 15 min — only NBA/NHL qualify, no need to scan constantly
-const MAX_PREGAME_PER_CYCLE = 2;   // Max trades per scan — be surgical, not spray-and-pray
-const MAX_PREGAME_PER_DAY = 2;     // Max 2 pre-game trades — only the absolute strongest
+const PREGAME_SCAN_INTERVAL = 15 * 60 * 1000; // every 15 min
+const MAX_PREGAME_PER_CYCLE = 4;   // Paper mode: more coverage per scan
+const MAX_PREGAME_PAPER_PER_DAY = 10; // Paper mode: log up to 10 paper picks/day for calibration
 let preGameTradesToday = 0;
 let preGameTradesDate = '';         // reset counter on new day
 const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
 
 async function checkPreGamePredictions() {
-  // Pre-game betting disabled — only live in-game edge bets allowed
-  console.log('[pre-game] Disabled — live-edge only mode');
-  return;
-
+  // PAPER MODE: Runs full pre-game analysis for all sports but logs to paper-trades.jsonl
+  // instead of placing real orders. Used for calibration — no real money at risk.
   if (Date.now() - lastPreGameScan < PREGAME_SCAN_INTERVAL) return;
   lastPreGameScan = Date.now();
   if (!canTrade()) return;
@@ -3086,34 +3139,28 @@ async function checkPreGamePredictions() {
     return;
   }
 
-  // Daily limit — count from JSONL (survives restarts), not just in-memory counter
+  // Daily paper limit — restore from paper-trades.jsonl (survives restarts)
   const todayDateStr = etNow.toISOString().slice(0, 10);
   if (preGameTradesDate !== todayDateStr) {
     preGameTradesDate = todayDateStr;
     preGameBetGames.clear();
-    // Restore count from JSONL — count ALL pre-game trades placed today, any status
     preGameTradesToday = 0;
-    if (existsSync(TRADES_LOG)) {
-      const todayLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+    if (existsSync(PAPER_TRADES_LOG)) {
+      const todayLines = readFileSync(PAPER_TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
       for (const l of todayLines) {
         try {
           const t = JSON.parse(l);
-          if (t.strategy === 'pre-game-prediction' && t.timestamp?.startsWith(todayDateStr)) {
+          if (t.strategy === 'pre-game-paper' && t.timestamp?.startsWith(todayDateStr)) {
             preGameTradesToday++;
-            // Use Kalshi base if available — Polymarket tickers are slugs, not base tickers
-            const rawTicker = t.ticker ?? '';
-            const tBase = rawTicker.startsWith('KX')
-              ? (rawTicker.lastIndexOf('-') > 0 ? rawTicker.slice(0, rawTicker.lastIndexOf('-')) : rawTicker)
-              : (t.kalshiBase ?? rawTicker); // fallback to kalshiBase field if logged
-            if (tBase) preGameBetGames.add(tBase);
+            if (t.marketBase) preGameBetGames.add(t.marketBase);
           }
         } catch {}
       }
     }
-    if (preGameTradesToday > 0) console.log(`[pre-game] Restored count from JSONL: ${preGameTradesToday} pre-game trades today`);
+    if (preGameTradesToday > 0) console.log(`[pre-game] Restored paper count: ${preGameTradesToday} paper trades today`);
   }
-  if (preGameTradesToday >= MAX_PREGAME_PER_DAY) {
-    console.log(`[pre-game] Daily limit reached (${preGameTradesToday}/${MAX_PREGAME_PER_DAY} trades). Skipping.`);
+  if (preGameTradesToday >= MAX_PREGAME_PAPER_PER_DAY) {
+    console.log(`[pre-game] Paper daily limit reached (${preGameTradesToday}/${MAX_PREGAME_PAPER_PER_DAY}). Skipping.`);
     return;
   }
 
@@ -3178,31 +3225,21 @@ async function checkPreGamePredictions() {
   if (preGameMarkets.length === 0) { console.log('[pre-game] No pre-game markets in range'); return; }
   console.log(`[pre-game] Found ${preGameMarkets.length} pre-game markets in sweet spot`);
 
-  // Filter: only send sports that CAN pass the confidence cap to Sonnet.
-  // MLB max 62%, Soccer max 57% — both fail 68% min. Don't waste $0.25/call.
-  // Only NBA (max 83%) and NHL (max 74%) can pass pre-game.
-  const PRE_GAME_ELIGIBLE_SPORTS = ['NBA', 'NHL'];
-  const eligibleMarkets = preGameMarkets.filter(m => {
-    const tk = m.base ?? '';
-    const sport = tk.includes('NBA') ? 'NBA' : tk.includes('NHL') ? 'NHL' :
-      tk.includes('MLB') ? 'MLB' : tk.includes('MLS') ? 'MLS' : tk.includes('EPL') ? 'EPL' : 'other';
-    return PRE_GAME_ELIGIBLE_SPORTS.includes(sport);
-  });
+  // PAPER MODE: all sports eligible — we're collecting calibration data, not limiting by real-money risk.
+  // Skip soccer TIE-only games (already filtered above). All of MLB/NBA/NHL/MLS/EPL/La Liga included.
+  const eligibleMarkets = preGameMarkets; // no sport filter
+  console.log(`[pre-game] ${eligibleMarkets.length} paper-eligible markets across all sports`);
 
-  if (eligibleMarkets.length === 0) {
-    if (preGameMarkets.length > 0) console.log(`[pre-game] ${preGameMarkets.length} markets found but none are NBA/NHL (only eligible pre-game sports)`);
-    return;
-  }
-  console.log(`[pre-game] ${eligibleMarkets.length} eligible (NBA/NHL) out of ${preGameMarkets.length} total`);
-
-  const pgSlice = eligibleMarkets.slice(0, 8);
+  const pgSlice = eligibleMarkets.slice(0, 12); // up to 12 per cycle for broad coverage
   const maxBetDisplay = getDynamicMaxTrade().toFixed(2);
 
   const todayDate = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'long', day: 'numeric' });
 
   const pgPrompts = pgSlice.map(market => {
     const tk = market.base ?? '';
-    const sport = tk.includes('NBA') ? 'NBA' : tk.includes('NHL') ? 'NHL' : 'Sport';
+    const sport = tk.includes('NBA') ? 'NBA' : tk.includes('NHL') ? 'NHL' :
+      tk.includes('MLB') ? 'MLB' : tk.includes('MLS') ? 'MLS' :
+      tk.includes('EPL') ? 'EPL' : tk.includes('LALIGA') ? 'La Liga' : 'Sport';
 
     const sportBaseline = {
       MLB: 'MLB home team wins 54%. Top pitcher (ERA<3.0) adds +10-15%. FIP is better predictor than ERA. Look up starting pitchers, recent form, bullpen ERA.',
@@ -3291,7 +3328,80 @@ async function checkPreGamePredictions() {
         `✓ Confidence ≥ 70% (higher bar than live — no score anchor)\n` +
         `✓ Confidence beats price by 4+ points\n` +
         `✓ Goalie is confirmed, stakes are understood, and you have a specific reason — not just "better team"\n` +
-        `Max bet: $${maxBetDisplay}\n\n` +
+        `JSON ONLY:\n` +
+        `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"reasoning":"one sentence"}`
+
+      : /* MLB */
+      sport === 'MLB'
+      ? `You are a professional MLB bettor. Predict who wins this game being played TODAY, ${todayDate}.\n\n` +
+        `⚠️ RESEARCH RULES: Only state facts you confirmed via web search. Never invent starting pitchers, ERAs, or lineup info. Flag all inferences explicitly. If you cannot confirm the starting pitcher, say NO.\n\n` +
+        `GAME: ${market.title}\n` +
+        `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
+        `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
+        `BASELINE: MLB home team wins 54%. Starting pitcher quality is the single biggest factor.\n\n` +
+        `═══ STEP 1 — RESEARCH (search in this order) ═══\n` +
+        `A) STARTING PITCHERS — MANDATORY: Search "[team1] starting pitcher today ${todayDate}" and "[team2] starting pitcher today". Confirm BOTH starters by name. If either is unconfirmed, say NO.\n` +
+        `B) PITCHER QUALITY: What is each starter's 2026 ERA and WHIP? Recent form (last 3 starts)? Search "[pitcher name] stats 2026".\n` +
+        `C) BULLPEN: Search "[team] bullpen ERA 2026" for each team. Note if a team's closer has ERA < 2.5 or > 4.5 — that matters for close games.\n` +
+        `D) LINEUP/INJURIES: Any star hitter (MVP-caliber, .300+) confirmed OUT today?\n\n` +
+        `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
+        `❌ Starting pitcher for the team you want to bet is NOT confirmed → NO\n` +
+        `❌ Team you want to bet has ERA > 5.5 starter going against ERA < 3.0 opponent → NO (mismatch too large)\n` +
+        `❌ Star cleanup hitter (confirmed .300+, 30+ HR pace) is OUT AND the matchup is otherwise close → NO\n\n` +
+        `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs) ═══\n` +
+        `Start from 54% home / 46% away baseline. Adjust only based on confirmed research:\n` +
+        `+ Elite starter (ERA < 2.5, WHIP < 1.0) going tonight → UP 8-12%\n` +
+        `+ Good starter (ERA 2.5-3.5) → UP 3-6%\n` +
+        `+ Opponent starter ERA > 5.0 → UP 5-8% (weak opposition)\n` +
+        `+ Strong bullpen (ERA < 3.5 team) in a projected close game → UP 2-3%\n` +
+        `+ Team won 5 of last 7 → UP 2-3% (hot streak)\n` +
+        `- Below-average starter (ERA 4.5-5.5) → DOWN 5-8%\n` +
+        `- Poor bullpen (ERA > 4.8) if game likely goes to extras → DOWN 3-5%\n` +
+        `- Opponent elite starter (ERA < 2.5) → DOWN 8-12%\n` +
+        `- Team lost 5 of last 7 → DOWN 3-4%\n` +
+        `- Road team at a pitcher's park (Coors Field reversed = hitter's park → ignore if at COL) → DOWN 1-2%\n\n` +
+        `═══ STEP 4 — DECISION ═══\n` +
+        `NOTE: MLB is highly random game-to-game. Only recommend if you have a clear pitching advantage OR a specific confirmed edge. If it's a coin flip, say so.\n` +
+        `BUY only if ALL three are true:\n` +
+        `✓ Confidence ≥ 70%\n` +
+        `✓ Confidence beats price by 4+ points\n` +
+        `✓ Both starters are confirmed AND you have a specific researched reason\n` +
+        `JSON ONLY:\n` +
+        `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"reasoning":"one sentence"}`
+
+      : /* Soccer (MLS / EPL / La Liga) */
+      `You are a professional soccer bettor. Predict who wins this game being played TODAY, ${todayDate}.\n\n` +
+        `⚠️ CRITICAL — DRAWS LOSE: This market is "team wins outright." A DRAW means the contract LOSES regardless of which team you bet. Factor in the draw probability when setting confidence — if a draw is likely (>25%), your true win probability is lower than it appears.\n\n` +
+        `⚠️ RESEARCH RULES: Only state confirmed facts. Flag inferences. If you cannot confirm key lineup or form data, say NO.\n\n` +
+        `GAME: ${market.title}\n` +
+        `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
+        `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
+        `BASELINE: ${sportBaseline}\n\n` +
+        `═══ STEP 1 — RESEARCH ═══\n` +
+        `A) FORM: Search "[team1] last 5 results ${todayDate}" and "[team2] last 5 results". What is each team's recent form (W/D/L)?\n` +
+        `B) KEY INJURIES: Any first-choice striker or central defender OUT today?\n` +
+        `C) TABLE POSITION: What are both teams' league positions and points? Is either in a must-win situation (relegation, title race, European qualification)?\n` +
+        `D) HEAD TO HEAD: Recent H2H — how have these teams matched up in the last 3 meetings?\n\n` +
+        `═══ STEP 2 — HARD NOs ═══\n` +
+        `❌ Draw probability is above 35% AND no clear advantage for either team → NO (draw risk too high for moneyline)\n` +
+        `❌ Team you want to bet has lost 4 of last 5 → NO\n` +
+        `❌ Key striker confirmed OUT and opponent is defensively strong → NO\n\n` +
+        `═══ STEP 3 — EDGE ANALYSIS ═══\n` +
+        `Start from home/away baseline for this league. Adjust only based on confirmed research:\n` +
+        `+ Team in must-win situation (confirmed: relegation battle, title clincher, cup spot) → UP 4-6%\n` +
+        `+ Strong recent form (4W in last 5) vs poor form opponent (1W in last 5) → UP 5-8%\n` +
+        `+ Home team with 65%+ home win rate this season → UP 3-5%\n` +
+        `+ H2H dominant (won last 3 meetings) → UP 3-4%\n` +
+        `- Draw-heavy team (D in 3 of last 5) → DOWN 5-8% (reduces win probability even in favorable matchups)\n` +
+        `- Key striker confirmed OUT → DOWN 5-7%\n` +
+        `- Away team with strong away record (40%+ WR away) → DOWN 3-5%\n\n` +
+        `═══ STEP 4 — DECISION ═══\n` +
+        `BUY only if ALL three are true:\n` +
+        `✓ Confidence ≥ 70% (must account for draw probability — if you think team wins 60% but draws 25%, true win% = ~60/75 = 80% of non-draw... but contract loses on draw, so state confidence in OUTRIGHT WIN)\n` +
+        `✓ Confidence beats price by 4+ points\n` +
+        `✓ You have confirmed form/stakes data — not just "better team on paper"\n` +
         `JSON ONLY:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"reasoning":"one sentence"}`;
@@ -3303,7 +3413,7 @@ async function checkPreGamePredictions() {
     };
   });
 
-  // Fire in parallel batches of 3 — max 2 trades per cycle
+  // Fire in parallel batches of 4 — paper mode, no real money at stake
   let preGameTradesThisCycle = 0;
   for (let batch = 0; batch < pgPrompts.length; batch += 3) {
     if (preGameTradesThisCycle >= MAX_PREGAME_PER_CYCLE) break;
@@ -3446,119 +3556,54 @@ async function checkPreGamePredictions() {
       continue;
     }
 
-    if (!canTrade()) break;
+    // PAPER MODE: skip real order placement. Compute what we would have bet, then log.
+    if (preGameTradesToday >= MAX_PREGAME_PAPER_PER_DAY) { console.log(`[pre-game] Paper daily limit reached`); continue; }
+    if (preGameBetGames.has(market.base)) { console.log(`[pre-game] Already logged paper trade for ${market.base} today`); continue; }
 
-    // Cross-platform price check — extract team abbreviations from ticker
-    const tickerParts = market.base.split('-');
-    const teamBlock = tickerParts.length >= 3 ? tickerParts[tickerParts.length - 2] : '';
-    const team1 = teamBlock.slice(-6, -3);
-    const team2 = teamBlock.slice(-3);
-    // Extract sport from Kalshi series ticker (KXMLBGAME → mlb, KXNBAGAME → nba)
-    const pgSport = market.base.includes('MLB') ? 'mlb' : market.base.includes('NBA') ? 'nba' : market.base.includes('NHL') ? 'nhl' : market.base.includes('MLS') ? 'mls' : market.base.includes('EPL') ? 'epl' : market.base.includes('LALIGA') ? 'laliga' : '';
-    const pgPolyMarkets = await getPolyMoneylines();
-    const pgPolyMatch = findPolyMarketForGame(team1, team2, pgPolyMarkets, pgSport);
-    // The team we want — from Claude's pick, always buying YES
-    const pgTargetTeam = matchedSide.team;
-    const pgBest = pickBestPlatform('yes', price, pgPolyMatch, pgTargetTeam);
-
-    const bestPrice = pgBest.price;
-    const edge = confidence - bestPrice;
-    if (confidence - bestPrice < pgReqMargin) continue;
-
-    const maxBet = getPositionSize(pgBest.platform, edge);
-    const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
-    if (safeBet < 1) continue;
-
-    const qty = Math.max(1, Math.floor(safeBet / bestPrice));
-    const priceInCents = Math.round(bestPrice * 100);
-
-    if (!canDeployMore(qty * bestPrice)) continue;
-    if (preGameTradesToday >= MAX_PREGAME_PER_DAY) { console.log(`[pre-game] Daily limit reached`); continue; }
-    if (preGameBetGames.has(market.base)) { console.log(`[pre-game] Already bet on ${market.base} today (memory)`); continue; }
-
-    // REAL duplicate check — survives restarts. Check Kalshi API positions + JSONL.
-    const alreadyHasPosition = openPositions.some(p => {
-      const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
-      return pBase === market.base;
-    });
-    if (alreadyHasPosition) { console.log(`[pre-game] Already have Kalshi position on ${market.base}`); continue; }
-
-    // Also check JSONL for today's trades on this game (catches trades from earlier restarts)
-    // Don't require status=open — any non-void pre-game trade today blocks re-entry (one shot per game)
-    if (existsSync(TRADES_LOG)) {
-      const todayTrades = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+    // Check paper-trades.jsonl for duplicate (survives restarts)
+    if (existsSync(PAPER_TRADES_LOG)) {
       const todayDateStr2 = etNow.toISOString().slice(0, 10);
-      const hasTodayTrade = todayTrades.some(l => {
+      const paperLines = readFileSync(PAPER_TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      const hasPaperToday = paperLines.some(l => {
         try {
           const t = JSON.parse(l);
-          if (t.status === 'testing-void') return false;
-          if (!t.timestamp?.startsWith(todayDateStr2)) return false;
-          if (t.strategy !== 'pre-game-prediction') return false;
-          // Kalshi ticker: check if it includes the base
-          if (t.ticker?.includes(market.base)) return true;
-          // Polymarket ticker: check stored kalshiBase fallback
-          if (t.kalshiBase === market.base) return true;
-          return false;
+          return t.strategy === 'pre-game-paper' && t.timestamp?.startsWith(todayDateStr2) && t.marketBase === market.base;
         } catch { return false; }
       });
-      if (hasTodayTrade) { console.log(`[pre-game] Already bet on ${market.base} today (JSONL)`); continue; }
+      if (hasPaperToday) { console.log(`[pre-game] Already logged paper trade for ${market.base} today (JSONL)`); continue; }
     }
 
-    const pgPlatformLabel = pgBest.platform === 'polymarket' ? `POLY (saved ${((price-bestPrice)*100).toFixed(0)}¢ vs Kalshi)` : 'KALSHI';
-    console.log(`[pre-game] 🎯 TRADE on ${pgPlatformLabel}: ${market.base} ${pick.side.toUpperCase()} @${priceInCents}¢ × ${qty} conf=${(confidence*100).toFixed(0)}% (${preGameTradesToday+1}/${MAX_PREGAME_PER_DAY} today)`);
-    logScreen({ stage: 'pre-game', ticker: market.base, result: 'TRADE', confidence, price: bestPrice, platform: pgBest.platform, reasoning: decision.reasoning });
+    // Simulate position size using same formula as real trades
+    const edge = confidence - price;
+    const wouldBetAmount = Math.min(getPositionSize('kalshi', edge), getDynamicMaxTrade());
+    const wouldQty = wouldBetAmount >= 1 ? Math.max(1, Math.floor(wouldBetAmount / price)) : 0;
+    if (wouldBetAmount < 1) continue; // wouldn't meet minimum — skip
 
-    tradeCooldowns.set(market.base, Date.now());
-    tradeCooldowns.set(market.base, Date.now());
+    preGameTradesToday++;
+    preGameTradesThisCycle++;
+    preGameBetGames.add(market.base);
 
-    let pgResult, deployed;
-    if (pgBest.platform === 'polymarket' && pgBest.slug) {
-      pgResult = await polymarketPost(pgBest.slug, pgBest.intent, bestPrice + 0.02, qty);
-      deployed = qty * bestPrice;
-    } else {
-      pgResult = await kalshiPost('/portfolio/orders', {
-        ticker: pick.ticker, action: 'buy', side: 'yes', count: qty,
-        yes_price: priceInCents,
-      });
-      deployed = qty * bestPrice;
-    }
+    logPaperTrade({
+      sport: pgSportKey,
+      marketBase: market.base,
+      ticker: matchedSide.ticker, // the specific team's YES market — used for settlement lookup
+      teamAbbr: matchedSide.team,
+      teamName: bettingOnTeam,
+      opponentAbbr: otherSide.team,
+      opponentName: otherSide.teamName,
+      marketTitle: market.title,
+      confidence,
+      price,
+      edge: Math.round(edge * 1000) / 10, // store as percentage points (e.g. 5.2)
+      wouldBetAmount: Math.round(wouldBetAmount * 100) / 100,
+      wouldQty,
+      reasoning: decision.reasoning,
+      // Calibration metadata
+      pgBaseline: pgTargetBaseline,
+    });
 
-    if (pgResult.ok) {
-      stats.tradesPlaced++;
-      preGameTradesToday++;
-      preGameTradesThisCycle++;
-      preGameBetGames.add(market.base);
-      logTrade({
-        exchange: pgBest.platform, strategy: 'pre-game-prediction',
-        ticker: pgBest.platform === 'polymarket' ? pgBest.slug : pick.ticker,
-        kalshiBase: market.base, // always stored so restart restore can find it regardless of platform
-        title: market.title,
-        side: 'yes', quantity: qty, entryPrice: bestPrice,
-        bettingOn: bettingOnTeam,
-        deployCost: deployed,
-        filled: (pgResult.data?.order ?? pgResult.data)?.quantity_filled ?? 0,
-        orderId: (pgResult.data?.order ?? pgResult.data)?.order_id ?? pgResult.data?.id ?? null,
-        edge: edge * 100, confidence,
-        reasoning: decision.reasoning,
-        // Calibration fields
-        league: pgSportKey,
-        weAtEntry: pgTargetBaseline, // pre-game home/away baseline WE
-        scoreDiff: 0,       // pre-game = before first pitch/puck drop
-        periodAtEntry: 0,   // pre-game = period 0
-        isLeadingTeam: null, // pre-game = no leader yet
-      });
-
-      const pgSavedMsg = pgBest.platform === 'polymarket' ? `\n💡 Poly was cheaper than Kalshi` : '';
-      await tg(
-        `🎯 <b>PRE-GAME BET — ${pgBest.platform.toUpperCase()}</b>\n\n` +
-        `<b>${market.title}</b>\n` +
-        `Betting on: <b>${bettingOnTeam}</b> to win (${pick.side.toUpperCase()} @ ${priceInCents}¢)\n` +
-        `${qty} contracts × ${priceInCents}¢ = <b>$${deployed.toFixed(2)}</b>\n` +
-        `Confidence: <b>${(confidence*100).toFixed(0)}%</b> vs price ${priceInCents}¢\n` +
-        `Potential profit: <b>$${(qty * (1 - bestPrice)).toFixed(2)}</b>${pgSavedMsg}\n\n` +
-        `🧠 <i>${decision.reasoning}</i>`
-      );
-    }
+    logScreen({ stage: 'pre-game-paper', ticker: market.base, result: 'PAPER', confidence, price, reasoning: decision.reasoning });
+    console.log(`[pre-game] 📋 PAPER: ${market.base} → ${matchedSide.team} @${Math.round(price*100)}¢ conf=${Math.round(confidence*100)}% wouldBet=$${wouldBetAmount.toFixed(2)} (${preGameTradesToday}/${MAX_PREGAME_PAPER_PER_DAY} today)`);
     }
   }
 }
@@ -5336,6 +5381,7 @@ async function main() {
   async function settlementLoop() {
     try { await managePositions(); } catch (e) { console.error('[exit] error:', e.message); }
     try { await checkSettlements(); } catch (e) { console.error('[settlement] error:', e.message); }
+    try { await settlePaperTrades(); } catch (e) { console.error('[paper-settle] error:', e.message); }
     try { await reviewStopLossOutcomes(); } catch (e) { console.error('[stop-review] error:', e.message); }
     try { await checkResolutionArbs(); } catch (e) { console.error('[resolve] error:', e.message); }
     setTimeout(settlementLoop, 5 * 60 * 1000);
@@ -5380,7 +5426,7 @@ async function main() {
     `Max deploy: ${(getMaxDeployment()*100).toFixed(0)}% ($${(bankroll*getMaxDeployment()).toFixed(2)}) | Positions: ${getMaxPositions()}\n` +
     `Daily loss halt: $${Math.max(10, bankroll * DAILY_LOSS_PCT).toFixed(2)} (${(DAILY_LOSS_PCT*100).toFixed(0)}%)\n` +
     `Reserve: ${(CAPITAL_RESERVE*100).toFixed(0)}% ($${(bankroll*CAPITAL_RESERVE).toFixed(2)}) | Game cap: 15% ($${(bankroll*0.15).toFixed(2)})\n` +
-    `Pre-game: max ${MAX_PREGAME_PER_CYCLE}/cycle, ${MAX_PREGAME_PER_DAY}/day | Consecutive loss: ${MAX_CONSECUTIVE_LOSSES}→half\n\n` +
+    `Pre-game: max ${MAX_PREGAME_PER_CYCLE}/cycle, ${MAX_PREGAME_PAPER_PER_DAY}/day | Consecutive loss: ${MAX_CONSECUTIVE_LOSSES}→half\n\n` +
     `<b>Config:</b>\n` +
     `Min confidence: ${(MIN_CONFIDENCE*100).toFixed(0)}% | Margins: dynamic by sport + price\n` +
     `Mode: ${KALSHI_ONLY ? 'Kalshi only' : 'Kalshi + Poly'} | ${DRY_RUN ? 'DRY RUN' : 'LIVE TRADING'}\n` +
