@@ -4325,6 +4325,31 @@ async function managePositions() {
           continue;
         }
 
+        // PARTIAL PROFIT-TAKE — sell 25% of position when up ≥12¢, mid/late game.
+        //
+        // Why: the LAA scenario — up 5-15¢ unrealized, NYY comes back in the 9th,
+        // full position wipes out. Selling 25% locks in a cushion while keeping
+        // 75% running for full settlement. At $225 bankroll this costs ~$0.20 EV
+        // per trade (3.5% of position) but cuts downside variance 25%.
+        //
+        // Deliberately conservative:
+        //   - 12¢ threshold → won't fire on noise (+2-3¢ from normal spread)
+        //   - 25% sell → keeps 75% running for growth (user wants to compound)
+        //   - Once per position → no cascading partial-takes
+        //   - Mid/late only → don't lock profit in inning 3 when game can swing back
+        if (profitPerContract >= 0.12 && (stage === 'mid' || stage === 'late') && !trade.partialTakeAt) {
+          const sellQty = Math.max(1, Math.floor(qty * 0.25));
+          if (qty - sellQty >= 2) {
+            console.log(`[exit] 📊 PARTIAL PROFIT-TAKE (${stage}): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ → selling ${sellQty} of ${qty} contracts at ${(currentPrice*100).toFixed(0)}¢ (locking ~$${(sellQty * profitPerContract).toFixed(2)}, keeping ${qty - sellQty} running)`);
+            const result = await executeSell(trade, sellQty, currentPrice, 'scale-out');
+            if (result) {
+              trade.partialTakeAt = new Date().toISOString();
+              anyUpdated = true;
+            }
+            continue;
+          }
+        }
+
         // NUCLEAR STOP — absolute floor, no Claude, just get out
         // This is deeper than the old stop-loss. Only fires on true blowouts.
         // 70¢+ entry: -60%. 50-70¢: -75%. Under 50¢: -85%.
