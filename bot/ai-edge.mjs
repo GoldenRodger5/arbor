@@ -1871,12 +1871,23 @@ async function checkLiveScoreEdges() {
                 sellFraction = 0.33; sellReason = `pg-profit-early (WE=${Math.round(weWinning*100)}% +${Math.round(gainCents*100)}¢)`;
               }
 
-              if (sellFraction > 0 && !trade.pgProfitSold) {
+              if (sellFraction > 0 && !trade.partialTakeAt) {
                 const sellQty = Math.max(1, Math.floor(qty * sellFraction));
                 const remaining = qty - sellQty;
                 if (sellQty >= 1) {
                   tradeCooldowns.set(pgWinKey, Date.now());
-                  trade.pgProfitSold = new Date().toISOString();
+                  // Persist partialTakeAt to JSONL immediately so it survives restarts
+                  // and managePositions won't double-sell (it checks !trade.partialTakeAt)
+                  trade.partialTakeAt = new Date().toISOString();
+                  trade._pgFirstSellFraction = sellFraction;
+                  const freshPgLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+                  const freshPgTrades = freshPgLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+                  const freshPgTrade = freshPgTrades.find(t => t.id === trade.id);
+                  if (freshPgTrade) {
+                    freshPgTrade.partialTakeAt = trade.partialTakeAt;
+                    freshPgTrade._pgFirstSellFraction = sellFraction;
+                    writeFileSync(TRADES_LOG, freshPgTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
+                  }
                   console.log(`[pg-profit] ${trade.ticker} SELLING ${sellQty}/${qty} contracts @ ${Math.round(currentPricePg*100)}¢ | ${sellReason} | gain=$${(gainCents*sellQty).toFixed(2)}`);
                   await sendTelegram(`📈 <b>Pre-game profit take</b>\n${trade.title ?? trade.ticker}\n${sellReason}\nSelling ${sellQty}/${qty} @ ${Math.round(currentPricePg*100)}¢ | +$${(gainCents*sellQty).toFixed(2)}`);
                   await executeSell(trade, sellQty, currentPricePg, sellReason);
@@ -1884,7 +1895,7 @@ async function checkLiveScoreEdges() {
                     console.log(`[pg-profit] ${remaining} contracts remain — riding to ${stage === 'early' ? 'mid-game' : 'settlement'}`);
                   }
                 }
-              } else if (sellFraction > 0 && trade.pgProfitSold) {
+              } else if (sellFraction > 0 && trade.partialTakeAt) {
                 // Already took profit once — only sell remaining on dominant late WE
                 if (stage === 'late' && weWinning >= 0.88) {
                   const remaining = qty - Math.floor(qty * (trade._pgFirstSellFraction ?? 0.5));
@@ -2847,10 +2858,10 @@ async function checkLiveScoreEdges() {
                 const jticker = (jt.ticker ?? '').toLowerCase();
                 if (tickerHasTeam(jticker, homeAbbr) && tickerHasTeam(jticker, awayAbbr)) {
                   // For pre-game positions, check how much is still open.
-                  // partialTakeAt or pgProfitSold means we've already taken ≥50% profit —
+                  // partialTakeAt means we've already taken ≥50% profit —
                   // in that case allow a fresh same-direction live entry up to game cap.
                   if (jt.strategy === 'pre-game-prediction' && jt.status === 'open') {
-                    const tookPartial = !!(jt.partialTakeAt || jt.pgProfitSold);
+                    const tookPartial = !!(jt.partialTakeAt);
                     pgPositionFraction = tookPartial ? 0.5 : 1.0;
                     pgPositionTeam = (jt.ticker ?? '').split('-').pop()?.toUpperCase() ?? null;
                   }
@@ -3745,12 +3756,15 @@ async function checkPreGamePredictions() {
     const pgSportKey = expectedSport.toLowerCase();
     const preGameBaselines = { mlb: 0.54, nba: 0.63, nhl: 0.59, mls: 0.49, epl: 0.45, laliga: 0.45 };
     const pgBaseline = preGameBaselines[pgSportKey] ?? 0.55;
-    // Sport-specific cap: MLB is random (max +12%), NBA allows more (+20%), NHL mid (+15%)
-    // MLB: +8% cap (54% home + 8% = 62%, fails 68% min → MLB pre-game blocked)
-    // NBA: +20% (can reach 83% → passes easily)
-    // NHL: +15% (can reach 74% → passes)
-    // Soccer: +8% (blocks pre-game soccer too — draws make it too risky)
-    const sportCapBonus = { mlb: 0.08, nba: 0.20, nhl: 0.15, mls: 0.08, epl: 0.08, laliga: 0.08 }[pgSportKey] ?? 0.15;
+    // Sport-specific cap: how far above baseline Claude can go pre-game.
+    // Strategy is sell-into-lead, not predict winner — so we care about "will price
+    // move up" not "will team win". MLB pre-game is viable on pitching mismatches
+    // because a team with an ace scores 2+ runs early more often than market prices.
+    // MLB: +15% (54% + 15% = 69%) — only exceptional pitching mismatches pass
+    // NBA: +20% (63% + 20% = 83%) — injuries/load mgmt create real edges
+    // NHL: +15% (59% + 15% = 74%) — goalie matchup is the edge
+    // Soccer: +8% — draws make it too risky, keep blocked
+    const sportCapBonus = { mlb: 0.15, nba: 0.20, nhl: 0.15, mls: 0.08, epl: 0.08, laliga: 0.08 }[pgSportKey] ?? 0.15;
     const pgTargetBaseline = pick.side === 'yes' ? pgBaseline : (1 - pgBaseline);
     const pgMaxAllowed = Math.min(0.85, pgTargetBaseline + sportCapBonus);
     if (confidence > pgMaxAllowed) {
@@ -3758,9 +3772,19 @@ async function checkPreGamePredictions() {
       confidence = pgMaxAllowed;
     }
 
+    // MAX ENTRY PRICE CAP — don't pay more than 68¢ pre-game.
+    // Sell-into-lead thesis only works if there's room for the price to move up.
+    // At 70¢+ entry, the market has already priced in the edge; upside is only 30¢
+    // vs. downside of 70¢ — asymmetry is wrong. Cap at 68¢ to preserve the trade structure.
+    if (price > 0.68) {
+      console.log(`[pre-game] Entry price too high: ${(price*100).toFixed(0)}¢ > 68¢ cap — market has priced out the edge`);
+      continue;
+    }
+
     const pgReqMargin = getRequiredMargin(price, { sport: pgSportKey, live: false });
-    // Pre-game needs 68% minimum (higher than live's 65% — market has had time to settle)
-    const PRE_GAME_MIN_CONF = 0.70; // Only take strong pre-game bets — 70% minimum
+    // Sport-specific minimum confidence — MLB is lower (67%) because sell-into-lead
+    // doesn't require predicting a winner, just a price movement opportunity.
+    const PRE_GAME_MIN_CONF = pgSportKey === 'mlb' ? 0.67 : 0.70;
     if (confidence < PRE_GAME_MIN_CONF || (confidence - price) < pgReqMargin) {
       console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${((confidence-price)*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% min=${(PRE_GAME_MIN_CONF*100).toFixed(0)}% (${pgSportKey})`);
       continue;
@@ -4811,6 +4835,22 @@ async function managePositions() {
             }
             continue;
           }
+        }
+
+        // PRE-GAME PRICE DROP MONITOR — exit before game starts if market reprices sharply.
+        // When a pre-game position's price drops 20¢+ and the game hasn't started (stage unknown),
+        // it almost certainly means news broke: pitcher scratched, goalie pulled, injury, lineup change.
+        // The market knows before we do. Don't hold into the game start with a broken thesis.
+        // This fires BEFORE the game starts — during the game, the nuclear stop / WE-reversal handle it.
+        if (trade.strategy === 'pre-game-prediction' &&
+            (ctx === null || ctx.stage === 'unknown') &&
+            (currentPrice - entryPrice) <= -0.20) {
+          const dropCents = Math.round((entryPrice - currentPrice) * 100);
+          console.log(`[exit] ⚠️ PRE-GAME PRICE DROP (pre-start): ${trade.ticker} dropped ${dropCents}¢ before game start — lineup/news change likely, exiting`);
+          await tg(`⚠️ Pre-game exit: ${trade.title?.slice(0, 50)} dropped ${dropCents}¢ before game start — possible lineup change`);
+          const result = await executeSell(trade, qty, currentPrice, 'pre-game-news-exit');
+          if (result) anyUpdated = true;
+          continue;
         }
 
         // PARTIAL PROFIT-TAKE (live bets) — sell 25% when up ≥15¢, late game only.
