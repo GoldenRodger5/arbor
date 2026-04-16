@@ -3546,11 +3546,79 @@ async function checkPreGamePredictions() {
 
   const todayDate = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'long', day: 'numeric' });
 
+  // ── ESPN starter enrichment ────────────────────────────────────────────────
+  // Fetch confirmed starters/goalies from ESPN before calling Claude.
+  // Claude's web search is unreliable for "is the starter confirmed tonight?" —
+  // it often returns stale articles. ESPN's scoreboard API has real-time probables.
+  // We inject these so Claude only needs to web-search for STATS, not identity.
+  const espnStarterMap = new Map(); // team abbr (lowercase) → { name, era?, wl?, svPct?, gaa?, sport }
+  const espnSportPaths = [
+    { key: 'MLB', path: 'baseball/mlb' },
+    { key: 'NHL', path: 'hockey/nhl' },
+    { key: 'NBA', path: 'basketball/nba' },
+  ];
+  await Promise.all(espnSportPaths.map(async ({ key, path }) => {
+    try {
+      const res = await fetch(`http://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      for (const ev of data.events ?? []) {
+        const comp = ev.competitions?.[0];
+        if (!comp) continue;
+        const state = comp.status?.type?.state;
+        if (state !== 'pre' && state !== 'in') continue;
+        for (const team of comp.competitors ?? []) {
+          const abbr = (team.team?.abbreviation ?? '').toLowerCase();
+          const probs = team.probables ?? [];
+          if (probs.length > 0 && abbr) {
+            const p = probs[0];
+            const name = p.athlete?.displayName ?? '';
+            if (!name) continue;
+            const getStat = (abbrev) => p.statistics?.find(s => s.abbreviation === abbrev)?.displayValue ?? null;
+            espnStarterMap.set(abbr, {
+              name,
+              era:   getStat('ERA'),
+              w:     getStat('W'),
+              l:     getStat('L'),
+              whip:  getStat('WHIP'),
+              svPct: getStat('SV%'),
+              gaa:   getStat('GAA'),
+              sport: key,
+            });
+          }
+        }
+      }
+    } catch { /* skip — ESPN down or timeout */ }
+  }));
+
+  // Build a per-market starter context string to inject at the top of each prompt
+  const buildStarterContext = (market) => {
+    const t1 = espnStarterMap.get(market.team1.team.toLowerCase());
+    const t2 = espnStarterMap.get(market.team2.team.toLowerCase());
+    if (!t1 && !t2) return '';
+    const fmt = (abbr, s) => {
+      if (!s) return `  ${abbr}: NOT IN ESPN — confirm via web search`;
+      const mlbStats = s.era ? ` (${s.w ?? '?'}-${s.l ?? '?'}, ERA ${s.era}${s.whip ? ', WHIP ' + s.whip : ''})` : '';
+      const nhlStats = s.svPct ? ` (SV% ${s.svPct}, GAA ${s.gaa ?? '?'})` : '';
+      return `  ${abbr}: ${s.name}${mlbStats}${nhlStats} ← ESPN confirmed`;
+    };
+    return (
+      `⚡ ESPN REAL-TIME STARTERS (confirmed — do NOT search to verify starter identity):\n` +
+      fmt(market.team1.team, t1) + '\n' +
+      fmt(market.team2.team, t2) + '\n' +
+      `Use web search ONLY for missing stats (ERA, SV%, GAA, recent form, injuries). ` +
+      `The starters above are authoritative — do not fire HARD NO for "unconfirmed" if ESPN provided the name.\n\n`
+    );
+  };
+
   const pgPrompts = pgSlice.map(market => {
     const tk = market.base ?? '';
     const sport = tk.includes('NBA') ? 'NBA' : tk.includes('NHL') ? 'NHL' :
       tk.includes('MLB') ? 'MLB' : tk.includes('MLS') ? 'MLS' :
       tk.includes('EPL') ? 'EPL' : tk.includes('LALIGA') ? 'La Liga' : 'Sport';
+    const starterCtx = buildStarterContext(market);
 
     const pgPromptText = sport === 'NBA'
       ? `You are a professional NBA swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
@@ -3595,7 +3663,7 @@ async function checkPreGamePredictions() {
       : sport === 'NHL'
       ? `You are a professional NHL swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
         `STRATEGY: We buy pre-game and SELL when price rises — we do NOT hold to settlement. Our exit triggers when this team SCORES FIRST and the contract reprices upward. In NHL, the team that scores first wins ~70% of games — when that first goal goes in, the contract price spikes immediately from ~55¢ to ~70¢+. That spike is our exit. We never need to hold through OT or a comeback. Your confidence = "how likely is this team to score the first goal?"\n\n` +
-        `⚠️ RESEARCH RULES: Only state confirmed facts. Never invent goalie starters, SV%, standings. Flag all inferences. If starting goalie is unconfirmed, say NO.\n\n` +
+        `⚠️ RESEARCH RULES: Only state confirmed facts. Never invent SV%, standings. Flag all inferences. If ESPN provided a starting goalie above, treat them as CONFIRMED — do not say NO for "unconfirmed goalie." Only say NO if ESPN shows "NOT IN ESPN" AND web search also fails to find the starter.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
@@ -3712,7 +3780,7 @@ async function checkPreGamePredictions() {
     return {
       market,
       sport,
-      prompt: pgPromptText,
+      prompt: starterCtx + pgPromptText,
     };
   });
 
