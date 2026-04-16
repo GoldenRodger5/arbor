@@ -2827,6 +2827,12 @@ async function checkLiveScoreEdges() {
         //
         // The old code had `if (jt.status !== 'open') continue;` which skipped closed-manual
         // trades. That's what let the ORL pre-game + PHI live double-entry happen.
+        // Track pre-game position state for the partial-position logic below.
+        // If we have an open pre-game bet and have already taken ≥50% profit,
+        // the live-edge is allowed to add a fresh same-direction bet up to the game cap.
+        let pgPositionFraction = 1.0; // assume full position until we find otherwise
+        let pgPositionTeam = null;
+
         if (!hasPosition && existsSync(TRADES_LOG)) {
           try {
             const dupStartMs = new Date(etNow().toISOString().slice(0,10) + 'T04:00:00Z').getTime();
@@ -2840,6 +2846,14 @@ async function checkLiveScoreEdges() {
                 if (jtMs < dupStartMs || jtMs >= dupEndMs) continue;
                 const jticker = (jt.ticker ?? '').toLowerCase();
                 if (tickerHasTeam(jticker, homeAbbr) && tickerHasTeam(jticker, awayAbbr)) {
+                  // For pre-game positions, check how much is still open.
+                  // partialTakeAt or pgProfitSold means we've already taken ≥50% profit —
+                  // in that case allow a fresh same-direction live entry up to game cap.
+                  if (jt.strategy === 'pre-game-prediction' && jt.status === 'open') {
+                    const tookPartial = !!(jt.partialTakeAt || jt.pgProfitSold);
+                    pgPositionFraction = tookPartial ? 0.5 : 1.0;
+                    pgPositionTeam = (jt.ticker ?? '').split('-').pop()?.toUpperCase() ?? null;
+                  }
                   hasPosition = true;
                   break;
                 }
@@ -2882,21 +2896,30 @@ async function checkLiveScoreEdges() {
           } catch {}
         }
 
-        // Block if we already have a position on this game — prevents duplicate buys and both-sides bets
-        // Use ticker BASE as canonical game key (consistent regardless of which team side we bet)
+        // Block if we already have a position on this game — prevents duplicate buys and both-sides bets.
+        // Exception: if a pre-game position has already taken ≥50% profit (partial exit done),
+        // allow a fresh same-direction live entry up to the game exposure cap.
         const currentScoreKey = scoreKey(homeScore, awayScore);
         if (hasPosition) {
-          if (!canScaleInto(gameBase, price, 0, currentScoreKey)) {
+          const isSameDirection = pgPositionTeam && pgPositionTeam === targetAbbr?.toUpperCase();
+          const partialExitDone = pgPositionFraction <= 0.5;
+          if (isSameDirection && partialExitDone) {
+            // Pre-game position is <50% remaining and live-edge agrees on direction.
+            // Allow a fresh live entry — treat as a new position up to game cap.
+            console.log(`[live-edge] ♻️ Pre-game partial exit done (≤50% remaining) + live agrees on ${targetAbbr} — allowing fresh live entry up to game cap`);
+            hasPosition = false; // clear block so trade proceeds normally below
+          } else if (!canScaleInto(gameBase, price, 0, currentScoreKey)) {
             const existingEntry = gameEntries.get(gameBase);
             const scoreChanged = existingEntry?.lastScoreKey && currentScoreKey && existingEntry.lastScoreKey !== currentScoreKey;
             const reason = scoreChanged
-              ? `score changed since last entry (${existingEntry.lastScoreKey} → ${currentScoreKey}) — game state is different, not averaging down on a deteriorated thesis`
+              ? `score changed since last entry (${existingEntry.lastScoreKey} → ${currentScoreKey}) — not averaging down on deteriorated thesis`
               : `scale-in conditions not met at ${(price*100).toFixed(0)}¢ (need ≥4¢ price improvement + unchanged score)`;
             console.log(`[live-edge] Already have position on ${homeAbbr}@${awayAbbr}, skipping: ${reason}`);
             logScreen({ stage: 'live-edge-skip', result: 'skip-has-position', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, reasoning: `Already holding a position on ${homeAbbr}@${awayAbbr} — ${reason}` });
             continue;
+          } else {
+            console.log(`[live-edge] 📈 Scale-in: ${homeAbbr}@${awayAbbr} price dropped to ${(price*100).toFixed(0)}¢ (score ${currentScoreKey} unchanged)`);
           }
-          console.log(`[live-edge] 📈 Scale-in: ${homeAbbr}@${awayAbbr} price dropped to ${(price*100).toFixed(0)}¢ (score ${currentScoreKey} unchanged)`);
         }
 
         // Smart cooldown: base 5min between new entries (use gameBase as canonical key)
@@ -3765,37 +3788,60 @@ async function checkPreGamePredictions() {
 
     if (PREGAME_LIVE) {
       // ── LIVE MODE: place a real Kalshi order ──────────────────────────────
-      const MAX_PREGAME_LIVE_PER_DAY = 3; // conservative limit while we calibrate
+      const MAX_PREGAME_LIVE_PER_DAY = 3; // conservative limit while calibrating
       if (preGameTradesToday > MAX_PREGAME_LIVE_PER_DAY) {
         console.log(`[pre-game] Daily live limit (${MAX_PREGAME_LIVE_PER_DAY}) reached — skipping ${market.base}`);
         preGameTradesToday--; preGameTradesThisCycle--; preGameBetGames.delete(market.base);
         continue;
       }
-      console.log(`[pre-game] 🎯 LIVE BET: ${market.base} → ${matchedSide.team} @${Math.round(price*100)}¢ conf=${Math.round(confidence*100)}% bet=$${betAmount.toFixed(2)} qty=${betQty}`);
+      const pgPriceInCents = Math.round(price * 100);
+      console.log(`[pre-game] 🎯 LIVE BET: ${market.base} → ${matchedSide.team} @${pgPriceInCents}¢ conf=${Math.round(confidence*100)}% bet=$${betAmount.toFixed(2)} qty=${betQty}`);
       try {
-        await executeOrder({
+        const pgResult = await kalshiPost('/portfolio/orders', {
           ticker: matchedSide.ticker,
+          action: 'buy',
           side: 'yes',
           count: betQty,
-          type: 'limit',
-          yes_price: Math.round(price * 100), // Kalshi uses cents integer
-          strategy: 'pre-game-prediction',
-          confidence,
-          edge: Math.round(edge * 1000) / 10,
-          reasoning: decision.reasoning,
-          pgBaseline: pgTargetBaseline,
+          yes_price: pgPriceInCents,
         });
-        // Also log to paper-trades.jsonl so the conflict detector finds it
-        logPaperTrade({
-          sport: pgSportKey, marketBase: market.base, ticker: matchedSide.ticker,
-          teamAbbr: matchedSide.team, teamName: bettingOnTeam,
-          opponentAbbr: otherSide.team, opponentName: otherSide.teamName,
-          marketTitle: market.title, confidence, price,
-          edge: Math.round(edge * 1000) / 10, wouldBetAmount: betAmount,
-          wouldQty: betQty, reasoning: decision.reasoning, pgBaseline: pgTargetBaseline,
-        });
+        if (pgResult.ok) {
+          const pgFill = getActualFill(pgResult, betQty);
+          if (pgFill > 0) {
+            const pgDeployed = pgFill * price;
+            logTrade({
+              exchange: 'kalshi',
+              strategy: 'pre-game-prediction',
+              ticker: matchedSide.ticker,
+              title: market.title,
+              side: 'yes',
+              quantity: pgFill,
+              entryPrice: price,
+              deployCost: pgDeployed,
+              filled: pgFill,
+              orderId: (pgResult.data?.order ?? pgResult.data)?.order_id ?? null,
+              edge: Math.round(edge * 1000) / 10,
+              confidence,
+              reasoning: decision.reasoning,
+              pgBaseline: pgTargetBaseline,
+              sport: pgSportKey,
+            });
+            // Mirror to paper-trades.jsonl so conflict detector and pg-guard find it
+            logPaperTrade({
+              sport: pgSportKey, marketBase: market.base, ticker: matchedSide.ticker,
+              teamAbbr: matchedSide.team, teamName: bettingOnTeam,
+              opponentAbbr: otherSide.team, opponentName: otherSide.teamName,
+              marketTitle: market.title, confidence, price,
+              edge: Math.round(edge * 1000) / 10, wouldBetAmount: pgDeployed,
+              wouldQty: pgFill, reasoning: decision.reasoning, pgBaseline: pgTargetBaseline,
+            });
+            await sendTelegram(`🎯 <b>Pre-game BET placed</b>\n${market.title}\n${matchedSide.team} YES @${pgPriceInCents}¢ × ${pgFill}\nConf=${Math.round(confidence*100)}% | Edge=+${Math.round(edge*100)}pts | $${pgDeployed.toFixed(2)}`);
+            console.log(`[pre-game] ✅ Filled ${pgFill}/${betQty} @ ${pgPriceInCents}¢ deployed=$${pgDeployed.toFixed(2)}`);
+          }
+        } else {
+          console.log(`[pre-game] LIVE order failed for ${market.base}: status=${pgResult.status}`);
+        }
       } catch (err) {
-        console.log(`[pre-game] LIVE order failed for ${market.base}: ${err.message}`);
+        console.log(`[pre-game] LIVE order error for ${market.base}: ${err.message}`);
       }
       logScreen({ stage: 'pre-game-live', ticker: market.base, result: 'LIVE', confidence, price, reasoning: decision.reasoning });
 
