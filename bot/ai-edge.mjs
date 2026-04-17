@@ -3969,8 +3969,9 @@ async function checkPreGamePredictions() {
         `C) LINEUP POWER: Does this team have top-5 run scorers? Any cleanup hitter (30+ HR, .300+) OUT today? Strong lineups score early more often.\n` +
         `D) PARK FACTOR: Is this a hitter's park (Coors, Fenway, Great American)? Hitter's parks increase early scoring probability for BOTH teams.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
+        `⛔ THESE ARE ABSOLUTE. If ANY Hard NO applies, respond {"trade":false} immediately. Do NOT continue reasoning. Do NOT write "however" or "but their offense can still score." If you find yourself building a case to override a Hard NO, STOP — that rationalization is the mistake.\n` +
         `❌ Starting pitcher for the team you want to bet is NOT confirmed → NO\n` +
-        `❌ Your team's starter is ERA > 5.0 (they'll fall behind early, not score early) → NO\n` +
+        `❌ Your team's starter is ERA > 5.0 → NO. The reason is NOT just "they'll fall behind" — it's that market-makers already know this ERA. They've discounted the price accordingly. Your edge disappears the moment your bad starter gives up runs, and that repricing happens in the same innings you're hoping your offense scores. No override for "weak opponent pitcher" — if your starter is ERA > 5.0, the edge math doesn't work.\n` +
         `❌ Opponent starter is ERA < 2.5 AND WHIP < 1.0 → NO (will limit your team's early scoring)\n\n` +
         `═══ STEP 3 — EARLY-SCORING EDGE ANALYSIS ═══\n` +
         `Start from 45% early-scoring baseline (2+ runs in first 3 innings). Adjust based on confirmed research:\n` +
@@ -5380,12 +5381,21 @@ async function managePositions() {
           const ourTeam = trade.ticker?.split('-').pop() ?? '';
           const ourWE = ctx.leading === ourTeam ? ctx.baselineWE : (1 - ctx.baselineWE);
           const isPreGame = trade.strategy === 'pre-game-prediction';
-          const weFloor = isPreGame && stage !== 'late' ? 0.20 : 0.30;
-          if (ourWE <= weFloor) {
-            console.log(`[exit] 🔄 WE-REVERSAL (${(ourWE*100).toFixed(0)}% WE ≤${Math.round(weFloor*100)}%${isPreGame ? ' pre-game' : ''}): ${trade.ticker} — game reversed, selling at ${(currentPrice*100).toFixed(0)}¢`);
-            const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
-            if (result) anyUpdated = true;
-            continue;
+          // Grace period: don't fire WE-reversal on pre-game positions within 10 min of entry.
+          // Prevents false triggers when the live-score API returns stale/pre-game state
+          // immediately after a buy (e.g. CIN bought at 09:24, WE-reversal fired at 09:27).
+          const entryMs = trade.timestamp ? Date.parse(trade.timestamp) : 0;
+          const minsSinceEntry = entryMs ? (Date.now() - entryMs) / 60000 : 99;
+          if (isPreGame && minsSinceEntry < 10) {
+            // Too soon — skip WE-reversal, let pg-guard handle it
+          } else {
+            const weFloor = isPreGame && stage !== 'late' ? 0.20 : 0.30;
+            if (ourWE <= weFloor) {
+              console.log(`[exit] 🔄 WE-REVERSAL (${(ourWE*100).toFixed(0)}% WE ≤${Math.round(weFloor*100)}%${isPreGame ? ' pre-game' : ''}): ${trade.ticker} — game reversed, selling at ${(currentPrice*100).toFixed(0)}¢`);
+              const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
+              if (result) anyUpdated = true;
+              continue;
+            }
           }
         }
 
