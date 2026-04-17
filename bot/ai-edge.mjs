@@ -3688,24 +3688,41 @@ async function checkPreGamePredictions() {
   const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
 
   // Daily paper limit — restore from paper-trades.jsonl (survives restarts)
-  const todayDateStr = etNow.toISOString().slice(0, 10);
+  // Use proper ET date (not UTC) so late-night games (10pm ET = 02:00 UTC+1) match correctly.
+  const todayDateStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  const tsToEtDate = (ts) => ts ? new Date(ts).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) : '';
   if (preGameTradesDate !== todayDateStr) {
     preGameTradesDate = todayDateStr;
     preGameBetGames.clear();
     preGameTradesToday = 0;
+    // Restore from paper-trades.jsonl (covers both paper and real-bet mirrors)
     if (existsSync(PAPER_TRADES_LOG)) {
       const todayLines = readFileSync(PAPER_TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
       for (const l of todayLines) {
         try {
           const t = JSON.parse(l);
-          if (t.strategy === 'pre-game-paper' && t.timestamp?.startsWith(todayDateStr)) {
+          if (t.strategy === 'pre-game-paper' && tsToEtDate(t.timestamp) === todayDateStr) {
             preGameTradesToday++;
             if (t.marketBase) preGameBetGames.add(t.marketBase);
           }
         } catch {}
       }
     }
-    if (preGameTradesToday > 0) console.log(`[pre-game] Restored paper count: ${preGameTradesToday} paper trades today`);
+    // Backstop: also restore from real trades.jsonl in case paper mirror was missed.
+    // Derives marketBase from ticker by stripping the trailing "-TEAMABBR" suffix.
+    if (existsSync(TRADES_LOG)) {
+      const tradeLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      for (const l of tradeLines) {
+        try {
+          const t = JSON.parse(l);
+          if (t.strategy === 'pre-game-prediction' && tsToEtDate(t.timestamp) === todayDateStr && t.ticker) {
+            const base = t.ticker.replace(/-[A-Z]+$/, '');
+            if (base) preGameBetGames.add(base);
+          }
+        } catch {}
+      }
+    }
+    if (preGameTradesToday > 0) console.log(`[pre-game] Restored paper count: ${preGameTradesToday} paper trades today, ${preGameBetGames.size} games locked`);
   }
   if (preGameTradesToday >= MAX_PREGAME_PAPER_PER_DAY) {
     console.log(`[pre-game] Paper daily limit reached (${preGameTradesToday}/${MAX_PREGAME_PAPER_PER_DAY}). Skipping.`);
