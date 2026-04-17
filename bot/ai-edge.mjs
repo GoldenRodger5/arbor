@@ -2029,34 +2029,31 @@ async function checkLiveScoreEdges() {
         console.log(`[pg-guard] ⚠️ PRE-GAME BET LOSING: ${trade.title} | ${ourTeam} trailing ${ourScore}-${theirScore} (${game.detail}) | ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%) | WE: ${(ourWE*100).toFixed(0)}% | ${triggerReason}`);
 
         const pgPrompt =
-          `You placed a PRE-GAME bet on ${sport} team ${ourTeam} to win at ${(entryPrice*100).toFixed(0)}¢. The game has started and YOUR TEAM IS LOSING.\n\n` +
-          `POSITION: Bought YES at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}% loss, -$${lossAmt.toFixed(2)}).\n` +
+          `You manage a pre-game ${sport} bet that is currently LOSING. Your job is to decide: hold, sell half, or sell all.\n\n` +
+          `POSITION: Bought ${ourTeam} YES at ${(entryPrice*100).toFixed(0)}¢. Current price: ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%, -$${lossAmt.toFixed(2)}).\n` +
           `Game: ${trade.title}\n` +
           `LIVE SCORE: ${awayAbbr} ${game.awayScore} @ ${homeAbbr} ${game.homeScore} | ${game.detail}\n` +
-          `Game stage: ${stage.toUpperCase()} | Win expectancy for ${ourTeam}: ${(ourWE*100).toFixed(0)}%\n\n` +
-          `ORIGINAL THESIS: "${trade.reasoning}"\n\n` +
+          `Game stage: ${stage.toUpperCase()}\n\n` +
+          `ORIGINAL THESIS (why we bought): "${trade.reasoning}"\n\n` +
           `${comebackContext}\n\n` +
-          `THIS IS A PRE-GAME BET — placed BEFORE the game started. Score is NEW information.\n\n` +
-          `THESIS INVALIDATION CHECK — answer this first:\n` +
-          `Did something happen that DIRECTLY contradicts the specific reason this bet was made?\n` +
-          `  → INVALIDATED: starting pitcher knocked out with damage (4+ ER), key player injured/ejected, goalie pulled after giving up goals\n` +
-          `  → INTACT: team trailing due to normal variance, thesis factor hasn't faced its test yet (e.g. opposing weak starter hasn't faced our lineup), small deficit early\n\n` +
-          `CRITICAL DISTINCTION — "thesis not yet tested" vs "thesis failed":\n` +
-          `If the bet thesis was about exploiting a WEAK OPPOSING STARTER or BACKUP GOALIE and:\n` +
-          `  → that player is still in the game and hasn't faced our lineup yet: thesis is INTACT, not failed\n` +
-          `  → our own team scored against them first (we're winning): thesis already worked\n` +
-          `  → the weak player got pulled without being exposed: thesis is DEAD, sell\n\n` +
+          `YOUR CORE QUESTION: Forget the original thesis for a moment. Look at the game RIGHT NOW.\n` +
+          `What is your honest win probability for ${ourTeam} given the current score, stage, and situation?\n` +
+          `Then compare that to the current market price of ${(currentPrice*100).toFixed(0)}¢.\n\n` +
+          `THE DECISION FRAMEWORK:\n` +
+          `- Your estimate >> market price (e.g. you think 45%, market shows 32¢): HOLD — market is underpricing the team, edge still exists\n` +
+          `- Your estimate ≈ market price (within 5pts): SELL — no edge, take the smaller loss now rather than gambling\n` +
+          `- Your estimate < market price: SELL FAST — market is being generous, take it\n` +
+          `- Game is late (MLB inn 7+ / NHL P3) AND trailing by 2+: lean toward sell unless estimate is well above price\n` +
+          `- Game is early (MLB inn 1-4 / NHL P1) AND deficit is small: lean toward hold — high variance, plenty of game left\n\n` +
+          `CONTEXT ON THE ORIGINAL THESIS:\n` +
+          `Use it as one input, not the whole answer. If the thesis factor (weak starter, backup goalie) is gone,\n` +
+          `that lowers your WE estimate — but the game situation might still justify holding.\n` +
+          `If the thesis factor hasn't been tested yet (starter still in game, hasn't faced our lineup), factor that into your estimate too.\n\n` +
           `OPTIONS:\n` +
-          `A) sell_all — thesis is DEAD or WE < 25%. Lock loss of $${lossAmt.toFixed(2)}, recover $${(qty * currentPrice).toFixed(2)}.\n` +
-          `B) sell_half — thesis UNCERTAIN (WE 30-40%, deficit growing, mid/late game). Sell ${halfSellQty}/${qty} contracts, hold rest.\n` +
-          `C) hold — thesis INTACT. Normal game variance or thesis hasn't been tested yet. Upside: +$${(qty * (1 - entryPrice)).toFixed(2)} if wins.\n\n` +
-          `RULES:\n` +
-          `- WE < 25%: say sell_all — math doesn't support holding regardless of thesis\n` +
-          `- Thesis directly invalidated (starter KO'd with 4+ ER, key injury, goalie pulled after goals): say sell_all\n` +
-          `- Early game (MLB inn 1-4 / NHL P1), trailing by 1-2, thesis not yet tested: say hold — too early, high variance\n` +
-          `- WE 30-40%, thesis uncertain, mid/late game: say sell_half\n` +
-          `- WE > 40%, thesis intact, any stage: say hold\n\n` +
-          `JSON ONLY: {"action": "sell_all"/"sell_half"/"hold", "thesis_intact": true/false, "reasoning": "one sentence referencing original thesis"}`;
+          `A) sell_all — your estimate is close to or below market price, or game is late with large deficit. Lock loss of $${lossAmt.toFixed(2)}, recover $${(qty * currentPrice).toFixed(2)}.\n` +
+          `B) sell_half — your estimate is above market but uncertain. Sell ${halfSellQty}/${qty} contracts, hold rest for comeback.\n` +
+          `C) hold — your estimate is clearly above market price. Edge still exists. Upside: +$${(qty * (1 - entryPrice)).toFixed(2)} if wins.\n\n` +
+          `JSON ONLY: {"action": "sell_all"/"sell_half"/"hold", "myWinEstimate": 0.XX, "marketPrice": 0.XX, "reasoning": "one sentence on why estimate vs price justifies the action"}`;
 
         const pgGuardText = await claudeSonnet(pgPrompt, { maxTokens: 500, timeout: 20000 });
         if (pgGuardText) {
@@ -2064,20 +2061,20 @@ async function checkLiveScoreEdges() {
             const match = extractJSON(pgGuardText);
             if (match) {
               const d = JSON.parse(match);
-              const thesisTag = d.thesis_intact ? '✅ thesis intact' : '❌ thesis dead';
+              const estPct = d.myWinEstimate != null ? `est=${Math.round(d.myWinEstimate*100)}% mkt=${Math.round(currentPrice*100)}¢` : '';
 
               if (d.action === 'sell_all' || d.action === 'sell') {
-                console.log(`[pg-guard] 🧠 SELL ALL (${thesisTag}): ${trade.ticker} | ${d.reasoning?.slice(0, 100)}`);
+                console.log(`[pg-guard] 🧠 SELL ALL (${estPct}): ${trade.ticker} | ${d.reasoning?.slice(0, 100)}`);
                 await tg(
                   `⚠️ <b>PRE-GAME EXIT</b>\n\n` +
                   `📋 <b>POSITION</b>\n` +
                   `${trade.title}\n\n` +
                   `📊 <b>METRICS</b>\n` +
-                  `Sold all contracts @ ${Math.round(currentPrice*100)}¢\n` +
-                  `Entry: ${Math.round(entryPrice*100)}¢ | Win expectancy: ${(ourWE*100).toFixed(0)}%\n` +
-                  `Tag: ${thesisTag}\n\n` +
-                  `💬 <b>REASON</b>\n` +
-                  (d.reasoning ?? 'Thesis broken')
+                  `Sold all @ ${Math.round(currentPrice*100)}¢\n` +
+                  `Entry: ${Math.round(entryPrice*100)}¢ | Stage: ${stage.toUpperCase()}\n` +
+                  (d.myWinEstimate != null ? `Claude's estimate: ${Math.round(d.myWinEstimate*100)}% vs market ${Math.round(currentPrice*100)}¢ — no edge\n` : '') +
+                  `\n💬 <b>REASON</b>\n` +
+                  (d.reasoning ?? 'No edge vs market price')
                 );
                 const freshLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
                 const freshTrades = freshLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
@@ -2090,17 +2087,17 @@ async function checkLiveScoreEdges() {
                   }
                 }
               } else if (d.action === 'sell_half') {
-                console.log(`[pg-guard] 🧠 SELL HALF (${thesisTag}): ${trade.ticker} | selling ${halfSellQty}/${qty} | ${d.reasoning?.slice(0, 80)}`);
+                console.log(`[pg-guard] 🧠 SELL HALF (${estPct}): ${trade.ticker} | selling ${halfSellQty}/${qty} | ${d.reasoning?.slice(0, 80)}`);
                 await tg(
                   `⚠️ <b>PRE-GAME SELL HALF</b>\n\n` +
                   `📋 <b>POSITION</b>\n` +
                   `${trade.title}\n\n` +
                   `📊 <b>METRICS</b>\n` +
-                  `Selling half @ ${Math.round(currentPrice*100)}¢\n` +
-                  `Entry: ${Math.round(entryPrice*100)}¢ | Win expectancy: ${(ourWE*100).toFixed(0)}%\n` +
-                  `Tag: ${thesisTag}\n\n` +
-                  `💬 <b>REASON</b>\n` +
-                  (d.reasoning ?? 'Partial exit on deteriorating thesis')
+                  `Selling ${halfSellQty}/${qty} @ ${Math.round(currentPrice*100)}¢\n` +
+                  `Entry: ${Math.round(entryPrice*100)}¢ | Stage: ${stage.toUpperCase()}\n` +
+                  (d.myWinEstimate != null ? `Claude's estimate: ${Math.round(d.myWinEstimate*100)}% vs market ${Math.round(currentPrice*100)}¢ — uncertain edge\n` : '') +
+                  `\n💬 <b>REASON</b>\n` +
+                  (d.reasoning ?? 'Partial exit — estimate above market but uncertain')
                 );
                 if (halfSellQty < qty) {
                   const freshLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
@@ -2115,7 +2112,7 @@ async function checkLiveScoreEdges() {
                   }
                 }
               } else {
-                console.log(`[pg-guard] 🧠 HOLD (${thesisTag}): ${trade.ticker} (${stage}, WE ${(ourWE*100).toFixed(0)}%) | ${d.reasoning?.slice(0, 80)}`);
+                console.log(`[pg-guard] 🧠 HOLD (${estPct}): ${trade.ticker} (${stage}) | ${d.reasoning?.slice(0, 80)}`);
               }
             }
           } catch { /* skip */ }
