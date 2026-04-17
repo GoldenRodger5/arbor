@@ -435,11 +435,18 @@ async function claudeScreen(prompt, { maxTokens = 300, timeout = 10000 } = {}) {
   }
 }
 
-// Sonnet without search tools — for nuanced decisions that don't need real-time data, ~$0.02/call
-async function claudeSonnet(prompt, { maxTokens = 400, timeout = 20000 } = {}) {
+// Sonnet without web search — for decisions where we already have the data we need (ESPN starters,
+// bullpen stats, etc). ~$0.02/call vs $0.05+ with searches. Supports optional system prompt.
+async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system = null } = {}) {
   stats.claudeCalls++;
-  stats.apiSpendCents += 2; // ~$0.02
+  stats.apiSpendCents += 2; // ~$0.02/call
   try {
+    const body = {
+      model: CLAUDE_DECIDER,
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }],
+    };
+    if (system) body.system = system;
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       signal: AbortSignal.timeout(timeout),
       method: 'POST',
@@ -448,15 +455,15 @@ async function claudeSonnet(prompt, { maxTokens = 400, timeout = 20000 } = {}) {
         'anthropic-version': '2023-06-01',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        model: CLAUDE_DECIDER,
-        max_tokens: maxTokens,
-        messages: [{ role: 'user', content: prompt }],
-      }),
+      body: JSON.stringify(body),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.error('[claude-sonnet] HTTP', res.status, await res.text().catch(() => ''));
+      return null;
+    }
     const data = await res.json();
-    return data.content?.[0]?.text ?? '';
+    const textBlocks = (data.content ?? []).filter(b => b.type === 'text');
+    return textBlocks.length > 0 ? textBlocks[textBlocks.length - 1].text : '';
   } catch (e) {
     console.error('[claude-sonnet] error:', e.message);
     return null;
@@ -3216,7 +3223,7 @@ async function checkLiveScoreEdges() {
   for (let batch = 0; batch < sonnetQueue.length; batch += 3) {
     const batchItems = sonnetQueue.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 2, system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
+      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 1, system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
     );
 
     for (let i = 0; i < batchItems.length; i++) {
@@ -3876,17 +3883,17 @@ async function checkPreGamePredictions() {
     const t2 = espnStarterMap.get(market.team2.team.toLowerCase());
     if (!t1 && !t2) return '';
     const fmt = (abbr, s) => {
-      if (!s) return `  ${abbr}: NOT IN ESPN — confirm via web search`;
+      if (!s) return `  ${abbr}: NOT IN ESPN — treat starter as unconfirmed`;
       const mlbStats = s.era ? ` (${s.w ?? '?'}-${s.l ?? '?'}, ERA ${s.era}${s.whip ? ', WHIP ' + s.whip : ''})` : '';
       const nhlStats = s.svPct ? ` (SV% ${s.svPct}, GAA ${s.gaa ?? '?'})` : '';
       return `  ${abbr}: ${s.name}${mlbStats}${nhlStats} ← ESPN confirmed`;
     };
     return (
-      `⚡ ESPN REAL-TIME STARTERS (confirmed — do NOT search to verify starter identity):\n` +
+      `⚡ ESPN REAL-TIME STARTERS (confirmed — treat as authoritative, no need to verify):\n` +
       fmt(market.team1.team, t1) + '\n' +
       fmt(market.team2.team, t2) + '\n' +
-      `Use web search ONLY for missing stats (ERA, SV%, GAA, recent form, injuries). ` +
-      `The starters above are authoritative — do not fire HARD NO for "unconfirmed" if ESPN provided the name.\n\n`
+      `Starters above are authoritative — do NOT fire Hard NO for "unconfirmed" if ESPN provided the name.\n` +
+      `Use your training knowledge for pitcher/goalie quality assessment.\n\n`
     );
   };
 
@@ -3900,16 +3907,17 @@ async function checkPreGamePredictions() {
     const pgPromptText = sport === 'NBA'
       ? `You are a professional NBA swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
         `STRATEGY: We buy pre-game and SELL when the price rises — we do NOT hold to settlement. Our exit is when the contract price reaches our entry + 12¢ at any point during the game. This means your confidence should reflect: "how likely is this team to be LEADING by 8+ points at some point in the first half?" — NOT "do they win the full game." A team that builds a 10-point first-quarter lead and then loses still pays us if we sell during that lead. Your job is to find early-lead catalysts, not final-score predictions.\n\n` +
-        `⚠️ RESEARCH RULES: Only state facts you confirmed via web search. Never invent injury status, records, or lineup info. Flag all inferences. If you cannot confirm something critical, say NO.\n\n` +
+        `⚠️ DATA RULES: No web search available. Use your training knowledge for team quality, roster, and typical injury patterns. For any star player whose 2026 status you cannot assess, apply a 3% uncertainty penalty and continue — do NOT use uncertainty as a reason to pass unless it would affect a Hard NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `EARLY-LEAD BASELINE: NBA teams build an 8+ point lead at some point in the first half ~72% of home games. This is higher than their 63% win rate. Your adjusted confidence should reflect early-lead probability, not win probability.\n\n` +
-        `═══ STEP 1 — RESEARCH (search in this order) ═══\n` +
-        `A) CONFIRMED ROSTERS: Search "[team1] injury report ${todayDate}" and "[team2] injury report ${todayDate}". Who is OUT tonight? List confirmed starters. Do NOT assume — look it up.\n` +
-        `B) BACK-TO-BACK: Did either team play yesterday? Fatigue kills first-half intensity.\n` +
-        `C) MOTIVATION: Search "[team1] standings 2026" and "[team2] standings 2026". Is either team in a must-win, fighting for seeding, or already clinched and resting? NBA teams rest stars in meaningless games — confirmed rest = NO trade.\n` +
-        `D) PACE & STYLE: Does this team start fast? Search "[team] first quarter scoring 2026". High first-quarter teams create early leads more reliably.\n\n` +
+        `═══ STEP 1 — ASSESS WITH TRAINING KNOWLEDGE ═══\n` +
+        `(No web search available — use your knowledge of these teams)\n` +
+        `A) ROSTER QUALITY: From your training knowledge, who are the key players for each team? Any well-known stars who were on injury reserve or known to be in decline? Apply your best assessment — flag if highly uncertain.\n` +
+        `B) BACK-TO-BACK: Based on typical NBA scheduling, use context clues from the ticker/date. Fatigue kills first-half intensity.\n` +
+        `C) MOTIVATION: Where are these teams in the standings from your training knowledge? Playoff race, seeding fights, or likely coasting? NBA teams in close playoff races play harder early.\n` +
+        `D) PACE & STYLE: Does this team typically start fast? High pace / first-quarter scoring teams create early leads more reliably.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Team you want to bet is resting 2+ starters tonight (confirmed load management) → NO\n` +
         `❌ Team has clinched seeding AND cannot confirm stars playing full minutes → NO\n` +
@@ -3940,17 +3948,17 @@ async function checkPreGamePredictions() {
       : sport === 'NHL'
       ? `You are a professional NHL swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
         `STRATEGY: We buy pre-game and SELL when price rises — we do NOT hold to settlement. Our exit triggers when this team SCORES FIRST and the contract reprices upward. In NHL, the team that scores first wins ~70% of games — when that first goal goes in, the contract price spikes immediately from ~55¢ to ~70¢+. That spike is our exit. We never need to hold through OT or a comeback. Your confidence = "how likely is this team to score the first goal?"\n\n` +
-        `⚠️ RESEARCH RULES: Only state confirmed facts. Never invent SV%, standings. Flag all inferences. If ESPN provided a starting goalie above, treat them as CONFIRMED — do not say NO for "unconfirmed goalie." Only say NO if ESPN shows "NOT IN ESPN" AND web search also fails to find the starter.\n\n` +
+        `⚠️ DATA RULES: ESPN-confirmed goalies are provided above. Use your training knowledge for goalie quality and team stats. If ESPN provided a starting goalie, treat them as CONFIRMED. Only fire Hard NO for "unconfirmed" if ESPN shows "NOT IN ESPN."\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `FIRST-GOAL BASELINE: NHL home team scores first ~56% of games. Elite goalie matchup advantage, power play edge, and opponent fatigue are the primary drivers. A team with a clear goalie/power-play edge scores first 60-65% of games.\n\n` +
-        `═══ STEP 1 — RESEARCH (search in this order) ═══\n` +
-        `A) CONFIRMED GOALIES — MANDATORY: Search "[team1] starting goalie tonight" and "[team2] starting goalie tonight". Must confirm BOTH by name. "Expected" or "likely" is not enough.\n` +
-        `B) GOALIE QUALITY: Season SV% and GAA for each confirmed starter? Recent form (last 5 starts)? Search "[goalie name] stats 2025-26".\n` +
-        `C) SPECIAL TEAMS: Search "[team1] power play % 2026" and "[team2] power play % 2026". PP goals happen early and drive first-goal probability.\n` +
-        `D) FATIGUE: Back-to-back or 3rd in 4 nights? Fatigued teams are slower in period 1.\n` +
-        `E) MOTIVATION: Search "[team1] standings 2026" and "[team2] standings 2026". Playoff race, seeding fights, or clinched/eliminated — this affects first-period intensity.\n\n` +
+        `═══ STEP 1 — ASSESS WITH ESPN DATA + TRAINING KNOWLEDGE ═══\n` +
+        `(No web search available — use the ESPN goalies provided above and your training knowledge)\n` +
+        `A) GOALIES: Goalies are confirmed above from ESPN. Use your training knowledge to assess each goalie's quality: career SV%, GAA tier, known strengths/weaknesses. An elite goalie (SV% > .920) suppresses early goals significantly.\n` +
+        `B) SPECIAL TEAMS: From your training knowledge, assess each team's power play and penalty kill quality. Top-5 PP teams score early via power plays more often.\n` +
+        `C) FATIGUE: Based on the game ticker date and typical NHL scheduling, assess whether either team is likely on a back-to-back.\n` +
+        `D) MOTIVATION: From your training knowledge of these franchises and typical late-season standings, assess playoff race intensity for each team.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Starting goalie for the team you want to bet is NOT confirmed → NO\n` +
         `❌ Team has clinched everything AND cannot confirm starting goalie and top line → NO\n` +
@@ -3981,15 +3989,16 @@ async function checkPreGamePredictions() {
       sport === 'MLB'
       ? `You are a professional MLB swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
         `STRATEGY: We buy pre-game and SELL when price rises — we do NOT hold to settlement. We exit when the contract price reaches our entry + 12¢, which typically happens when this team scores 2+ runs in the first 3-4 innings. We never need the team to win the full game. Your confidence = "how likely is this team to score 2+ runs in the first 3-4 innings?" — not "do they win 9 innings?" An ace pitcher limiting the opponent while his offense scores early is a profitable trade even if they blow it in the 7th. We're trading the first act.\n\n` +
-        `⚠️ RESEARCH RULES: Only state confirmed facts. Never invent starting pitchers, ERAs, lineup info. Flag all inferences. If starting pitcher is unconfirmed, say NO.\n\n` +
+        `⚠️ DATA RULES: ESPN-confirmed starters are provided above. Use your training knowledge for pitcher quality. If a starter is listed above, treat them as confirmed. Flag any pitcher whose career ERA you cannot recall — if truly unknown, treat as average (ERA ~4.5).\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `EARLY-SCORING BASELINE: A team facing a weak starter (ERA > 4.5) scores 2+ in the first 3 innings ~45% of games. With an elite opponent starter (ERA < 3.0), that drops to ~25%. The gap between these is your edge window.\n\n` +
-        `═══ STEP 1 — RESEARCH (search in this order) ═══\n` +
-        `A) STARTING PITCHERS — MANDATORY: Search "[team1] starting pitcher today ${todayDate}" and "[team2] starting pitcher today". Confirm BOTH by name. Unconfirmed = NO.\n` +
-        `B) PITCHER QUALITY: Each starter's 2026 ERA, WHIP, K/9? Recent form (last 3 starts)? Search "[pitcher name] stats 2026". An ace (ERA < 2.5) limits opponent early scoring. A weak starter (ERA > 4.5) gives up early runs.\n` +
-        `C) LINEUP POWER: Does this team have top-5 run scorers? Any cleanup hitter (30+ HR, .300+) OUT today? Strong lineups score early more often.\n` +
+        `═══ STEP 1 — ASSESS WITH ESPN DATA + TRAINING KNOWLEDGE ═══\n` +
+        `(No web search available — use the ESPN starters provided above and your training knowledge)\n` +
+        `A) STARTING PITCHERS: Starters are listed above from ESPN. Assess each pitcher's quality from your training: career ERA tier, pitch mix, typical WHIP range. An ace (career ERA < 3.0) suppresses early scoring. A weak starter (career ERA > 4.5) gives up early runs.\n` +
+        `B) PITCHER QUALITY: Use training knowledge for ERA range, velocity trends, K/9, recent season performance through your knowledge cutoff. Flag if a pitcher is too new/obscure to assess — treat as average.\n` +
+        `C) LINEUP POWER: Does this team have known run-producers? Any well-known slugger who typically bats cleanup? Strong lineups score early more often.\n` +
         `D) PARK FACTOR: Is this a hitter's park (Coors, Fenway, Great American)? Hitter's parks increase early scoring probability for BOTH teams.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `⛔ THESE ARE ABSOLUTE. If ANY Hard NO applies, respond {"trade":false} immediately. Do NOT continue reasoning. Do NOT write "however" or "but their offense can still score." If you find yourself building a case to override a Hard NO, STOP — that rationalization is the mistake.\n` +
@@ -4019,17 +4028,18 @@ async function checkPreGamePredictions() {
       : /* Soccer (MLS / EPL / La Liga) */
       `You are a professional soccer swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
         `STRATEGY: We buy pre-game and SELL when the price rises — we do NOT care about the final score. Our exit is when this team SCORES FIRST and the contract reprices upward. When a team scores the first goal in soccer, their price spikes immediately — from 45¢ to 65¢+. We sell into that spike and we're done. Whether the game ends 1-1, 1-0, or 2-1 is IRRELEVANT. A draw does NOT hurt us because we exit before the game ends. Your confidence = "how likely is this team to score the first goal?" — not "do they win outright?"\n\n` +
-        `⚠️ RESEARCH RULES: Only state confirmed facts. Flag inferences. If you cannot confirm key lineup or form data, say NO.\n\n` +
+        `⚠️ DATA RULES: No web search available. Use your training knowledge for team quality, typical lineups, and attack/defense profiles. If you cannot confirm a key injury, treat the player as available but apply a 2% uncertainty buffer. Do NOT use uncertainty as a reason to pass unless it affects a Hard NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `FIRST-GOAL BASELINE: Home teams score first ~55% of soccer games. Strong attacking teams with high shots-on-target rates score first more often regardless of eventual match result. Draw probability is irrelevant to us.\n\n` +
-        `═══ STEP 1 — RESEARCH ═══\n` +
-        `A) ATTACK QUALITY: Search "[team1] goals scored per game 2026" and "[team2] goals per game 2026". High-scoring teams score first more often.\n` +
-        `B) KEY INJURIES: Is the first-choice striker confirmed OUT? A missing #9 significantly reduces first-goal probability.\n` +
-        `C) FORM: Search "[team1] last 5 results ${todayDate}". Teams in good form score early more often — confidence, pressing intensity.\n` +
-        `D) MOTIVATION: Is either team in a must-win (relegation, title, European qualification)? High-stakes teams press harder from kickoff and score first more often.\n` +
-        `E) OPPONENT DEFENSE: Is the opponent's defense porous (conceding 2+ per game) or elite (under 1 per game)? Weak defenses give up first goals early.\n\n` +
+        `═══ STEP 1 — ASSESS WITH TRAINING KNOWLEDGE ═══\n` +
+        `(No web search available — use your knowledge of these clubs)\n` +
+        `A) ATTACK QUALITY: From your training knowledge, how prolific is each team's attack? Top-5 goals-per-game teams score first more often. Flag if you have limited knowledge of a club.\n` +
+        `B) KEY PLAYERS: Are either team's known star strikers/forwards likely available? Use your training knowledge — if a key forward was injury-prone or recently transferring, apply uncertainty.\n` +
+        `C) FORM: From your training knowledge, are these teams typically strong starters? High-energy pressing teams score first more often.\n` +
+        `D) MOTIVATION: Is either team in a must-win (relegation, title run, European qualification)? Use your knowledge of standings context for these leagues.\n` +
+        `E) OPPONENT DEFENSE: From training knowledge, is the opponent's defense porous or elite? Weak defenses give up first goals early.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Your team's first-choice striker is confirmed OUT AND opponent defense is strong → NO\n` +
         `❌ Both teams are defensive/low-scoring (under 1 goal per game each) → NO (first goal may not come)\n` +
@@ -4062,13 +4072,14 @@ async function checkPreGamePredictions() {
     };
   });
 
-  // Fire in parallel batches of 4 — paper mode, no real money at stake
+  // Fire in parallel batches of 3 — use claudeSonnet (no web search) since ESPN starters
+  // are already injected into the prompt. Web search saved ~$5-10/day for no quality loss.
   let preGameTradesThisCycle = 0;
   for (let batch = 0; batch < pgPrompts.length; batch += 3) {
     if (preGameTradesThisCycle >= MAX_PREGAME_PER_CYCLE) break;
     const batchItems = pgPrompts.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 2000, maxSearches: 2, system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
+      batchItems.map(item => claudeSonnet(item.prompt, { maxTokens: 2000, system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
     );
 
     for (let i = 0; i < batchItems.length; i++) {
