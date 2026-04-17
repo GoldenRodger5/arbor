@@ -5310,11 +5310,17 @@ async function managePositions() {
           }
         }
 
-        // PRE-GAME NUCLEAR STOP — fires at -50%, earlier than the general nuclear.
-        // Pre-game bets entered at 65% confidence; at -50% price drop WE is ~20-25%.
-        // WE-REVERSAL (≤30%) usually fires first, but this is the hard safety net.
-        if (trade.strategy === 'pre-game-prediction' && pctChange < -0.50) {
-          console.log(`[exit] 🛑 PRE-GAME NUCLEAR (${stage}, entry ${(entryPrice*100).toFixed(0)}¢): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — hard floor hit`);
+        // PRE-GAME NUCLEAR STOP — stage-aware hard floor, no Claude.
+        // Early game has high variance: a bad first inning can drop price -50%+ with 7+ innings left.
+        // We learned this the hard way: COL was down 0-2 in inning 1, nuclear fired at -56%,
+        // price recovered to 60¢+ two hours later as COL came back to win.
+        // Claude correctly said HOLD each time but nuclear overrode it.
+        //   Early (MLB inn 1-4 / NHL P1 / NBA Q1-Q2): -70% floor — plenty of game left
+        //   Mid   (MLB inn 5-7 / NHL P2 / NBA Q3):    -60% floor — still recoverable
+        //   Late  (MLB inn 8+ / NHL P3 / NBA Q4):     -50% floor — game nearly over
+        const pgNuclearFloor = stage === 'early' ? -0.70 : stage === 'mid' ? -0.60 : -0.50;
+        if (trade.strategy === 'pre-game-prediction' && pctChange < pgNuclearFloor) {
+          console.log(`[exit] 🛑 PRE-GAME NUCLEAR (${stage}, entry ${(entryPrice*100).toFixed(0)}¢): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — ${stage} floor ${Math.round(pgNuclearFloor*100)}% hit`);
           const result = await executeSell(trade, qty, currentPrice, 'pre-game-nuclear');
           if (result) anyUpdated = true;
           continue;
