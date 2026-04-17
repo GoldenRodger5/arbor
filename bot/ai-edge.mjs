@@ -581,6 +581,7 @@ const gameEntries = new Map();    // "game:ATH@NYM" → { count: 2, lastPrice: 0
 const lastSeenPrices = new Map(); // ticker → { price, ts } for line movement detection
 const LINE_MOVE_THRESHOLD = 0.05; // 5¢ move = something happened
 const missingFromKalshi = new Map(); // tradeId → firstMissingMs — 2-strike rule before closing
+const recentCrossContraMovers = new Map(); // ticker → { velocity, when } — cross-confirmed drops for pg-guard
 
 // Restore gameEntries + tradeCooldowns from trades.jsonl on startup so restarts don't
 // wipe knowledge of existing positions (prevents double-buys and scale-in at worse prices)
@@ -2028,6 +2029,14 @@ async function checkLiveScoreEdges() {
 
         console.log(`[pg-guard] ⚠️ PRE-GAME BET LOSING: ${trade.title} | ${ourTeam} trailing ${ourScore}-${theirScore} (${game.detail}) | ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%) | WE: ${(ourWE*100).toFixed(0)}% | ${triggerReason}`);
 
+        // Check if the market has recently cross-confirmed a rapid drop on this position.
+        // This means both Kalshi contracts agreed — a stronger signal than price alone.
+        const contraMove = recentCrossContraMovers.get(trade.ticker);
+        const contraAgeMin = contraMove ? Math.round((Date.now() - contraMove.when) / 60000) : null;
+        const contraContext = contraMove
+          ? `\nMARKET MOVEMENT ALERT: This position's price dropped at ${contraMove.velocity.toFixed(1)}¢/min with CROSS-CONFIRMATION (both contracts moved the same direction) ${contraAgeMin === 0 ? 'just now' : `${contraAgeMin} minute(s) ago`}. Cross-confirmed drops mean the market has information beyond the raw score — how the team looks at the plate, pitcher stuff, momentum. This is a real signal. Weight it toward sell unless your estimate has a very clear 15+ point edge over the market.\n`
+          : '';
+
         const pgPrompt =
           `You manage a pre-game ${sport} bet that is currently LOSING. Your job is to decide: hold, sell half, or sell all.\n\n` +
           `POSITION: Bought ${ourTeam} YES at ${(entryPrice*100).toFixed(0)}¢. Current price: ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%, -$${lossAmt.toFixed(2)}).\n` +
@@ -2035,24 +2044,27 @@ async function checkLiveScoreEdges() {
           `LIVE SCORE: ${awayAbbr} ${game.awayScore} @ ${homeAbbr} ${game.homeScore} | ${game.detail}\n` +
           `Game stage: ${stage.toUpperCase()}\n\n` +
           `ORIGINAL THESIS (why we bought): "${trade.reasoning}"\n\n` +
-          `${comebackContext}\n\n` +
+          `${comebackContext}\n` +
+          `${contraContext}\n` +
           `YOUR CORE QUESTION: Forget the original thesis for a moment. Look at the game RIGHT NOW.\n` +
           `What is your honest win probability for ${ourTeam} given the current score, stage, and situation?\n` +
           `Then compare that to the current market price of ${(currentPrice*100).toFixed(0)}¢.\n\n` +
           `THE DECISION FRAMEWORK:\n` +
-          `- Your estimate >> market price (e.g. you think 45%, market shows 32¢): HOLD — market is underpricing the team, edge still exists\n` +
-          `- Your estimate ≈ market price (within 5pts): SELL — no edge, take the smaller loss now rather than gambling\n` +
-          `- Your estimate < market price: SELL FAST — market is being generous, take it\n` +
-          `- Game is late (MLB inn 7+ / NHL P3) AND trailing by 2+: lean toward sell unless estimate is well above price\n` +
-          `- Game is early (MLB inn 1-4 / NHL P1) AND deficit is small: lean toward hold — high variance, plenty of game left\n\n` +
+          `- Your estimate is 15+ points above market (e.g. you think 40%, market shows 24¢): HOLD — clear edge, market is underpricing\n` +
+          `- Your estimate is 5–14 points above market: SELL HALF — within estimation uncertainty, not a reliable edge alone\n` +
+          `- Your estimate is within 5 points of market: SELL ALL — no edge, lock the loss now\n` +
+          `- Your estimate is below market: SELL ALL FAST — market is being generous, take it\n` +
+          `- Game is late (MLB inn 7+ / NHL P3) AND trailing by 2+: lean sell_all unless estimate is 15+ above price\n` +
+          `- Game is early (MLB inn 1-4 / NHL P1) AND deficit is small AND no market movement alert: lean hold if 15+ edge\n` +
+          `NOTE: A gap of less than 15 points is within normal estimation noise — do NOT treat it as a reliable edge.\n\n` +
           `CONTEXT ON THE ORIGINAL THESIS:\n` +
           `Use it as one input, not the whole answer. If the thesis factor (weak starter, backup goalie) is gone,\n` +
           `that lowers your WE estimate — but the game situation might still justify holding.\n` +
           `If the thesis factor hasn't been tested yet (starter still in game, hasn't faced our lineup), factor that into your estimate too.\n\n` +
           `OPTIONS:\n` +
-          `A) sell_all — your estimate is close to or below market price, or game is late with large deficit. Lock loss of $${lossAmt.toFixed(2)}, recover $${(qty * currentPrice).toFixed(2)}.\n` +
-          `B) sell_half — your estimate is above market but uncertain. Sell ${halfSellQty}/${qty} contracts, hold rest for comeback.\n` +
-          `C) hold — your estimate is clearly above market price. Edge still exists. Upside: +$${(qty * (1 - entryPrice)).toFixed(2)} if wins.\n\n` +
+          `A) sell_all — estimate is near/below market, or late game deficit, or market movement alert. Lock loss of $${lossAmt.toFixed(2)}, recover $${(qty * currentPrice).toFixed(2)}.\n` +
+          `B) sell_half — estimate is 5–14 points above market, uncertain. Sell ${halfSellQty}/${qty} contracts, hold rest.\n` +
+          `C) hold — estimate is clearly 15+ points above market with no strong market signal against. Upside: +$${(qty * (1 - entryPrice)).toFixed(2)} if wins.\n\n` +
           `JSON ONLY: {"action": "sell_all"/"sell_half"/"hold", "myWinEstimate": 0.XX, "marketPrice": 0.XX, "reasoning": "one sentence on why estimate vs price justifies the action"}`;
 
         const pgGuardText = await claudeSonnet(pgPrompt, { maxTokens: 500, timeout: 20000 });
@@ -2241,6 +2253,16 @@ async function checkLiveScoreEdges() {
           candidate._baselineWE = Math.max(candidate._baselineWE, 0.90); // boost to top of priority queue
         }
         console.log(`[line-move] ${isConfirming ? '✅ CONFIRMING' : '⚠️ CONTRA'} for ${leadingAbbr} (mover: ${moverTeam} ${mover.direction} ${(mover.velocity ?? 0).toFixed(1)}¢/min)${crossConfirmed ? ' — CROSS-CONFIRMED' : ''}`);
+
+        // Store cross-confirmed price drops so pg-guard can see rapid market moves against a position.
+        // Only store when BOTH contracts agreed (cross-confirmed) — single-contract moves are noise.
+        if (crossConfirmed && mover.to < mover.from) {
+          recentCrossContraMovers.set(mover.ticker, { velocity: mover.velocity ?? 0, when: Date.now() });
+        }
+        // Prune entries older than 5 minutes
+        for (const [k, v] of recentCrossContraMovers) {
+          if (Date.now() - v.when > 5 * 60 * 1000) recentCrossContraMovers.delete(k);
+        }
       }
     }
     // Re-sort — confirming moves at top, contra moves stay at natural WE rank
