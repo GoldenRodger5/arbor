@@ -1943,10 +1943,10 @@ async function checkLiveScoreEdges() {
                 } else if (stage === 'early' && lead >= 1 && gainCents >= 0.07) {
                   sellFraction = 0.50;
                   sellReason = `pg-profit-mlb-early-1run (1-run early lead @ +${Math.round(gainCents*100)}¢ — selling half, riding rest for more scoring)`;
-                } else if (stage === 'mid' && lead >= 1) {
+                } else if (stage === 'mid' && lead >= 1 && gainCents >= -0.05) {
                   sellFraction = 0.75;
                   sellReason = `pg-profit-mlb-mid (${lead}-run lead inn ${game.period} — capturing most)`;
-                } else if (stage === 'late' && lead >= 1) {
+                } else if (stage === 'late' && lead >= 1 && gainCents >= -0.05) {
                   sellFraction = 1.0;
                   sellReason = `pg-profit-mlb-late (${lead}-run lead inn ${game.period} — locking all)`;
                 }
@@ -2030,6 +2030,38 @@ async function checkLiveScoreEdges() {
             }
           }
           continue; // winning branch handled — don't fall through to loss logic
+        }
+
+        // ── THESIS EXPIRY: MLB still tied after inning 4 ─────────────────────────
+        // We bet on early scoring. 0-0 through 4+ innings means the early-scoring
+        // thesis never played out — exit at current price rather than holding to settlement.
+        if (deficit === 0 && game.league === 'mlb' && game.period >= 5 && !trade.thesisExpiredAt) {
+          let expirePrice = 0;
+          try {
+            const expMkt = await kalshiGet(`/markets/${trade.ticker}`);
+            expirePrice = parseFloat((expMkt.market ?? expMkt).yes_ask_dollars ?? '0');
+          } catch {}
+          if (expirePrice > 0) {
+            const expQty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / (trade.entryPrice ?? 1));
+            trade.thesisExpiredAt = new Date().toISOString();
+            const expLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+            const expTrades = expLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            const expT = expTrades.find(t => t.id === trade.id);
+            if (expT) {
+              expT.thesisExpiredAt = trade.thesisExpiredAt;
+              writeFileSync(TRADES_LOG, expTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
+            }
+            const expGain = expirePrice - (trade.entryPrice ?? 0);
+            console.log(`[pg-expire] ${trade.ticker} thesis expired — 0-0 at inn ${game.period}, exiting @ ${Math.round(expirePrice*100)}¢ (${expGain >= 0 ? '+' : ''}${Math.round(expGain*100)}¢)`);
+            await tg(
+              `⏰ <b>PRE-GAME THESIS EXPIRED</b>\n\n` +
+              `${trade.title ?? trade.ticker}\n` +
+              `Still 0-0 at inning ${game.period} — early-scoring thesis never materialized.\n\n` +
+              `Exiting @ ${Math.round(expirePrice*100)}¢ | Entry: ${Math.round((trade.entryPrice ?? 0)*100)}¢ | P&L: ${expGain >= 0 ? '+' : ''}$${(expGain * expQty).toFixed(2)}`
+            );
+            await executeSell(trade, expQty, expirePrice, 'pg-thesis-expired-0-0-mlb');
+          }
+          continue;
         }
 
         // Only evaluate if our team is LOSING (deficit > 0)
