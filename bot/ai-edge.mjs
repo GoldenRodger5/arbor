@@ -4253,7 +4253,19 @@ async function checkPreGamePredictions() {
     preGameTradesThisCycle++;
     preGameBetGames.add(market.base);
 
+    // ESPN GATE — only place real money when ESPN has confirmed at least one starter.
+    // The pre-game scan runs overnight (2-5 AM ET) when ESPN's scoreboard doesn't yet
+    // have today's games loaded. Without ESPN starters, Claude web-searches at midnight
+    // and "confirms" starters from stale articles — leading to bets on wrong pitchers.
+    // If ESPN has neither team's starter, defer to paper only until starters are known.
     if (PREGAME_LIVE) {
+      const espnT1 = espnStarterMap.get(market.team1.team.toLowerCase());
+      const espnT2 = espnStarterMap.get(market.team2.team.toLowerCase());
+      const isMlbOrHockey = pgSportKey === 'mlb' || pgSportKey === 'nhl';
+      if (isMlbOrHockey && !espnT1 && !espnT2) {
+        console.log(`[pre-game] ⏳ ESPN GATE: no starters confirmed for ${market.base} yet — deferring to paper-only until ESPN loads`);
+        // Fall through to paper logging below (don't place real bet)
+      } else {
       // ── LIVE MODE: place a real Kalshi order ──────────────────────────────
       const pgPriceInCents = Math.round(price * 100);
       console.log(`[pre-game] 🎯 LIVE BET: ${market.base} → ${matchedSide.team} @${pgPriceInCents}¢ conf=${Math.round(confidence*100)}% bet=$${betAmount.toFixed(2)} qty=${betQty}`);
@@ -4319,7 +4331,7 @@ async function checkPreGamePredictions() {
         console.log(`[pre-game] LIVE order error for ${market.base}: ${err.message}`);
       }
       logScreen({ stage: 'pre-game-live', ticker: market.base, result: 'LIVE', confidence, price, reasoning: decision.reasoning });
-
+      } // end ESPN gate else
     } else {
       // ── PAPER MODE: log only, no real order ──────────────────────────────
       if (preGameTradesToday > MAX_PREGAME_PER_CYCLE * 10) { console.log(`[pre-game] Paper daily limit reached`); continue; }
