@@ -583,6 +583,24 @@ const LINE_MOVE_THRESHOLD = 0.05; // 5¢ move = something happened
 const missingFromKalshi = new Map(); // tradeId → firstMissingMs — 2-strike rule before closing
 const recentCrossContraMovers = new Map(); // ticker → { velocity, when } — cross-confirmed drops for pg-guard
 
+// Check whether a tomorrow-dated ticker starts within maxHours of now (ET).
+// Ticker format embeds HHMM immediately after the date string, e.g. "26APR172010".
+// This prevents betting on tomorrow evening games when the pre-game scanner opens
+// at 10pm — only games starting within 8 hours (late West Coast crossover) are valid.
+function tomorrowTickerWithinHours(ticker, tonightStr, etNow, maxHours = 8) {
+  const dateIdx = ticker.indexOf(tonightStr);
+  if (dateIdx < 0) return false;
+  const timeStr = ticker.slice(dateIdx + tonightStr.length, dateIdx + tonightStr.length + 4);
+  if (!/^\d{4}$/.test(timeStr)) return false;
+  const gameH = parseInt(timeStr.slice(0, 2));
+  const gameM = parseInt(timeStr.slice(2, 4));
+  const nowMins = etNow.getHours() * 60 + etNow.getMinutes();
+  const gameMins = gameH * 60 + gameM;
+  // Minutes until game — crosses midnight so add 24h and mod
+  const minsUntil = (gameMins + 24 * 60 - nowMins) % (24 * 60);
+  return minsUntil <= maxHours * 60;
+}
+
 // Restore gameEntries + tradeCooldowns from trades.jsonl on startup so restarts don't
 // wipe knowledge of existing positions (prevents double-buys and scale-in at worse prices)
 try {
@@ -3705,7 +3723,7 @@ async function checkPreGamePredictions() {
       for (const m of data.markets ?? []) {
         if (!m.yes_ask_dollars) continue;
         const ticker = m.ticker ?? '';
-        if (!ticker.includes(todayStr) && !(tonightStr && ticker.includes(tonightStr))) continue;
+        if (!ticker.includes(todayStr) && !(tonightStr && tomorrowTickerWithinHours(ticker, tonightStr, etNow))) continue;
         const lastH = ticker.lastIndexOf('-');
         const base = lastH > 0 ? ticker.slice(0, lastH) : ticker;
         const team = ticker.split('-').pop() ?? '';
@@ -4605,7 +4623,7 @@ async function claudeBroadScan() {
         // Keep TIE contracts — draw betting is valid for in-game tied soccer
       } else {
         // US Sports: filter by ticker date (today/tonight only)
-        if (!ticker.includes(todayFilter) && !(tonightFilter && ticker.includes(tonightFilter))) {
+        if (!ticker.includes(todayFilter) && !(tonightFilter && tomorrowTickerWithinHours(ticker, tonightFilter, etNowFilter))) {
           allMarkets.splice(i, 1);
         }
       }
@@ -4758,7 +4776,12 @@ async function claudeBroadScan() {
     const todayShort = toShort(etNow);
     // Only include tomorrow after 10pm ET
     const etHourBS = etNow.getHours();
-    const tomorrowShort = etHourBS >= 22 ? toShort(etTomorrow) : null;
+    // Only mention tomorrow in the prompt if filtered markets actually contain tomorrow games
+    // (markets are already filtered by tomorrowTickerWithinHours at location 2 above,
+    //  so if no within-8h tomorrow game exists, tomorrowShortCandidate won't appear in the data)
+    const tomorrowShortCandidate = etHourBS >= 22 ? toShort(etTomorrow) : null;
+    const tomorrowShort = (tomorrowShortCandidate && marketSummaryFiltered.includes(tomorrowShortCandidate))
+      ? tomorrowShortCandidate : null;
     const today = etNow.toISOString().slice(0, 10);
 
     // === STAGE 1: Cheap Haiku screen — find 0-3 candidates ($0.002/call) ===
