@@ -1902,24 +1902,68 @@ async function checkLiveScoreEdges() {
               const gainCents = currentPricePg - entryPg;
               const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / entryPg);
 
-              // Dynamic sell target by stage + WE:
-              // Large gain (≥30¢ profit/contract)  → sell ALL — lock the windfall, don't give it back
-              // Early game (WE 65%+, 10¢+ gain) → sell 33% — lock a slice, keep upside
-              // Mid game  (WE 72%+, 15¢+ gain) → sell 50% — meaningful profit secured
-              // Late game (WE 80%+, 20¢+ gain) → sell 75% — near certainty, take it
-              // Late game (WE 88%+, any gain)  → sell all  — game is essentially over
+              // ── Event-driven exits by sport ──────────────────────────────────────
+              // Pre-game = swing trade. Exit when the thesis plays out. Don't convert
+              // it into a hold-to-settlement bet by selling only 33% and riding the game.
+              //
+              // NHL/Soccer: SELL ALL on first goal. Thesis done. Price already spiked
+              //   55¢→72¢. Holding for goal #2 only moves 75¢→88¢ for the same risk.
+              //   The team that scores first wins ~65-70% of NHL games — that's priced in.
+              //
+              // MLB: SELL ALL on 2-run early lead (thesis confirmed — price already
+              //   jumped 15-20¢). SELL HALF on 1-run early lead (partial proof, ride
+              //   rest in case they score again). Escalate mid/late.
+              //
+              // NBA: More volatile — a 4-pt Q1 lead is noise. SELL ALL on 15+.
+              //   SELL HALF on 8+ in first half. Full exit late/dominant.
+              const isSoccer = ['mls', 'epl', 'laliga'].includes(league);
               let sellFraction = 0;
               let sellReason = '';
+
               if (gainCents >= 0.30) {
-                sellFraction = 1.0; sellReason = `pg-profit-large-gain (+${Math.round(gainCents*100)}¢ — locking windfall)`;
-              } else if (stage === 'late' && weWinning >= 0.88) {
-                sellFraction = 1.0; sellReason = `pg-profit-late-dominant (WE=${Math.round(weWinning*100)}%)`;
-              } else if (stage === 'late' && weWinning >= 0.80 && gainCents >= 0.20) {
-                sellFraction = 0.75; sellReason = `pg-profit-late-strong (WE=${Math.round(weWinning*100)}% +${Math.round(gainCents*100)}¢)`;
-              } else if (stage === 'mid' && weWinning >= 0.72 && gainCents >= 0.15) {
-                sellFraction = 0.50; sellReason = `pg-profit-mid (WE=${Math.round(weWinning*100)}% +${Math.round(gainCents*100)}¢)`;
-              } else if (stage === 'early' && weWinning >= 0.65 && gainCents >= 0.10) {
-                sellFraction = 0.33; sellReason = `pg-profit-early (WE=${Math.round(weWinning*100)}% +${Math.round(gainCents*100)}¢)`;
+                // Windfall — always lock regardless of sport
+                sellFraction = 1.0;
+                sellReason = `pg-profit-windfall (+${Math.round(gainCents*100)}¢ — locking windfall)`;
+
+              } else if (league === 'nhl' || isSoccer) {
+                // First goal = full exit. Every second we hold after scoring risks a
+                // tying goal that collapses the price back to entry.
+                if (lead >= 1 && gainCents >= 0.04) {
+                  sellFraction = 1.0;
+                  sellReason = `pg-profit-first-goal (${sport} scored first, thesis proven — selling all @ +${Math.round(gainCents*100)}¢ before lead can disappear)`;
+                }
+
+              } else if (league === 'mlb') {
+                // 2+ run early lead: thesis confirmed (price already up 15-20¢). Take it.
+                // 1-run early lead: partial proof — sell half, ride rest if they score more.
+                // Mid-game: capture most with 75%. Late: close it out.
+                if (stage === 'early' && lead >= 2) {
+                  sellFraction = 1.0;
+                  sellReason = `pg-profit-mlb-early-2run (${lead}-run lead inn ${game.period} — thesis confirmed, selling all @ +${Math.round(gainCents*100)}¢)`;
+                } else if (stage === 'early' && lead >= 1 && gainCents >= 0.07) {
+                  sellFraction = 0.50;
+                  sellReason = `pg-profit-mlb-early-1run (1-run early lead @ +${Math.round(gainCents*100)}¢ — selling half, riding rest for more scoring)`;
+                } else if (stage === 'mid' && lead >= 1) {
+                  sellFraction = 0.75;
+                  sellReason = `pg-profit-mlb-mid (${lead}-run lead inn ${game.period} — capturing most)`;
+                } else if (stage === 'late' && lead >= 1) {
+                  sellFraction = 1.0;
+                  sellReason = `pg-profit-mlb-late (${lead}-run lead inn ${game.period} — locking all)`;
+                }
+
+              } else if (league === 'nba') {
+                // A 4-pt Q1 lead is noise in the NBA. An 8-pt first-half lead is real
+                // signal. A 15-pt lead is essentially over — don't wait for late WE thresholds.
+                if (lead >= 15 && gainCents >= 0.07) {
+                  sellFraction = 1.0;
+                  sellReason = `pg-profit-nba-big-lead (${lead}-pt lead — locking full gain @ +${Math.round(gainCents*100)}¢)`;
+                } else if (stage === 'late' && weWinning >= 0.85) {
+                  sellFraction = 1.0;
+                  sellReason = `pg-profit-nba-late (WE=${Math.round(weWinning*100)}% Q4 — selling all)`;
+                } else if (stage !== 'late' && lead >= 8 && gainCents >= 0.07) {
+                  sellFraction = 0.50;
+                  sellReason = `pg-profit-nba-early-lead (${lead}-pt lead ${stage} game @ +${Math.round(gainCents*100)}¢ — selling half)`;
+                }
               }
 
               if (sellFraction > 0 && !trade.partialTakeAt) {
@@ -1957,9 +2001,15 @@ async function checkLiveScoreEdges() {
                     console.log(`[pg-profit] ${remaining} contracts remain — riding to ${stage === 'early' ? 'mid-game' : 'settlement'}`);
                   }
                 }
-              } else if (sellFraction > 0 && trade.partialTakeAt && !trade.pgFinalSellAt) {
-                // Already took profit once — only sell remaining on dominant late WE
-                if (stage === 'late' && weWinning >= 0.88) {
+              } else if (trade.partialTakeAt && !trade.pgFinalSellAt) {
+                // Already took first partial — sell remaining when game is decided
+                const isSoccerFinal = ['mls', 'epl', 'laliga'].includes(league);
+                const finalSellNow = stage === 'late' ||
+                  (league === 'mlb' && lead >= 3) ||
+                  ((league === 'nhl' || isSoccerFinal) && lead >= 2) ||
+                  (league === 'nba' && lead >= 20) ||
+                  weWinning >= 0.88;
+                if (finalSellNow) {
                   const remaining = qty - Math.floor(qty * (trade._pgFirstSellFraction ?? 0.5));
                   if (remaining >= 1) {
                     tradeCooldowns.set(pgWinKey, Date.now());
@@ -2835,9 +2885,10 @@ async function checkLiveScoreEdges() {
             ? `The WE baseline is ${_weTargetPct}% (period average) → **${_weTimeAdjPct}%** (adjusted for ${_timeAdj.label}). USE ${_weTimeAdjPct}% as your anchor — the period average overstates early-period situations.\n`
             : `The WE baseline is ${_weTargetPct != null ? _weTargetPct + '%' : 'computed'} for ${targetAbbr}.\n`) +
           `Market price is ${(price*100).toFixed(0)}¢. Edge = adjusted WE% − price%. If |edge| < 4 points → respond {"trade":false} immediately with reason "market efficient".\n\n` +
-          `═══ STEP 1 — SEARCH FIRST, ANALYZE SECOND ═══\n` +
+          `═══ STEP 1 — ONE SEARCH ONLY ═══\n` +
+          `⚠️ SEARCH BUDGET: You have exactly ONE web search. Pick the single most important query from the options below and do only that one search. Prioritize: for MLB, search starter pitch count / closer availability. For NBA, search injury report. For NHL, search starting goalie.\n` +
           `⚠️ RESEARCH RULES: Only state facts you found via web search. Never invent statistics, records, or lineup information. You may draw inferences from confirmed data (e.g., "team has clinched so they may be conserving energy") but flag all inferences explicitly. IMPORTANT: "Cannot confirm" is NOT a Hard NO and is NOT a reason to pass. If a stat is unavailable, apply a bounded uncertainty penalty (max −3%) and continue your analysis. The only things that block a trade are the Hard NOs listed in Step 2 — uncertainty about a secondary stat is not one of them.\n\n` +
-          `Search in this order:\n` +
+          `Your ONE search (pick the most important):\n` +
           (league === 'mlb' ?
             `A) STARTER STATE: Search "${leadingAbbr} starting pitcher tonight pitch count" — is the starter still in? Above what pitch count? Who is warming?\n` +
             `   The BULLPEN section above shows the team's authoritative relief ERA (season / L30D / L7D) from the MLB Stats API. Do NOT web-search for bullpen ERA — use the numbers above. ${leadingBullpenTier !== 'unknown' ? `Leading team tier = ${leadingBullpenTier}.` : 'Bullpen data unavailable for this team — treat as average-tier (no penalty, no Hard NO).'}\n` +
