@@ -2046,25 +2046,25 @@ async function checkLiveScoreEdges() {
           `ORIGINAL THESIS (why we bought): "${trade.reasoning}"\n\n` +
           `${comebackContext}\n` +
           `${contraContext}\n` +
-          `YOUR CORE QUESTION: Forget the original thesis for a moment. Look at the game RIGHT NOW.\n` +
-          `What is your honest win probability for ${ourTeam} given the current score, stage, and situation?\n` +
-          `Then compare that to the current market price of ${(currentPrice*100).toFixed(0)}¢.\n\n` +
+          `YOUR CORE QUESTION: Estimate the true win probability for ${ourTeam} RIGHT NOW.\n` +
+          `${stage !== 'late'
+            ? `IMPORTANT — game stage is ${stage.toUpperCase()}: The original thesis factor (weak starter, hot goalie, lineup edge) is still part of the picture if it hasn't been invalidated. Check: is the thesis factor still in play? Same goalie? Starter still in? If yes, weight it into your estimate — don't ignore it just because the opponent scored.\n`
+            : `Game is LATE — weight current score and time remaining heavily. The original thesis matters less now.\n`
+          }` +
+          `Then compare your estimate to the current market price of ${(currentPrice*100).toFixed(0)}¢.\n\n` +
           `THE DECISION FRAMEWORK:\n` +
-          `- Your estimate is 15+ points above market (e.g. you think 40%, market shows 24¢): HOLD — clear edge, market is underpricing\n` +
-          `- Your estimate is 5–14 points above market: SELL HALF — within estimation uncertainty, not a reliable edge alone\n` +
-          `- Your estimate is within 5 points of market: SELL ALL — no edge, lock the loss now\n` +
-          `- Your estimate is below market: SELL ALL FAST — market is being generous, take it\n` +
-          `- Game is late (MLB inn 7+ / NHL P3) AND trailing by 2+: lean sell_all unless estimate is 15+ above price\n` +
-          `- Game is early (MLB inn 1-4 / NHL P1) AND deficit is small AND no market movement alert: lean hold if 15+ edge\n` +
-          `NOTE: A gap of less than 15 points is within normal estimation noise — do NOT treat it as a reliable edge.\n\n` +
-          `CONTEXT ON THE ORIGINAL THESIS:\n` +
-          `Use it as one input, not the whole answer. If the thesis factor (weak starter, backup goalie) is gone,\n` +
-          `that lowers your WE estimate — but the game situation might still justify holding.\n` +
-          `If the thesis factor hasn't been tested yet (starter still in game, hasn't faced our lineup), factor that into your estimate too.\n\n` +
+          `- Your estimate is 15+ points above market (e.g. you think 40%, market shows 24¢): HOLD — clear edge\n` +
+          `- Your estimate is 5–14 points above market: SELL HALF — within noise, cut exposure\n` +
+          `- Your estimate is within 5 points above market: SELL ALL — no reliable edge\n` +
+          `- Your estimate is 1–5 points below market: SELL HALF — slight negative but within noise; cut exposure, don't panic-exit\n` +
+          `- Your estimate is 5+ points below market: SELL ALL — market is being generous, take it\n` +
+          `- Game is late AND trailing by 2+: lean sell_all unless estimate is 15+ above price\n` +
+          `- Game is early/mid AND thesis factor still intact: lean toward hold/sell_half unless estimate is clearly negative\n` +
+          `NOTE: Estimates within ±5 points of market are noise — do NOT treat a small negative gap as a strong sell signal.\n\n` +
           `OPTIONS:\n` +
-          `A) sell_all — estimate is near/below market, or late game deficit, or market movement alert. Lock loss of $${lossAmt.toFixed(2)}, recover $${(qty * currentPrice).toFixed(2)}.\n` +
-          `B) sell_half — estimate is 5–14 points above market, uncertain. Sell ${halfSellQty}/${qty} contracts, hold rest.\n` +
-          `C) hold — estimate is clearly 15+ points above market with no strong market signal against. Upside: +$${(qty * (1 - entryPrice)).toFixed(2)} if wins.\n\n` +
+          `A) sell_all — estimate is 5+ below market, or late game large deficit, or thesis clearly dead. Lock loss of $${lossAmt.toFixed(2)}, recover $${(qty * currentPrice).toFixed(2)}.\n` +
+          `B) sell_half — estimate is within ±5 of market or 5–14 above. Sell ${halfSellQty}/${qty} contracts, hold rest.\n` +
+          `C) hold — estimate is clearly 15+ points above market. Upside: +$${(qty * (1 - entryPrice)).toFixed(2)} if wins.\n\n` +
           `JSON ONLY: {"action": "sell_all"/"sell_half"/"hold", "myWinEstimate": 0.XX, "marketPrice": 0.XX, "reasoning": "one sentence on why estimate vs price justifies the action"}`;
 
         const pgGuardText = await claudeSonnet(pgPrompt, { maxTokens: 500, timeout: 20000 });
