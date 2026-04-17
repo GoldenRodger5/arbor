@@ -3257,9 +3257,14 @@ async function checkLiveScoreEdges() {
         // Confidence-based gate — sport-specific floor if calibration override exists, else global
         let confidence = decision.confidence ?? 0;
         const sportMinConf = CAL.minConfidenceLive?.[league] ?? MIN_CONFIDENCE;
-        if (confidence < sportMinConf) {
-          console.log(`[live-edge] Confidence too low on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(confidence*100).toFixed(0)}% < ${(sportMinConf*100).toFixed(0)}%${CAL.minConfidenceLive?.[league] ? ' [calibrated]' : ''}`);
-          logScreen({ stage: 'live-edge-skip', result: 'skip-conf-low', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, confidence: decision.confidence, targetAbbr, reasoning: `Claude wanted to trade ${targetAbbr} at ${(confidence*100).toFixed(0)}% confidence but floor is ${(sportMinConf*100).toFixed(0)}%${CAL.minConfidenceLive?.[league] ? ' (calibrated)' : ''} — ${decision.reasoning?.slice(0, 120) ?? ''}` });
+        // Underdog entries (price < 50¢) require higher confidence (72% vs 65%).
+        // Data: 0-for-3 at standard floor on <50¢ live entries. Market prices underdogs
+        // correctly more often — need a clearer signal to override.
+        const effectiveMinConf = price < 0.50 ? Math.max(sportMinConf, 0.72) : sportMinConf;
+        if (confidence < effectiveMinConf) {
+          const floorNote = price < 0.50 ? ' [underdog floor 72%]' : (CAL.minConfidenceLive?.[league] ? ' [calibrated]' : '');
+          console.log(`[live-edge] Confidence too low on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(confidence*100).toFixed(0)}% < ${(effectiveMinConf*100).toFixed(0)}%${floorNote}`);
+          logScreen({ stage: 'live-edge-skip', result: 'skip-conf-low', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, confidence: decision.confidence, targetAbbr, reasoning: `Claude wanted to trade ${targetAbbr} at ${(confidence*100).toFixed(0)}% confidence but floor is ${(effectiveMinConf*100).toFixed(0)}%${floorNote} — ${decision.reasoning?.slice(0, 120) ?? ''}` });
           continue;
         }
 
