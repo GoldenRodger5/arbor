@@ -1860,6 +1860,211 @@ function pickBestPlatform(side, kalshiPrice, polyMatch, targetTeamAbbr = '') {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Thesis Status — detect in-game player changes that invalidate pre-game thesis
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Checks if the key player(s) the thesis was built on are still active.
+ * Returns a non-empty alert string if the thesis has been invalidated/weakened,
+ * or null if everything looks intact (or sport unsupported / data unavailable).
+ *
+ * @param {Object} trade  - the open pre-game trade (has trade.reasoning, trade.ticker)
+ * @param {Object} game   - the liveGames entry (has game.league, game.ev.id, game.comp)
+ * @returns {Promise<string|null>}
+ */
+async function getThesisStatus(trade, game) {
+  const eventId = game.ev?.id;
+  if (!eventId) return null;
+  const league = game.league;
+
+  try {
+    // ── MLB: did the starter we bet on get pulled? ────────────────────────────
+    if (league === 'mlb') {
+      const summaryUrl = `https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/summary?event=${eventId}`;
+      const summaryRes = await fetch(summaryUrl, {
+        headers: { 'User-Agent': 'arbor-ai/1' },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!summaryRes.ok) return null;
+      const summary = await summaryRes.json();
+
+      // Build pitcher map from boxscore: athleteId → { name, ip, er, pitchCount }
+      const pitcherStats = new Map();
+      for (const teamPlayers of summary.boxscore?.players ?? []) {
+        for (const statGroup of teamPlayers.statistics ?? []) {
+          if (statGroup.name !== 'pitching') continue;
+          for (const athlete of statGroup.athletes ?? []) {
+            const name = athlete.athlete?.displayName ?? athlete.athlete?.shortName ?? '';
+            const labels = statGroup.labels ?? [];
+            const stats = athlete.stats ?? [];
+            const getIdx = (lbl) => labels.indexOf(lbl);
+            const ipIdx = getIdx('IP'); const erIdx = getIdx('ER'); const pcIdx = getIdx('PC');
+            const ip = ipIdx >= 0 ? parseFloat(stats[ipIdx] ?? '0') : 0;
+            const er = erIdx >= 0 ? parseInt(stats[erIdx] ?? '0', 10) : 0;
+            const pc = pcIdx >= 0 ? parseInt(stats[pcIdx] ?? '0', 10) : 0;
+            if (name) pitcherStats.set(athlete.athlete?.id, { name, ip, er, pc });
+          }
+        }
+      }
+
+      // Current pitcher: scan the most recent play participant with type 'pitcher'
+      let currentPitcherId = null;
+      const plays = summary.plays ?? [];
+      for (let i = plays.length - 1; i >= 0; i--) {
+        const pitcher = (plays[i].participants ?? []).find(p => p.type === 'pitcher');
+        if (pitcher?.athlete?.id) { currentPitcherId = pitcher.athlete.id; break; }
+      }
+
+      if (!currentPitcherId || !pitcherStats.size) return null;
+
+      // Find whether the bet is on the home or away team
+      const isHome = tickerHasTeam(trade.ticker, game.home.team?.abbreviation ?? '');
+
+      // Get the starting pitcher for our team (first pitcher in boxscore = starter)
+      let ourStarterId = null;
+      let ourStarterName = null;
+      for (const teamPlayers of summary.boxscore?.players ?? []) {
+        const teamAbbr = (teamPlayers.team?.abbreviation ?? '').toUpperCase();
+        if (
+          (isHome && teamAbbr === (game.home.team?.abbreviation ?? '').toUpperCase()) ||
+          (!isHome && teamAbbr === (game.away.team?.abbreviation ?? '').toUpperCase())
+        ) {
+          for (const statGroup of teamPlayers.statistics ?? []) {
+            if (statGroup.name !== 'pitching') continue;
+            const firstAthlete = statGroup.athletes?.[0];
+            if (firstAthlete?.athlete?.id) {
+              ourStarterId = firstAthlete.athlete.id;
+              ourStarterName = firstAthlete.athlete?.displayName ?? firstAthlete.athlete?.shortName ?? 'Starter';
+            }
+            break;
+          }
+          break;
+        }
+      }
+
+      if (!ourStarterId) return null;
+
+      const starterStats = pitcherStats.get(ourStarterId);
+      const currentStats = pitcherStats.get(currentPitcherId);
+      const currentName = currentStats?.name ?? 'unknown';
+
+      // Check if starter was pulled (current pitcher ≠ starter)
+      if (currentPitcherId !== ourStarterId && starterStats) {
+        const ip = starterStats.ip;
+        const er = starterStats.er;
+        const earlyExit = ip < 5;
+        if (earlyExit) {
+          return `⚠️ THESIS ALERT: ${ourStarterName} (the pitcher we bet on) was PULLED after ${ip} IP / ${er} ER. Current pitcher: ${currentName}. Early exit invalidates the starter-ERA thesis.`;
+        } else {
+          return `ℹ️ THESIS NOTE: ${ourStarterName} finished ${ip} IP / ${er} ER and was relieved by ${currentName}. Game now in bullpen.`;
+        }
+      }
+
+      // Starter still in — report status as context
+      if (starterStats) {
+        return `✅ THESIS INTACT: ${ourStarterName} still pitching (${starterStats.ip} IP, ${starterStats.er} ER, ${starterStats.pc} pitches).`;
+      }
+      return null;
+    }
+
+    // ── NHL: did the goalie we bet on get pulled? ─────────────────────────────
+    if (league === 'nhl') {
+      // probables[] is already in game.comp (scoreboard data fetched each cycle)
+      const isHome = tickerHasTeam(trade.ticker, game.home.team?.abbreviation ?? '');
+      const ourTeamComp = isHome ? game.home : game.away;
+      const currentProbs = ourTeamComp.probables ?? [];
+      if (!currentProbs.length) return null;
+
+      const currentGoalie = currentProbs[0]?.athlete?.displayName
+        ?? currentProbs[0]?.athlete?.shortName ?? '';
+      if (!currentGoalie) return null;
+
+      // Try to find the goalie name mentioned in the reasoning
+      const reasoning = trade.reasoning ?? '';
+      // Extract words that look like a goalie name (capitalized words near "goalie", "starter", ".sv%", etc.)
+      const goaliePatterns = [
+        /starter[:\s]+([A-Z][a-z]+ [A-Z][a-z]+)/i,
+        /goalie[:\s]+([A-Z][a-z]+ [A-Z][a-z]+)/i,
+        /([A-Z][a-z]+ [A-Z][a-z]+)\s+(?:starting|in goal|\.sv%|save%|SV%)/i,
+        /(?:bet(?:ting)? on|backing|thesis)[^.]*?([A-Z][a-z]+ [A-Z][a-z]+)/i,
+      ];
+
+      let thesisGoalie = null;
+      for (const pat of goaliePatterns) {
+        const m = reasoning.match(pat);
+        if (m?.[1]) { thesisGoalie = m[1]; break; }
+      }
+
+      if (thesisGoalie) {
+        const sameGoalie = currentGoalie.toLowerCase().includes(thesisGoalie.split(' ').pop()?.toLowerCase() ?? '');
+        if (!sameGoalie) {
+          return `⚠️ THESIS ALERT: Goalie change! We bet based on ${thesisGoalie} but current active goalie is ${currentGoalie}. Goalie-based thesis is INVALIDATED.`;
+        }
+        return `✅ THESIS INTACT: ${currentGoalie} still in net (matches thesis goalie ${thesisGoalie}).`;
+      }
+
+      // No specific goalie mentioned — just report current goalie for context
+      return `ℹ️ Current goalie: ${currentGoalie}.`;
+    }
+
+    // ── MLS/Soccer: has a key forward been subbed out before 60'? ─────────────
+    if (['mls', 'epl', 'laliga'].includes(league)) {
+      const sportPath = league === 'mls' ? 'soccer/usa.1' : league === 'epl' ? 'soccer/eng.1' : 'soccer/esp.1';
+      const summaryUrl = `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/summary?event=${eventId}`;
+      const summaryRes = await fetch(summaryUrl, {
+        headers: { 'User-Agent': 'arbor-ai/1' },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!summaryRes.ok) return null;
+      const summary = await summaryRes.json();
+
+      const isHome = tickerHasTeam(trade.ticker, game.home.team?.abbreviation ?? '');
+      const reasoning = trade.reasoning ?? '';
+
+      const earlySubAlerts = [];
+      for (const rosterTeam of summary.rosters ?? []) {
+        const teamAbbr = (rosterTeam.team?.abbreviation ?? '').toUpperCase();
+        if (
+          (isHome && teamAbbr !== (game.home.team?.abbreviation ?? '').toUpperCase()) ||
+          (!isHome && teamAbbr !== (game.away.team?.abbreviation ?? '').toUpperCase())
+        ) continue;
+
+        for (const player of rosterTeam.roster ?? []) {
+          if (!player.starter) continue;
+          const subbedOut = player.subbedOut ?? false;
+          const subbedOutAt = player.subbedOutAt ?? null;
+          const pos = (player.position?.abbreviation ?? '').toUpperCase();
+          const isAttacker = ['CF', 'LW', 'RW', 'SS', 'FW', 'ST', 'AM', 'CF-R', 'CF-L', 'LWF', 'RWF'].some(p => pos.includes(p));
+          if (!subbedOut) continue;
+          if (subbedOutAt != null && subbedOutAt <= 60) {
+            const name = player.athlete?.displayName ?? player.athlete?.shortName ?? 'Unknown';
+            const mentionedInThesis = reasoning.toLowerCase().includes((player.athlete?.lastName ?? name.split(' ').pop() ?? '').toLowerCase());
+            if (isAttacker || mentionedInThesis) {
+              earlySubAlerts.push(`${name} (${pos}) subbed out at ${subbedOutAt}'`);
+            }
+          }
+        }
+      }
+
+      if (earlySubAlerts.length > 0) {
+        return `⚠️ THESIS ALERT: Key attacker(s) subbed out early: ${earlySubAlerts.join(', ')}. Offensive thesis may be weakened.`;
+      }
+
+      // Get current minute for context
+      const clockMin = parseInt(game.comp?.status?.displayClock?.split(':')[0] ?? '0', 10);
+      return clockMin >= 60
+        ? `ℹ️ Soccer: no key attackers subbed early. Now in ${clockMin}' — game approaching final phase.`
+        : null;
+    }
+
+  } catch (e) {
+    // Non-fatal — thesis check is best-effort
+    console.log(`[thesis-status] ${game.league} fetch failed: ${e.message}`);
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Live Predictions — predict winners during live games
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2134,14 +2339,25 @@ async function checkLiveScoreEdges() {
         //   Late game + WE ≤ 50%: trailing at all in late game = urgent
         const weTrigger = (stage === 'late' && ourWE <= 0.50) || (stage === 'mid' && ourWE <= 0.40);
 
-        if (pctChange >= PG_CLAUDE_THRESHOLD && !weTrigger) {
+        // Thesis monitoring: check if the key player(s) we bet on are still active.
+        // This runs regardless of price threshold — a starter pull is a thesis-killer.
+        const thesisAlert = await getThesisStatus(trade, game);
+        const thesisIsKiller = thesisAlert?.startsWith('⚠️ THESIS ALERT');
+        if (thesisAlert) {
+          console.log(`[pg-guard] [thesis] ${ticker}: ${thesisAlert}`);
+        }
+
+        // Bypass price threshold if thesis has been invalidated (e.g. starter pulled, goalie changed)
+        if (pctChange >= PG_CLAUDE_THRESHOLD && !weTrigger && !thesisIsKiller) {
           if (pctChange < 0) {
             console.log(`[pg-guard] ${ticker} trailing ${ourScore}-${theirScore} (${game.detail}) | ${stage} threshold=${Math.round(PG_CLAUDE_THRESHOLD*100)}% WE=${(ourWE*100).toFixed(0)}% | price ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%), watching...`);
           }
           continue;
         }
 
-        const triggerReason = weTrigger
+        const triggerReason = thesisIsKiller
+          ? `thesis-killer (${thesisAlert?.slice(0, 80)})`
+          : weTrigger
           ? `WE-trigger (WE=${(ourWE*100).toFixed(0)}%, stage=${stage})`
           : `price-trigger (${(pctChange*100).toFixed(0)}%, threshold=${Math.round(PG_CLAUDE_THRESHOLD*100)}%)`;
 
@@ -2167,6 +2383,13 @@ async function checkLiveScoreEdges() {
           ? `\nMARKET MOVEMENT ALERT: This position's price dropped at ${contraMove.velocity.toFixed(1)}¢/min with CROSS-CONFIRMATION (both contracts moved the same direction) ${contraAgeMin === 0 ? 'just now' : `${contraAgeMin} minute(s) ago`}. Cross-confirmed drops mean the market has information beyond the raw score — how the team looks at the plate, pitcher stuff, momentum. This is a real signal. Weight it toward sell unless your estimate has a very clear 15+ point edge over the market.\n`
           : '';
 
+        const thesisContext = thesisAlert
+          ? `\nIN-GAME THESIS STATUS: ${thesisAlert}\n` +
+            (thesisIsKiller
+              ? `CRITICAL: The key player/factor the thesis was built on is no longer active. Do NOT assume the original thesis edge still applies. Re-evaluate as if this were a fresh bet with current game state only.\n`
+              : ``)
+          : '';
+
         const pgPrompt =
           `You manage a pre-game ${sport} bet that is currently LOSING. Your job is to decide: hold, sell half, or sell all.\n\n` +
           `POSITION: Bought ${ourTeam} YES at ${(entryPrice*100).toFixed(0)}¢. Current price: ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%, -$${lossAmt.toFixed(2)}).\n` +
@@ -2175,6 +2398,7 @@ async function checkLiveScoreEdges() {
           `Game stage: ${stage.toUpperCase()}\n\n` +
           `ORIGINAL THESIS (why we bought): "${trade.reasoning}"\n\n` +
           `${comebackContext}\n` +
+          `${thesisContext}\n` +
           `${contraContext}\n` +
           `YOUR CORE QUESTION: Estimate the true win probability for ${ourTeam} RIGHT NOW.\n` +
           `${stage !== 'late'
