@@ -2295,9 +2295,30 @@ async function checkLiveScoreEdges() {
         // Only evaluate if our team is LOSING (deficit > 0)
         if (deficit <= 0) continue;
 
+        // Determine sport + game context — needed for stage-aware thresholds and thesis check
+        const league = game.league;
+        const sport = league === 'nhl' ? 'NHL' : league === 'nba' ? 'NBA' : league === 'mlb' ? 'MLB' :
+          ['mls', 'epl', 'laliga'].includes(league) ? 'Soccer' : 'Sport';
+        const stage = league === 'mlb' ? (game.period <= 4 ? 'early' : game.period <= 6 ? 'mid' : 'late') :
+          league === 'nba' ? (game.period <= 2 ? 'early' : game.period === 3 ? 'mid' : 'late') :
+          league === 'nhl' ? (game.period === 1 ? 'early' : game.period === 2 ? 'mid' : 'late') :
+          game.period === 1 ? 'early' : 'late';
+
+        const we = getWinExpectancy(league, deficit, game.period, !isOurTeamHome) ?? 0;
+        const ourWE = 1 - we; // we're the trailing team
+
+        // Thesis monitoring runs BEFORE the cooldown — a starter pull or goalie change is
+        // an urgent thesis-killer that must not be gated behind a 20-minute window.
+        const thesisAlert = await getThesisStatus(trade, game);
+        const thesisIsKiller = thesisAlert?.startsWith('⚠️ THESIS ALERT');
+        if (thesisAlert) {
+          console.log(`[pg-guard] [thesis] ${ticker}: ${thesisAlert}`);
+        }
+
         // Cooldown: don't cascade-sell by re-evaluating too quickly. 20 min prevents sell_half spam.
+        // Thesis-killers bypass this — a starter being pulled mid-game can't wait 20 minutes.
         const pgGuardKey = 'pg-guard:' + trade.ticker;
-        if (Date.now() - (tradeCooldowns.get(pgGuardKey) ?? 0) < 20 * 60 * 1000) continue;
+        if (!thesisIsKiller && Date.now() - (tradeCooldowns.get(pgGuardKey) ?? 0) < 20 * 60 * 1000) continue;
         tradeCooldowns.set(pgGuardKey, Date.now());
 
         // Fetch current market price (batch prices aren't loaded yet — individual fetch)
@@ -2313,18 +2334,6 @@ async function checkLiveScoreEdges() {
         const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / entryPrice);
         const pctChange = (currentPrice - entryPrice) / entryPrice;
 
-        // Determine sport + game context FIRST — needed for stage-aware thresholds below
-        const league = game.league;
-        const sport = league === 'nhl' ? 'NHL' : league === 'nba' ? 'NBA' : league === 'mlb' ? 'MLB' :
-          ['mls', 'epl', 'laliga'].includes(league) ? 'Soccer' : 'Sport';
-        const stage = league === 'mlb' ? (game.period <= 4 ? 'early' : game.period <= 6 ? 'mid' : 'late') :
-          league === 'nba' ? (game.period <= 2 ? 'early' : game.period === 3 ? 'mid' : 'late') :
-          league === 'nhl' ? (game.period === 1 ? 'early' : game.period === 2 ? 'mid' : 'late') :
-          game.period === 1 ? 'early' : 'late';
-
-        const we = getWinExpectancy(league, deficit, game.period, !isOurTeamHome) ?? 0;
-        const ourWE = 1 - we; // we're the trailing team
-
         // Stage-aware price threshold — early games have high variance, don't panic-sell on normal scoring.
         //   early (MLB inn 1-4 / NHL P1 / NBA Q1): require -25% before calling Claude
         //   mid   (MLB inn 5-7 / NHL P2 / NBA Q2-Q3): require -15%
@@ -2338,14 +2347,6 @@ async function checkLiveScoreEdges() {
         //     We want Claude to evaluate real deterioration, not normal early variance.
         //   Late game + WE ≤ 50%: trailing at all in late game = urgent
         const weTrigger = (stage === 'late' && ourWE <= 0.50) || (stage === 'mid' && ourWE <= 0.40);
-
-        // Thesis monitoring: check if the key player(s) we bet on are still active.
-        // This runs regardless of price threshold — a starter pull is a thesis-killer.
-        const thesisAlert = await getThesisStatus(trade, game);
-        const thesisIsKiller = thesisAlert?.startsWith('⚠️ THESIS ALERT');
-        if (thesisAlert) {
-          console.log(`[pg-guard] [thesis] ${ticker}: ${thesisAlert}`);
-        }
 
         // Bypass price threshold if thesis has been invalidated (e.g. starter pulled, goalie changed)
         if (pctChange >= PG_CLAUDE_THRESHOLD && !weTrigger && !thesisIsKiller) {
