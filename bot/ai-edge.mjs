@@ -222,7 +222,9 @@ try {
 
 function kalshiHeaders(method, path) {
   const ts = String(Date.now());
-  const fullPath = path.startsWith('/trade-api/v2') ? path : `/trade-api/v2${path}`;
+  // Kalshi signs path WITHOUT query string — strip before signing
+  const pathOnly = path.split('?')[0];
+  const fullPath = pathOnly.startsWith('/trade-api/v2') ? pathOnly : `/trade-api/v2${pathOnly}`;
   const sig = cryptoSign('sha256', Buffer.from(`${ts}${method}${fullPath}`), {
     key: kalshiPrivateKey,
     padding: cryptoConstants.RSA_PKCS1_PSS_PADDING,
