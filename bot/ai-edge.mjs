@@ -2439,6 +2439,37 @@ async function checkLiveScoreEdges() {
               const priceInCents = Math.round(tiePrice * 100);
               console.log(`[draw-bet] ⚽ ${homeAbbr} ${homeScore}-${awayScore} ${awayAbbr} at ${effectiveMin}' | TIE @${priceInCents}¢ (prob: ${(drawProb*100).toFixed(0)}%) margin: ${(margin*100).toFixed(0)}%`);
 
+              // Claude reasoning gate — evaluate contextually before placing
+              const drawPrompt = `You are a soccer betting analyst. Evaluate this draw bet.\n\n` +
+                `MATCH: ${homeAbbr} vs ${awayAbbr} (${league.toUpperCase()})\n` +
+                `SCORE: ${homeScore}-${awayScore} at ${effectiveMin}'\n` +
+                `DRAW PROBABILITY (historical baseline): ${(drawProb*100).toFixed(0)}%\n` +
+                `TIE PRICE: ${priceInCents}¢ (margin: ${(margin*100).toFixed(0)}%)\n` +
+                `DEPLOY: $${(qty * tiePrice).toFixed(2)} (${qty} contracts)\n\n` +
+                `Consider:\n` +
+                `- Is the scoreline trajectory favoring a draw or a late goal?\n` +
+                `- At ${effectiveMin}', how much time is left for the draw to break?\n` +
+                `- Is ${(margin*100).toFixed(0)}% margin enough given remaining variance?\n` +
+                `- Any red flags (dominant team likely to score, open game flow)?\n\n` +
+                `Reply with EXACTLY this format:\n` +
+                `VERDICT: BUY or SKIP\n` +
+                `CONFIDENCE: <number 0-100>\n` +
+                `REASONING: <1-2 sentences explaining why>`;
+
+              const drawAnalysis = await claudeSonnet(drawPrompt, { maxTokens: 200, timeout: 15000 });
+              const drawVerdict = (drawAnalysis ?? '').toUpperCase().includes('VERDICT: BUY') ? 'BUY' : 'SKIP';
+              const drawReasoning = (drawAnalysis ?? '').match(/REASONING:\s*(.+)/i)?.[1]?.trim() ?? 'No reasoning provided';
+              const drawConf = parseInt((drawAnalysis ?? '').match(/CONFIDENCE:\s*(\d+)/i)?.[1] ?? '0');
+
+              if (drawVerdict !== 'BUY' || drawConf < 55) {
+                console.log(`[draw-bet] Claude says ${drawVerdict} (conf: ${drawConf}%): ${drawReasoning}`);
+                tradeCooldowns.set(tieMarket.ticker, Date.now());
+                tradeCooldowns.set(gameBase, Date.now());
+                continue;
+              }
+
+              console.log(`[draw-bet] Claude APPROVED (conf: ${drawConf}%): ${drawReasoning}`);
+
               tradeCooldowns.set(tieMarket.ticker, Date.now());
               tradeCooldowns.set(gameBase, Date.now());
 
@@ -2456,14 +2487,13 @@ async function checkLiveScoreEdges() {
                   side: 'yes', quantity: qty, entryPrice: tiePrice, deployCost: deployed,
                   filled: (result.data.order ?? result.data).quantity_filled ?? 0,
                   orderId: (result.data.order ?? result.data).order_id ?? null,
-                  edge: margin * 100, confidence: drawProb,
-                  reasoning: `${homeScore}-${awayScore} at ${effectiveMin}'. Draw baseline ${(drawProb*100).toFixed(0)}% vs price ${priceInCents}¢.`,
-                  // Calibration fields
+                  edge: margin * 100, confidence: drawConf / 100,
+                  reasoning: drawReasoning,
                   league,
-                  scoreDiff: 0, // draw-bets are always on tied games
+                  scoreDiff: 0,
                   periodAtEntry: period,
-                  weAtEntry: drawProb, // the model's draw probability IS the WE estimate
-                  isLeadingTeam: false, // draw bets have no leader — treat as non-leader for calibration
+                  weAtEntry: drawProb,
+                  isLeadingTeam: false,
                 });
 
                 await tg(
@@ -2472,7 +2502,7 @@ async function checkLiveScoreEdges() {
                   `BUY TIE @ ${priceInCents}¢ × ${qty} = <b>$${deployed.toFixed(2)}</b>\n` +
                   `Draw probability: <b>${(drawProb*100).toFixed(0)}%</b> vs price ${priceInCents}¢\n` +
                   `Potential profit: <b>$${(qty * (1 - tiePrice)).toFixed(2)}</b>\n\n` +
-                  `🧠 <i>Pure math: ${homeScore === 0 && awayScore === 0 ? '0-0' : homeScore+'-'+awayScore} at ${effectiveMin}' = ${(drawProb*100).toFixed(0)}% draw historically</i>`
+                  `🧠 <i>Claude (${drawConf}%): ${drawReasoning}</i>`
                 );
               }
             }
