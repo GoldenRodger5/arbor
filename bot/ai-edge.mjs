@@ -588,6 +588,7 @@ const gameEntries = new Map();    // "game:ATH@NYM" → { count: 2, lastPrice: 0
 const lastSeenPrices = new Map(); // ticker → { price, ts } for line movement detection
 const LINE_MOVE_THRESHOLD = 0.05; // 5¢ move = something happened
 const missingFromKalshi = new Map(); // tradeId → firstMissingMs — 2-strike rule before closing
+let massDisappearStreak = 0; // consecutive sync cycles where ALL Kalshi positions are absent
 const recentCrossContraMovers = new Map(); // ticker → { velocity, when } — cross-confirmed drops for pg-guard
 
 // Check whether a tomorrow-dated ticker starts within maxHours of now (ET).
@@ -1345,9 +1346,14 @@ async function refreshPortfolio() {
           const openKalshiCount = trades.filter(t2 => t2.status === 'open' && t2.exchange === 'kalshi').length;
           const missingCount = trades.filter(t2 => t2.status === 'open' && t2.exchange === 'kalshi' && !([...kalshiTickers].some(kt => t2.ticker === kt || t2.ticker.startsWith(kt + '-') || kt.startsWith(t2.ticker + '-')))).length;
           if (missingCount >= openKalshiCount && openKalshiCount >= 2) {
-            // All positions vanished — almost certainly a Kalshi API blip, not mass manual cashout
-            console.log(`[sync] ALL ${openKalshiCount} Kalshi positions absent simultaneously — likely API glitch, NOT marking cashout`);
-            break; // skip cashout logic for this sync cycle
+            massDisappearStreak++;
+            if (massDisappearStreak < 3) {
+              console.log(`[sync] ALL ${openKalshiCount} Kalshi positions absent (streak ${massDisappearStreak}/3) — waiting to confirm`);
+              break;
+            }
+            console.log(`[sync] ALL ${openKalshiCount} Kalshi positions absent for ${massDisappearStreak} cycles — treating as real manual cashout`);
+          } else {
+            massDisappearStreak = 0;
           }
           const firstMissing = missingFromKalshi.get(t.id);
           if (!firstMissing) {
@@ -5872,8 +5878,15 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
     return false;
   }
 
+  const actualFill = (result.data?.order ?? result.data)?.quantity_filled ?? 0;
+  if (actualFill === 0) {
+    console.log(`[exit] Sell order accepted but 0 filled for ${trade.ticker} — position likely already sold`);
+    return false;
+  }
+
+  const effectiveQty = Math.min(actualFill, sellQty);
   const totalQty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / entryPrice);
-  const profit = (currentPrice - entryPrice) * sellQty;
+  const profit = (currentPrice - entryPrice) * effectiveQty;
 
   if (sellQty >= totalQty) {
     // Full exit
