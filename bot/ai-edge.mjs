@@ -3689,10 +3689,8 @@ async function checkLiveScoreEdges() {
 const PREGAME_SCAN_INTERVAL = 15 * 60 * 1000; // every 15 min
 const MAX_PREGAME_PER_CYCLE = 8;   // Analyze up to 8 markets per scan cycle
 const MAX_PREGAME_PAPER_PER_DAY = 999; // Paper mode: no real cap — log every qualifying pick for calibration
-const MAX_PREGAME_LIVE_PER_DAY = 6; // Hard cap on real money pre-game bets per day
 const PREGAME_HOURS_WINDOW = 4;    // Only place real bet when game starts within this many hours
 let preGameTradesToday = 0;
-let preGameLiveToday = 0;           // real-money pre-game bets placed today
 let preGameTradesDate = '';         // reset counter on new day
 const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
 
@@ -3716,7 +3714,6 @@ async function checkPreGamePredictions() {
     preGameTradesDate = todayDateStr;
     preGameBetGames.clear();
     preGameTradesToday = 0;
-    preGameLiveToday = 0;
     // Restore from paper-trades.jsonl (covers both paper and real-bet mirrors)
     if (existsSync(PAPER_TRADES_LOG)) {
       const todayLines = readFileSync(PAPER_TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
@@ -3732,7 +3729,6 @@ async function checkPreGamePredictions() {
     }
     // Backstop: also restore from real trades.jsonl in case paper mirror was missed.
     // Derives marketBase from ticker by stripping the trailing "-TEAMABBR" suffix.
-    // Also restores preGameLiveToday (real-money cap) from the same file.
     if (existsSync(TRADES_LOG)) {
       const tradeLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
       for (const l of tradeLines) {
@@ -3741,7 +3737,6 @@ async function checkPreGamePredictions() {
           if (t.strategy === 'pre-game-prediction' && tsToEtDate(t.timestamp) === todayDateStr && t.ticker) {
             const base = t.ticker.replace(/-[A-Z]+$/, '');
             if (base) preGameBetGames.add(base);
-            preGameLiveToday++;
           }
         } catch {}
       }
@@ -4313,11 +4308,6 @@ async function checkPreGamePredictions() {
       if (etNow.getHours() < 10) {
         console.log(`[pre-game] 🌙 OVERNIGHT GATE: ${market.base} — no real bets before 10 AM ET (currently ${etNow.getHours()}:${String(etNow.getMinutes()).padStart(2,'0')} ET)`);
         // Fall through to paper logging below
-      } else
-      // ── DAILY CAP: max 6 real pre-game bets per day ───────────────────────
-      if (preGameLiveToday >= MAX_PREGAME_LIVE_PER_DAY) {
-        console.log(`[pre-game] 🚫 Daily live cap reached (${preGameLiveToday}/${MAX_PREGAME_LIVE_PER_DAY}) — deferring ${market.base} to paper`);
-        // Fall through to paper logging below
       } else {
       // ── 4-HOUR WINDOW: only bet when game starts within PREGAME_HOURS_WINDOW ──
       // Parse HHMM from ticker (e.g. KXMLBGAME-26APR172010STLHOU → 2010 = 8:10 PM ET).
@@ -4405,8 +4395,7 @@ async function checkPreGamePredictions() {
               `🧠 <b>REASONING</b>\n` +
               `${decision.reasoning ?? 'No reasoning returned'}`
             );
-            preGameLiveToday++;
-            console.log(`[pre-game] ✅ Filled ${pgFill}/${betQty} @ ${pgPriceInCents}¢ deployed=$${pgDeployed.toFixed(2)} (live today: ${preGameLiveToday}/${MAX_PREGAME_LIVE_PER_DAY})`);
+            console.log(`[pre-game] ✅ Filled ${pgFill}/${betQty} @ ${pgPriceInCents}¢ deployed=$${pgDeployed.toFixed(2)}`);
           }
         } else {
           console.log(`[pre-game] LIVE order failed for ${market.base}: status=${pgResult.status}`);
