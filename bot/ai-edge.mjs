@@ -3689,7 +3689,7 @@ async function checkLiveScoreEdges() {
 const PREGAME_SCAN_INTERVAL = 15 * 60 * 1000; // every 15 min
 const MAX_PREGAME_PER_CYCLE = 8;   // Analyze up to 8 markets per scan cycle
 const MAX_PREGAME_PAPER_PER_DAY = 999; // Paper mode: no real cap — log every qualifying pick for calibration
-const PREGAME_HOURS_WINDOW = 4;    // Only place real bet when game starts within this many hours
+const PREGAME_HOURS_WINDOW = 2;    // Only place real bet when game starts within this many hours
 let preGameTradesToday = 0;
 let preGameTradesDate = '';         // reset counter on new day
 const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
