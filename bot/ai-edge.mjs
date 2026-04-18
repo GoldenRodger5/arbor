@@ -685,6 +685,21 @@ function renderStructuredReasoning(r) {
   return parts.join(' | ');
 }
 
+// Full multi-line reasoning for Telegram — shows each section on its own line
+function renderReasoningForTelegram(r, fallbackStr) {
+  if (!r || typeof r !== 'object') return fallbackStr || '';
+  const lines = [];
+  if (r.steel_man)        lines.push(`STEEL-MAN: ${r.steel_man}`);
+  if (r.edge_source)      lines.push(`EDGE SOURCE: ${r.edge_source}`);
+  if (r.edge_argument)    lines.push(`WHY MARKET IS WRONG: ${r.edge_argument}`);
+  if (Array.isArray(r.key_facts) && r.key_facts.length > 0) {
+    lines.push(`KEY FACTS: ${r.key_facts.filter(Boolean).join('; ')}`);
+  }
+  if (r.top_risk)         lines.push(`KEY RISK: ${r.top_risk}`);
+  if (r.conviction)       lines.push(`CONVICTION: ${r.conviction}`);
+  return lines.length > 0 ? lines.join('\n') : (fallbackStr || '');
+}
+
 // Smart cooldown: allow adding to position IF price improved AND score is
 // unchanged, block otherwise.
 //
@@ -3659,7 +3674,7 @@ async function checkLiveScoreEdges() {
             `Win expectancy: ${weAtEntry !== null ? `${(weAtEntry*100).toFixed(0)}%` : 'N/A'} | Period: ${period}\n` +
             `${isSwingMode ? `Exit: +12¢ profit (${priceInCents + 12}¢) | Stop: -10¢ (${priceInCents - 10}¢)` : `Stop-loss: ~${Math.round(bestPrice * 100 * 0.86)}¢ | Max profit: <b>$${(actualFill * (1 - bestPrice)).toFixed(2)}</b>`}${savedMsg}${hcMsg}\n\n` +
             `🧠 <b>REASONING</b>\n` +
-            `${decision.reasoning}`
+            `${renderReasoningForTelegram(decision.reasoningStructured, decision.reasoning)}`
           );
         } else {
           console.error(`[live-edge] Order failed:`, result.status, JSON.stringify(result.data));
@@ -4602,7 +4617,8 @@ async function checkPreGamePredictions() {
               `Baseline: ${Math.round(pgTargetBaseline*100)}% | Exit target: ${pgPriceInCents + 12}¢ (+12¢)\n` +
               `Max profit (at exit): <b>$${(pgFill * 0.12).toFixed(2)}</b> | Max loss: $${pgDeployed.toFixed(2)}\n\n` +
               `🧠 <b>REASONING</b>\n` +
-              `${decision.reasoning ?? 'No reasoning returned'}`
+              `${decision.reasoning ?? 'No reasoning returned'}` +
+              (decision.exitScenario ? `\n\n📍 <b>EXIT SCENARIO</b>\n${decision.exitScenario}` : '')
             );
             console.log(`[pre-game] ✅ Filled ${pgFill}/${betQty} @ ${pgPriceInCents}¢ deployed=$${pgDeployed.toFixed(2)}`);
           }
