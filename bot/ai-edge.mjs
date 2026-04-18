@@ -4017,7 +4017,7 @@ async function checkPreGamePredictions() {
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `⛔ THESE ARE ABSOLUTE. If ANY Hard NO applies, respond {"trade":false} immediately. Do NOT continue reasoning.\n` +
         `❌ Starting pitcher for the team you want to bet is NOT confirmed → NO\n` +
-        `❌ Your team's starter is ERA > 5.0 → NO. Market-makers already know this ERA and have priced it in. When a bad starter gives up runs, the price drops fast — your contract loses value while you're hoping for a comeback. The edge math doesn't work.\n` +
+        `❌ Your team's starter is ERA > 5.0 AND opponent starter is ERA < 3.5 → NO. Your bad starter vs their good one = your team falls behind early, price drops, no swing-trade opportunity. BUT if BOTH starters are ERA > 4.5, this is a HIGH-SCORING game — volatile prices = swing trade opportunity. Let it through and evaluate the matchup.\n` +
         `❌ Opponent starter is ERA < 2.5 AND WHIP < 1.0 → NO (will dominate your lineup, price won't rise)\n\n` +
         `═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══\n` +
         `Start from 54% win rate (home) / 46% (away). Adjust based on confirmed research:\n` +
@@ -4215,11 +4215,12 @@ async function checkPreGamePredictions() {
     const preGameBaselines = { mlb: 0.45, nba: 0.72, nhl: 0.56, mls: 0.55, epl: 0.55, laliga: 0.55 };
     const pgBaseline = preGameBaselines[pgSportKey] ?? 0.55;
     // Cap: how far above early-event baseline Claude can go.
-    // MLB: +20% (45% + 20% = 65% max) — pitching mismatch can push early-scoring to 65%
+    // MLB: +25% (45% + 25% = 70% max) — was 20% but created a dead zone where
+    //   65% cap + 67% min-conf = impossible. Raised to let genuine conviction through.
     // NBA: +15% (72% + 15% = 87% max) — dominant mismatch e.g. opponent resting all starters
     // NHL: +18% (56% + 18% = 74% max) — elite goalie vs backup + PP edge
     // Soccer: +15% (55% + 15% = 70% max) — opens soccer since we exit on first goal (draws irrelevant)
-    const sportCapBonus = { mlb: 0.20, nba: 0.15, nhl: 0.18, mls: 0.15, epl: 0.15, laliga: 0.15 }[pgSportKey] ?? 0.15;
+    const sportCapBonus = { mlb: 0.25, nba: 0.15, nhl: 0.18, mls: 0.15, epl: 0.15, laliga: 0.15 }[pgSportKey] ?? 0.15;
     const pgTargetBaseline = pick.side === 'yes' ? pgBaseline : (1 - pgBaseline);
     const pgMaxAllowed = Math.min(0.85, pgTargetBaseline + sportCapBonus);
     if (confidence > pgMaxAllowed) {
@@ -4248,15 +4249,15 @@ async function checkPreGamePredictions() {
     //   Above 65¢:  72% — expensive favorites, need strong conviction
     //
     // Tiers (MLB/Soccer):
-    //   Under 50¢:  65% — unchanged (MLB already allows 65% flat)
-    //   50–65¢:     67% — slight lift for mid-range
-    //   Above 65¢:  70% — expensive favorites
+    //   Under 50¢:  63% — matches NHL/NBA, opens highest-edge swing trades (18pt edge at 44¢)
+    //   50–65¢:     65% — lowered from 67% to work with the 70% cap
+    //   Above 65¢:  68% — expensive favorites need conviction but not an impossible bar
     const isSoccer = pgSportKey === 'mls' || pgSportKey === 'epl' || pgSportKey === 'laliga';
     const isNhlNba = pgSportKey === 'nhl' || pgSportKey === 'nba';
     const PRE_GAME_MIN_CONF = isNhlNba
       ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.70 : 0.72)
       : (pgSportKey === 'mlb' || isSoccer)
-        ? (price < 0.50 ? 0.65 : price <= 0.65 ? 0.67 : 0.70)
+        ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68)
         : 0.65; // fallback for other sports
     if (confidence < PRE_GAME_MIN_CONF || (confidence - price) < pgReqMargin) {
       console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${((confidence-price)*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% min=${(PRE_GAME_MIN_CONF*100).toFixed(0)}% (${pgSportKey})`);
@@ -5452,11 +5453,26 @@ async function managePositions() {
           }
         }
 
+        // PRE-GAME HARD STOP — cent-based, time-gated.
+        // Swing-trade thesis: we exit at +12¢. Symmetric risk means we cut at -12¢.
+        // But early game is noisy — only fire after mid-game to avoid cutting on 1st-inning variance.
+        //   MLB: fire after inning 3+  |  NBA: fire after Q2+  |  NHL: fire after P1  |  Soccer: after min 30
+        const pgHardStopCents = entryPrice < 0.50 ? 0.12 : 0.10;
+        const pgHardStopReady = trade.strategy === 'pre-game-prediction' && (
+          (league === 'mlb' && ctx?.period >= 3) ||
+          (league === 'nba' && ctx?.period >= 2) ||
+          (league === 'nhl' && ctx?.period >= 2) ||
+          (['mls','epl','laliga'].includes(league) && ctx?.period >= 30)
+        );
+        if (pgHardStopReady && (entryPrice - currentPrice) >= pgHardStopCents) {
+          console.log(`[exit] 🛑 PRE-GAME HARD STOP (${stage}): ${trade.ticker} down ${Math.round((entryPrice - currentPrice)*100)}¢ (limit ${Math.round(pgHardStopCents*100)}¢) | entry ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢`);
+          const result = await executeSell(trade, qty, currentPrice, 'pre-game-hard-stop');
+          if (result) anyUpdated = true;
+          continue;
+        }
+
         // PRE-GAME NUCLEAR STOP — stage-aware hard floor, no Claude.
-        // Early game has high variance: a bad first inning can drop price -50%+ with 7+ innings left.
-        // We learned this the hard way: COL was down 0-2 in inning 1, nuclear fired at -56%,
-        // price recovered to 60¢+ two hours later as COL came back to win.
-        // Claude correctly said HOLD each time but nuclear overrode it.
+        // Catches extreme blowouts that the cent-based stop hasn't reached yet (early game).
         //   Early (MLB inn 1-4 / NHL P1 / NBA Q1-Q2): -70% floor — plenty of game left
         //   Mid   (MLB inn 5-7 / NHL P2 / NBA Q3):    -60% floor — still recoverable
         //   Late  (MLB inn 8+ / NHL P3 / NBA Q4):     -50% floor — game nearly over
