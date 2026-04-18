@@ -17,11 +17,17 @@ export default function RecapPage() {
   const [period, setPeriod] = useState<'daily' | 'weekly'>('daily');
   const [data, setData] = useState<RecapData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const load = (p: 'daily' | 'weekly') => {
     setLoading(true);
-    api.getRecap(period).then(d => { setData(d); setLoading(false); }).catch(() => setLoading(false));
-  }, [period]);
+    setError(null);
+    api.getRecap(p)
+      .then(d => { setData(d); setLoading(false); })
+      .catch(e => { setError(e.message ?? 'Failed to load'); setLoading(false); });
+  };
+
+  useEffect(() => { load(period); }, [period]);
 
   return (
     <div>
@@ -44,8 +50,16 @@ export default function RecapPage() {
           <div className="skeleton" style={{ height: 80, borderRadius: 12 }} />
           <div className="skeleton" style={{ height: 120, borderRadius: 12 }} />
         </div>
+      ) : error ? (
+        <div style={{ padding: 40, textAlign: 'center' }}>
+          <div style={{ color: 'var(--red)', fontSize: 13, marginBottom: 12 }}>{error}</div>
+          <button onClick={() => load(period)} style={{
+            background: 'var(--accent)', color: 'white', border: 'none',
+            borderRadius: 8, padding: '10px 20px', fontSize: 13, fontWeight: 600, cursor: 'pointer',
+          }}>Tap to retry</button>
+        </div>
       ) : !data ? (
-        <div style={{ color: 'var(--text-tertiary)', padding: 40, textAlign: 'center' }}>No data</div>
+        <div style={{ color: 'var(--text-tertiary)', padding: 40, textAlign: 'center' }}>No data available for this period</div>
       ) : (
         <>
           <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 12 }}>

@@ -74,6 +74,8 @@ export default function AnalyticsPage() {
   const { trades } = useArbor();
   const [tf, setTf] = useState<Timeframe>('7d');
   const [drill, setDrill] = useState<{ title: string; subtitle?: string; trades: any[] } | null>(null);
+  const [calSport, setCalSport] = useState<string>('all');
+  const [calDay, setCalDay] = useState<string>('all');
 
   const start = tfStart(tf);
   const filtered = useMemo(() => trades.filter(t => new Date(t.timestamp).getTime() >= start), [trades, start]);
@@ -122,7 +124,34 @@ export default function AnalyticsPage() {
     return Object.values(map).map((s, i) => ({ ...s, pnl: Math.round(s.pnl * 100) / 100, winRate: s.value ? Math.round((s.wins / s.value) * 100) : 0, fill: COLORS[i % COLORS.length] }));
   }, [filtered]);
 
-  // Calibration
+  // Available sports and days for calibration filters
+  const calSports = useMemo(() => {
+    const set = new Set<string>();
+    for (const t of settled) if (t.confidence != null) set.add(sportOf(t));
+    return ['all', ...Array.from(set).sort()];
+  }, [settled]);
+
+  const calDays = useMemo(() => {
+    const set = new Set<string>();
+    for (const t of settled) {
+      if (t.confidence == null) continue;
+      const d = new Date(t.timestamp);
+      set.add(['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()]);
+    }
+    return ['all', ...['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].filter(d => set.has(d))];
+  }, [settled]);
+
+  // Calibration — filtered by sport + day
+  const calFiltered = useMemo(() => settled.filter(t => {
+    if (t.confidence == null) return false;
+    if (calSport !== 'all' && sportOf(t) !== calSport) return false;
+    if (calDay !== 'all') {
+      const d = new Date(t.timestamp);
+      if (['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()] !== calDay) return false;
+    }
+    return true;
+  }), [settled, calSport, calDay]);
+
   const calData = useMemo(() => {
     const buckets = [
       { label: '65-70%', min: 0.65, max: 0.70 },
@@ -131,11 +160,15 @@ export default function AnalyticsPage() {
       { label: '80-85%', min: 0.80, max: 0.85 },
       { label: '85-90%', min: 0.85, max: 0.90 },
       { label: '90%+', min: 0.90, max: 1.01 },
-    ].map(b => ({ ...b, total: 0, wins: 0 }));
-    for (const t of settled) {
-      if (t.confidence == null) continue;
+    ].map(b => ({ ...b, total: 0, wins: 0, pnl: 0 }));
+    for (const t of calFiltered) {
       for (const b of buckets) {
-        if (t.confidence >= b.min && t.confidence < b.max) { b.total++; if ((t.realizedPnL ?? 0) > 0) b.wins++; break; }
+        if (t.confidence >= b.min && t.confidence < b.max) {
+          b.total++;
+          if ((t.realizedPnL ?? 0) > 0) b.wins++;
+          b.pnl += t.realizedPnL ?? 0;
+          break;
+        }
       }
     }
     return buckets.filter(b => b.total > 0).map(b => ({
@@ -143,8 +176,19 @@ export default function AnalyticsPage() {
       predicted: (b.min + b.max) / 2 * 100,
       actual: Math.round((b.wins / b.total) * 100),
       total: b.total,
+      wins: b.wins,
+      pnl: Math.round(b.pnl * 100) / 100,
     }));
-  }, [settled]);
+  }, [calFiltered]);
+
+  const calOverall = useMemo(() => {
+    if (calFiltered.length === 0) return null;
+    const avgConf = calFiltered.reduce((s, t) => s + t.confidence, 0) / calFiltered.length;
+    const wins = calFiltered.filter(t => (t.realizedPnL ?? 0) > 0).length;
+    const actualWr = wins / calFiltered.length;
+    const gap = (actualWr - avgConf) * 100;
+    return { avgConf: Math.round(avgConf * 100), actualWr: Math.round(actualWr * 100), gap: Math.round(gap), total: calFiltered.length };
+  }, [calFiltered]);
 
   // Hour of day
   const hourData = useMemo(() => {
@@ -293,26 +337,114 @@ export default function AnalyticsPage() {
       )}
 
       {/* Calibration */}
-      {calData.length > 0 && (
-        <Section title="CONFIDENCE CALIBRATION · TAP TO DRILL">
-          <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 10 }}>
-            Diagonal = perfect. Above diagonal = underconfident (good). Below = overconfident (bad).
+      <Section title="CONFIDENCE CALIBRATION">
+        {/* Sport filter */}
+        <div style={{ display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap' }}>
+          {calSports.map(s => (
+            <button key={s} onClick={() => { buzz('light'); setCalSport(s); }} style={{
+              padding: '5px 10px', borderRadius: 6,
+              background: calSport === s ? 'var(--accent)' : 'var(--bg-base)',
+              color: calSport === s ? 'white' : 'var(--text-secondary)',
+              border: '1px solid var(--border)',
+              fontSize: 11, fontWeight: 600, cursor: 'pointer', textTransform: 'uppercase',
+            }}>{s}</button>
+          ))}
+        </div>
+        {/* Day filter */}
+        <div style={{ display: 'flex', gap: 6, marginBottom: 12, flexWrap: 'wrap' }}>
+          {calDays.map(d => (
+            <button key={d} onClick={() => { buzz('light'); setCalDay(d); }} style={{
+              padding: '5px 8px', borderRadius: 6,
+              background: calDay === d ? 'var(--accent)' : 'var(--bg-base)',
+              color: calDay === d ? 'white' : 'var(--text-secondary)',
+              border: '1px solid var(--border)',
+              fontSize: 10, fontWeight: 600, cursor: 'pointer',
+            }}>{d === 'all' ? 'All Days' : d}</button>
+          ))}
+        </div>
+
+        {/* Summary stat */}
+        {calOverall && (
+          <div style={{
+            display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 14,
+          }}>
+            <div style={{ background: 'var(--bg-base)', borderRadius: 8, padding: '8px 10px', textAlign: 'center' }}>
+              <div style={{ fontSize: 9, color: 'var(--text-tertiary)' }}>TRADES</div>
+              <div className="font-mono" style={{ fontSize: 16, fontWeight: 700 }}>{calOverall.total}</div>
+            </div>
+            <div style={{ background: 'var(--bg-base)', borderRadius: 8, padding: '8px 10px', textAlign: 'center' }}>
+              <div style={{ fontSize: 9, color: 'var(--text-tertiary)' }}>AVG CONF</div>
+              <div className="font-mono" style={{ fontSize: 16, fontWeight: 700 }}>{calOverall.avgConf}%</div>
+            </div>
+            <div style={{ background: 'var(--bg-base)', borderRadius: 8, padding: '8px 10px', textAlign: 'center' }}>
+              <div style={{ fontSize: 9, color: 'var(--text-tertiary)' }}>ACTUAL WR</div>
+              <div className="font-mono" style={{ fontSize: 16, fontWeight: 700, color: calOverall.actualWr >= calOverall.avgConf ? 'var(--green)' : 'var(--red)' }}>{calOverall.actualWr}%</div>
+            </div>
+            <div style={{ background: 'var(--bg-base)', borderRadius: 8, padding: '8px 10px', textAlign: 'center' }}>
+              <div style={{ fontSize: 9, color: 'var(--text-tertiary)' }}>GAP</div>
+              <div className="font-mono" style={{ fontSize: 16, fontWeight: 700, color: calOverall.gap >= 0 ? 'var(--green)' : 'var(--red)' }}>{calOverall.gap >= 0 ? '+' : ''}{calOverall.gap}%</div>
+            </div>
           </div>
-          <ResponsiveContainer width="100%" height={230}>
-            <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 10 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-              <XAxis dataKey="predicted" type="number" domain={[60, 100]} tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} />
-              <YAxis dataKey="actual" type="number" domain={[0, 100]} tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} />
-              <Tooltip {...tooltipStyle} formatter={(v: number, name: string) => [`${v}%`, name]} />
-              <Scatter data={calData} onClick={(d: any) => d?.payload && drillBucket(d.payload)} cursor="pointer">
-                {calData.map((d, i) => (
-                  <Cell key={i} fill={d.actual >= d.predicted ? 'var(--green)' : 'var(--red)'} />
-                ))}
-              </Scatter>
-            </ScatterChart>
-          </ResponsiveContainer>
-        </Section>
-      )}
+        )}
+
+        {calData.length > 0 ? (
+          <>
+            <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 10 }}>
+              Diagonal = perfect. Above = underconfident (good). Below = overconfident (bad).
+            </div>
+            <ResponsiveContainer width="100%" height={230}>
+              <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 10 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                <XAxis dataKey="predicted" type="number" domain={[60, 100]} tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} label={{ value: 'Predicted', position: 'bottom', fontSize: 10, fill: 'var(--text-tertiary)' }} />
+                <YAxis dataKey="actual" type="number" domain={[0, 100]} tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} label={{ value: 'Actual', angle: -90, position: 'left', fontSize: 10, fill: 'var(--text-tertiary)' }} />
+                <Tooltip {...tooltipStyle} formatter={(v: number, name: string) => [`${v}%`, name]} />
+                <Scatter data={calData} onClick={(d: any) => d?.payload && drillBucket(d.payload)} cursor="pointer">
+                  {calData.map((d, i) => (
+                    <Cell key={i} fill={d.actual >= d.predicted ? 'var(--green)' : 'var(--red)'} r={Math.max(6, Math.min(16, d.total))} />
+                  ))}
+                </Scatter>
+              </ScatterChart>
+            </ResponsiveContainer>
+
+            {/* Bucket detail table */}
+            <div style={{ marginTop: 14 }}>
+              {calData.map(b => {
+                const gap = b.actual - Math.round(b.predicted);
+                return (
+                  <button
+                    key={b.label}
+                    onClick={() => drillBucket(b)}
+                    style={{
+                      width: '100%', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                      padding: '8px 10px', background: 'var(--bg-base)', borderRadius: 6,
+                      border: '1px solid var(--border)', marginBottom: 6, cursor: 'pointer',
+                      fontSize: 12,
+                    }}
+                  >
+                    <span style={{ fontWeight: 600, minWidth: 60 }}>{b.label}</span>
+                    <span className="font-mono" style={{ color: 'var(--text-secondary)' }}>
+                      {b.wins}/{b.total}
+                    </span>
+                    <span className="font-mono" style={{ color: b.actual >= Math.round(b.predicted) ? 'var(--green)' : 'var(--red)' }}>
+                      {b.actual}% actual
+                    </span>
+                    <span className="font-mono" style={{ color: gap >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600, minWidth: 45, textAlign: 'right' }}>
+                      {gap >= 0 ? '+' : ''}{gap}%
+                    </span>
+                    <span className="font-mono" style={{ color: b.pnl >= 0 ? 'var(--green)' : 'var(--red)', minWidth: 65, textAlign: 'right' }}>
+                      {b.pnl >= 0 ? '+' : ''}${b.pnl.toFixed(2)}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </>
+        ) : (
+          <div style={{ color: 'var(--text-tertiary)', fontSize: 13, padding: 20, textAlign: 'center' }}>
+            No calibration data for this filter combination.
+          </div>
+        )}
+      </Section>
 
       {/* Strategy */}
       {stratData.length > 0 && (

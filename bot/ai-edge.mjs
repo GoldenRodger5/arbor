@@ -6442,17 +6442,20 @@ async function main() {
   }
   setTimeout(soccerExitLoop, 30 * 1000); // starts 30s after bot init
 
-  // Calibration engine — runs once per day at 6am ET (after overnight settlements)
-  let lastCalibration = '';
-  async function calibrationLoop() {
-    const today = etTodayStr();
-    if (etHour() === 6 && lastCalibration !== today) {
-      lastCalibration = today;
-      try { runCalibration(); } catch (e) { console.error('[calibrate] error:', e.message); }
-    }
-    setTimeout(calibrationLoop, 60 * 60 * 1000); // check every hour
-  }
-  setTimeout(calibrationLoop, 10 * 60 * 1000); // first check after 10 min
+  // Calibration engine — DISABLED per user request (2026-04-18).
+  // Was: runs once per day at 6am ET, sends Telegram report.
+  // Re-enable by uncommenting the setTimeout below.
+  // let lastCalibration = '';
+  // async function calibrationLoop() {
+  //   const today = etTodayStr();
+  //   if (etHour() === 6 && lastCalibration !== today) {
+  //     lastCalibration = today;
+  //     try { runCalibration(); } catch (e) { console.error('[calibrate] error:', e.message); }
+  //   }
+  //   setTimeout(calibrationLoop, 60 * 60 * 1000);
+  // }
+  // setTimeout(calibrationLoop, 10 * 60 * 1000);
+  console.log('[calibrate] Auto-calibration DISABLED');
 
   // Daily report — checks every hour, sends at midnight ET
   let lastDailyReport = '';

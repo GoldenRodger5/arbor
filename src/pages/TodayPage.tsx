@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { useArbor } from '@/context/ArborContext';
 import { api } from '@/lib/api';
+import type { Trade } from '@/types';
 import { toast } from 'sonner';
 import { buzz, notificationPermission, requestNotificationPermission } from '@/lib/notify';
 import { useEffect, useState } from 'react';
@@ -27,6 +28,47 @@ const SPORT_COLOR: Record<string, string> = {
   MLS: '#005293', EPL: '#3d195b', 'La Liga': '#ff4b00',
   UFC: '#d20a0a', Other: '#4B4B5E',
 };
+
+function ReasoningCard({ trade }: { trade: Trade }) {
+  const [expanded, setExpanded] = useState(false);
+  const text = trade.reasoning ?? '';
+  const preview = text.length > 160 ? text.slice(0, 160) + '…' : text;
+
+  return (
+    <section style={{
+      background: 'var(--bg-surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 16,
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+        <div className="label">LATEST REASONING</div>
+        <span style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>
+          {new Date(trade.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}
+        </span>
+      </div>
+      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+        {trade.title}
+      </div>
+      <div className="font-mono" style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 8 }}>
+        {trade.side?.toUpperCase()} @ {(trade.entryPrice * 100).toFixed(0)}¢ ·
+        {' '}conf {(trade.confidence * 100).toFixed(0)}%
+        {trade.edge != null && <> · edge {trade.edge.toFixed(1)}%</>}
+      </div>
+      <div
+        onClick={() => { if (text.length > 160) setExpanded(!expanded); }}
+        style={{
+          fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.55, fontStyle: 'italic',
+          cursor: text.length > 160 ? 'pointer' : 'default',
+        }}
+      >
+        {expanded ? text : preview}
+      </div>
+      {text.length > 160 && !expanded && (
+        <div onClick={() => setExpanded(true)} style={{
+          marginTop: 6, fontSize: 11, color: 'var(--accent)', cursor: 'pointer',
+        }}>Show full reasoning</div>
+      )}
+    </section>
+  );
+}
 
 function strategyTag(strategy?: string): { label: string; color: string; bg: string } | null {
   if (!strategy) return null;
@@ -261,31 +303,9 @@ export default function TodayPage() {
         )}
       </section>
 
-      {/* Latest reasoning */}
+      {/* Latest reasoning — collapsed by default */}
       {latestReasoned && (
-        <section style={{
-          background: 'var(--bg-surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 16,
-        }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-            <div className="label">LATEST REASONING</div>
-            <span style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>
-              {new Date(latestReasoned.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}
-            </span>
-          </div>
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
-            {latestReasoned.title}
-          </div>
-          <div className="font-mono" style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 8 }}>
-            {latestReasoned.side?.toUpperCase()} @ {(latestReasoned.entryPrice * 100).toFixed(0)}¢ ·
-            {' '}conf {(latestReasoned.confidence * 100).toFixed(0)}%
-            {latestReasoned.edge != null && <> · edge {latestReasoned.edge.toFixed(1)}%</>}
-          </div>
-          <div style={{
-            fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.55, fontStyle: 'italic',
-          }}>
-            {latestReasoned.reasoning}
-          </div>
-        </section>
+        <ReasoningCard trade={latestReasoned} />
       )}
 
       {/* Recent activity */}

@@ -9,7 +9,7 @@ const MORE_NAV = [
   { label: 'Analytics', path: '/analytics', icon: '📈', desc: 'Charts & drill-downs' },
   { label: 'Recap', path: '/recap', icon: '📅', desc: 'Daily & weekly' },
   { label: 'Trade Review', path: '/review', icon: '🧠', desc: 'AI-graded post-game' },
-  { label: 'Live Feed', path: '/live', icon: '📡', desc: 'Bot activity + summary' },
+  { label: 'Games', path: '/games', icon: '🎮', desc: 'Live game decisions' },
   { label: 'Settings', path: '/settings', icon: '⚙️', desc: 'Control the bot' },
 ];
 
@@ -96,34 +96,15 @@ export default function CommandCenter() {
 
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <h1 style={{ fontSize: 24, fontWeight: 700, margin: 0 }}>Overview</h1>
-            <span style={{
-              width: 8, height: 8, borderRadius: '50%',
-              background: connected ? 'var(--green)' : 'var(--red)',
-              display: 'inline-block',
-            }} className={connected ? 'status-dot-live' : ''} />
-          </div>
-          <div style={{ fontSize: 12, color: error ? 'var(--red)' : 'var(--text-tertiary)', marginTop: 4 }}>
-            {error ? `Connection error: ${error}` : `Live — updates every 15s${refreshing ? ' (refreshing...)' : ''}`}
-          </div>
-        </div>
-        <button
-          onClick={refresh}
-          disabled={refreshing}
-          style={{
-            background: refreshing ? 'var(--bg-elevated)' : 'var(--accent)',
-            color: 'white', border: 'none', borderRadius: 8,
-            padding: '8px 16px', fontSize: 13, cursor: refreshing ? 'default' : 'pointer', fontWeight: 500,
-            opacity: refreshing ? 0.6 : 1, transition: 'opacity 150ms',
-          }}
-        >
-          {refreshing ? 'Refreshing...' : 'Refresh'}
-        </button>
+        <h1 style={{ fontSize: 24, fontWeight: 700, margin: 0 }}>More</h1>
+        <span style={{
+          width: 8, height: 8, borderRadius: '50%',
+          background: connected ? 'var(--green)' : 'var(--red)',
+          display: 'inline-block',
+        }} className={connected ? 'status-dot-live' : ''} />
       </div>
 
-      {/* Quick nav (for mobile — More tab lands here) */}
+      {/* Quick nav */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 8, marginBottom: 20 }}>
         {MORE_NAV.map(item => (
           <Link key={item.path} to={item.path} style={{
@@ -140,100 +121,26 @@ export default function CommandCenter() {
         ))}
       </div>
 
-      {/* Bankroll Hero */}
+      {/* Projections */}
       <div style={{
-        background: 'linear-gradient(135deg, var(--bg-surface), var(--bg-elevated))',
-        border: '1px solid var(--border)', borderRadius: 16, padding: '24px 28px', marginBottom: 20,
+        background: 'var(--bg-surface)', border: '1px solid var(--border)', borderRadius: 12, padding: '16px 20px', marginBottom: 20,
       }}>
-        <div className="label" style={{ marginBottom: 8 }}>TOTAL BANKROLL</div>
-        <div className="font-mono" style={{ fontSize: 36, fontWeight: 700 }}>${bankroll.toFixed(2)}</div>
-        <div style={{ display: 'flex', gap: 24, marginTop: 12, fontSize: 13, color: 'var(--text-secondary)' }}>
-          <span>Kalshi: ${kalshiCash.toFixed(2)} cash + ${kalshiPos.toFixed(2)} positions</span>
-          <span>Poly: ${polyBal.toFixed(2)}</span>
-        </div>
-        <div style={{ marginTop: 8 }}>
-          <span style={{ fontSize: 13, marginRight: 16 }}>Today: <PnlColor value={s.todayPnL ?? 0} /></span>
-          <span style={{ fontSize: 13 }}>All time: <PnlColor value={s.totalPnL ?? 0} /></span>
-        </div>
-      </div>
-
-      {/* Daily Challenge + Projections */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 20 }}>
-        {/* Daily Challenge */}
-        <div style={{
-          background: 'var(--bg-surface)', border: '1px solid var(--border)', borderRadius: 12, padding: '16px 20px',
-        }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-            <span className="label">DAILY TARGET</span>
-            <span className="font-mono" style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-              ${(s.todayPnL ?? 0).toFixed(2)} / ${dailyTarget.toFixed(2)}
-            </span>
+        <div className="label" style={{ marginBottom: 8 }}>PROJECTIONS</div>
+        {todayPnL !== 0 ? (
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.9 }}>
+            <div>If every day = today: <span className="font-mono" style={{ color: weeklyIfToday >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>{weeklyIfToday >= 0 ? '+' : ''}${weeklyIfToday.toFixed(0)}/wk</span> · <span className="font-mono" style={{ color: monthlyIfToday >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>{monthlyIfToday >= 0 ? '+' : ''}${monthlyIfToday.toFixed(0)}/mo</span></div>
           </div>
-          <div style={{ height: 8, background: 'var(--bg-base)', borderRadius: 4, overflow: 'hidden' }}>
-            <div style={{
-              height: '100%', borderRadius: 4, transition: 'width 500ms ease',
-              width: `${Math.min(100, dailyProgress * 100)}%`,
-              background: dailyProgress >= 1 ? 'var(--green)' : dailyProgress >= 0.5 ? 'var(--accent)' : 'var(--amber)',
-            }} />
+        ) : (
+          <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>No P&L today yet</div>
+        )}
+        {dailyAvgPnL > 0 && (
+          <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.8 }}>
+            <div>Avg daily: <span className="font-mono">${dailyAvgPnL.toFixed(2)}</span> → <span className="font-mono">${weeklyAvg.toFixed(0)}/wk</span></div>
+            {daysTo1K != null && daysTo1K > 0 && daysTo1K < 365 && (
+              <div>$1K bankroll in <span className="font-mono" style={{ color: 'var(--accent)' }}>{daysTo1K} days</span></div>
+            )}
           </div>
-          {dailyProgress >= 1 && (
-            <div style={{ marginTop: 8, fontSize: 12, color: 'var(--green)', fontWeight: 600 }}>
-              Target hit! Keep stacking.
-            </div>
-          )}
-        </div>
-
-        {/* Projections */}
-        <div style={{
-          background: 'var(--bg-surface)', border: '1px solid var(--border)', borderRadius: 12, padding: '16px 20px',
-        }}>
-          <div className="label" style={{ marginBottom: 8 }}>IF EVERY DAY IS LIKE TODAY</div>
-          {todayPnL !== 0 ? (
-            <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.9 }}>
-              <div>This week: <span className="font-mono" style={{ color: weeklyIfToday >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>{weeklyIfToday >= 0 ? '+' : ''}${weeklyIfToday.toFixed(0)}/wk</span></div>
-              <div>This month: <span className="font-mono" style={{ color: monthlyIfToday >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>{monthlyIfToday >= 0 ? '+' : ''}${monthlyIfToday.toFixed(0)}/mo</span></div>
-              <div>This year: <span className="font-mono" style={{ color: yearlyIfToday >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>{yearlyIfToday >= 0 ? '+' : ''}${yearlyIfToday.toFixed(0)}/yr</span></div>
-            </div>
-          ) : (
-            <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>No P&L today yet</div>
-          )}
-          {dailyAvgPnL > 0 && (
-            <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)', fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.8 }}>
-              <div>Avg daily: <span className="font-mono">${dailyAvgPnL.toFixed(2)}</span> → <span className="font-mono">${weeklyAvg.toFixed(0)}/wk</span></div>
-              {daysTo1K != null && daysTo1K > 0 && daysTo1K < 365 && (
-                <div>$1K bankroll in <span className="font-mono" style={{ color: 'var(--accent)' }}>{daysTo1K} days</span></div>
-              )}
-              {daysTo5K != null && daysTo5K > 0 && daysTo5K < 365 && (
-                <div>$5K bankroll in <span className="font-mono" style={{ color: 'var(--accent)' }}>{daysTo5K} days</span></div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Stats Grid */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginBottom: 20 }}>
-        <StatCard label="TODAY'S TRADES" value={s.todayTrades ?? 0} sub={<>Settled: {s.todaySettled ?? 0}</>} />
-        <StatCard label="WIN RATE" value={s.winRate != null ? `${s.winRate}%` : 'N/A'} sub={<>{s.wins ?? 0}W / {s.losses ?? 0}L</>} />
-        <StatCard
-          label="STREAK"
-          value={
-            <span className={s.streakType === 'win' && (s.streak ?? 0) >= 3 ? 'streak-fire' : ''}>
-              {streakIcon} {s.streak ?? 0} {s.streakType ?? ''}
-            </span>
-          }
-        />
-        <StatCard label="OPEN" value={s.openTrades ?? 0} sub={<>${(positions.reduce((sum, p) => sum + (p.deployCost ?? 0), 0)).toFixed(2)} deployed</>} />
-        <StatCard
-          label="BEST TRADE"
-          value={s.bestTrade ? <PnlColor value={s.bestTrade.pnl} /> : 'N/A'}
-          sub={s.bestTrade?.title?.slice(0, 30)}
-        />
-        <StatCard
-          label="WORST TRADE"
-          value={s.worstTrade ? <PnlColor value={s.worstTrade.pnl} /> : 'N/A'}
-          sub={s.worstTrade?.title?.slice(0, 30)}
-        />
+        )}
       </div>
 
       {/* Bankroll Chart */}
@@ -261,76 +168,8 @@ export default function CommandCenter() {
         </div>
       )}
 
-      {/* Active Positions */}
-      <div style={{ background: 'var(--bg-surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 20, marginBottom: 20 }}>
-        <div className="label" style={{ marginBottom: 12 }}>ACTIVE POSITIONS ({positions.length})</div>
-        {positions.length === 0 ? (
-          <div style={{ color: 'var(--text-tertiary)', fontSize: 13, padding: '12px 0' }}>No open positions</div>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {positions.slice(0, 12).map(p => {
-              const pnl = p.exitPrice != null ? (p.exitPrice - p.entryPrice) * p.quantity : 0;
-              const sport = p.ticker?.includes('MLB') ? 'MLB' : p.ticker?.includes('NBA') ? 'NBA' : p.ticker?.includes('NHL') ? 'NHL' : p.ticker?.includes('MLS') ? 'MLS' : p.exchange === 'polymarket' ? 'POLY' : '';
-              return (
-                <div key={p.id} style={{
-                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                  padding: '10px 12px', background: 'var(--bg-base)', borderRadius: 8,
-                }}>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      {sport && <span style={{
-                        background: 'var(--bg-elevated)', padding: '2px 6px', borderRadius: 4,
-                        fontSize: 10, fontWeight: 600, color: 'var(--accent)',
-                      }}>{sport}</span>}
-                      <span style={{ fontSize: 13, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {p.title}
-                      </span>
-                    </div>
-                    <div className="font-mono" style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 4 }}>
-                      {p.side?.toUpperCase()} @ {(p.entryPrice * 100).toFixed(0)}¢ × {p.quantity} = ${p.deployCost?.toFixed(2)}
-                    </div>
-                  </div>
-                  <div style={{ textAlign: 'right', marginLeft: 12 }}>
-                    <div className="font-mono" style={{ fontSize: 13, fontWeight: 500, color: 'var(--accent)' }}>
-                      {(p.confidence * 100).toFixed(0)}%
-                    </div>
-                    <div style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>conf</div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
-      {/* Recent Activity */}
-      <div style={{ background: 'var(--bg-surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 20 }}>
-        <div className="label" style={{ marginBottom: 12 }}>RECENT ACTIVITY</div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-          {recentTrades.map(t => {
-            const icon = t.status === 'settled' && (t.realizedPnL ?? 0) >= 0 ? '✅' :
-              t.status === 'settled' ? '❌' :
-              t.status?.startsWith('sold-') ? '🛑' :
-              t.status === 'open' ? '🎯' : '📋';
-            const time = new Date(t.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-            return (
-              <div key={t.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, padding: '4px 0' }}>
-                <span>{icon}</span>
-                <span className="font-mono" style={{ color: 'var(--text-tertiary)', width: 55, flexShrink: 0 }}>{time}</span>
-                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {t.title} — {t.side?.toUpperCase()} @ {(t.entryPrice * 100).toFixed(0)}¢
-                </span>
-                {t.realizedPnL != null && <PnlColor value={t.realizedPnL} />}
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
       {/* Achievements */}
-      <div style={{ marginTop: 20 }}>
-        <Achievements stats={s} trades={trades} />
-      </div>
+      <Achievements stats={s} trades={trades} />
     </div>
   );
 }

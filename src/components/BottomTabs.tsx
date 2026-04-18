@@ -4,7 +4,7 @@ import { buzz } from '@/lib/notify';
 const tabs = [
   { label: 'Today', path: '/', icon: '🏠' },
   { label: 'Positions', path: '/positions', icon: '📊' },
-  { label: 'Games', path: '/games', icon: '🎮' },
+  { label: 'Live Feed', path: '/live', icon: '📡' },
   { label: 'History', path: '/history', icon: '📋' },
   { label: 'More', path: '/overview', icon: '⋯' },
 ];
