@@ -2437,22 +2437,24 @@ async function checkLiveScoreEdges() {
               const priceInCents = Math.round(tiePrice * 100);
               console.log(`[draw-bet] ⚽ ${homeAbbr} ${homeScore}-${awayScore} ${awayAbbr} at ${effectiveMin}' | TIE @${priceInCents}¢ (prob: ${(drawProb*100).toFixed(0)}%) margin: ${(margin*100).toFixed(0)}%`);
 
-              // Claude reasoning gate — evaluate contextually before placing
-              const drawPrompt = `You are a soccer betting analyst. Evaluate this draw bet.\n\n` +
+              // Claude reasoning gate — swing-trade evaluation before placing
+              const drawPrompt = `You are a soccer swing-trade analyst. We are NOT betting on settlement — we buy TIE and sell when the price RISES in the next 10-15 minutes. Evaluate this entry.\n\n` +
                 `MATCH: ${homeAbbr} vs ${awayAbbr} (${league.toUpperCase()})\n` +
                 `SCORE: ${homeScore}-${awayScore} at ${effectiveMin}'\n` +
                 `DRAW PROBABILITY (historical baseline): ${(drawProb*100).toFixed(0)}%\n` +
                 `TIE PRICE: ${priceInCents}¢ (margin: ${(margin*100).toFixed(0)}%)\n` +
                 `DEPLOY: $${(qty * tiePrice).toFixed(2)} (${qty} contracts)\n\n` +
+                `SWING-TRADE LOGIC: TIE price rises as clock ticks without a goal. Every goalless minute = higher TIE price. We sell at +12¢. We stop-loss at -50%.\n\n` +
                 `Consider:\n` +
-                `- Is the scoreline trajectory favoring a draw or a late goal?\n` +
-                `- At ${effectiveMin}', how much time is left for the draw to break?\n` +
-                `- Is ${(margin*100).toFixed(0)}% margin enough given remaining variance?\n` +
-                `- Any red flags (dominant team likely to score, open game flow)?\n\n` +
+                `- Is the game OPEN (end-to-end, both teams attacking) or CLOSED (defensive, low-energy, time-wasting)? Closed = TIE price rises faster.\n` +
+                `- At ${effectiveMin}', will the next 10-15 minutes likely be goalless? That's all we need for profit.\n` +
+                `- Is either team pressing hard for a winner? A team throwing bodies forward = higher goal risk = bad for us.\n` +
+                `- Is ${(margin*100).toFixed(0)}% margin enough to absorb a brief dip before TIE price climbs?\n` +
+                `- Any red flags: dominant team likely to score, substitution patterns suggesting attacking push?\n\n` +
                 `Reply with EXACTLY this format:\n` +
                 `VERDICT: BUY or SKIP\n` +
                 `CONFIDENCE: <number 0-100>\n` +
-                `REASONING: <1-2 sentences explaining why>`;
+                `REASONING: <1-2 sentences focused on whether TIE PRICE will rise in the next 10-15 minutes>`;
 
               const drawAnalysis = await claudeSonnet(drawPrompt, { maxTokens: 200, timeout: 15000 });
               const drawVerdict = (drawAnalysis ?? '').toUpperCase().includes('VERDICT: BUY') ? 'BUY' : 'SKIP';
@@ -4045,16 +4047,16 @@ async function checkPreGamePredictions() {
     const pgPromptText = sport === 'NBA'
       ? `You are a professional NBA swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
         `STRATEGY: We buy pre-game and SELL when the price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building a lead, or the opponent struggling. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing. Find a genuine win-probability edge over the posted price.\n\n` +
-        `⚠️ DATA RULES: No web search available. Use your training knowledge for team quality, roster, and typical injury patterns. For any star player whose 2026 status you cannot assess, apply a 3% uncertainty penalty and continue — do NOT use uncertainty as a reason to pass unless it would affect a Hard NO.\n\n` +
+        `⚠️ DATA RULES: You have ONE web search. Use it to check TODAY's injury report + rest/lineup news for both teams. For any star player whose 2026 status you cannot confirm after searching, apply a 3% uncertainty penalty and continue — do NOT use uncertainty as a reason to pass unless it would affect a Hard NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `WIN PROBABILITY BASELINE: NBA home teams win ~63% of games. A motivated team vs. a resting/eliminated opponent can push to 70%+. Teams on back-to-backs win ~45% of those games.\n\n` +
-        `═══ STEP 1 — ASSESS WITH TRAINING KNOWLEDGE ═══\n` +
-        `(No web search available — use your knowledge of these teams)\n` +
-        `A) ROSTER QUALITY: From your training knowledge, who are the key players for each team? Any well-known stars who were on injury reserve or known to be in decline? Apply your best assessment — flag if highly uncertain.\n` +
-        `B) BACK-TO-BACK: Based on typical NBA scheduling, use context clues from the ticker/date. Fatigue significantly reduces win probability.\n` +
-        `C) MOTIVATION: Where are these teams in the standings from your training knowledge? Playoff race, seeding fights, or likely coasting? NBA teams tanking or fully clinched play worse.\n` +
+        `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
+        `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} injury report lineup news" and use results to assess:\n` +
+        `A) ROSTER QUALITY: Who are the key players for each team? Any stars OUT, DOUBTFUL, or on rest? Confirmed injuries from your search trump training knowledge.\n` +
+        `B) BACK-TO-BACK: Is either team on a back-to-back or 3rd game in 4 nights? Check schedule from search results. Fatigue significantly reduces win probability.\n` +
+        `C) MOTIVATION: Where are these teams in the standings? Playoff race, seeding fights, or coasting? NBA teams tanking or fully clinched play worse.\n` +
         `D) MATCHUP EDGE: Does this team have a structural advantage — size, pace, offensive system — that makes them more likely to win specifically against this opponent?\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Team you want to bet is confirmed resting 2+ starters (load management) → NO\n` +
@@ -4084,17 +4086,17 @@ async function checkPreGamePredictions() {
       : sport === 'NHL'
       ? `You are a professional NHL swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
         `STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring first, building a lead, or the opponent struggling early. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing. Goalie matchup and special teams are the primary drivers in NHL win probability.\n\n` +
-        `⚠️ DATA RULES: ESPN-confirmed goalies are provided above. Use your training knowledge for goalie quality and team stats. If ESPN provided a starting goalie, treat them as CONFIRMED. Only fire Hard NO for "unconfirmed" if ESPN shows "NOT IN ESPN."\n\n` +
+        `⚠️ DATA RULES: ESPN-confirmed goalies are provided above. You have ONE web search — use it to confirm goalie starts, check for late scratches, and verify special teams rankings. If ESPN provided a starting goalie, treat them as CONFIRMED. Only fire Hard NO for "unconfirmed" if ESPN shows "NOT IN ESPN."\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `WIN PROBABILITY BASELINE: NHL home teams win (in regulation + OT) ~55% of games. An elite goalie vs. a backup can push that to 62%+. A team on back-to-back drops to ~47%.\n\n` +
-        `═══ STEP 1 — ASSESS WITH ESPN DATA + TRAINING KNOWLEDGE ═══\n` +
-        `(No web search available — use the ESPN goalies provided above and your training knowledge)\n` +
-        `A) GOALIES: Goalies confirmed above from ESPN. Assess each goalie's win probability impact from training knowledge: career SV%, GAA tier, known strengths. An elite goalie (SV% > .920) vs. a backup (.890) is a 10-15% win probability swing.\n` +
-        `B) SPECIAL TEAMS: From training knowledge, assess power play and penalty kill quality. Top-5 PP teams convert at a higher rate and generate scoring momentum.\n` +
+        `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
+        `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} goalie confirmed injury news" and use results to assess:\n` +
+        `A) GOALIES: Goalies confirmed above from ESPN. Verify with search results — any late goalie changes? Assess each goalie's win probability impact: career SV%, GAA tier, known strengths. An elite goalie (SV% > .920) vs. a backup (.890) is a 10-15% win probability swing.\n` +
+        `B) SPECIAL TEAMS: From search + training knowledge, assess power play and penalty kill quality. Top-5 PP teams convert at a higher rate and generate scoring momentum.\n` +
         `C) FATIGUE: Is either team on a back-to-back? NHL back-to-back teams win at ~8% lower rates.\n` +
-        `D) MOTIVATION: From training knowledge, playoff race intensity for each team. Teams fighting for seeding play harder in regulation.\n\n` +
+        `D) MOTIVATION: Playoff race intensity for each team. Teams fighting for seeding play harder in regulation.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Starting goalie for the team you want to bet is NOT confirmed → NO\n` +
         `❌ Team has clinched everything AND cannot confirm starting goalie → NO\n` +
@@ -4123,16 +4125,16 @@ async function checkPreGamePredictions() {
       sport === 'MLB'
       ? `You are a professional MLB swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
         `STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building an early lead, or the opponent's starter struggling. Your confidence = "what is the real probability this team WINS today?" Starting pitching is the dominant driver of MLB win probability. An ace vs. a weak lineup can win 65%+ of games; a weak starter on your side drops it below 45%.\n\n` +
-        `⚠️ DATA RULES: ESPN-confirmed starters are provided above. Use your training knowledge for pitcher quality. If a starter is listed above, treat them as confirmed. Flag any pitcher whose career ERA you cannot recall — if truly unknown, treat as average (ERA ~4.5).\n\n` +
+        `⚠️ DATA RULES: ESPN-confirmed starters are provided above. You have ONE web search — use it to verify pitcher stats, check for late lineup changes, and confirm bullpen availability. If a starter is listed above, treat them as confirmed. Flag any pitcher whose career ERA you cannot confirm — if truly unknown, treat as average (ERA ~4.5).\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `WIN PROBABILITY BASELINE: MLB home teams win ~54% of games. An ace (ERA < 3.0) pitching vs. a weak lineup boosts that to ~62-65%. A weak starter (ERA > 5.0) drops it to ~42-46%.\n\n` +
-        `═══ STEP 1 — ASSESS WITH ESPN DATA + TRAINING KNOWLEDGE ═══\n` +
-        `(No web search available — use the ESPN starters provided above and your training knowledge)\n` +
-        `A) STARTING PITCHERS: Starters are listed above from ESPN. Assess quality from training: career ERA tier, WHIP, pitch mix. An ace (ERA < 3.0) dominates and wins ~65% of starts. A weak starter (ERA > 5.0) loses more than they win and get lit up early.\n` +
+        `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
+        `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} pitcher stats lineup news" and use results to assess:\n` +
+        `A) STARTING PITCHERS: Starters are listed above from ESPN. Verify with search — confirm 2026 ERA, WHIP, recent form. An ace (ERA < 3.0) dominates and wins ~65% of starts. A weak starter (ERA > 5.0) loses more than they win and get lit up early.\n` +
         `B) BULLPEN: Does this team have a strong bullpen to protect leads? Weak bullpens blow leads in the 7th-8th even with good starters.\n` +
-        `C) LINEUP POWER: Assess run-scoring ability. Strong lineups (+4.5 R/G) put pressure on the opponent. Known sluggers in the 3-4 spots.\n` +
+        `C) LINEUP POWER: Assess run-scoring ability from search results. Strong lineups (+4.5 R/G) put pressure on the opponent. Known sluggers in the 3-4 spots.\n` +
         `D) PARK FACTOR: Hitter's parks (Coors, Fenway, Great American) favor offenses; pitcher's parks (Oracle, Dodger Stadium) favor pitching. Match to which team benefits.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `⛔ THESE ARE ABSOLUTE. If ANY Hard NO applies, respond {"trade":false} immediately. Do NOT continue reasoning.\n` +
@@ -4161,16 +4163,16 @@ async function checkPreGamePredictions() {
       : /* Soccer (MLS / EPL / La Liga) */
       `You are a professional soccer swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
         `STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring, building a lead, or dominating possession while the opponent struggles. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing. A strong attack vs. a leaky defense produces both goals AND win probability. A draw only hurts if we're still holding at the end.\n\n` +
-        `⚠️ DATA RULES: No web search available. Use your training knowledge for team quality, typical lineups, and attack/defense profiles. If you cannot confirm a key injury, treat the player as available but apply a 2% uncertainty buffer. Do NOT use uncertainty as a reason to pass unless it affects a Hard NO.\n\n` +
+        `⚠️ DATA RULES: You have ONE web search. Use it to check TODAY's team news, key injuries, form, and motivation context. If you cannot confirm a key injury after searching, treat the player as available but apply a 2% uncertainty buffer. Do NOT use uncertainty as a reason to pass unless it affects a Hard NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `WIN PROBABILITY BASELINE: Soccer home teams win (regulation) ~45% of games, draw ~27%, away ~28%. Strong home sides vs. weak away teams can reach 55-60% win probability. Draw probability is NOT irrelevant — it counts against us since we need the team to WIN for the price to rise and stay elevated.\n\n` +
-        `═══ STEP 1 — ASSESS WITH TRAINING KNOWLEDGE ═══\n` +
-        `(No web search available — use your knowledge of these clubs)\n` +
-        `A) ATTACK QUALITY: From training knowledge, how prolific is each team's attack? Top-5 goals-per-game teams generate scoring chances that translate to wins.\n` +
-        `B) KEY PLAYERS: Are either team's known star strikers/forwards likely available? Key absences significantly reduce win probability.\n` +
-        `C) FORM & STYLE: High-energy pressing teams create chances earlier. Teams in strong form win at higher rates.\n` +
+        `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
+        `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} team news injuries form" and use results to assess:\n` +
+        `A) ATTACK QUALITY: How prolific is each team's attack? Top-5 goals-per-game teams generate scoring chances that translate to wins.\n` +
+        `B) KEY PLAYERS: Are either team's star strikers/forwards available? Check injury news from search. Key absences significantly reduce win probability.\n` +
+        `C) FORM & STYLE: Recent form from search results. High-energy pressing teams create chances earlier. Teams in strong form win at higher rates.\n` +
         `D) MOTIVATION: Is either team in a must-win (relegation, title run, European qualification)? Higher motivation = more aggressive pressing = more goals = higher win probability.\n` +
         `E) DEFENSE: Elite defenses (conceding <0.8/game) can keep motivated opponents scoreless. Porous defenses lose more games.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
@@ -4203,14 +4205,12 @@ async function checkPreGamePredictions() {
     };
   });
 
-  // Fire in parallel batches of 3 — use claudeSonnet (no web search) since ESPN starters
-  // are already injected into the prompt. Web search saved ~$5-10/day for no quality loss.
   let preGameTradesThisCycle = 0;
   for (let batch = 0; batch < pgPrompts.length; batch += 3) {
     if (preGameTradesThisCycle >= MAX_PREGAME_PER_CYCLE) break;
     const batchItems = pgPrompts.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeSonnet(item.prompt, { maxTokens: 2000, system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
+      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 2000, maxSearches: 1, system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
     );
 
     for (let i = 0; i < batchItems.length; i++) {
@@ -5571,6 +5571,23 @@ async function managePositions() {
             `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
           );
           const result = await executeSell(trade, qty, currentPrice, 'draw-bet-profit-lock');
+          if (result) anyUpdated = true;
+          continue;
+        }
+
+        // DRAW-BET STOP-LOSS — cut at -50% immediately. A goal breaking the tie
+        // sends TIE from ~50¢ to ~5¢ instantly. No Claude deliberation, just exit.
+        if (trade.strategy === 'draw-bet' && pctChange < -0.50) {
+          const lossAmt = Math.abs(profitPerContract) * qty;
+          console.log(`[exit] ⚽🛑 DRAW-BET STOP: ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — cutting loss at $${lossAmt.toFixed(2)}`);
+          await tg(
+            `⚽🛑 <b>DRAW-BET STOP-LOSS</b>\n\n` +
+            `${trade.title}\n` +
+            `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%)\n` +
+            `Loss: <b>-$${lossAmt.toFixed(2)}</b>\n\n` +
+            `💬 Goal likely broke the tie — exiting before further collapse`
+          );
+          const result = await executeSell(trade, qty, currentPrice, 'draw-bet-stop');
           if (result) anyUpdated = true;
           continue;
         }
