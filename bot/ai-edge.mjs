@@ -4240,21 +4240,22 @@ async function checkPreGamePredictions() {
         `A) STARTING PITCHERS: Starters are listed above from ESPN. Verify with search — confirm 2026 ERA, WHIP, recent form. An ace (ERA < 3.0) dominates and wins ~65% of starts. A weak starter (ERA > 5.0) loses more than they win and get lit up early.\n` +
         `B) BULLPEN: Does this team have a strong bullpen to protect leads? Weak bullpens blow leads in the 7th-8th even with good starters.\n` +
         `C) LINEUP POWER: Assess run-scoring ability from search results. Strong lineups (+4.5 R/G) put pressure on the opponent. Known sluggers in the 3-4 spots.\n` +
-        `D) PARK FACTOR: Hitter's parks (Coors, Fenway, Great American) favor offenses; pitcher's parks (Oracle, Dodger Stadium) favor pitching. Match to which team benefits.\n\n` +
+        `D) PARK FACTOR: Note the park for context only — do NOT add percentage points for park factors. The market already prices park factors in. A hitter's park at Coors doesn't give you an edge; the market knows Coors exists.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `⛔ THESE ARE ABSOLUTE. If ANY Hard NO applies, respond {"trade":false} immediately. Do NOT continue reasoning.\n` +
         `❌ Starting pitcher for the team you want to bet is NOT confirmed → NO\n` +
-        `❌ Your team's starter is ERA > 5.0 AND opponent starter is ERA < 3.5 → NO. Your bad starter vs their good one = your team falls behind early, price drops, no swing-trade opportunity. BUT if BOTH starters are ERA > 4.5, this is a HIGH-SCORING game — volatile prices = swing trade opportunity. Let it through and evaluate the matchup.\n` +
+        `❌ Your team's starter is ERA > 5.0 AND opponent starter is ERA < 3.5 → NO. Your bad starter vs their good one = your team falls behind early, price drops, no swing-trade opportunity.\n` +
+        `❌ BOTH starters ERA 4.5–5.5 (mediocre matchup) → NO. The market prices coin-flip games correctly. Stacking adjustments on top of a mediocre matchup does NOT create edge — the market has seen all those stats too. Pass.\n` +
         `❌ Opponent starter is ERA < 2.5 AND WHIP < 1.0 → NO (will dominate your lineup, price won't rise)\n\n` +
         `═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══\n` +
         `Start from 54% win rate (home) / 46% (away). Adjust based on confirmed research:\n` +
         `+ Your ace (ERA < 3.0) vs opponent ERA > 4.5 → UP 8-12% (pitching mismatch is the biggest lever)\n` +
-        `+ Opponent starter ERA 4.0-5.0 and your lineup is strong → UP 4-7%\n` +
-        `+ Your team top-tier bullpen (ERA < 3.5) → UP 2-4%\n` +
-        `+ Hitter's park + your team's stronger lineup → UP 2-3%\n` +
+        `+ Opponent starter ERA > 6.0 (genuinely terrible, not just below average) → UP 8-12%\n` +
+        `+ Opponent starter ERA 5.0–6.0 AND your lineup is strong → UP 4-6%\n` +
+        `+ Your team top-tier bullpen (ERA < 3.5) → UP 2-3%\n` +
         `- Opponent has elite ace (ERA < 2.5, WHIP < 1.0) → DOWN 8-12%\n` +
-        `- Your key lineup bat confirmed OUT → DOWN 4-6%\n` +
-        `- Pitcher's park + opponent's superior pitching → DOWN 3-5%\n\n` +
+        `- Your key lineup bat confirmed OUT → DOWN 4-6%\n\n` +
+        `⚠️ CONFIDENCE CAP: For MLB, confidence above 65% requires a clear ERA gap of 2.5+ between the two starters OR confirmed opponent ERA > 6.0. If you're reaching 66%+ by stacking 3-4 small factors (bullpen + lineup + recent form + park), cap at 65%. The market prices all of those in.\n\n` +
         `═══ STEP 4 — DECISION ═══\n` +
         `REMEMBER: confidence = P(this team wins the game). We exit at +12¢ — typically happens after they score early and the market reprices. A clear pitching edge translates to win probability and contract price movement.\n` +
         `BUY only if ALL are true:\n` +
