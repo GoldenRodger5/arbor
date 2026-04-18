@@ -5460,9 +5460,9 @@ async function managePositions() {
         const pgHardStopCents = entryPrice < 0.50 ? 0.12 : 0.10;
         const pgHardStopReady = trade.strategy === 'pre-game-prediction' && (
           (league === 'mlb' && ctx?.period >= 3) ||
-          (league === 'nba' && ctx?.period >= 2) ||
+          (league === 'nba' && ctx?.period >= 3) ||
           (league === 'nhl' && ctx?.period >= 2) ||
-          (['mls','epl','laliga'].includes(league) && ctx?.period >= 30)
+          (['mls','epl','laliga'].includes(league) && ctx?.period >= 60)
         );
         if (pgHardStopReady && (entryPrice - currentPrice) >= pgHardStopCents) {
           console.log(`[exit] 🛑 PRE-GAME HARD STOP (${stage}): ${trade.ticker} down ${Math.round((entryPrice - currentPrice)*100)}¢ (limit ${Math.round(pgHardStopCents*100)}¢) | entry ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢`);
