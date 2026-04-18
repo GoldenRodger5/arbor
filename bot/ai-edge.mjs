@@ -1439,6 +1439,7 @@ const ABBR_MAP = {
   'WOL': 'WLV', 'WLV': 'WOL',    // Wolverhampton
   'BRE': 'BRE',                     // Brentford
   'FUL': 'FUL',                     // Fulham
+  'BHA': 'BRI', 'BRI': 'BHA',     // Brighton — ESPN=BHA, Kalshi=BRI
 };
 
 // Check if a ticker contains a team abbreviation (tries both ESPN and Kalshi versions)
@@ -2192,8 +2193,9 @@ async function checkLiveScoreEdges() {
     g._baselineWE = we;
     g._scoreChanged = scoreChanged;
 
-    // Include if: score changed, OR baseline suggests opportunity (>60% WE with a lead)
-    if (scoreChanged || (g.diff > 0 && we >= 0.60)) {
+    // Include if: score changed, OR baseline suggests opportunity (>60% WE with a lead),
+    // OR it's a tied soccer game (draw-bet logic evaluates these separately)
+    if (scoreChanged || (g.diff > 0 && we >= 0.60) || (g.isSoccer && g.diff === 0)) {
       candidates.push(g);
     }
   }
