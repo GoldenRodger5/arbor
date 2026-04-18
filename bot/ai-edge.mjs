@@ -4565,6 +4565,72 @@ async function checkPreGamePredictions() {
         console.log(`[pre-game] ⏳ ESPN GATE: no starters confirmed for ${market.base} yet — deferring to paper-only until ESPN loads`);
         // Fall through to paper logging below (don't place real bet)
       } else {
+      // ── MLB STARTER CROSS-VALIDATION ──────────────────────────────────────
+      // ESPN provides probable starters, but they can be wrong (late scratches,
+      // bullpen games announced after ESPN updates). Before risking real money,
+      // do a targeted web search to confirm the starters match what ESPN says.
+      // If the search finds a conflict → hard NO, defer to paper.
+      let starterConflict = false;
+      if (pgSportKey === 'mlb' && (espnT1 || espnT2)) {
+        const homeAbbr = market.team2.team.toUpperCase();
+        const awayAbbr = market.team1.team.toUpperCase();
+        const espnHomeName = espnT2?.name ?? 'unknown';
+        const espnAwayName = espnT1?.name ?? 'unknown';
+        console.log(`[pre-game] 🔍 STARTER XVAL: verifying ${awayAbbr} (${espnAwayName}) @ ${homeAbbr} (${espnHomeName})`);
+        try {
+          const xvalPrompt = `Today is ${todayDate}. I need to verify the starting pitchers for tonight's MLB game: ${awayAbbr} at ${homeAbbr}.
+
+ESPN lists:
+- ${homeAbbr}: ${espnHomeName}
+- ${awayAbbr}: ${espnAwayName}
+
+Search for "${homeAbbr} ${awayAbbr} starting pitcher today ${todayDate}" and verify:
+1. Are these the confirmed starters, or has there been a late scratch / change?
+2. Is either team using an opener or bullpen game instead?
+
+Respond in EXACTLY this JSON format:
+{
+  "homeConfirmed": true/false,
+  "awayConfirmed": true/false,
+  "homeActual": "pitcher name from your search",
+  "awayActual": "pitcher name from your search",
+  "conflict": true/false,
+  "note": "brief explanation"
+}
+
+Set conflict=true if your search shows a DIFFERENT starter than ESPN for either team, or if a bullpen game / opener is announced. Set conflict=false if starters match or you can't find contradicting info.`;
+          const xvalResult = await claudeWithSearch(xvalPrompt, { maxTokens: 512, maxSearches: 2, timeout: 30000 });
+          if (xvalResult) {
+            const xvalJson = xvalResult.match(/\{[\s\S]*\}/)?.[0];
+            if (xvalJson) {
+              try {
+                const xval = JSON.parse(xvalJson);
+                if (xval.conflict) {
+                  starterConflict = true;
+                  console.log(`[pre-game] ⚠️ STARTER CONFLICT for ${market.base}: ESPN says ${espnHomeName}/${espnAwayName}, search found ${xval.homeActual ?? '?'}/${xval.awayActual ?? '?'} — ${xval.note}`);
+                  await tg(
+                    `⚠️ <b>STARTER CONFLICT — ${market.base}</b>\n` +
+                    `ESPN: ${espnAwayName} @ ${espnHomeName}\n` +
+                    `Search: ${xval.awayActual ?? '?'} @ ${xval.homeActual ?? '?'}\n` +
+                    `${xval.note}\n` +
+                    `<i>Deferring to paper only</i>`
+                  );
+                } else {
+                  console.log(`[pre-game] ✅ STARTER CONFIRMED: ${espnAwayName} @ ${espnHomeName} — ${xval.note ?? 'matches search results'}`);
+                }
+              } catch (parseErr) {
+                console.log(`[pre-game] ⚠️ STARTER XVAL parse error: ${parseErr.message} — proceeding with ESPN data`);
+              }
+            }
+          }
+        } catch (xvalErr) {
+          console.log(`[pre-game] ⚠️ STARTER XVAL failed: ${xvalErr.message} — proceeding with ESPN data`);
+        }
+      }
+
+      if (starterConflict) {
+        // Fall through to paper logging below — don't place real bet
+      } else {
       // ── LIVE MODE: place a real Kalshi order ──────────────────────────────
       const pgPriceInCents = Math.round(price * 100);
       console.log(`[pre-game] 🎯 LIVE BET: ${market.base} → ${matchedSide.team} @${pgPriceInCents}¢ conf=${Math.round(confidence*100)}% bet=$${betAmount.toFixed(2)} qty=${betQty}`);
@@ -4634,6 +4700,7 @@ async function checkPreGamePredictions() {
         console.log(`[pre-game] LIVE order error for ${market.base}: ${err.message}`);
       }
       logScreen({ stage: 'pre-game-live', ticker: market.base, result: 'LIVE', confidence, price, reasoning: decision.reasoning });
+      } // end starterConflict else
       } // end ESPN gate else
       } // end time window else
       } // end daily cap else
