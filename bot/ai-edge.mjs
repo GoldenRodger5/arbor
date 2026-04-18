@@ -2341,21 +2341,22 @@ async function checkLiveScoreEdges() {
         const effectiveMin = period === 2 ? Math.max(minutes, 45) : minutes;
 
         // Draw probability baselines by minute (research-verified)
-        // Soccer draws are ~25-28% of all games — most exploitable edge we have
+        // EPL ~27% draw rate, MLS ~25% with 3.0 goals/game vs EPL's 2.7 — MLS
+        // draws break more often in late minutes due to open play and fitness gaps.
+        const isHighGoalLeague = league === 'mls';
+        const drawAdj = isHighGoalLeague ? -0.03 : 0;
         let drawProb = 0;
         if (homeScore === 0 && awayScore === 0) {
-          // 0-0 game — highest draw rates
           if (effectiveMin >= 80) drawProb = 0.88;
           else if (effectiveMin >= 75) drawProb = 0.85;
           else if (effectiveMin >= 70) drawProb = 0.78;
           else if (effectiveMin >= 65) drawProb = 0.70;
           else if (effectiveMin >= 60) drawProb = 0.59;
           else if (effectiveMin >= 55) drawProb = 0.50;
-          else if (effectiveMin >= 45) drawProb = 0.42; // start of 2nd half
-          else if (effectiveMin >= 35) drawProb = 0.36; // late 1st half 0-0
+          else if (effectiveMin >= 45) drawProb = 0.42;
+          else if (effectiveMin >= 35) drawProb = 0.36;
           else drawProb = 0;
         } else {
-          // 1-1, 2-2 etc — slightly lower (both teams showed they can score)
           if (effectiveMin >= 80) drawProb = 0.84;
           else if (effectiveMin >= 75) drawProb = 0.80;
           else if (effectiveMin >= 70) drawProb = 0.72;
@@ -2364,6 +2365,7 @@ async function checkLiveScoreEdges() {
           else if (effectiveMin >= 55) drawProb = 0.47;
           else drawProb = 0;
         }
+        if (drawProb > 0) drawProb = Math.max(0, drawProb + drawAdj);
 
         // Red card guard — our minute-based tables assume 11v11. A red card changes
         // the entire game dynamic in ways our tables don't model. Skip draw bet if detected.
@@ -2389,7 +2391,8 @@ async function checkLiveScoreEdges() {
             const tiePrice = parseFloat(tieMarket.yes_ask_dollars ?? '1');
 
             // Only buy if our probability exceeds the price by 3%+
-            if (tiePrice < drawProb - CONFIDENCE_MARGIN && tiePrice <= MAX_PRICE && tiePrice >= 0.10) {
+            const drawMargin = isHighGoalLeague ? 0.05 : CONFIDENCE_MARGIN;
+            if (tiePrice < drawProb - drawMargin && tiePrice <= MAX_PRICE && tiePrice >= 0.10) {
               const margin = drawProb - tiePrice;
 
               // Check risk gates
