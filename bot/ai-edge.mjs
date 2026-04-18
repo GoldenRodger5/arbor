@@ -1069,7 +1069,8 @@ function extractJSONArray(text) {
 // Extract actual fill count from order response — Kalshi returns 0 on initial POST, fills async
 function getActualFill(result, requestedQty) {
   const order = result.data?.order ?? result.data ?? {};
-  const filled = order.quantity_filled ?? order.filled_quantity ?? order.filled ?? 0;
+  // Kalshi API returns fill_count_fp as a string (e.g. "57.00"), NOT quantity_filled.
+  const filled = parseFloat(order.fill_count_fp) || (order.quantity_filled ?? order.filled_quantity ?? order.filled ?? 0);
   // If API says 0 filled (common for limit orders), assume full fill for IOC or check status
   // For IOC orders: filled = actual. For limit orders: filled may be 0 initially → use requested qty
   // We'll trust the fill count if > 0, otherwise assume full fill (Kalshi fills most orders)
@@ -4066,10 +4067,12 @@ async function checkPreGamePredictions() {
   // it often returns stale articles. ESPN's scoreboard API has real-time probables.
   // We inject these so Claude only needs to web-search for STATS, not identity.
   const espnStarterMap = new Map(); // team abbr (lowercase) → { name, era?, wl?, svPct?, gaa?, sport }
+  const espnStartTimeMap = new Map(); // "AWAY-HOME" (uppercase) → Date object (UTC start time)
   const espnSportPaths = [
     { key: 'MLB', path: 'baseball/mlb' },
     { key: 'NHL', path: 'hockey/nhl' },
     { key: 'NBA', path: 'basketball/nba' },
+    { key: 'MLS', path: 'soccer/usa.1' },
   ];
   await Promise.all(espnSportPaths.map(async ({ key, path }) => {
     try {
@@ -4083,7 +4086,17 @@ async function checkPreGamePredictions() {
         if (!comp) continue;
         const state = comp.status?.type?.state;
         if (state !== 'pre' && state !== 'in') continue;
-        for (const team of comp.competitors ?? []) {
+        // Build start time map from ESPN event date (ISO UTC)
+        // Key format: "AWAY-HOME" uppercase to match against Kalshi ticker team codes
+        const competitors = comp.competitors ?? [];
+        const away = competitors.find(c => c.homeAway === 'away');
+        const home = competitors.find(c => c.homeAway === 'home');
+        if (away && home && ev.date) {
+          const awayAbbr = (away.team?.abbreviation ?? '').toUpperCase();
+          const homeAbbr = (home.team?.abbreviation ?? '').toUpperCase();
+          espnStartTimeMap.set(`${awayAbbr}-${homeAbbr}`, new Date(ev.date));
+        }
+        for (const team of competitors) {
           const abbr = (team.team?.abbreviation ?? '').toLowerCase();
           const probs = team.probables ?? [];
           if (probs.length > 0 && abbr) {
@@ -4543,6 +4556,7 @@ async function checkPreGamePredictions() {
       const pgTimeStr = pgDateIdx >= 0 ? market.base.slice(pgDateIdx + pgDateStr.length, pgDateIdx + pgDateStr.length + 4) : '';
       let withinWindow = true;
       if (/^\d{4}$/.test(pgTimeStr)) {
+        // MLB tickers embed HHMM in ET (e.g. 1605 = 4:05 PM ET)
         const pgGameH = parseInt(pgTimeStr.slice(0, 2));
         const pgGameM = parseInt(pgTimeStr.slice(2, 4));
         const pgNowMins = etNow.getHours() * 60 + etNow.getMinutes();
@@ -4553,6 +4567,22 @@ async function checkPreGamePredictions() {
         if (!withinWindow) {
           const pgHrsUntil = (pgMinsUntil / 60).toFixed(1);
           console.log(`[pre-game] ⏰ TIME GATE: ${market.base} starts in ${pgHrsUntil}h (>${PREGAME_HOURS_WINDOW}h window) — deferring to paper`);
+        }
+      } else {
+        // MLS/NBA/NHL tickers don't embed HHMM — use ESPN start times as fallback.
+        // Without this, the time gate is completely bypassed for non-MLB sports.
+        const t1Abbr = market.team1.team.toUpperCase();
+        const t2Abbr = market.team2.team.toUpperCase();
+        const espnStart = espnStartTimeMap.get(`${t1Abbr}-${t2Abbr}`) ?? espnStartTimeMap.get(`${t2Abbr}-${t1Abbr}`);
+        if (espnStart) {
+          const pgMinsUntil = Math.max(0, (espnStart.getTime() - Date.now()) / 60000);
+          withinWindow = pgMinsUntil <= PREGAME_HOURS_WINDOW * 60;
+          if (!withinWindow) {
+            const pgHrsUntil = (pgMinsUntil / 60).toFixed(1);
+            console.log(`[pre-game] ⏰ TIME GATE (ESPN): ${market.base} starts in ${pgHrsUntil}h (>${PREGAME_HOURS_WINDOW}h window) — deferring to paper`);
+          }
+        } else {
+          console.log(`[pre-game] ⚠️ No start time for ${market.base} (no HHMM in ticker, no ESPN match) — allowing bet`);
         }
       }
       if (!withinWindow) {
@@ -6067,6 +6097,27 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
   const entryPrice = trade.entryPrice ?? 0;
   const priceInCents = Math.round(currentPrice * 100);
 
+  // POSITION GUARD: Check actual Kalshi position before selling to prevent accidental shorts.
+  // If our tracked qty disagrees with Kalshi (e.g. a previous sell filled but we didn't detect it),
+  // use the real Kalshi position to cap our sell qty. This prevents double-sells.
+  try {
+    const posCheck = await kalshiGet(`/portfolio/positions?ticker=${trade.ticker}`);
+    const mktPos = (posCheck.market_positions ?? []).find(p => p.ticker === trade.ticker);
+    const kalshiQty = Math.max(0, parseFloat(mktPos?.position_fp ?? '0'));
+    if (kalshiQty === 0) {
+      console.log(`[exit] POSITION GUARD: Kalshi shows 0 contracts for ${trade.ticker} — already sold, skipping`);
+      // Mark trade as sold so we don't keep retrying
+      trade.status = trade.status === 'open' ? `sold-${reason}` : trade.status;
+      return false;
+    }
+    if (kalshiQty < sellQty) {
+      console.log(`[exit] POSITION GUARD: Kalshi has ${kalshiQty} but we wanted to sell ${sellQty} — capping to avoid short`);
+      sellQty = kalshiQty;
+    }
+  } catch (posErr) {
+    console.log(`[exit] Position check failed (${posErr.message}) — proceeding with tracked qty`);
+  }
+
   // For stop-loss: sell at 1¢ (market order — get out immediately)
   // For profit-take: sell at current price - 2¢ (want a good exit)
   const isStopLoss = reason.includes('stop');
@@ -6085,7 +6136,9 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
     return false;
   }
 
-  const actualFill = (result.data?.order ?? result.data)?.quantity_filled ?? 0;
+  const orderData = result.data?.order ?? result.data ?? {};
+  // Kalshi returns fill_count_fp (string like "57.00"), NOT quantity_filled
+  const actualFill = parseFloat(orderData.fill_count_fp) || orderData.quantity_filled || 0;
   if (actualFill === 0) {
     console.log(`[exit] Sell order accepted but 0 filled for ${trade.ticker} — position likely already sold`);
     return false;
