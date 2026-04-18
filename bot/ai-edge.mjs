@@ -2347,22 +2347,17 @@ async function checkLiveScoreEdges() {
         const drawAdj = isHighGoalLeague ? -0.03 : 0;
         let drawProb = 0;
         if (homeScore === 0 && awayScore === 0) {
+          // 0-0: neither team has shown scoring ability — safer draw profile
           if (effectiveMin >= 80) drawProb = 0.88;
           else if (effectiveMin >= 75) drawProb = 0.85;
           else if (effectiveMin >= 70) drawProb = 0.78;
           else if (effectiveMin >= 65) drawProb = 0.70;
-          else if (effectiveMin >= 60) drawProb = 0.59;
-          else if (effectiveMin >= 55) drawProb = 0.50;
-          else if (effectiveMin >= 45) drawProb = 0.42;
-          else if (effectiveMin >= 35) drawProb = 0.36;
           else drawProb = 0;
         } else {
+          // 1-1, 2-2 etc: both teams CAN score — don't enter before 70'
           if (effectiveMin >= 80) drawProb = 0.84;
           else if (effectiveMin >= 75) drawProb = 0.80;
           else if (effectiveMin >= 70) drawProb = 0.72;
-          else if (effectiveMin >= 65) drawProb = 0.63;
-          else if (effectiveMin >= 60) drawProb = 0.55;
-          else if (effectiveMin >= 55) drawProb = 0.47;
           else drawProb = 0;
         }
         if (drawProb > 0) drawProb = Math.max(0, drawProb + drawAdj);
@@ -2378,9 +2373,9 @@ async function checkLiveScoreEdges() {
           console.log(`[draw-bet] Skipping ${homeAbbr} vs ${awayAbbr}: red card detected — minute tables invalid for 10v11`);
         }
 
-        // Bet draws when probability is meaningful (>42% for 0-0 late, >47% for scored ties)
-        // Lower threshold allows earlier entries when market is cheap
-        if (!hasRedCard && drawProb >= 0.42) {
+        // Only bet draws when probability is strong (65%+) — eliminates the
+        // 55-64% zone where a single goal wipes out the entire position
+        if (!hasRedCard && drawProb >= 0.65) {
           // Find the TIE market from cached prices (instant, no API call)
           const tieEntry = [...cachedPrices.entries()].find(([t]) =>
             t.includes('-TIE') && tickerHasTeam(t, homeAbbr) && tickerHasTeam(t, awayAbbr)
