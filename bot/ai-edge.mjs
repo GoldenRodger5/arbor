@@ -2392,14 +2392,41 @@ async function checkLiveScoreEdges() {
               if (Date.now() - (tradeCooldowns.get(tieMarket.ticker) ?? 0) < COOLDOWN_MS) continue;
               if (Date.now() - (tradeCooldowns.get(gameBase) ?? 0) < COOLDOWN_MS) continue;
 
-              // Check no existing position
-              const hasPos = openPositions.some(p => {
+              // Check no existing position (portfolio API)
+              let hasPos = openPositions.some(p => {
                 const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
                 return pBase === gameBase || (p.exchange === 'polymarket' && tickerHasTeam(p.ticker, homeAbbr) && tickerHasTeam(p.ticker, awayAbbr));
               });
-              if (hasPos) continue;
 
-              const maxBet = getPositionSize('kalshi', margin);
+              // Also check JSONL — prevents stacking when portfolio API hasn't synced yet.
+              // This was the bug: 4 draw-bets on TOT-BRI totaling $167 because each
+              // cycle saw no position in portfolio, cooldown had expired, and edge grew.
+              if (!hasPos && existsSync(TRADES_LOG)) {
+                try {
+                  const dupStart = new Date(etNow().toISOString().slice(0,10) + 'T04:00:00Z').getTime();
+                  const dupEnd = dupStart + 24 * 60 * 60 * 1000;
+                  const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+                  for (const l of lines) {
+                    try {
+                      const jt = JSON.parse(l);
+                      if (jt.status === 'testing-void') continue;
+                      const jtMs = jt.timestamp ? Date.parse(jt.timestamp) : 0;
+                      if (jtMs < dupStart || jtMs >= dupEnd) continue;
+                      const jticker = (jt.ticker ?? '').toLowerCase();
+                      if (jticker.includes(gameBase.toLowerCase()) || (tickerHasTeam(jticker, homeAbbr) && tickerHasTeam(jticker, awayAbbr))) {
+                        hasPos = true;
+                        break;
+                      }
+                    } catch {}
+                  }
+                } catch {}
+              }
+              if (hasPos) {
+                console.log(`[draw-bet] Already have position on ${homeAbbr} vs ${awayAbbr}, skipping`);
+                continue;
+              }
+
+              const maxBet = Math.min(getPositionSize('kalshi', margin), getBankroll() * 0.10);
               const qty = Math.max(1, Math.floor(maxBet / tiePrice));
               if (!canDeployMore(qty * tiePrice)) continue;
 
@@ -5432,6 +5459,32 @@ async function managePositions() {
         if (stage === 'late' && currentPrice >= 0.97 && profitPerContract > 0) {
           console.log(`[exit] 💰 LATE-GAME LOCK (${stage}): ${trade.ticker} at ${(currentPrice*100).toFixed(0)}¢ — locking profit, not worth risking for 3¢`);
           const result = await executeSell(trade, qty, currentPrice, 'profit-take');
+          if (result) anyUpdated = true;
+          continue;
+        }
+
+        // MID-GAME PROFIT-LOCK — cash out live bets at 92¢+ before late game.
+        // At 92¢ the remaining 8¢ upside ($1.00 settlement) is marginal, but a
+        // reversal (opponent scores, momentum shift) can erase 20-30¢ in minutes.
+        // Early game: lock at 95¢ (even more game left = more reversal risk)
+        // Mid game: lock at 92¢
+        // Late game: handled above at 97¢ (closer to settlement, safer to hold)
+        const midLockThreshold = stage === 'early' ? 0.95 : 0.92;
+        if ((stage === 'early' || stage === 'mid') && currentPrice >= midLockThreshold && profitPerContract > 0 && trade.strategy !== 'pre-game-prediction') {
+          const gainPct = Math.round((profitPerContract / entryPrice) * 100);
+          console.log(`[exit] 💰 MID-GAME LOCK (${stage}): ${trade.ticker} at ${(currentPrice*100).toFixed(0)}¢ — up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}%, locking profit (${Math.round((1-currentPrice)*100)}¢ remaining not worth ${stage}-game risk)`);
+          await tg(
+            `💰 <b>MID-GAME PROFIT-LOCK</b>\n\n` +
+            `📋 <b>POSITION</b>\n` +
+            `${trade.title}\n` +
+            `Stage: ${stage.toUpperCase()}\n\n` +
+            `📊 <b>METRICS</b>\n` +
+            `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
+            `Selling ALL ${qty} contracts\n` +
+            `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>\n\n` +
+            `💬 Only ${Math.round((1-currentPrice)*100)}¢ remaining upside — not worth ${stage}-game reversal risk`
+          );
+          const result = await executeSell(trade, qty, currentPrice, 'mid-game-profit-lock');
           if (result) anyUpdated = true;
           continue;
         }
