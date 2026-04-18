@@ -5524,6 +5524,59 @@ async function managePositions() {
           }
         }
 
+        // DRAW-BET PROFIT-LOCK — sell at +12¢. Draw-bets are binary cliffs:
+        // one goal and TIE goes from 50¢ to 5¢ instantly. Can't manage the downside
+        // on a 60s cycle. Lock the profit, don't gamble on settlement.
+        if (trade.strategy === 'draw-bet' && profitPerContract >= 0.12) {
+          const gainPct = Math.round((profitPerContract / entryPrice) * 100);
+          console.log(`[exit] ⚽💰 DRAW-BET PROFIT-LOCK: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
+          await tg(
+            `⚽💰 <b>DRAW-BET PROFIT-LOCK</b>\n\n` +
+            `${trade.title}\n` +
+            `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
+            `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
+          );
+          const result = await executeSell(trade, qty, currentPrice, 'draw-bet-profit-lock');
+          if (result) anyUpdated = true;
+          continue;
+        }
+
+        // LIVE-PREDICTION PROFIT-LOCK — sell at +15¢. At typical 72-75¢ entry,
+        // you need 87%+ WR for hold-to-settlement to beat locking +15¢. Our WE
+        // floor is 75% (wins ~79% historically) — below that threshold. The
+        // asymmetry kills us: a loss at 75¢ entry costs 3x what a +15¢ lock gains.
+        // At $200 bankroll, variance protection > theoretical EV optimization.
+        if (trade.strategy === 'live-prediction' && profitPerContract >= 0.15) {
+          const gainPct = Math.round((profitPerContract / entryPrice) * 100);
+          console.log(`[exit] 🎯💰 LIVE PROFIT-LOCK: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
+          await tg(
+            `🎯💰 <b>LIVE PROFIT-LOCK</b>\n\n` +
+            `${trade.title}\n` +
+            `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
+            `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>\n\n` +
+            `💬 +${gainPct}% return locked — at this bankroll, locking beats holding to settlement`
+          );
+          const result = await executeSell(trade, qty, currentPrice, 'live-profit-lock');
+          if (result) anyUpdated = true;
+          continue;
+        }
+
+        // LIVE HIGH-CONVICTION PROFIT-LOCK — same logic but +20¢ for high-conviction
+        // trades since they entered with bigger sizing and higher confidence.
+        if (trade.strategy === 'high-conviction' && profitPerContract >= 0.20) {
+          const gainPct = Math.round((profitPerContract / entryPrice) * 100);
+          console.log(`[exit] 🔥💰 HC PROFIT-LOCK: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
+          await tg(
+            `🔥💰 <b>HIGH-CONVICTION PROFIT-LOCK</b>\n\n` +
+            `${trade.title}\n` +
+            `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
+            `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
+          );
+          const result = await executeSell(trade, qty, currentPrice, 'hc-profit-lock');
+          if (result) anyUpdated = true;
+          continue;
+        }
+
         // === LIVE SWING EXIT PATHS ===
         // Swing trades exit on profit, hard-stop, or thesis expiry — never hold to settlement.
         if (trade.strategy === 'live-swing') {
