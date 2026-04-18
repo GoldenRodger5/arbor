@@ -1435,26 +1435,96 @@ const ABBR_MAP = {
   'TB': 'TBL', 'TBL': 'TB',       // Tampa Bay Lightning (NHL only — MLB TB is fine)
   'WSH': 'WAS', 'WAS': 'WSH',     // Washington (varies by sport)
   'ATH': 'OAK', 'OAK': 'ATH',     // Oakland/Athletics
-  // Soccer abbreviation mismatches (ESPN vs Kalshi)
+  // Soccer — MLS
+  'RBNY': 'NYRB', 'NYRB': 'RBNY', // NY Red Bulls — ESPN=RBNY, Kalshi=NYRB
+  'NYCFC': 'NYC', 'NYC': 'NYCFC', // NYC FC
+  'SKC': 'KC',                      // Sporting KC — ESPN=SKC, Kalshi=KC (check for conflicts w/ MLB KC)
+  'SJ': 'SJE', 'SJE': 'SJ',       // San Jose Earthquakes
+  'CLT': 'CHA',                     // Charlotte FC — ESPN=CLT, Kalshi may use CHA
+  'LAFC': 'LAFC',                   // LAFC (same)
+  'LAG': 'LAG',                     // LA Galaxy (same)
+  // Soccer — EPL / La Liga
   'MAN': 'MUN', 'MUN': 'MAN',     // Manchester United
-  'LEE': 'LEE',                     // Leeds (same but for completeness)
-  'FIO': 'FIO',                     // Fiorentina
-  'LAZ': 'LAZ',                     // Lazio
-  'VAL': 'VLL', 'VLL': 'VAL',     // Valladolid
-  'EIB': 'EIB',                     // Eibar
   'WOL': 'WLV', 'WLV': 'WOL',    // Wolverhampton
-  'BRE': 'BRE',                     // Brentford
-  'FUL': 'FUL',                     // Fulham
   'BHA': 'BRI', 'BRI': 'BHA',     // Brighton — ESPN=BHA, Kalshi=BRI
+  'VAL': 'VLL', 'VLL': 'VAL',     // Valladolid
+  'SHU': 'SHE', 'SHE': 'SHU',    // Sheffield United
+  'WHU': 'WH', 'WH': 'WHU',      // West Ham
+  'NUFC': 'NEW', 'NEW': 'NUFC',  // Newcastle
 };
 
-// Check if a ticker contains a team abbreviation (tries both ESPN and Kalshi versions)
+// Dynamic aliases learned from Kalshi ticker ↔ ESPN name matching at runtime
+const dynamicAbbr = new Map();
+
+// Check if a ticker contains a team abbreviation (tries static map, then dynamic aliases)
 function tickerHasTeam(ticker, teamAbbr) {
   const upper = ticker.toUpperCase();
-  if (upper.includes(teamAbbr.toUpperCase())) return true;
-  const alt = ABBR_MAP[teamAbbr.toUpperCase()];
+  const abbr = teamAbbr.toUpperCase();
+  if (upper.includes(abbr)) return true;
+  const alt = ABBR_MAP[abbr];
   if (alt && upper.includes(alt)) return true;
+  const dynAlts = dynamicAbbr.get(abbr);
+  if (dynAlts) {
+    for (const da of dynAlts) { if (upper.includes(da)) return true; }
+  }
   return false;
+}
+
+// Build dynamic aliases by matching Kalshi market titles against ESPN team names.
+// Called once per scan cycle after fetching Kalshi markets.
+function buildDynamicAliases(cachedPrices, espnGames) {
+  for (const game of espnGames) {
+    const homeAbbr = (game.home?.team?.abbreviation ?? '').toUpperCase();
+    const awayAbbr = (game.away?.team?.abbreviation ?? '').toUpperCase();
+    const homeName = (game.home?.team?.displayName ?? game.home?.team?.shortDisplayName ?? '').toLowerCase();
+    const awayName = (game.away?.team?.displayName ?? game.away?.team?.shortDisplayName ?? '').toLowerCase();
+    if (!homeAbbr || !awayAbbr || !homeName || !awayName) continue;
+
+    for (const [ticker] of cachedPrices) {
+      const tu = ticker.toUpperCase();
+      const alreadyMatchesBoth = tickerHasTeam(tu, homeAbbr) && tickerHasTeam(tu, awayAbbr);
+      if (alreadyMatchesBoth) continue;
+
+      const title = (cachedPrices.get(ticker)?.title ?? '').toLowerCase();
+      const titleHasHome = title.includes(homeName) || title.includes(homeName.split(' ').pop());
+      const titleHasAway = title.includes(awayName) || title.includes(awayName.split(' ').pop());
+      if (!titleHasHome || !titleHasAway) continue;
+
+      // Title matches both teams but ticker abbr doesn't — extract Kalshi's abbr from ticker
+      const basePart = tu.split('-').slice(0, -1).join('-');
+      const dateMatch = basePart.match(/\d{2}[A-Z]{3}\d{2}(\d{4})?/);
+      if (!dateMatch) continue;
+      const teamsStr = basePart.slice(dateMatch.index + dateMatch[0].length);
+      if (!teamsStr) continue;
+
+      // Try to figure out which ESPN abbr is missing from the ticker
+      const missingHome = !tu.includes(homeAbbr) && !(ABBR_MAP[homeAbbr] && tu.includes(ABBR_MAP[homeAbbr]));
+      const missingAway = !tu.includes(awayAbbr) && !(ABBR_MAP[awayAbbr] && tu.includes(ABBR_MAP[awayAbbr]));
+
+      if (missingHome && !missingAway) {
+        // Home abbr is the one Kalshi uses differently — extract it
+        const knownAway = ABBR_MAP[awayAbbr] && tu.includes(ABBR_MAP[awayAbbr]) ? ABBR_MAP[awayAbbr] : awayAbbr;
+        const kalshiHome = teamsStr.replace(knownAway, '');
+        if (kalshiHome && kalshiHome.length >= 2 && kalshiHome.length <= 5) {
+          if (!dynamicAbbr.has(homeAbbr)) dynamicAbbr.set(homeAbbr, new Set());
+          if (!dynamicAbbr.get(homeAbbr).has(kalshiHome)) {
+            dynamicAbbr.get(homeAbbr).add(kalshiHome);
+            console.log(`[abbr-learn] Discovered alias: ESPN "${homeAbbr}" = Kalshi "${kalshiHome}" (from ${ticker})`);
+          }
+        }
+      } else if (missingAway && !missingHome) {
+        const knownHome = ABBR_MAP[homeAbbr] && tu.includes(ABBR_MAP[homeAbbr]) ? ABBR_MAP[homeAbbr] : homeAbbr;
+        const kalshiAway = teamsStr.replace(knownHome, '');
+        if (kalshiAway && kalshiAway.length >= 2 && kalshiAway.length <= 5) {
+          if (!dynamicAbbr.has(awayAbbr)) dynamicAbbr.set(awayAbbr, new Set());
+          if (!dynamicAbbr.get(awayAbbr).has(kalshiAway)) {
+            dynamicAbbr.get(awayAbbr).add(kalshiAway);
+            console.log(`[abbr-learn] Discovered alias: ESPN "${awayAbbr}" = Kalshi "${kalshiAway}" (from ${ticker})`);
+          }
+        }
+      }
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2232,6 +2302,9 @@ async function checkLiveScoreEdges() {
       }
     }
   } catch { /* batch fetch failed, will fall back to individual calls */ }
+
+  // Auto-discover abbreviation mismatches between ESPN and Kalshi
+  buildDynamicAliases(cachedPrices, liveGames.map(g => ({ home: g.home, away: g.away })));
 
   // === LINE MOVEMENT DETECTION — flag big price swings for priority analysis ===
   const lineMovers = [];
