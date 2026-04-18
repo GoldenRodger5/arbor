@@ -1883,9 +1883,6 @@ async function checkLiveScoreEdges() {
             : league === 'nba' ? (game.period <= 2 ? 'early' : game.period === 3 ? 'mid' : 'late')
             : league === 'nhl' ? (game.period === 1 ? 'early' : game.period === 2 ? 'mid' : 'late')
             : game.period === 1 ? 'early' : 'late';
-          const isOurTeamHomeWin = tickerHasTeam(ourTeam, homeAbbr);
-          const weWinning = getWinExpectancy(league, lead, game.period, isOurTeamHomeWin) ?? 0;
-
           // Only act when WE crosses meaningful thresholds AND we've gained at least 8¢
           const pgWinKey = 'pg-win:' + trade.ticker;
           const winCooldown = tradeCooldowns.get(pgWinKey) ?? 0;
@@ -1902,68 +1899,24 @@ async function checkLiveScoreEdges() {
               const gainCents = currentPricePg - entryPg;
               const qty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / entryPg);
 
-              // ── Event-driven exits by sport ──────────────────────────────────────
-              // Pre-game = swing trade. Exit when the thesis plays out. Don't convert
-              // it into a hold-to-settlement bet by selling only 33% and riding the game.
-              //
-              // NHL/Soccer: SELL ALL on first goal. Thesis done. Price already spiked
-              //   55¢→72¢. Holding for goal #2 only moves 75¢→88¢ for the same risk.
-              //   The team that scores first wins ~65-70% of NHL games — that's priced in.
-              //
-              // MLB: SELL ALL on 2-run early lead (thesis confirmed — price already
-              //   jumped 15-20¢). SELL HALF on 1-run early lead (partial proof, ride
-              //   rest in case they score again). Escalate mid/late.
-              //
-              // NBA: More volatile — a 4-pt Q1 lead is noise. SELL ALL on 15+.
-              //   SELL HALF on 8+ in first half. Full exit late/dominant.
-              const isSoccer = ['mls', 'epl', 'laliga'].includes(league);
+              // ── Winning exits — two rules only ───────────────────────────────────
+              // The +12¢ price-target exit is handled by managePositions every cycle.
+              // pg-guard winning branch covers two cases managePositions can't catch cleanly:
+              //   1. WINDFALL: price up 30¢+ — lock immediately, don't wait for next cycle
+              //   2. LATE GAME: game is closing out with us winning — sell before it can flip
               let sellFraction = 0;
               let sellReason = '';
 
               if (gainCents >= 0.30) {
-                // Windfall — always lock regardless of sport
                 sellFraction = 1.0;
                 sellReason = `pg-profit-windfall (+${Math.round(gainCents*100)}¢ — locking windfall)`;
-
-              } else if (league === 'nhl' || isSoccer) {
-                // First goal = full exit. Every second we hold after scoring risks a
-                // tying goal that collapses the price back to entry.
-                if (lead >= 1 && gainCents >= 0.04) {
-                  sellFraction = 1.0;
-                  sellReason = `pg-profit-first-goal (${sport} scored first, thesis proven — selling all @ +${Math.round(gainCents*100)}¢ before lead can disappear)`;
-                }
-
-              } else if (league === 'mlb') {
-                // 2+ run early lead: thesis confirmed (price already up 15-20¢). Take it.
-                // 1-run early lead: partial proof — sell half, ride rest if they score more.
-                // Mid-game: capture most with 75%. Late: close it out.
-                if (stage === 'early' && lead >= 2) {
-                  sellFraction = 1.0;
-                  sellReason = `pg-profit-mlb-early-2run (${lead}-run lead inn ${game.period} — thesis confirmed, selling all @ +${Math.round(gainCents*100)}¢)`;
-                } else if (stage === 'early' && lead >= 1 && gainCents >= 0.07) {
-                  sellFraction = 0.50;
-                  sellReason = `pg-profit-mlb-early-1run (1-run early lead @ +${Math.round(gainCents*100)}¢ — selling half, riding rest for more scoring)`;
-                } else if (stage === 'mid' && lead >= 1 && gainCents >= -0.05) {
-                  sellFraction = 0.75;
-                  sellReason = `pg-profit-mlb-mid (${lead}-run lead inn ${game.period} — capturing most)`;
-                } else if (stage === 'late' && lead >= 1 && gainCents >= -0.05) {
-                  sellFraction = 1.0;
-                  sellReason = `pg-profit-mlb-late (${lead}-run lead inn ${game.period} — locking all)`;
-                }
-
-              } else if (league === 'nba') {
-                // A 4-pt Q1 lead is noise in the NBA. An 8-pt first-half lead is real
-                // signal. A 15-pt lead is essentially over — don't wait for late WE thresholds.
-                if (lead >= 15 && gainCents >= 0.07) {
-                  sellFraction = 1.0;
-                  sellReason = `pg-profit-nba-big-lead (${lead}-pt lead — locking full gain @ +${Math.round(gainCents*100)}¢)`;
-                } else if (stage === 'late' && weWinning >= 0.85) {
-                  sellFraction = 1.0;
-                  sellReason = `pg-profit-nba-late (WE=${Math.round(weWinning*100)}% Q4 — selling all)`;
-                } else if (stage !== 'late' && lead >= 8 && gainCents >= 0.07) {
-                  sellFraction = 0.50;
-                  sellReason = `pg-profit-nba-early-lead (${lead}-pt lead ${stage} game @ +${Math.round(gainCents*100)}¢ — selling half)`;
-                }
+              } else if (stage === 'late' && lead >= 1) {
+                // Late game with any lead: the price target may never have hit +12¢ cleanly
+                // (e.g. bought at 44¢, team leads 1-0 in 7th, market is at 74¢ = +30¢ windfall,
+                // or leads 1-0 in 7th with market only at 54¢ = +10¢, game ending soon).
+                // Sell to capture the late-game premium before a blown save wipes the gain.
+                sellFraction = 1.0;
+                sellReason = `pg-profit-late (${lead}-${lead === 0 ? 'tie' : 'run/goal/pt'} lead ${stage} game inn/pd ${game.period} — closing out)`;
               }
 
               if (sellFraction > 0 && !trade.partialTakeAt) {
@@ -2001,31 +1954,6 @@ async function checkLiveScoreEdges() {
                     console.log(`[pg-profit] ${remaining} contracts remain — riding to ${stage === 'early' ? 'mid-game' : 'settlement'}`);
                   }
                 }
-              } else if (trade.partialTakeAt && !trade.pgFinalSellAt) {
-                // Already took first partial — sell remaining when game is decided
-                const isSoccerFinal = ['mls', 'epl', 'laliga'].includes(league);
-                const finalSellNow = stage === 'late' ||
-                  (league === 'mlb' && lead >= 3) ||
-                  ((league === 'nhl' || isSoccerFinal) && lead >= 2) ||
-                  (league === 'nba' && lead >= 20) ||
-                  weWinning >= 0.88;
-                if (finalSellNow) {
-                  const remaining = qty - Math.floor(qty * (trade._pgFirstSellFraction ?? 0.5));
-                  if (remaining >= 1) {
-                    tradeCooldowns.set(pgWinKey, Date.now());
-                    // Persist pgFinalSellAt immediately so next cycle doesn't double-sell
-                    trade.pgFinalSellAt = new Date().toISOString();
-                    const freshPgLines2 = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
-                    const freshPgTrades2 = freshPgLines2.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-                    const freshPgTrade2 = freshPgTrades2.find(t => t.id === trade.id);
-                    if (freshPgTrade2) {
-                      freshPgTrade2.pgFinalSellAt = trade.pgFinalSellAt;
-                      writeFileSync(TRADES_LOG, freshPgTrades2.map(t => JSON.stringify(t)).join('\n') + '\n');
-                    }
-                    console.log(`[pg-profit] ${trade.ticker} FINAL SELL ${remaining} remaining @ ${Math.round(currentPricePg*100)}¢ | game essentially over`);
-                    await executeSell(trade, remaining, currentPricePg, 'pg-profit-final');
-                  }
-                }
               }
             }
           }
@@ -2052,11 +1980,11 @@ async function checkLiveScoreEdges() {
               writeFileSync(TRADES_LOG, expTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
             }
             const expGain = expirePrice - (trade.entryPrice ?? 0);
-            console.log(`[pg-expire] ${trade.ticker} thesis expired — 0-0 at inn ${game.period}, exiting @ ${Math.round(expirePrice*100)}¢ (${expGain >= 0 ? '+' : ''}${Math.round(expGain*100)}¢)`);
+            console.log(`[pg-expire] ${trade.ticker} stalled — 0-0 at inn ${game.period}, price not moving, exiting @ ${Math.round(expirePrice*100)}¢ (${expGain >= 0 ? '+' : ''}${Math.round(expGain*100)}¢)`);
             await tg(
-              `⏰ <b>PRE-GAME THESIS EXPIRED</b>\n\n` +
+              `⏰ <b>PRE-GAME STALLED EXIT</b>\n\n` +
               `${trade.title ?? trade.ticker}\n` +
-              `Still 0-0 at inning ${game.period} — early-scoring thesis never materialized.\n\n` +
+              `Still 0-0 at inning ${game.period} — price hasn't moved, cutting to preserve capital.\n\n` +
               `Exiting @ ${Math.round(expirePrice*100)}¢ | Entry: ${Math.round((trade.entryPrice ?? 0)*100)}¢ | P&L: ${expGain >= 0 ? '+' : ''}$${(expGain * expQty).toFixed(2)}`
             );
             await executeSell(trade, expQty, expirePrice, 'pg-thesis-expired-0-0-mlb');
@@ -2067,9 +1995,9 @@ async function checkLiveScoreEdges() {
         // Only evaluate if our team is LOSING (deficit > 0)
         if (deficit <= 0) continue;
 
-        // Cooldown: don't spam evaluations. 3 min for pre-game guardian (faster than normal 8-12 min).
+        // Cooldown: don't cascade-sell by re-evaluating too quickly. 20 min prevents sell_half spam.
         const pgGuardKey = 'pg-guard:' + trade.ticker;
-        if (Date.now() - (tradeCooldowns.get(pgGuardKey) ?? 0) < 3 * 60 * 1000) continue;
+        if (Date.now() - (tradeCooldowns.get(pgGuardKey) ?? 0) < 20 * 60 * 1000) continue;
         tradeCooldowns.set(pgGuardKey, Date.now());
 
         // Fetch current market price (batch prices aren't loaded yet — individual fetch)
@@ -3989,164 +3917,157 @@ async function checkPreGamePredictions() {
 
     const pgPromptText = sport === 'NBA'
       ? `You are a professional NBA swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
-        `STRATEGY: We buy pre-game and SELL when the price rises — we do NOT hold to settlement. Our exit is when the contract price reaches our entry + 12¢ at any point during the game. This means your confidence should reflect: "how likely is this team to be LEADING by 8+ points at some point in the first half?" — NOT "do they win the full game." A team that builds a 10-point first-quarter lead and then loses still pays us if we sell during that lead. Your job is to find early-lead catalysts, not final-score predictions.\n\n` +
+        `STRATEGY: We buy pre-game and SELL when the price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building a lead, or the opponent struggling. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing. Find a genuine win-probability edge over the posted price.\n\n` +
         `⚠️ DATA RULES: No web search available. Use your training knowledge for team quality, roster, and typical injury patterns. For any star player whose 2026 status you cannot assess, apply a 3% uncertainty penalty and continue — do NOT use uncertainty as a reason to pass unless it would affect a Hard NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
-        `EARLY-LEAD BASELINE: NBA teams build an 8+ point lead at some point in the first half ~72% of home games. This is higher than their 63% win rate. Your adjusted confidence should reflect early-lead probability, not win probability.\n\n` +
+        `WIN PROBABILITY BASELINE: NBA home teams win ~63% of games. A motivated team vs. a resting/eliminated opponent can push to 70%+. Teams on back-to-backs win ~45% of those games.\n\n` +
         `═══ STEP 1 — ASSESS WITH TRAINING KNOWLEDGE ═══\n` +
         `(No web search available — use your knowledge of these teams)\n` +
         `A) ROSTER QUALITY: From your training knowledge, who are the key players for each team? Any well-known stars who were on injury reserve or known to be in decline? Apply your best assessment — flag if highly uncertain.\n` +
-        `B) BACK-TO-BACK: Based on typical NBA scheduling, use context clues from the ticker/date. Fatigue kills first-half intensity.\n` +
-        `C) MOTIVATION: Where are these teams in the standings from your training knowledge? Playoff race, seeding fights, or likely coasting? NBA teams in close playoff races play harder early.\n` +
-        `D) PACE & STYLE: Does this team typically start fast? High pace / first-quarter scoring teams create early leads more reliably.\n\n` +
+        `B) BACK-TO-BACK: Based on typical NBA scheduling, use context clues from the ticker/date. Fatigue significantly reduces win probability.\n` +
+        `C) MOTIVATION: Where are these teams in the standings from your training knowledge? Playoff race, seeding fights, or likely coasting? NBA teams tanking or fully clinched play worse.\n` +
+        `D) MATCHUP EDGE: Does this team have a structural advantage — size, pace, offensive system — that makes them more likely to win specifically against this opponent?\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
-        `❌ Team you want to bet is resting 2+ starters tonight (confirmed load management) → NO\n` +
-        `❌ Team has clinched seeding AND cannot confirm stars playing full minutes → NO\n` +
+        `❌ Team you want to bet is confirmed resting 2+ starters (load management) → NO\n` +
+        `❌ Team has clinched and cannot confirm stars playing meaningful minutes → NO\n` +
         `❌ Team on back-to-back AND star player is DOUBTFUL or OUT → NO\n` +
-        `❌ No specific early-lead catalyst — just "better team overall" → NO (that's already priced in)\n\n` +
-        `═══ STEP 3 — EARLY-LEAD EDGE ANALYSIS ═══\n` +
-        `Start from 72% early-lead baseline (home) / 55% (away). Adjust based on confirmed research:\n` +
-        `+ Opponent confirmed resting stars / eliminated / tanking → UP 8-12% (intensity gap shows up immediately in first quarter)\n` +
-        `+ Your team in must-win / seeding-critical game vs rested but less motivated opponent → UP 5-8%\n` +
-        `+ Your team leads first-quarter scoring stats (top-5 in league) → UP 3-5%\n` +
-        `+ Opponent back-to-back fatigue → UP 4-6% (slower first quarter)\n` +
-        `+ Star player back from injury tonight → UP 4-6%\n` +
-        `- Your team on back-to-back → DOWN 5-8% (first half energy conserved)\n` +
-        `- Star player (15+ ppg) OUT → DOWN 10-15% (offense stalls, no early run creator)\n` +
-        `- Your team slow starters (bottom-5 in first-quarter scoring) → DOWN 4-6%\n` +
-        `- Opponent elite defense → DOWN 3-5%\n\n` +
+        `❌ No specific edge — just "they're the better team" → NO (already priced in)\n\n` +
+        `═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══\n` +
+        `Start from 63% win rate (home) / 37% (away). Adjust based on confirmed research:\n` +
+        `+ Opponent confirmed resting stars / eliminated / tanking → UP 8-12%\n` +
+        `+ Your team in must-win / seeding-critical game vs lower-stakes opponent → UP 5-8%\n` +
+        `+ Opponent back-to-back fatigue AND your team is rested → UP 4-6%\n` +
+        `+ Clear matchup advantage (size, pace, system) confirmed by standings/stats → UP 3-5%\n` +
+        `- Your team on back-to-back → DOWN 5-8%\n` +
+        `- Star player (15+ ppg) OUT → DOWN 10-15%\n` +
+        `- Opponent has a significant home/rest/motivation advantage → DOWN 4-8%\n\n` +
         `═══ STEP 4 — DECISION ═══\n` +
-        `REMEMBER: confidence = P(team builds 8+ point lead at some point in first half). This is higher than win probability.\n` +
+        `REMEMBER: confidence = P(this team wins the game). We exit at +12¢ — typically happens when the team builds a lead and the market reprices.\n` +
         `BUY only if ALL are true:\n` +
-        `✓ Confidence ≥ 70% (early-lead probability, not win probability)\n` +
+        `✓ Confidence ≥ 70% (win probability)\n` +
         `✓ Confidence beats current price by 4+ points\n` +
-        `✓ You have a SPECIFIC confirmed early-lead catalyst (not just "they're better")\n` +
+        `✓ You have a SPECIFIC edge catalyst — not just "better team"\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
-        `JSON ONLY — include exitScenario (the specific event that causes the price spike):\n` +
+        `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific event e.g. team builds 10-pt Q1 lead on opponent missing 2 starters","reasoning":"one sentence"}`
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. opponent resting 3 starters, team motivated for playoff seeding — price rises when they build Q1 lead","reasoning":"one sentence"}`
 
       : sport === 'NHL'
       ? `You are a professional NHL swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
-        `STRATEGY: We buy pre-game and SELL when price rises — we do NOT hold to settlement. Our exit triggers when this team SCORES FIRST and the contract reprices upward. In NHL, the team that scores first wins ~70% of games — when that first goal goes in, the contract price spikes immediately from ~55¢ to ~70¢+. That spike is our exit. We never need to hold through OT or a comeback. Your confidence = "how likely is this team to score the first goal?"\n\n` +
+        `STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring first, building a lead, or the opponent struggling early. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing. Goalie matchup and special teams are the primary drivers in NHL win probability.\n\n` +
         `⚠️ DATA RULES: ESPN-confirmed goalies are provided above. Use your training knowledge for goalie quality and team stats. If ESPN provided a starting goalie, treat them as CONFIRMED. Only fire Hard NO for "unconfirmed" if ESPN shows "NOT IN ESPN."\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
-        `FIRST-GOAL BASELINE: NHL home team scores first ~56% of games. Elite goalie matchup advantage, power play edge, and opponent fatigue are the primary drivers. A team with a clear goalie/power-play edge scores first 60-65% of games.\n\n` +
+        `WIN PROBABILITY BASELINE: NHL home teams win (in regulation + OT) ~55% of games. An elite goalie vs. a backup can push that to 62%+. A team on back-to-back drops to ~47%.\n\n` +
         `═══ STEP 1 — ASSESS WITH ESPN DATA + TRAINING KNOWLEDGE ═══\n` +
         `(No web search available — use the ESPN goalies provided above and your training knowledge)\n` +
-        `A) GOALIES: Goalies are confirmed above from ESPN. Use your training knowledge to assess each goalie's quality: career SV%, GAA tier, known strengths/weaknesses. An elite goalie (SV% > .920) suppresses early goals significantly.\n` +
-        `B) SPECIAL TEAMS: From your training knowledge, assess each team's power play and penalty kill quality. Top-5 PP teams score early via power plays more often.\n` +
-        `C) FATIGUE: Based on the game ticker date and typical NHL scheduling, assess whether either team is likely on a back-to-back.\n` +
-        `D) MOTIVATION: From your training knowledge of these franchises and typical late-season standings, assess playoff race intensity for each team.\n\n` +
+        `A) GOALIES: Goalies confirmed above from ESPN. Assess each goalie's win probability impact from training knowledge: career SV%, GAA tier, known strengths. An elite goalie (SV% > .920) vs. a backup (.890) is a 10-15% win probability swing.\n` +
+        `B) SPECIAL TEAMS: From training knowledge, assess power play and penalty kill quality. Top-5 PP teams convert at a higher rate and generate scoring momentum.\n` +
+        `C) FATIGUE: Is either team on a back-to-back? NHL back-to-back teams win at ~8% lower rates.\n` +
+        `D) MOTIVATION: From training knowledge, playoff race intensity for each team. Teams fighting for seeding play harder in regulation.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Starting goalie for the team you want to bet is NOT confirmed → NO\n` +
-        `❌ Team has clinched everything AND cannot confirm starting goalie and top line → NO\n` +
+        `❌ Team has clinched everything AND cannot confirm starting goalie → NO\n` +
         `❌ Team on 3rd game in 4 nights AND opponent is rested → NO\n` +
-        `❌ No first-goal catalyst — just "better team overall" → NO (already priced in)\n\n` +
-        `═══ STEP 3 — FIRST-GOAL EDGE ANALYSIS ═══\n` +
-        `Start from 56% first-goal baseline (home) / 44% (away). Adjust based on confirmed research:\n` +
-        `+ Elite goalie (SV% > .920) vs below-average opponent goalie (SV% < .905) → UP 5-8% (gives up fewer early goals, team stays motivated to push)\n` +
-        `+ Your team top-5 power play AND opponent bottom-5 penalty kill → UP 4-6% (PP goals are first-goal candidates)\n` +
-        `+ Opponent on back-to-back → UP 4-5% (slower first period)\n` +
+        `❌ No specific edge — just "better team overall" → NO (already priced in)\n\n` +
+        `═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══\n` +
+        `Start from 55% win rate (home) / 45% (away). Adjust based on confirmed research:\n` +
+        `+ Elite goalie (SV% > .920) vs below-average opponent goalie (SV% < .905) → UP 8-12%\n` +
+        `+ Your team top-5 power play AND opponent bottom-5 penalty kill → UP 4-6%\n` +
+        `+ Opponent on back-to-back → UP 4-5%\n` +
         `+ Your team in must-win (seeding, playoff survival) vs lower-stakes opponent → UP 3-5%\n` +
-        `+ Your team won 4 of last 5 with strong first-period stats → UP 2-3%\n` +
-        `- Backup goalie starting for your team → DOWN 6-10%\n` +
-        `- Your goalie SV% below .900 → DOWN 5-8%\n` +
+        `- Backup goalie starting for your team → DOWN 8-12%\n` +
         `- Your team on back-to-back → DOWN 4-6%\n` +
         `- Opponent elite PP (top-5) AND your PK bottom-10 → DOWN 4-6%\n\n` +
         `═══ STEP 4 — DECISION ═══\n` +
-        `REMEMBER: confidence = P(this team scores first goal). This is separable from P(team wins full game including OT).\n` +
+        `REMEMBER: confidence = P(this team wins the game). We exit at +12¢ — typically happens when they score first and the market reprices their win probability.\n` +
         `BUY only if ALL are true:\n` +
-        `✓ Confidence ≥ 70% (first-goal probability)\n` +
+        `✓ Confidence ≥ 70% (win probability)\n` +
         `✓ Confidence beats current price by 4+ points\n` +
-        `✓ Goalie is confirmed AND you have a specific first-goal catalyst\n` +
+        `✓ Goalie is confirmed AND you have a specific win-probability edge\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific event e.g. team scores first goal — elite goalie SV .928 vs backup .891","reasoning":"one sentence"}`
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. elite goalie SV .928 vs backup .891 — price rises when they score first","reasoning":"one sentence"}`
 
       : /* MLB */
       sport === 'MLB'
       ? `You are a professional MLB swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
-        `STRATEGY: We buy pre-game and SELL when price rises — we do NOT hold to settlement. We exit when the contract price reaches our entry + 12¢, which typically happens when this team scores 2+ runs in the first 3-4 innings. We never need the team to win the full game. Your confidence = "how likely is this team to score 2+ runs in the first 3-4 innings?" — not "do they win 9 innings?" An ace pitcher limiting the opponent while his offense scores early is a profitable trade even if they blow it in the 7th. We're trading the first act.\n\n` +
+        `STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building an early lead, or the opponent's starter struggling. Your confidence = "what is the real probability this team WINS today?" Starting pitching is the dominant driver of MLB win probability. An ace vs. a weak lineup can win 65%+ of games; a weak starter on your side drops it below 45%.\n\n` +
         `⚠️ DATA RULES: ESPN-confirmed starters are provided above. Use your training knowledge for pitcher quality. If a starter is listed above, treat them as confirmed. Flag any pitcher whose career ERA you cannot recall — if truly unknown, treat as average (ERA ~4.5).\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
-        `EARLY-SCORING BASELINE: A team facing a weak starter (ERA > 4.5) scores 2+ in the first 3 innings ~45% of games. With an elite opponent starter (ERA < 3.0), that drops to ~25%. The gap between these is your edge window.\n\n` +
+        `WIN PROBABILITY BASELINE: MLB home teams win ~54% of games. An ace (ERA < 3.0) pitching vs. a weak lineup boosts that to ~62-65%. A weak starter (ERA > 5.0) drops it to ~42-46%.\n\n` +
         `═══ STEP 1 — ASSESS WITH ESPN DATA + TRAINING KNOWLEDGE ═══\n` +
         `(No web search available — use the ESPN starters provided above and your training knowledge)\n` +
-        `A) STARTING PITCHERS: Starters are listed above from ESPN. Assess each pitcher's quality from your training: career ERA tier, pitch mix, typical WHIP range. An ace (career ERA < 3.0) suppresses early scoring. A weak starter (career ERA > 4.5) gives up early runs.\n` +
-        `B) PITCHER QUALITY: Use training knowledge for ERA range, velocity trends, K/9, recent season performance through your knowledge cutoff. Flag if a pitcher is too new/obscure to assess — treat as average.\n` +
-        `C) LINEUP POWER: Does this team have known run-producers? Any well-known slugger who typically bats cleanup? Strong lineups score early more often.\n` +
-        `D) PARK FACTOR: Is this a hitter's park (Coors, Fenway, Great American)? Hitter's parks increase early scoring probability for BOTH teams.\n\n` +
+        `A) STARTING PITCHERS: Starters are listed above from ESPN. Assess quality from training: career ERA tier, WHIP, pitch mix. An ace (ERA < 3.0) dominates and wins ~65% of starts. A weak starter (ERA > 5.0) loses more than they win and get lit up early.\n` +
+        `B) BULLPEN: Does this team have a strong bullpen to protect leads? Weak bullpens blow leads in the 7th-8th even with good starters.\n` +
+        `C) LINEUP POWER: Assess run-scoring ability. Strong lineups (+4.5 R/G) put pressure on the opponent. Known sluggers in the 3-4 spots.\n` +
+        `D) PARK FACTOR: Hitter's parks (Coors, Fenway, Great American) favor offenses; pitcher's parks (Oracle, Dodger Stadium) favor pitching. Match to which team benefits.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
-        `⛔ THESE ARE ABSOLUTE. If ANY Hard NO applies, respond {"trade":false} immediately. Do NOT continue reasoning. Do NOT write "however" or "but their offense can still score." If you find yourself building a case to override a Hard NO, STOP — that rationalization is the mistake.\n` +
+        `⛔ THESE ARE ABSOLUTE. If ANY Hard NO applies, respond {"trade":false} immediately. Do NOT continue reasoning.\n` +
         `❌ Starting pitcher for the team you want to bet is NOT confirmed → NO\n` +
-        `❌ Your team's starter is ERA > 5.0 → NO. The reason is NOT just "they'll fall behind" — it's that market-makers already know this ERA. They've discounted the price accordingly. Your edge disappears the moment your bad starter gives up runs, and that repricing happens in the same innings you're hoping your offense scores. No override for "weak opponent pitcher" — if your starter is ERA > 5.0, the edge math doesn't work.\n` +
-        `❌ Opponent starter is ERA < 2.5 AND WHIP < 1.0 → NO (will limit your team's early scoring)\n\n` +
-        `═══ STEP 3 — EARLY-SCORING EDGE ANALYSIS ═══\n` +
-        `Start from 45% early-scoring baseline (2+ runs in first 3 innings). Adjust based on confirmed research:\n` +
-        `+ Opponent starter ERA > 5.0 → UP 8-12% (weak starters give up early runs consistently)\n` +
-        `+ Opponent starter ERA 4.0-5.0 → UP 4-7%\n` +
-        `+ Your team top-5 in first-inning runs scored this season → UP 4-6%\n` +
-        `+ Hitter's park (Coors, Fenway, Great American Ball Park) → UP 3-5%\n` +
-        `+ Your starter ERA < 2.5 → UP 3-4% (confident offense, keeps game close early)\n` +
-        `- Opponent starter ERA < 3.0 AND WHIP < 1.1 → DOWN 8-12% (will suppress your early scoring)\n` +
-        `- Pitcher's park (Oracle, Dodger Stadium) → DOWN 2-3%\n` +
-        `- Your team's top run-producer confirmed OUT → DOWN 4-6%\n\n` +
+        `❌ Your team's starter is ERA > 5.0 → NO. Market-makers already know this ERA and have priced it in. When a bad starter gives up runs, the price drops fast — your contract loses value while you're hoping for a comeback. The edge math doesn't work.\n` +
+        `❌ Opponent starter is ERA < 2.5 AND WHIP < 1.0 → NO (will dominate your lineup, price won't rise)\n\n` +
+        `═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══\n` +
+        `Start from 54% win rate (home) / 46% (away). Adjust based on confirmed research:\n` +
+        `+ Your ace (ERA < 3.0) vs opponent ERA > 4.5 → UP 8-12% (pitching mismatch is the biggest lever)\n` +
+        `+ Opponent starter ERA 4.0-5.0 and your lineup is strong → UP 4-7%\n` +
+        `+ Your team top-tier bullpen (ERA < 3.5) → UP 2-4%\n` +
+        `+ Hitter's park + your team's stronger lineup → UP 2-3%\n` +
+        `- Opponent has elite ace (ERA < 2.5, WHIP < 1.0) → DOWN 8-12%\n` +
+        `- Your key lineup bat confirmed OUT → DOWN 4-6%\n` +
+        `- Pitcher's park + opponent's superior pitching → DOWN 3-5%\n\n` +
         `═══ STEP 4 — DECISION ═══\n` +
-        `REMEMBER: confidence = P(team scores 2+ runs in first 3-4 innings). This is NOT the same as P(team wins). MLB games are random over 9 innings — but early-inning scoring against a weak starter is more predictable.\n` +
+        `REMEMBER: confidence = P(this team wins the game). We exit at +12¢ — typically happens after they score early and the market reprices. A clear pitching edge translates to win probability and contract price movement.\n` +
         `BUY only if ALL are true:\n` +
-        `✓ Confidence ≥ 65% (early-scoring probability — lower bar than NBA/NHL because this is a more precise sub-event)\n` +
+        `✓ Confidence ≥ 65% (win probability)\n` +
         `✓ Confidence beats current price by 4+ points\n` +
-        `✓ Both starters confirmed AND there's a clear pitching mismatch driving early-scoring edge\n` +
+        `✓ Both starters confirmed AND there's a clear pitching/matchup edge\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific event e.g. team scores 2+ in first 3 innings vs ERA 5.2 starter","reasoning":"one sentence"}`
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. ace ERA 2.8 vs ERA 5.1 starter — price rises when they score first and market reprices win probability","reasoning":"one sentence"}`
 
       : /* Soccer (MLS / EPL / La Liga) */
       `You are a professional soccer swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
-        `STRATEGY: We buy pre-game and SELL when the price rises — we do NOT care about the final score. Our exit is when this team SCORES FIRST and the contract reprices upward. When a team scores the first goal in soccer, their price spikes immediately — from 45¢ to 65¢+. We sell into that spike and we're done. Whether the game ends 1-1, 1-0, or 2-1 is IRRELEVANT. A draw does NOT hurt us because we exit before the game ends. Your confidence = "how likely is this team to score the first goal?" — not "do they win outright?"\n\n` +
+        `STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring, building a lead, or dominating possession while the opponent struggles. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing. A strong attack vs. a leaky defense produces both goals AND win probability. A draw only hurts if we're still holding at the end.\n\n` +
         `⚠️ DATA RULES: No web search available. Use your training knowledge for team quality, typical lineups, and attack/defense profiles. If you cannot confirm a key injury, treat the player as available but apply a 2% uncertainty buffer. Do NOT use uncertainty as a reason to pass unless it affects a Hard NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
-        `FIRST-GOAL BASELINE: Home teams score first ~55% of soccer games. Strong attacking teams with high shots-on-target rates score first more often regardless of eventual match result. Draw probability is irrelevant to us.\n\n` +
+        `WIN PROBABILITY BASELINE: Soccer home teams win (regulation) ~45% of games, draw ~27%, away ~28%. Strong home sides vs. weak away teams can reach 55-60% win probability. Draw probability is NOT irrelevant — it counts against us since we need the team to WIN for the price to rise and stay elevated.\n\n` +
         `═══ STEP 1 — ASSESS WITH TRAINING KNOWLEDGE ═══\n` +
         `(No web search available — use your knowledge of these clubs)\n` +
-        `A) ATTACK QUALITY: From your training knowledge, how prolific is each team's attack? Top-5 goals-per-game teams score first more often. Flag if you have limited knowledge of a club.\n` +
-        `B) KEY PLAYERS: Are either team's known star strikers/forwards likely available? Use your training knowledge — if a key forward was injury-prone or recently transferring, apply uncertainty.\n` +
-        `C) FORM: From your training knowledge, are these teams typically strong starters? High-energy pressing teams score first more often.\n` +
-        `D) MOTIVATION: Is either team in a must-win (relegation, title run, European qualification)? Use your knowledge of standings context for these leagues.\n` +
-        `E) OPPONENT DEFENSE: From training knowledge, is the opponent's defense porous or elite? Weak defenses give up first goals early.\n\n` +
+        `A) ATTACK QUALITY: From training knowledge, how prolific is each team's attack? Top-5 goals-per-game teams generate scoring chances that translate to wins.\n` +
+        `B) KEY PLAYERS: Are either team's known star strikers/forwards likely available? Key absences significantly reduce win probability.\n` +
+        `C) FORM & STYLE: High-energy pressing teams create chances earlier. Teams in strong form win at higher rates.\n` +
+        `D) MOTIVATION: Is either team in a must-win (relegation, title run, European qualification)? Higher motivation = more aggressive pressing = more goals = higher win probability.\n` +
+        `E) DEFENSE: Elite defenses (conceding <0.8/game) can keep motivated opponents scoreless. Porous defenses lose more games.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
-        `❌ Your team's first-choice striker is confirmed OUT AND opponent defense is strong → NO\n` +
-        `❌ Both teams are defensive/low-scoring (under 1 goal per game each) → NO (first goal may not come)\n` +
-        `❌ No specific first-goal catalyst — just "better team" → NO (already priced in)\n\n` +
-        `═══ STEP 3 — FIRST-GOAL EDGE ANALYSIS ═══\n` +
-        `Start from 55% first-goal baseline (home) / 45% (away). Adjust based on confirmed research:\n` +
-        `+ Your team scores 2+ per game AND opponent defense concedes 1.5+ per game → UP 6-10% (prolific attack vs leaky defense = early goals)\n` +
-        `+ Your team in must-win (confirmed: relegation, title run, Europa/Champions League spot) → UP 4-7% (high-press from kickoff)\n` +
-        `+ Opponent missing key central defender → UP 4-6%\n` +
-        `+ Your team won last 3 head-to-heads scoring first each time → UP 3-5%\n` +
-        `+ Strong home record with early goals (60%+ scoring in first 30 min at home) → UP 3-4%\n` +
+        `❌ Your team's key striker is confirmed OUT AND opponent defense is strong → NO\n` +
+        `❌ Both teams are defensive/low-scoring (under 1 goal per game each) → NO (likely to draw, price won't move)\n` +
+        `❌ No specific edge — just "they're better overall" → NO (already priced in)\n\n` +
+        `═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══\n` +
+        `Start from 45% win rate (home) / 28% (away). Adjust based on confirmed research:\n` +
+        `+ Your team scores 2+ per game AND opponent defense concedes 1.5+ per game → UP 8-12%\n` +
+        `+ Your team in must-win (relegation, title run, European spot) vs lower-stakes opponent → UP 5-8%\n` +
+        `+ Opponent missing key central defender or goalkeeper → UP 4-6%\n` +
+        `+ Strong home record at this venue (60%+ win rate) → UP 3-5%\n` +
         `- Your team's starting striker confirmed OUT → DOWN 8-12%\n` +
-        `- Opponent elite defense (conceding under 0.8 per game) → DOWN 5-8%\n` +
-        `- Your team low-scoring (under 1.2 goals per game) → DOWN 4-6%\n` +
-        `- Away team historically suppresses first goal (plays 0-0 for long periods) → DOWN 3-5%\n\n` +
+        `- Opponent elite defense (conceding under 0.8 per game) → DOWN 6-10%\n` +
+        `- Your team low-scoring (under 1.2 goals per game) → DOWN 5-8%\n\n` +
         `═══ STEP 4 — DECISION ═══\n` +
-        `REMEMBER: confidence = P(this team scores the first goal of the match). Draws, final scores, and second-half results are all irrelevant — we exit on the first goal spike.\n` +
+        `REMEMBER: confidence = P(this team wins the game in regulation). We exit at +12¢ — typically happens when they score and the market reprices their win probability upward.\n` +
         `BUY only if ALL are true:\n` +
-        `✓ Confidence ≥ 65% (first-goal probability)\n` +
+        `✓ Confidence ≥ 65% (win probability)\n` +
         `✓ Confidence beats current price by 4+ points\n` +
-        `✓ You have a specific confirmed first-goal catalyst (attack quality, defensive weakness, motivation)\n` +
+        `✓ You have a specific confirmed win-probability catalyst\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific event e.g. team scores first goal — prolific attack vs defense conceding 1.8/game","reasoning":"one sentence"}`;
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. prolific attack vs defense conceding 1.8/game — price rises when they score first goal","reasoning":"one sentence"}`;
 
     return {
       market,
@@ -4359,6 +4280,13 @@ async function checkPreGamePredictions() {
     // and "confirms" starters from stale articles — leading to bets on wrong pitchers.
     // If ESPN has neither team's starter, defer to paper only until starters are known.
     if (PREGAME_LIVE) {
+      // ── OVERNIGHT GATE: no real bets before 10 AM ET ──────────────────────
+      // Overnight scans run 2-5 AM ET when stale articles "confirm" wrong starters.
+      // Games 12-18 hrs away give no edge and lock capital for half a day.
+      if (etNow.getHours() < 10) {
+        console.log(`[pre-game] 🌙 OVERNIGHT GATE: ${market.base} — no real bets before 10 AM ET (currently ${etNow.getHours()}:${String(etNow.getMinutes()).padStart(2,'0')} ET)`);
+        // Fall through to paper logging below
+      } else
       // ── DAILY CAP: max 6 real pre-game bets per day ───────────────────────
       if (preGameLiveToday >= MAX_PREGAME_LIVE_PER_DAY) {
         console.log(`[pre-game] 🚫 Daily live cap reached (${preGameLiveToday}/${MAX_PREGAME_LIVE_PER_DAY}) — deferring ${market.base} to paper`);
@@ -5428,28 +5356,22 @@ async function managePositions() {
         //   MLB: 50% — early lead; 6 innings left, worth holding half
         //   NBA: 50% — first-half lead; second half is the real game
         if (trade.strategy === 'pre-game-prediction' && profitPerContract >= 0.12 && !trade.partialTakeAt) {
-          const sportKey = (trade.sport ?? '').toLowerCase();
-          const isSoccer = sportKey === 'mls' || sportKey === 'epl' || sportKey === 'laliga';
-          const isNHL = sportKey === 'nhl';
-          const exitFraction = isSoccer ? 0.90 : isNHL ? 0.75 : 0.50;
-          const sellQty = Math.max(1, Math.floor(qty * exitFraction));
-          const remaining = qty - sellQty;
-          if (sellQty >= 1) {
+          // Price target hit — sell the full position. Strategy is: buy team at a discount,
+          // sell when market agrees (+12¢). No partial holds; a held partial just exposes
+          // us to full-game variance without the edge that justified the original entry.
+          if (qty >= 1) {
             const gainPct = Math.round((profitPerContract / entryPrice) * 100);
-            const sportLabel = isSoccer ? 'first-goal spike' : isNHL ? 'first-goal' : 'early lead';
-            console.log(`[exit] 💰 PRE-GAME PROFIT-LOCK (${sportKey} ${sportLabel}): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% → selling ${sellQty}/${qty} (${Math.round(exitFraction*100)}%) at ${(currentPrice*100).toFixed(0)}¢, locking ~$${(sellQty * profitPerContract).toFixed(2)}`);
+            console.log(`[exit] 💰 PRE-GAME TARGET HIT: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty} @ ${(currentPrice*100).toFixed(0)}¢, profit ~$${(qty * profitPerContract).toFixed(2)}`);
             await tg(
-              `💰 <b>PRE-GAME PROFIT LOCK</b>\n\n` +
+              `💰 <b>PRE-GAME TARGET HIT</b>\n\n` +
               `📋 <b>POSITION</b>\n` +
-              `${trade.title}\n` +
-              `Sport: ${sportLabel.toUpperCase()}\n\n` +
+              `${trade.title}\n\n` +
               `📊 <b>METRICS</b>\n` +
-              `Selling ${Math.round(exitFraction*100)}% (${sellQty} contracts) @ ${(currentPrice*100).toFixed(0)}¢\n` +
+              `Selling ALL ${qty} contracts @ ${(currentPrice*100).toFixed(0)}¢\n` +
               `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
-              `Profit this sale: <b>+$${(profitPerContract * sellQty).toFixed(2)}</b>\n` +
-              `${remaining > 0 ? `Holding ${remaining} contracts — riding for more` : 'Full position closed'}`
+              `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
             );
-            const result = await executeSell(trade, sellQty, currentPrice, 'pre-game-profit-lock');
+            const result = await executeSell(trade, qty, currentPrice, 'pre-game-profit-lock');
             if (result) {
               trade.partialTakeAt = new Date().toISOString();
               anyUpdated = true;
@@ -5541,13 +5463,14 @@ async function managePositions() {
           const ourTeam = trade.ticker?.split('-').pop() ?? '';
           const ourWE = ctx.leading === ourTeam ? ctx.baselineWE : (1 - ctx.baselineWE);
           const isPreGame = trade.strategy === 'pre-game-prediction';
-          // Grace period: don't fire WE-reversal on pre-game positions within 10 min of entry.
-          // Prevents false triggers when the live-score API returns stale/pre-game state
-          // immediately after a buy (e.g. CIN bought at 09:24, WE-reversal fired at 09:27).
+          // Grace period: don't fire WE-reversal on pre-game positions within 30 min of entry.
+          // Also require game to be genuinely in progress (stage known) — stale ESPN data
+          // returning 0-0 pre-start can compute 3% WE and trigger an erroneous sell.
           const entryMs = trade.timestamp ? Date.parse(trade.timestamp) : 0;
           const minsSinceEntry = entryMs ? (Date.now() - entryMs) / 60000 : 99;
-          if (isPreGame && minsSinceEntry < 10) {
-            // Too soon — skip WE-reversal, let pg-guard handle it
+          const gameIsLive = stage !== 'unknown';
+          if (isPreGame && (minsSinceEntry < 30 || !gameIsLive)) {
+            // Too soon or game not confirmed live — skip WE-reversal, let pg-guard handle it
           } else {
             const weFloor = isPreGame && stage !== 'late' ? 0.20 : 0.30;
             if (ourWE <= weFloor) {
