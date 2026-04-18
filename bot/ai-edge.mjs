@@ -5558,6 +5558,7 @@ async function managePositions() {
         // Fetch game context (stage, score, ESPN data)
         const ctx = await getGameContext(trade);
         const stage = ctx?.stage ?? 'unknown';
+        const league = ctx?.league ?? (trade.ticker?.includes('MLB') ? 'mlb' : trade.ticker?.includes('NBA') ? 'nba' : trade.ticker?.includes('NHL') ? 'nhl' : trade.ticker?.includes('MLS') ? 'mls' : trade.ticker?.includes('EPL') ? 'epl' : trade.ticker?.includes('LALIGA') ? 'laliga' : '');
         const thresholds = getExitThresholds(stage, entryPrice);
 
         // === TIER 1: Rule-based auto-exits ===
