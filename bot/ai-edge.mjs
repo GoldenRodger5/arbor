@@ -3451,6 +3451,14 @@ async function checkLiveScoreEdges() {
                 if (ptMs < pgDupStartMs || ptMs >= pgDupEndMs) continue;
                 const pticker = (pt.ticker ?? '').toLowerCase();
                 if (tickerHasTeam(pticker, homeAbbr) && tickerHasTeam(pticker, awayAbbr)) {
+                  // Starter-conflict deferred trades are NOT real money — the pre-game bet
+                  // was blocked because the starting pitcher was uncertain. Once the game is
+                  // live, the starter identity is confirmed in the boxscore, so the live-edge
+                  // should evaluate freely on its own merits without the pre-game block.
+                  if (pt.starterConflict) {
+                    console.log(`[live-edge] ℹ️ Conflict-deferred paper trade for ${homeAbbr}@${awayAbbr} — pre-game starter was uncertain, live-edge evaluating freely`);
+                    break;
+                  }
                   const paperTeam = (pt.teamAbbr ?? pt.ticker?.split('-').pop() ?? '?').toUpperCase();
                   if (paperTeam !== targetAbbr?.toUpperCase()) {
                     if (PREGAME_LIVE) {
@@ -4827,7 +4835,14 @@ async function checkPreGamePredictions() {
       // ESPN provides probable starters, but they can be wrong (late scratches,
       // bullpen games announced after ESPN updates). Before risking real money,
       // do a targeted web search to confirm the starters match what ESPN says.
-      // If the search finds a conflict → hard NO, defer to paper.
+      // ── STARTER CROSS-VALIDATION ─────────────────────────────────────────────
+      // Three-source approach to avoid false positives from stale web search results:
+      //   1. ESPN probables (already fetched above — real-time scoreboard)
+      //   2. MLB.com official schedule API (authoritative probable pitcher feed)
+      //   3. Claude web search (tiebreaker ONLY if sources 1 & 2 disagree)
+      //
+      // A conflict is only declared if the web search ALSO disagrees with ESPN.
+      // ESPN + MLB.com agreeing = confirmed. One source lagging = not a real conflict.
       let starterConflict = false;
       if (pgSportKey === 'mlb' && (espnT1 || espnT2)) {
         const homeAbbr = market.team2.team.toUpperCase();
@@ -4835,59 +4850,147 @@ async function checkPreGamePredictions() {
         const espnHomeName = espnT2?.name ?? 'unknown';
         const espnAwayName = espnT1?.name ?? 'unknown';
         console.log(`[pre-game] 🔍 STARTER XVAL: verifying ${awayAbbr} (${espnAwayName}) @ ${homeAbbr} (${espnHomeName})`);
+
+        // Helper: compare pitcher names via last name (handles "C. Sanchez" vs "Cristopher Sanchez")
+        const lastName = (n) => (n ?? '').trim().split(/\s+/).pop()?.toLowerCase() ?? '';
+        const namesMatch = (a, b) => {
+          if (!a || !b || a === 'unknown' || b === 'unknown') return null; // can't compare
+          if (a.toLowerCase() === b.toLowerCase()) return true;
+          return lastName(a) === lastName(b);
+        };
+
+        // Step 1: MLB.com official probable pitcher API
+        let mlbHomeActual = null;
+        let mlbAwayActual = null;
         try {
-          const xvalPrompt = `Today is ${todayDate}. I need to verify the starting pitchers for tonight's MLB game: ${awayAbbr} at ${homeAbbr}.
-
-ESPN lists:
-- ${homeAbbr}: ${espnHomeName}
-- ${awayAbbr}: ${espnAwayName}
-
-Search for "${homeAbbr} ${awayAbbr} starting pitcher today ${todayDate}" and verify:
-1. Are these the confirmed starters, or has there been a late scratch / change?
-2. Is either team using an opener or bullpen game instead?
-
-Respond in EXACTLY this JSON format:
-{
-  "homeConfirmed": true/false,
-  "awayConfirmed": true/false,
-  "homeActual": "pitcher name from your search",
-  "awayActual": "pitcher name from your search",
-  "conflict": true/false,
-  "note": "brief explanation"
-}
-
-Set conflict=true if your search shows a DIFFERENT starter than ESPN for either team, or if a bullpen game / opener is announced. Set conflict=false if starters match or you can't find contradicting info.`;
-          const xvalResult = await claudeWithSearch(xvalPrompt, { maxTokens: 512, maxSearches: 2, timeout: 30000 });
-          if (xvalResult) {
-            const xvalJson = xvalResult.match(/\{[\s\S]*\}/)?.[0];
-            if (xvalJson) {
-              try {
-                const xval = JSON.parse(xvalJson);
-                if (xval.conflict) {
-                  starterConflict = true;
-                  console.log(`[pre-game] ⚠️ STARTER CONFLICT for ${market.base}: ESPN says ${espnHomeName}/${espnAwayName}, search found ${xval.homeActual ?? '?'}/${xval.awayActual ?? '?'} — ${xval.note}`);
-                  await tg(
-                    `⚠️ <b>STARTER CONFLICT — ${market.base}</b>\n` +
-                    `ESPN: ${espnAwayName} @ ${espnHomeName}\n` +
-                    `Search: ${xval.awayActual ?? '?'} @ ${xval.homeActual ?? '?'}\n` +
-                    `${xval.note}\n` +
-                    `<i>Deferring to paper only</i>`
-                  );
-                } else {
-                  console.log(`[pre-game] ✅ STARTER CONFIRMED: ${espnAwayName} @ ${espnHomeName} — ${xval.note ?? 'matches search results'}`);
+          const mlbDateStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' }); // YYYY-MM-DD
+          const mlbRes = await fetch(
+            `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${mlbDateStr}&hydrate=probablePitcher`,
+            { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) }
+          );
+          if (mlbRes.ok) {
+            const mlbData = await mlbRes.json();
+            for (const dateEntry of mlbData.dates ?? []) {
+              for (const game of dateEntry.games ?? []) {
+                const mlbHome = (game.teams?.home?.team?.abbreviation ?? '').toUpperCase();
+                const mlbAway = (game.teams?.away?.team?.abbreviation ?? '').toUpperCase();
+                // Match on at least one team abbreviation (MLB uses different abbr than ESPN sometimes)
+                const homeMatch = mlbHome === homeAbbr || mlbHome.slice(0, 3) === homeAbbr.slice(0, 3);
+                const awayMatch = mlbAway === awayAbbr || mlbAway.slice(0, 3) === awayAbbr.slice(0, 3);
+                if (homeMatch && awayMatch) {
+                  mlbHomeActual = game.teams?.home?.probablePitcher?.fullName ?? null;
+                  mlbAwayActual = game.teams?.away?.probablePitcher?.fullName ?? null;
+                  console.log(`[pre-game] 📋 MLB.com: home=${mlbHomeActual ?? 'TBD'} away=${mlbAwayActual ?? 'TBD'}`);
+                  break;
                 }
-              } catch (parseErr) {
-                console.log(`[pre-game] ⚠️ STARTER XVAL parse error: ${parseErr.message} — proceeding with ESPN data`);
               }
             }
           }
-        } catch (xvalErr) {
-          console.log(`[pre-game] ⚠️ STARTER XVAL failed: ${xvalErr.message} — proceeding with ESPN data`);
+        } catch (mlbErr) {
+          console.log(`[pre-game] ⚠️ MLB.com fetch failed: ${mlbErr.message} — using ESPN only`);
+        }
+
+        // Step 2: Compare ESPN and MLB.com
+        const homeAgree = namesMatch(espnHomeName, mlbHomeActual);
+        const awayAgree = namesMatch(espnAwayName, mlbAwayActual);
+        const sourcesAgree = (homeAgree !== false) && (awayAgree !== false); // null = unknown, false = mismatch
+
+        if (sourcesAgree && (mlbHomeActual || mlbAwayActual)) {
+          // ESPN and MLB.com agree (or MLB.com has no data yet) — confirmed, skip web search
+          console.log(`[pre-game] ✅ STARTER CONFIRMED (ESPN+MLB.com): ${espnAwayName} @ ${espnHomeName}`);
+        } else {
+          // Sources disagree or MLB.com is missing — run Claude web search as tiebreaker
+          const mlbConflictNote = mlbHomeActual || mlbAwayActual
+            ? `MLB.com shows home=${mlbHomeActual ?? 'TBD'} away=${mlbAwayActual ?? 'TBD'}`
+            : 'MLB.com returned no probable pitcher data yet';
+          console.log(`[pre-game] ⚠️ ESPN vs MLB.com mismatch — running web search tiebreaker. ${mlbConflictNote}`);
+
+          // Get game start time for tighter search
+          const gameStartDate = espnStartTimeMap.get(`${awayAbbr}-${homeAbbr}`) ?? espnStartTimeMap.get(`${homeAbbr}-${awayAbbr}`);
+          const gameTimeET = gameStartDate
+            ? gameStartDate.toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: 'numeric', minute: '2-digit' })
+            : 'tonight';
+
+          try {
+            const xvalPrompt = `Today is ${todayDate}. I need to determine the ACTUAL starting pitchers for the MLB game: ${awayAbbr} at ${homeAbbr}, starting ${gameTimeET} ET.
+
+SOURCE COMPARISON:
+- ESPN probables: ${awayAbbr}=${espnAwayName}, ${homeAbbr}=${espnHomeName}
+- MLB.com probables: ${awayAbbr}=${mlbAwayActual ?? 'not listed'}, ${homeAbbr}=${mlbHomeActual ?? 'not listed'}
+
+These sources show different pitchers (or MLB.com has no data). Search for the CURRENT confirmed starting pitcher for this specific game tonight.
+
+Search: "${awayAbbr} ${homeAbbr} starting pitcher ${todayDate}" AND "${homeAbbr} starting pitcher tonight"
+
+For EACH team, determine: what is the confirmed pitcher throwing the FIRST PITCH tonight?
+
+IMPORTANT: Only set conflict=true if you find CLEAR evidence that the actual starter is DIFFERENT from ESPN's listing. Name abbreviations (e.g. "C. Sanchez" vs "Cristopher Sanchez") are NOT conflicts — they are the same person. A conflict is only when a completely different player is confirmed, or a bullpen/opener game is announced instead.
+
+Respond in EXACTLY this JSON:
+{
+  "homeConfirmed": true/false,
+  "awayConfirmed": true/false,
+  "homeActual": "full pitcher name",
+  "awayActual": "full pitcher name",
+  "conflict": true/false,
+  "conflictTeam": "HOME"/"AWAY"/"BOTH"/null,
+  "note": "one sentence explanation"
+}`;
+            const xvalResult = await claudeWithSearch(xvalPrompt, { maxTokens: 512, maxSearches: 2, timeout: 30000 });
+            if (xvalResult) {
+              const xvalJson = xvalResult.match(/\{[\s\S]*\}/)?.[0];
+              if (xvalJson) {
+                try {
+                  const xval = JSON.parse(xvalJson);
+                  // Only flag as conflict if web search actively confirms a DIFFERENT starter
+                  // (not just uncertainty — uncertainty defaults to trusting ESPN)
+                  if (xval.conflict) {
+                    // Final sanity check: if web search's "actual" matches ESPN by last name,
+                    // it's a false positive (abbreviation vs full name confusion)
+                    const webHomeMatch = namesMatch(espnHomeName, xval.homeActual);
+                    const webAwayMatch = namesMatch(espnAwayName, xval.awayActual);
+                    if (webHomeMatch === false || webAwayMatch === false) {
+                      starterConflict = true;
+                      console.log(`[pre-game] ⚠️ STARTER CONFLICT for ${market.base}: ESPN says ${espnAwayName}/${espnHomeName}, confirmed actual: ${xval.awayActual ?? '?'}/${xval.homeActual ?? '?'} — ${xval.note}`);
+                      await tg(
+                        `⚠️ <b>STARTER CONFLICT — ${market.base}</b>\n` +
+                        `ESPN: ${espnAwayName} @ ${espnHomeName}\n` +
+                        `MLB.com: ${mlbAwayActual ?? 'TBD'} @ ${mlbHomeActual ?? 'TBD'}\n` +
+                        `Web search: ${xval.awayActual ?? '?'} @ ${xval.homeActual ?? '?'}\n` +
+                        `${xval.note}\n` +
+                        `<i>Deferring pre-game to paper — live bets still allowed once game starts</i>`
+                      );
+                    } else {
+                      console.log(`[pre-game] ✅ STARTER CONFIRMED (web tiebreaker): names match ESPN by last name — ${xval.note}`);
+                    }
+                  } else {
+                    console.log(`[pre-game] ✅ STARTER CONFIRMED (web tiebreaker): ${espnAwayName} @ ${espnHomeName} — ${xval.note ?? 'matches search results'}`);
+                  }
+                } catch (parseErr) {
+                  console.log(`[pre-game] ⚠️ STARTER XVAL parse error: ${parseErr.message} — proceeding with ESPN data`);
+                }
+              }
+            }
+          } catch (xvalErr) {
+            console.log(`[pre-game] ⚠️ STARTER XVAL failed: ${xvalErr.message} — proceeding with ESPN data`);
+          }
         }
       }
 
       if (starterConflict) {
-        // Fall through to paper logging below — don't place real bet
+        // Log a conflict-deferred paper trade for record-keeping and calibration.
+        // Tagged with starterConflict: true so the live-edge skips its both-sides guard
+        // — the game is live now with a confirmed starter, live-edge should evaluate freely.
+        logPaperTrade({
+          sport: pgSportKey, marketBase: market.base, ticker: matchedSide.ticker,
+          teamAbbr: matchedSide.team, teamName: bettingOnTeam,
+          opponentAbbr: otherSide.team, opponentName: otherSide.teamName,
+          marketTitle: market.title, confidence, price,
+          edge: Math.round(edge * 1000) / 10, wouldBetAmount: Math.round(betAmount * 100) / 100,
+          wouldQty: betQty, reasoning: decision.reasoning,
+          starterConflict: true,
+          status: 'conflict-deferred',
+        });
       } else {
       // ── LIVE MODE: place a real Kalshi order ──────────────────────────────
       const pgPriceInCents = Math.round(price * 100);
