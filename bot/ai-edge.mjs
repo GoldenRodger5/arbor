@@ -4255,13 +4255,40 @@ async function checkPreGamePredictions() {
 
     // Duplicate guard — one bet per game per day (survives restarts via JSONL)
     if (preGameBetGames.has(market.base)) { console.log(`[pre-game] Already bet ${market.base} today`); continue; }
-    const todayDateStr2 = etNow.toISOString().slice(0, 10);
     if (existsSync(PAPER_TRADES_LOG)) {
       const paperLines = readFileSync(PAPER_TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      // Fix: compare using ET date (tsToEtDate) not UTC date string — trades at 10pm ET have next-day UTC timestamps
       const hasPaperToday = paperLines.some(l => {
-        try { const t = JSON.parse(l); return t.timestamp?.startsWith(todayDateStr2) && t.marketBase === market.base; } catch { return false; }
+        try { const t = JSON.parse(l); return tsToEtDate(t.timestamp) === todayDateStr && t.marketBase === market.base; } catch { return false; }
       });
       if (hasPaperToday) { console.log(`[pre-game] Already logged trade for ${market.base} today (JSONL)`); continue; }
+    }
+
+    // Cross-day matchup guard — don't re-enter the same two-team matchup if we lost it in the last 36h.
+    // Real data: TEXATH-TEX Apr16 (win), TEXSEA-TEX Apr17 (diff opponent, allowed).
+    // This blocks same-series re-entry e.g. KC@DET Mon (loss) → KC@DET Tue (blocked).
+    // Only fires if BOTH team abbreviations appear in a losing pre-game trade from the last 36h.
+    if (existsSync(TRADES_LOG)) {
+      const t1 = market.team1.team.toUpperCase();
+      const t2 = market.team2.team.toUpperCase();
+      const cutoffMs = Date.now() - 36 * 60 * 60 * 1000;
+      const recentLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      const hadMatchupLoss = recentLines.some(l => {
+        try {
+          const tr = JSON.parse(l);
+          if (tr.strategy !== 'pre-game-prediction') return false;
+          if (!tr.timestamp || Date.parse(tr.timestamp) < cutoffMs) return false;
+          const tk = (tr.ticker ?? '').toUpperCase();
+          if (!tk.includes(t1) || !tk.includes(t2)) return false; // different matchup
+          // Confirmed loss: negative P&L or a stop/nuclear/claude-stop exit
+          return (tr.realizedPnL != null && tr.realizedPnL < 0) ||
+                 ['sold-stop-loss','sold-pre-game-nuclear','sold-pre-game-claude-stop','sold-claude-stop'].includes(tr.status);
+        } catch { return false; }
+      });
+      if (hadMatchupLoss) {
+        console.log(`[pre-game] 🚫 CROSS-DAY BLOCK: ${market.base} — lost ${t1} vs ${t2} matchup in last 36h`);
+        continue;
+      }
     }
 
     const edge = confidence - price;
