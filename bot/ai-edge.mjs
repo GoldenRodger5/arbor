@@ -3676,6 +3676,8 @@ async function checkLiveScoreEdges() {
             `🧠 <b>REASONING</b>\n` +
             `${renderReasoningForTelegram(decision.reasoningStructured, decision.reasoning)}`
           );
+          // Deduct from cached balance so subsequent orders this cycle are aware
+          kalshiBalance = Math.max(0, kalshiBalance - actualDeployed);
         } else {
           console.error(`[live-edge] Order failed:`, result.status, JSON.stringify(result.data));
         }
@@ -4621,9 +4623,12 @@ async function checkPreGamePredictions() {
               (decision.exitScenario ? `\n\n📍 <b>EXIT SCENARIO</b>\n${decision.exitScenario}` : '')
             );
             console.log(`[pre-game] ✅ Filled ${pgFill}/${betQty} @ ${pgPriceInCents}¢ deployed=$${pgDeployed.toFixed(2)}`);
+            // Deduct from cached balance so subsequent orders in this batch
+            // know how much cash remains (prevents insufficient_balance 400s)
+            kalshiBalance = Math.max(0, kalshiBalance - pgDeployed);
           }
         } else {
-          console.log(`[pre-game] LIVE order failed for ${market.base}: status=${pgResult.status}`);
+          console.log(`[pre-game] LIVE order failed for ${market.base}: status=${pgResult.status} ${JSON.stringify(pgResult.data).slice(0, 200)}`);
         }
       } catch (err) {
         console.log(`[pre-game] LIVE order error for ${market.base}: ${err.message}`);
