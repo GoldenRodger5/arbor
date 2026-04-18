@@ -3693,6 +3693,8 @@ const PREGAME_HOURS_WINDOW = 4;    // Only place real bet when game starts withi
 let preGameTradesToday = 0;
 let preGameTradesDate = '';         // reset counter on new day
 const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
+const preGameAnalysisCache = new Map(); // marketBase → timestamp of last Claude analysis (2-hour TTL)
+const PREGAME_ANALYSIS_TTL = 2 * 60 * 60 * 1000; // re-analyze each market at most once every 2 hours
 
 async function checkPreGamePredictions() {
   // PAPER MODE: Runs full pre-game analysis for all sports but logs to paper-trades.jsonl
@@ -3713,6 +3715,7 @@ async function checkPreGamePredictions() {
   if (preGameTradesDate !== todayDateStr) {
     preGameTradesDate = todayDateStr;
     preGameBetGames.clear();
+    preGameAnalysisCache.clear();
     preGameTradesToday = 0;
     // Restore from paper-trades.jsonl (covers both paper and real-bet mirrors)
     if (existsSync(PAPER_TRADES_LOG)) {
@@ -3831,7 +3834,16 @@ async function checkPreGamePredictions() {
   const eligibleMarkets = preGameMarkets; // no sport filter
   console.log(`[pre-game] ${eligibleMarkets.length} paper-eligible markets across all sports`);
 
-  const pgSlice = eligibleMarkets.slice(0, 12); // up to 12 per cycle for broad coverage
+  // Skip markets Claude already analyzed recently — prevents burning tokens re-analyzing
+  // the same rejected games every 15 minutes overnight when no bets can be placed.
+  const now = Date.now();
+  const uncachedMarkets = eligibleMarkets.filter(m =>
+    !preGameAnalysisCache.has(m.base) || now - preGameAnalysisCache.get(m.base) > PREGAME_ANALYSIS_TTL
+  );
+  if (uncachedMarkets.length < eligibleMarkets.length) {
+    console.log(`[pre-game] Analysis cache: skipping ${eligibleMarkets.length - uncachedMarkets.length} recently-analyzed markets (${uncachedMarkets.length} uncached)`);
+  }
+  const pgSlice = uncachedMarkets.slice(0, 12); // up to 12 per cycle for broad coverage
   const maxBetDisplay = getDynamicMaxTrade().toFixed(2);
 
   const todayDate = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'long', day: 'numeric' });
@@ -4179,6 +4191,9 @@ async function checkPreGamePredictions() {
         console.log(`[pre-game] BLOCKED: Claude confused sport for ${market.base}. Expected ${expectedSport}, reasoning mentions wrong sport.`);
         continue;
       }
+
+      // Mark as analyzed regardless of trade/no-trade — don't re-analyze for 2 hours
+      preGameAnalysisCache.set(market.base, Date.now());
 
       if (!decision.trade) {
         console.log(`[pre-game] Sonnet rejected ${market.base}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
