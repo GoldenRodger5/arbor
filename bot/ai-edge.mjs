@@ -2453,6 +2453,9 @@ async function checkLiveScoreEdges() {
 
     // === WIN EXPECTANCY FLOOR — don't waste Sonnet when baseline WE is too low to trade ===
     // If baseline WE < 65%, Claude can't reach 65% min confidence (Claude rarely exceeds baseline
+    // in early games). Games between SWING_WE_FLOOR and MIN_WE_FOR_SONNET enter swing mode.
+    let isSwingMode = false;
+    // If baseline WE < 65%, Claude can't reach 65% min confidence (Claude rarely exceeds baseline
     // in early games). This naturally handles every situation:
     //   - 1-run lead inn 2 (58% WE) → skip (noise)
     //   - 3-run lead inn 1 (72% WE) → analyze (real blowout)
@@ -2483,10 +2486,24 @@ async function checkLiveScoreEdges() {
         if (league === 'nba' && period <= 3) return 0.73; // Q1/Q2/Q3 needs 12pt+ lead — marginal early leads too volatile (POR/PHX Q2 8pt, MIA/CHA Q3 5pt)
         return 0.65;
       })();
+
+      // SWING MODE: games between SWING_WE_FLOOR and MIN_WE_FOR_SONNET are candidates
+      // for live swing trades — buy at ≤65¢, exit at +12¢ profit (not hold to settlement).
+      const SWING_WE_FLOOR = (() => {
+        if (league === 'mlb') return 0.65;
+        if (league === 'nba') return 0.62;
+        if (league === 'nhl') return 0.65;
+        return 0.60; // soccer
+      })();
       if (baseWE < MIN_WE_FOR_SONNET) {
-        console.log(`[live-edge] Skipping low-WE: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} ${diff}-${league === 'nba' ? 'pt' : league === 'mlb' ? 'run' : 'goal'} lead P${period}, WE=${(baseWE*100).toFixed(0)}% (need ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%+ for ${league.toUpperCase()} ${diff === 1 ? '1-goal' : ''})`);
-        logScreen({ stage: 'live-edge-skip', result: 'skip-we-floor', league, homeAbbr: home.team?.abbreviation ?? '', awayAbbr: away.team?.abbreviation ?? '', homeScore, awayScore, diff, period, winExpectancy: baseWE, reasoning: `WE=${(baseWE*100).toFixed(0)}% is below the ${(MIN_WE_FOR_SONNET*100).toFixed(0)}% floor for ${league.toUpperCase()}${diff === 1 && league === 'nhl' ? ' 1-goal leads' : ''} — need stronger lead or later period to justify analysis` });
-        continue;
+        if (baseWE >= SWING_WE_FLOOR && _scoreChanged) {
+          isSwingMode = true;
+          console.log(`[live-swing] 🔄 Swing candidate: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} WE=${(baseWE*100).toFixed(0)}% (swing floor ${(SWING_WE_FLOOR*100).toFixed(0)}%, live floor ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%)`);
+        } else {
+          console.log(`[live-edge] Skipping low-WE: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} ${diff}-${league === 'nba' ? 'pt' : league === 'mlb' ? 'run' : 'goal'} lead P${period}, WE=${(baseWE*100).toFixed(0)}% (need ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%+ for ${league.toUpperCase()} ${diff === 1 ? '1-goal' : ''})`);
+          logScreen({ stage: 'live-edge-skip', result: 'skip-we-floor', league, homeAbbr: home.team?.abbreviation ?? '', awayAbbr: away.team?.abbreviation ?? '', homeScore, awayScore, diff, period, winExpectancy: baseWE, reasoning: `WE=${(baseWE*100).toFixed(0)}% is below the ${(MIN_WE_FOR_SONNET*100).toFixed(0)}% floor for ${league.toUpperCase()}${diff === 1 && league === 'nhl' ? ' 1-goal leads' : ''} — need stronger lead or later period to justify analysis` });
+          continue;
+        }
       }
     }
 
@@ -2494,6 +2511,15 @@ async function checkLiveScoreEdges() {
     // SJ (bottom team) won tonight with a 1-goal P3 lead. The baseline WE is real.
     // Bad teams DO protect leads 79% of the time (P3 1-goal). Let Claude assess
     // with full context instead of auto-blocking. Win rate is now a prompt adjustment.
+
+    // SWING MODE: max 2 concurrent swing trades
+    if (isSwingMode) {
+      const openSwingCount = openPositions.filter(p => p.strategy === 'live-swing').length;
+      if (openSwingCount >= 2) {
+        console.log(`[live-swing] BLOCKED: already ${openSwingCount} open swing trades (max 2)`);
+        continue;
+      }
+    }
 
     // Cap Sonnet calls per cycle to avoid stale prices on later games
     if (sonnetCallsThisCycle >= MAX_SONNET_PER_CYCLE) {
@@ -2820,8 +2846,12 @@ async function checkLiveScoreEdges() {
         }
 
         const livePrompt =
-          `You are a professional sports bettor. Your job is NOT to predict whether the leading team wins — the WE baseline already does that. Your job is to find a SPECIFIC, VERIFIABLE reason the market has this priced wrong.\n\n` +
-          `The DEFAULT answer is NO. The market has the same live score we do, plus more. If you cannot name one concrete fact that explains why the market is underpricing this team, say no.\n\n` +
+          (isSwingMode
+            ? `You are a professional sports bettor evaluating a SWING TRADE — NOT a hold-to-settlement bet. We buy now and sell when the price rises +12¢. We do NOT need this team to win the game, just to extend or protect their lead long enough for the price to spike.\n\n` +
+              `The DEFAULT answer is NO. Swing trades need SHORT-TERM momentum — a reason the price will rise in the next 1-2 periods. If you cannot name a concrete catalyst for a near-term price increase, say no.\n\n`
+            : `You are a professional sports bettor. Your job is NOT to predict whether the leading team wins — the WE baseline already does that. Your job is to find a SPECIFIC, VERIFIABLE reason the market has this priced wrong.\n\n` +
+              `The DEFAULT answer is NO. The market has the same live score we do, plus more. If you cannot name one concrete fact that explains why the market is underpricing this team, say no.\n\n`
+          ) + +
           `═══ LIVE ${league.toUpperCase()} GAME ═══\n` +
           `${away.team?.displayName} (${awayRecord}${awayRoadRec ? ', ' + awayRoadRec + ' away' : ''}) ${awayScore}\n` +
           `  at\n` +
@@ -2931,13 +2961,22 @@ async function checkLiveScoreEdges() {
           `Put that thesis in your reasoning field as "STEEL-MAN: [their argument in one sentence]". Then answer: does your edge-reason beat their thesis, or is it just different?\n` +
           `If you cannot articulate a real counter-argument — if you catch yourself dismissing the market as "wrong" without naming what they see — pass. A pro bettor who can't steel-man the other side hasn't done the work.\n\n` +
           `═══ STEP 4 — DECISION ═══\n` +
-          (_weTimeAdjPct != null
-            ? `⚠️ CALIBRATION CHECK: Time-adjusted WE = ${_weTimeAdjPct}% for ${targetAbbr}${_weTimeAdjPct !== _weTargetPct ? ` (period average was ${_weTargetPct}%, adjusted for ${_timeAdj.label})` : ''}. Your final confidence must be within 6 points of the TIME-ADJUSTED number — not the period average. If it's not, name the single specific confirmed fact that justifies the deviation. "They're the better team" does not count.\n\n`
-            : _weTargetPct != null ? `⚠️ CALIBRATION CHECK: WE = ${_weTargetPct}% for ${targetAbbr}. Your final confidence must be within 8 points of this number.\n\n` : '') +
-          `BUY only if ALL three are true:\n` +
-          `✓ Confidence ≥ 65%\n` +
-          `✓ Confidence beats price by 3+ points for late-game strong leads (WE ≥ 80%, inning 7+ / P3 / Q4). 4+ points required for early game (Q1/P1/innings 1-5) or marginal leads under 80% WE.\n` +
-          `✓ You have CLEAR conviction. If you had to talk yourself into it, say NO.\n` +
+          (isSwingMode
+            ? `⚠️ SWING TRADE MODE: This is a swing trade — we exit at +12¢ profit, NOT hold to settlement.\n` +
+              `Focus on SHORT-TERM price momentum: will this team extend their lead or maintain it long enough for a 12¢ price spike?\n\n` +
+              `BUY only if ALL are true:\n` +
+              `✓ Confidence ≥ 68% that the price will rise 12¢+ within the next 1-2 periods\n` +
+              `✓ Entry price ≤ 65¢ (we need room for the price to spike)\n` +
+              `✓ You can name a specific near-term catalyst (pitcher cruising, team on a run, power play coming)\n` +
+              `✓ The lead is likely to hold or grow in the next 15-30 minutes\n`
+            : (_weTimeAdjPct != null
+              ? `⚠️ CALIBRATION CHECK: Time-adjusted WE = ${_weTimeAdjPct}% for ${targetAbbr}${_weTimeAdjPct !== _weTargetPct ? ` (period average was ${_weTargetPct}%, adjusted for ${_timeAdj.label})` : ''}. Your final confidence must be within 6 points of the TIME-ADJUSTED number — not the period average. If it's not, name the single specific confirmed fact that justifies the deviation. "They're the better team" does not count.\n\n`
+              : _weTargetPct != null ? `⚠️ CALIBRATION CHECK: WE = ${_weTargetPct}% for ${targetAbbr}. Your final confidence must be within 8 points of this number.\n\n` : '') +
+            `BUY only if ALL three are true:\n` +
+            `✓ Confidence ≥ 65%\n` +
+            `✓ Confidence beats price by 3+ points for late-game strong leads (WE ≥ 80%, inning 7+ / P3 / Q4). 4+ points required for early game (Q1/P1/innings 1-5) or marginal leads under 80% WE.\n` +
+            `✓ You have CLEAR conviction. If you had to talk yourself into it, say NO.\n`
+          ) +
           `${targetAbbr !== leadingAbbr ? `⚠️ UNDERDOG BET — HARD CAPS (non-negotiable):\n` +
             `  • Your confidence CANNOT exceed ${league === 'nhl' ? '58' : league === 'nba' ? '60' : league === 'mlb' ? '58' : '55'}% regardless of team quality.\n` +
             `  • Historical comeback rate for this deficit/time is the anchor — team records add AT MOST +10% above it.\n` +
@@ -3055,7 +3094,12 @@ async function checkLiveScoreEdges() {
         // Block if we already have a position on this game — prevents duplicate buys and both-sides bets.
         // Exception: if a pre-game position has already taken ≥50% profit (partial exit done),
         // allow a fresh same-direction live entry up to the game exposure cap.
+        // Swing mode: NO scale-in, NO escalation — hard block if any position exists.
         const currentScoreKey = scoreKey(homeScore, awayScore);
+        if (isSwingMode && hasPosition) {
+          console.log(`[live-swing] BLOCKED ${targetAbbr}: already have position on ${homeAbbr}@${awayAbbr} — no escalation for swing trades`);
+          continue;
+        }
         if (hasPosition) {
           const isSameDirection = pgPositionTeam && pgPositionTeam === targetAbbr?.toUpperCase();
           const partialExitDone = pgPositionFraction <= 0.5;
@@ -3307,11 +3351,22 @@ async function checkLiveScoreEdges() {
           }
         }
 
+        // Swing mode: entry price must be ≤65¢ and confidence ≥68%
+        if (isSwingMode) {
+          if (price > 0.65) {
+            console.log(`[live-swing] BLOCKED ${targetAbbr}: price ${(price*100).toFixed(0)}¢ > 65¢ cap for swing trades`);
+            continue;
+          }
+          if (confidence < 0.68) {
+            console.log(`[live-swing] BLOCKED ${targetAbbr}: confidence ${(confidence*100).toFixed(0)}% < 68% min for swing trades`);
+            continue;
+          }
+        }
+
         // Dynamic margin — sport-aware, price-aware, situation-aware
-        // Hard floor: require at least 5% edge. 3% was too thin — SJ@NSH had 1-4pt edge and still bet.
-        // Min edge lowered from 5% back to 4%: SJ won tonight at 4% edge.
-        // 5% was too tight — blocks valid bets. Sport base margins already handle per-sport.
-        const reqMargin = Math.max(0.04, getRequiredMargin(price, {
+        // Swing mode uses 3% floor (we exit at +12¢, not settlement — tighter edge OK).
+        // Standard mode uses 4% floor.
+        const reqMargin = Math.max(isSwingMode ? 0.03 : 0.04, getRequiredMargin(price, {
           sport: league, live: true,
           scoreChanged: !!item._scoreChanged,
           lineMove: !!item._lineMove,
@@ -3359,12 +3414,13 @@ async function checkLiveScoreEdges() {
           league === 'nba' ? (period <= 2 ? 'early' : period === 3 ? 'mid' : 'late') :
           league === 'nhl' ? (period === 1 ? 'early' : period === 2 ? 'mid' : 'late') :
           period === 1 ? 'early' : 'late';
-        const hcCheck = checkHighConviction(confidence, league, liveStage, diff, period, bestPrice);
-        const maxBetLE = hcCheck.isHighConv
+        const hcCheck = isSwingMode ? { isHighConv: false } : checkHighConviction(confidence, league, liveStage, diff, period, bestPrice);
+        let maxBetLE = hcCheck.isHighConv
           ? getPositionSize(best.platform, bestEdge, hcCheck.tier)
           : getPositionSize(best.platform, bestEdge);
+        if (isSwingMode) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for swing trades
         const claudeBet = decision.betAmount ?? 0;
-        const safeBet = hcCheck.isHighConv ? maxBetLE : Math.min(claudeBet, maxBetLE);
+        const safeBet = hcCheck.isHighConv ? maxBetLE : Math.min(claudeBet > 0 ? claudeBet : maxBetLE, maxBetLE);
         if (safeBet < 1) {
           console.log(`[live-edge] BLOCKED ${targetAbbr}: bet too small (max=$${maxBetLE.toFixed(2)} Claude=$${claudeBet})`);
           continue;
@@ -3430,7 +3486,7 @@ async function checkLiveScoreEdges() {
 
           logTrade({
             exchange: best.platform,
-            strategy: hcCheck.isHighConv ? 'high-conviction' : 'live-prediction',
+            strategy: isSwingMode ? 'live-swing' : hcCheck.isHighConv ? 'high-conviction' : 'live-prediction',
             ticker: best.platform === 'polymarket' ? best.slug : ticker,
             title, side: 'yes',
             quantity: actualFill, entryPrice: bestPrice, deployCost: actualDeployed,
@@ -3453,7 +3509,8 @@ async function checkLiveScoreEdges() {
 
           const savedMsg = best.platform === 'polymarket' ? `\n💡 Bought on Poly (${(price*100).toFixed(0)}¢ Kalshi → ${priceInCents}¢ Poly)` : '';
           const hcMsg = hcCheck.isHighConv ? `\n🔥 HIGH CONVICTION — ${hcCheck.reason}` : '';
-          const betLabel = hcCheck.isHighConv ? '🔥 HIGH CONVICTION' :
+          const betLabel = isSwingMode ? '🔄 SWING TRADE' :
+            hcCheck.isHighConv ? '🔥 HIGH CONVICTION' :
             targetAbbr === leadingAbbr ? '🎯 PREDICTION' : '🐕 UNDERDOG';
           await tg(
             `<b>${betLabel} BET — ${best.platform.toUpperCase()}</b>\n\n` +
@@ -3464,7 +3521,7 @@ async function checkLiveScoreEdges() {
             `Team: <b>${targetAbbr}</b> YES @ ${priceInCents}¢ × ${actualFill} = <b>$${actualDeployed.toFixed(2)}</b>\n` +
             `Confidence: <b>${(confidence*100).toFixed(0)}%</b> | Edge: <b>+${Math.round((confidence - bestPrice) * 100)}pts</b>\n` +
             `Win expectancy: ${weAtEntry !== null ? `${(weAtEntry*100).toFixed(0)}%` : 'N/A'} | Period: ${period}\n` +
-            `Stop-loss: ~${Math.round(bestPrice * 100 * 0.86)}¢ | Max profit: <b>$${(actualFill * (1 - bestPrice)).toFixed(2)}</b>${savedMsg}${hcMsg}\n\n` +
+            `${isSwingMode ? `Exit: +12¢ profit (${priceInCents + 12}¢) | Stop: -10¢ (${priceInCents - 10}¢)` : `Stop-loss: ~${Math.round(bestPrice * 100 * 0.86)}¢ | Max profit: <b>$${(actualFill * (1 - bestPrice)).toFixed(2)}</b>`}${savedMsg}${hcMsg}\n\n` +
             `🧠 <b>REASONING</b>\n` +
             `${decision.reasoning}`
           );
@@ -5412,6 +5469,60 @@ async function managePositions() {
             }
             continue;
           }
+        }
+
+        // === LIVE SWING EXIT PATHS ===
+        // Swing trades exit on profit, hard-stop, or thesis expiry — never hold to settlement.
+        if (trade.strategy === 'live-swing') {
+          const swingProfit = currentPrice - entryPrice;
+          const periodsElapsed = ctx?.period != null && trade.periodAtEntry != null
+            ? ctx.period - trade.periodAtEntry : 0;
+
+          // 1. PROFIT-LOCK: sell all at +12¢
+          if (swingProfit >= 0.12) {
+            const gainPct = Math.round((swingProfit / entryPrice) * 100);
+            console.log(`[exit] 🔄💰 SWING PROFIT-LOCK: ${trade.ticker} up ${(swingProfit*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
+            await tg(
+              `🔄💰 <b>SWING PROFIT-LOCK</b>\n\n` +
+              `${trade.title}\n` +
+              `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(swingProfit*100).toFixed(0)}¢, +${gainPct}%)\n` +
+              `Profit: <b>+$${(qty * swingProfit).toFixed(2)}</b>`
+            );
+            const result = await executeSell(trade, qty, currentPrice, 'swing-profit-lock');
+            if (result) anyUpdated = true;
+            continue;
+          }
+
+          // 2. HARD-STOP: sell at -10¢ after 1+ period elapsed
+          if (periodsElapsed >= 1 && swingProfit <= -0.10) {
+            console.log(`[exit] 🔄🛑 SWING HARD-STOP: ${trade.ticker} down ${Math.round(-swingProfit*100)}¢ after ${periodsElapsed} period(s) — cutting loss`);
+            await tg(
+              `🔄🛑 <b>SWING HARD-STOP</b>\n\n` +
+              `${trade.title}\n` +
+              `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (${(swingProfit*100).toFixed(0)}¢)\n` +
+              `Loss: <b>$${(qty * swingProfit).toFixed(2)}</b> — ${periodsElapsed} period(s) elapsed, thesis failed`
+            );
+            const result = await executeSell(trade, qty, currentPrice, 'swing-hard-stop');
+            if (result) anyUpdated = true;
+            continue;
+          }
+
+          // 3. THESIS-EXPIRY: sell if <+8¢ after 2+ periods (didn't spike, momentum gone)
+          if (periodsElapsed >= 2 && swingProfit < 0.08) {
+            console.log(`[exit] 🔄⏰ SWING THESIS-EXPIRY: ${trade.ticker} only +${(swingProfit*100).toFixed(0)}¢ after ${periodsElapsed} periods — exiting (need +12¢, got <+8¢)`);
+            await tg(
+              `🔄⏰ <b>SWING THESIS-EXPIRY</b>\n\n` +
+              `${trade.title}\n` +
+              `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(swingProfit*100).toFixed(0)}¢)\n` +
+              `${swingProfit > 0 ? `Small gain: +$${(qty * swingProfit).toFixed(2)}` : `Loss: $${(qty * swingProfit).toFixed(2)}`} — 2+ periods, no momentum, exiting`
+            );
+            const result = await executeSell(trade, qty, currentPrice, 'swing-thesis-expiry');
+            if (result) anyUpdated = true;
+            continue;
+          }
+
+          // Swing trades skip all other exit logic — they ONLY exit via the 3 paths above
+          continue;
         }
 
         // PRE-GAME PRICE DROP MONITOR — exit before game starts if market reprices sharply.
