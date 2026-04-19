@@ -2221,6 +2221,49 @@ async function checkLiveScoreEdges() {
                 // Sell to capture the late-game premium before a blown save wipes the gain.
                 sellFraction = 1.0;
                 sellReason = `pg-profit-late (${lead}-${lead === 0 ? 'tie' : 'run/goal/pt'} lead ${stage} game inn/pd ${game.period} — closing out)`;
+              } else if (gainCents >= 0.10 && (stage === 'mid' || stage === 'early') && lead >= 1 && !trade.pgWinThesisChecked) {
+                // MILESTONE RE-EVALUATION: position profitable + leading + not yet milestone-evaluated.
+                // Ask Claude: thesis confirmed? Hold to settlement for maximum gain, or lock profits now?
+                // This captures "COL up +15¢ in inning 3 after scoring 2 early — should we ride this?"
+                tradeCooldowns.set(pgWinKey, Date.now());
+                trade.pgWinThesisChecked = true;
+                const pgWinThesisLeague = league;
+                const pgWinThesisSport = pgWinThesisLeague === 'nhl' ? 'NHL' : pgWinThesisLeague === 'nba' ? 'NBA' : pgWinThesisLeague === 'mlb' ? 'MLB' : 'Soccer';
+                const pgWinPrompt =
+                  `You manage a pre-game ${pgWinThesisSport} bet that is currently WINNING. Decide: HOLD to settlement for maximum gain, or LOCK profits now at the profit target.\n\n` +
+                  `POSITION: Bought ${ourTeam} YES at ${(entryPg*100).toFixed(0)}¢. Current price: ${Math.round(currentPricePg*100)}¢ (+${Math.round(gainCents*100)}¢, +${Math.round((gainCents/entryPg)*100)}%).\n` +
+                  `Live score: ${awayAbbr} ${game.awayScore} @ ${homeAbbr} ${game.homeScore} | ${game.detail} | Stage: ${stage.toUpperCase()}\n` +
+                  `Our team (${ourTeam}) is LEADING by ${lead}.\n\n` +
+                  `ORIGINAL THESIS: "${trade.reasoning}"\n\n` +
+                  `QUESTION: Is the original edge (starter quality, matchup, lineup advantage) still actively in play given the current game state? ` +
+                  `If the thesis is confirmed and the team looks dominant, HOLD for settlement (full win value). ` +
+                  `If the lead is fragile or the thesis is expiring, LOCK profits now.\n\n` +
+                  `Profit if locked now: +$${(gainCents * qty).toFixed(2)}. Profit if held to settlement win: +$${((1 - entryPg) * qty).toFixed(2)}.\n\n` +
+                  `JSON ONLY: {"action": "hold"/"lock", "reasoning": "one sentence"}`;
+                try {
+                  const pgWinText = await claudeSonnet(pgWinPrompt, { maxTokens: 300, timeout: 15000 });
+                  if (pgWinText) {
+                    const pgWinJson = extractJSON(pgWinText);
+                    if (pgWinJson) {
+                      const pgWinD = JSON.parse(pgWinJson);
+                      console.log(`[pg-win] 🧠 MILESTONE CHECK ${pgWinD.action?.toUpperCase()}: ${trade.ticker} +${Math.round(gainCents*100)}¢ ${stage} | ${pgWinD.reasoning?.slice(0, 80)}`);
+                      if (pgWinD.action === 'hold') {
+                        // Mark trade so managePositions skips the +12¢ profit-lock
+                        trade.pgHoldToSettlement = true;
+                        const holdLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+                        const holdTrades = holdLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+                        const holdT = holdTrades.find(t => t.id === trade.id);
+                        if (holdT) {
+                          holdT.pgHoldToSettlement = true;
+                          holdT.pgWinThesisChecked = true;
+                          writeFileSync(TRADES_LOG, holdTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
+                        }
+                        await tg(`🏆 <b>PRE-GAME: RIDING TO SETTLEMENT</b>\n${trade.title ?? trade.ticker}\n+${Math.round(gainCents*100)}¢ in ${stage} — thesis confirmed, skipping profit-lock target\n${pgWinD.reasoning ?? ''}`);
+                      }
+                      // if 'lock': do nothing — managePositions handles the +12¢ exit normally
+                    }
+                  }
+                } catch { /* skip milestone check on error */ }
               }
 
               if (sellFraction > 0 && !trade.partialTakeAt) {
@@ -2410,10 +2453,13 @@ async function checkLiveScoreEdges() {
           `${thesisContext}\n` +
           `${contraContext}\n` +
           `YOUR CORE QUESTION: Estimate the true win probability for ${ourTeam} RIGHT NOW.\n` +
-          `${stage !== 'late'
-            ? `IMPORTANT — game stage is ${stage.toUpperCase()}: The original thesis factor (weak starter, hot goalie, lineup edge) is still part of the picture if it hasn't been invalidated. Check: is the thesis factor still in play? Same goalie? Starter still in? If yes, weight it into your estimate — don't ignore it just because the opponent scored.\n`
+          (stage === 'early'
+            ? `🚨 EARLY GAME CONSTRAINT (${sport} — ${league === 'mlb' ? 'innings 1-4' : league === 'nhl' ? 'period 1' : league === 'nba' ? 'Q1-Q2' : '1st half'}): Do NOT recommend sell_all unless BOTH are true: (1) deficit is ${league === 'mlb' ? '4+ runs' : league === 'nba' ? '15+ points' : '2+ goals/points'} AND (2) the original thesis factor is clearly dead (starter pulled, goalie changed, star player fouled out). A single goal/run scored against us in early game is NORMAL variance — it is not a reason to exit. Our hard-stop rules protect against catastrophic losses. Your job is NOT to exit early variance.\n`
+            : stage === 'mid'
+            ? `IMPORTANT — game stage is MID: The original thesis factor is still relevant if not invalidated. Check: is the starter still in? Same goalie? If yes, the thesis has not expired — weight it into your estimate. Only recommend sell_all if the deficit is severe (${league === 'mlb' ? '4+ runs after inning 5' : league === 'nba' ? '20+ points' : '2+ goals'}) or the thesis factor is clearly dead.\n`
             : `Game is LATE — weight current score and time remaining heavily. The original thesis matters less now.\n`
-          }` +
+          ) +
+          (thesisAlert && !thesisIsKiller ? `📍 LIVE STATUS: ${thesisAlert}\n` : '') +
           `Then compare your estimate to the current market price of ${(currentPrice*100).toFixed(0)}¢.\n\n` +
           `THE DECISION FRAMEWORK:\n` +
           `- Your estimate is 15+ points above market (e.g. you think 40%, market shows 24¢): HOLD — clear edge\n` +
@@ -2422,7 +2468,7 @@ async function checkLiveScoreEdges() {
           `- Your estimate is 1–5 points below market: SELL HALF — slight negative but within noise; cut exposure, don't panic-exit\n` +
           `- Your estimate is 5+ points below market: SELL ALL — market is being generous, take it\n` +
           `- Game is late AND trailing by 2+: lean sell_all unless estimate is 15+ above price\n` +
-          `- Game is early/mid AND thesis factor still intact: lean toward hold/sell_half unless estimate is clearly negative\n` +
+          `- Game is EARLY: lean HOLD/sell_half — see constraint above. Do NOT sell_all on early variance alone.\n` +
           `NOTE: Estimates within ±5 points of market are noise — do NOT treat a small negative gap as a strong sell signal.\n\n` +
           `OPTIONS:\n` +
           `A) sell_all — estimate is 5+ below market, or late game large deficit, or thesis clearly dead. Lock loss of $${lossAmt.toFixed(2)}, recover $${(qty * currentPrice).toFixed(2)}.\n` +
@@ -4365,6 +4411,9 @@ async function checkPreGamePredictions() {
     { key: 'NBA', path: 'basketball/nba' },
     { key: 'MLS', path: 'soccer/usa.1' },
   ];
+  // espnRosterMap: team abbr (lowercase) → { active: string[], inactive: string[] }
+  // Used to inject confirmed roster/lineup into prompts so Claude can't hallucinate wrong players
+  const espnRosterMap = new Map();
   await Promise.all(espnSportPaths.map(async ({ key, path }) => {
     try {
       const res = await fetch(`http://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard`, {
@@ -4406,42 +4455,82 @@ async function checkPreGamePredictions() {
               sport: key,
             });
           }
+          // NBA: extract active/inactive player list to prevent hallucinated lineups
+          if (key === 'NBA' && abbr) {
+            const roster = team.roster ?? [];
+            const active = roster.filter(r => !r.didNotPlay).map(r => r.athlete?.displayName ?? r.athlete?.shortName ?? '').filter(Boolean);
+            const inactive = roster.filter(r => r.didNotPlay).map(r => r.athlete?.displayName ?? r.athlete?.shortName ?? '').filter(Boolean);
+            if (active.length > 0 || inactive.length > 0) {
+              espnRosterMap.set(abbr, { active, inactive, teamName: team.team?.displayName ?? '' });
+            }
+          }
         }
       }
     } catch { /* skip — ESPN down or timeout */ }
   }));
 
-  // Build a per-market starter context string to inject at the top of each prompt
+  // Build a per-market starter context string to inject at the top of each prompt.
+  // These stats are ESPN ground truth — Claude must not contradict or hallucinate different numbers.
   const buildStarterContext = (market) => {
     const t1 = espnStarterMap.get(market.team1.team.toLowerCase());
     const t2 = espnStarterMap.get(market.team2.team.toLowerCase());
-    if (!t1 && !t2) return '';
+    const r1 = espnRosterMap.get(market.team1.team.toLowerCase());
+    const r2 = espnRosterMap.get(market.team2.team.toLowerCase());
+    const hasStarters = t1 || t2;
+    const hasRosters  = r1 || r2;
+    if (!hasStarters && !hasRosters) return '';
+
     const fmt = (abbr, s) => {
       if (!s) return `  ${abbr}: NOT IN ESPN — treat starter as unconfirmed`;
-      const mlbStats = s.era ? ` (${s.w ?? '?'}-${s.l ?? '?'}, ERA ${s.era}${s.whip ? ', WHIP ' + s.whip : ''})` : '';
-      const nhlStats = s.svPct ? ` (SV% ${s.svPct}, GAA ${s.gaa ?? '?'})` : '';
-      return `  ${abbr}: ${s.name}${mlbStats}${nhlStats} ← ESPN confirmed`;
+      const mlbStats = s.era
+        ? ` | Record: ${s.w ?? '?'}-${s.l ?? '?'} | ERA: ${s.era} | WHIP: ${s.whip ?? '?'}`
+        : '';
+      const nhlStats = s.svPct ? ` | SV%: ${s.svPct} | GAA: ${s.gaa ?? '?'}` : '';
+      return `  ${abbr}: ${s.name}${mlbStats}${nhlStats}  ← ESPN confirmed starter`;
     };
-    return (
-      `⚡ ESPN REAL-TIME STARTERS (confirmed — treat as authoritative, no need to verify):\n` +
-      fmt(market.team1.team, t1) + '\n' +
-      fmt(market.team2.team, t2) + '\n' +
-      `Starters above are authoritative — do NOT fire Hard NO for "unconfirmed" if ESPN provided the name.\n` +
-      `Use your training knowledge for pitcher/goalie quality assessment.\n\n`
-    );
+
+    const fmtRoster = (abbr, r) => {
+      if (!r) return '';
+      const t = r.teamName ? `${abbr} (${r.teamName})` : abbr;
+      const inactStr = r.inactive.length > 0 ? `\n    OUT/DNP: ${r.inactive.slice(0, 8).join(', ')}` : '';
+      const actStr = r.active.length > 0 ? `\n    Available: ${r.active.slice(0, 8).join(', ')}` : '';
+      return `  ${t}:${actStr}${inactStr}`;
+    };
+
+    let out = `⚡ ESPN GROUND TRUTH — DO NOT CONTRADICT THESE NUMBERS IN YOUR REASONING:\n`;
+    if (hasStarters) {
+      out += fmt(market.team1.team, t1) + '\n';
+      out += fmt(market.team2.team, t2) + '\n';
+      out += `⛔ STAT INTEGRITY RULES:\n`;
+      out += `  • The ERA/WHIP/SV% numbers above are the authoritative ground truth for today.\n`;
+      out += `  • Do NOT cite different ERA/WHIP/SV% values in your reasoning — your training data may be stale.\n`;
+      out += `  • If your web search returns a different ERA, explicitly note "ESPN shows X, search shows Y" and explain why you prefer one.\n`;
+      out += `  • Treat starters as confirmed. Only fire Hard NO for "unconfirmed" if ESPN shows "NOT IN ESPN."\n`;
+    }
+    if (hasRosters) {
+      out += `\n📋 ESPN ROSTER STATUS (confirmed active/inactive players):\n`;
+      out += fmtRoster(market.team1.team, r1) + '\n';
+      out += fmtRoster(market.team2.team, r2) + '\n';
+      out += `  ⚠️ ROSTER INTEGRITY: Only cite players listed above. Do NOT reference players from other teams.\n`;
+    }
+    out += `\n`;
+    return out;
   };
 
   const pgPrompts = pgSlice.map(market => {
     const tk = market.base ?? '';
     const sport = tk.includes('NBA') ? 'NBA' : tk.includes('NHL') ? 'NHL' :
       tk.includes('MLB') ? 'MLB' : tk.includes('MLS') ? 'MLS' :
-      tk.includes('EPL') ? 'EPL' : tk.includes('LALIGA') ? 'La Liga' : 'Sport';
+      tk.includes('EPL') ? 'EPL' : tk.includes('LALIGA') ? 'La Liga' :
+      tk.includes('SERIAA') ? 'Serie A' : tk.includes('BUNDESLIGA') ? 'Bundesliga' :
+      tk.includes('LIGUE1') ? 'Ligue 1' : 'Sport';
     const starterCtx = buildStarterContext(market);
 
     const pgPromptText = sport === 'NBA'
       ? `You are a professional NBA swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
         `STRATEGY: We buy pre-game and SELL when the price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building a lead, or the opponent struggling. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing. Find a genuine win-probability edge over the posted price.\n\n` +
-        `⚠️ DATA RULES: You have ONE web search. Use it to check TODAY's injury report + rest/lineup news for both teams. For any star player whose 2026 status you cannot confirm after searching, apply a 3% uncertainty penalty and continue — do NOT use uncertainty as a reason to pass unless it would affect a Hard NO.\n\n` +
+        `⚠️ DATA RULES: ESPN roster data is injected above — use it. You have ONE web search. Use it to check TODAY's injury report, back-to-back schedule, and rest news for both teams. If ESPN provided active/inactive players above, those are confirmed — do NOT contradict them. For any star player whose 2026 status you cannot confirm after searching, apply a 3% uncertainty penalty and continue — do NOT use uncertainty as a reason to pass unless it would affect a Hard NO.\n` +
+        `⚠️ ROSTER INTEGRITY: Only cite players who play for the SPECIFIC teams in this game. Do NOT reference players from other franchises.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
@@ -4473,6 +4562,12 @@ async function checkPreGamePredictions() {
         `✓ Confidence beats current price by 4+ points\n` +
         `✓ You have a SPECIFIC edge catalyst — not just "better team"\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
+        `📊 CONFIDENCE CALIBRATION — use this scale precisely:\n` +
+        `  0.65 = marginal edge (1 weak factor confirmed)\n` +
+        `  0.70 = clear edge (2+ independently confirmed factors)\n` +
+        `  0.75 = strong edge (3 factors — injury, rest advantage, AND motivation/matchup)\n` +
+        `  0.80+ = exceptional (reserved for opponent missing 2+ stars + confirmed tanking/rest + blowout matchup — all must be verified from your search, not assumed)\n` +
+        `⛔ If you reach 0.75+, you MUST list each factor as a separate sentence in your reasoning. Stacking adjustments without independent confirmation = cap at 0.72.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. opponent resting 3 starters, team motivated for playoff seeding — price rises when they build Q1 lead","reasoning":"one sentence"}`
@@ -4480,14 +4575,15 @@ async function checkPreGamePredictions() {
       : sport === 'NHL'
       ? `You are a professional NHL swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
         `STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring first, building a lead, or the opponent struggling early. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing. Goalie matchup and special teams are the primary drivers in NHL win probability.\n\n` +
-        `⚠️ DATA RULES: ESPN-confirmed goalies are provided above. You have ONE web search — use it to confirm goalie starts, check for late scratches, and verify special teams rankings. If ESPN provided a starting goalie, treat them as CONFIRMED. Only fire Hard NO for "unconfirmed" if ESPN shows "NOT IN ESPN."\n\n` +
+        `⚠️ DATA RULES: ESPN-confirmed goalies and their SV%/GAA are provided above — those numbers are authoritative ground truth. Do NOT contradict ESPN stats with different values from training data. You have ONE web search — use it to check for late goalie changes, scratches, special teams rankings, and back-to-back schedule. If ESPN provided a goalie, treat them as CONFIRMED. Only fire Hard NO for "unconfirmed" if ESPN shows "NOT IN ESPN."\n` +
+        `⚠️ ROSTER INTEGRITY: Only cite players who play for ${market.team1.teamName} or ${market.team2.teamName}. Do NOT reference players from other franchises.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `WIN PROBABILITY BASELINE: NHL home teams win (in regulation + OT) ~55% of games. An elite goalie vs. a backup can push that to 62%+. A team on back-to-back drops to ~47%.\n\n` +
         `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
         `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} goalie confirmed injury news" and use results to assess:\n` +
-        `A) GOALIES: Goalies confirmed above from ESPN. Verify with search results — any late goalie changes? Assess each goalie's win probability impact using 2026 SEASON save percentage (not career average — form matters). An elite goalie (SV% > .920) vs. a backup (.890) is a 10-15% win probability swing. In playoff context: search for the goalie's 2026 PLAYOFF SV% specifically — playoff goaltending is higher-leverage and elite goalies (Bobrovsky, Hellebuyck, etc.) outperform their regular-season numbers in elimination games. A 0.01 SV% difference at the playoff level (~30 shots/game) is worth 3-4% WP shift.\n` +
+        `A) GOALIES: Goalies confirmed above from ESPN — use the ESPN SV%/GAA as ground truth. Verify with search for any last-minute changes. Assess each goalie's win probability impact. An elite goalie (SV% > .920) vs. a backup (.890) is a 10-15% win probability swing. In playoff context: search for 2026 PLAYOFF SV% specifically — elite goalies outperform regular-season numbers in elimination games.\n` +
         `B) SPECIAL TEAMS: From search + training knowledge, assess power play and penalty kill quality. Top-5 PP teams convert at a higher rate and generate scoring momentum.\n` +
         `C) FATIGUE: Is either team on a back-to-back? NHL back-to-back teams win at ~8% lower rates.\n` +
         `D) MOTIVATION: Playoff race intensity for each team. Teams fighting for seeding play harder in regulation.\n\n` +
@@ -4510,7 +4606,13 @@ async function checkPreGamePredictions() {
         `BUY only if ALL are true:\n` +
         `✓ Confidence ≥ 70% (win probability)\n` +
         `✓ Confidence beats current price by 4+ points\n` +
-        `✓ Goalie is confirmed AND you have a specific win-probability edge\n` +
+        `✓ Goalie is confirmed AND you have a specific win-probability edge\n\n` +
+        `📊 CONFIDENCE CALIBRATION — use this scale precisely:\n` +
+        `  0.65 = slight edge (goalie mismatch alone, or back-to-back alone)\n` +
+        `  0.70 = clear edge (elite goalie SV% > .920 vs backup, confirmed)\n` +
+        `  0.75 = strong edge (elite goalie + fatigue disadvantage for opponent + motivation)\n` +
+        `  0.80+ = exceptional (dominant goalie in playoff context + opponent depleted + home ice — all must be verified from search, not assumed)\n` +
+        `⛔ SV%/GAA values above are from ESPN — use them exactly. If your search returns a different SV%, note both values.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. elite goalie SV .928 vs backup .891 — price rises when they score first","reasoning":"one sentence"}`
@@ -4519,7 +4621,8 @@ async function checkPreGamePredictions() {
       sport === 'MLB'
       ? `You are a professional MLB swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
         `STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building an early lead, or the opponent's starter struggling. Your confidence = "what is the real probability this team WINS today?" Starting pitching is the dominant driver of MLB win probability. An ace vs. a weak lineup can win 65%+ of games; a weak starter on your side drops it below 45%.\n\n` +
-        `⚠️ DATA RULES: ESPN-confirmed starters are provided above. You have ONE web search — use it to verify pitcher stats, check for late lineup changes, and confirm bullpen availability. If a starter is listed above, treat them as confirmed. Flag any pitcher whose career ERA you cannot confirm — if truly unknown, treat as average (ERA ~4.5).\n\n` +
+        `⚠️ DATA RULES: ESPN-confirmed starters and their ERA/WHIP are provided above — those are authoritative ground truth. Do NOT override ESPN stats with different values from your training data or web search. You have ONE web search — use it for: last 5 starts form, bullpen rest, lineup injuries, any late scratches. Do NOT search for pitcher ERA — it is already provided above.\n` +
+        `⚠️ ROSTER INTEGRITY: Only cite players who play for the SPECIFIC teams in this game. Verify any player name you mention belongs to ${market.team1.teamName} or ${market.team2.teamName}, not another franchise.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
@@ -4550,7 +4653,13 @@ async function checkPreGamePredictions() {
         `BUY only if ALL are true:\n` +
         `✓ Confidence ≥ 65% (win probability)\n` +
         `✓ Confidence beats current price by 4+ points\n` +
-        `✓ Both starters confirmed AND there's a clear pitching/matchup edge\n` +
+        `✓ Both starters confirmed AND there's a clear pitching/matchup edge\n\n` +
+        `📊 CONFIDENCE CALIBRATION — MLB scale (MLB is the most random sport):\n` +
+        `  0.65 = slight edge (ERA gap 2.5-3.5, lineup is solid but not dominant)\n` +
+        `  0.68 = clear edge (ERA gap 3.5+ confirmed from ESPN stats, or opponent ERA > 6.0)\n` +
+        `  0.72 = strong edge (ace ERA < 3.0 vs ERA > 5.5 confirmed + lineup has clear run-scoring advantage)\n` +
+        `  0.75+ = exceptional (ace ERA < 2.5 + opponent ERA > 6.5 + confirmed injuries to opponent lineup — all three independently verified from ESPN + search)\n` +
+        `⛔ ESPN ERA/WHIP above are ground truth. If you write a different ERA in your reasoning than what ESPN shows, your analysis is invalid. Use the ESPN number.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. ace ERA 2.8 vs ERA 5.1 starter — price rises when they score first and market reprices win probability","reasoning":"one sentence"}`
@@ -4588,7 +4697,13 @@ async function checkPreGamePredictions() {
         `BUY only if ALL are true:\n` +
         `✓ Confidence ≥ 65% (win probability)\n` +
         `✓ Confidence beats current price by 4+ points\n` +
-        `✓ You have a specific confirmed win-probability catalyst\n` +
+        `✓ You have a specific confirmed win-probability catalyst\n\n` +
+        `📊 CONFIDENCE CALIBRATION — Soccer scale (draw rate ~25% is a major suppressor):\n` +
+        `  0.65 = marginal edge (home favorite + leaky opponent defense)\n` +
+        `  0.70 = clear edge (prolific attack 2+/game vs defense conceding 1.5+/game, confirmed)\n` +
+        `  0.75 = strong edge (dominant home side + opponent missing key striker + motivation gap)\n` +
+        `  0.80+ = exceptional (all three: dominant attack, confirmed injuries to opponent, must-win context — all from search, not assumed)\n` +
+        `⛔ ROSTER INTEGRITY: Only cite players confirmed on ${market.team1.teamName} or ${market.team2.teamName} rosters. Do NOT reference players from other clubs.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. prolific attack vs defense conceding 1.8/game — price rises when they score first goal","reasoning":"one sentence"}`;
@@ -4717,6 +4832,19 @@ async function checkPreGamePredictions() {
       }
 
     let confidence = decision.confidence ?? 0;
+
+    // CONFIDENCE OUTLIER GATE: if Claude claims >0.75, require at least 2 numeric stats
+    // cited in the reasoning. High confidence on vague reasoning = overfit on narrative.
+    // Regex matches any stat pattern: ERA 3.2, SV% .921, 12.6 K/9, 1-5, 63%, etc.
+    if (confidence > 0.75) {
+      const fullReasoning = (decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? '');
+      const numericStatMatches = fullReasoning.match(/\b\d+\.?\d*\s*(?:%|ERA|WHIP|SV%|GAA|K\/9|R\/G|ppg|pts|win|loss|W-L|goals?|saves?|innings?)\b/gi) ?? [];
+      const distinctNumbers = (fullReasoning.match(/\b\d+\.\d+\b|\b\d{2,}\b/g) ?? []).length;
+      if (numericStatMatches.length < 2 && distinctNumbers < 3) {
+        console.log(`[pre-game] ⚠️ CONFIDENCE SOFT-CAP: ${market.base} confidence ${(confidence*100).toFixed(0)}% → 73% — high confidence but only ${numericStatMatches.length} verifiable stat(s) cited. Reasoning: ${fullReasoning.slice(0, 100)}`);
+        confidence = 0.73;
+      }
+    }
 
     // HARD CAP: Pre-game confidence capped at early-event baseline + sport-specific bonus.
     // Baselines are now EARLY-EVENT probabilities (first-goal / early-lead / early-scoring),
@@ -6227,7 +6355,7 @@ async function managePositions() {
         const confGainTarget = (confFloorPrice > entryPrice) ? (confFloorPrice - entryPrice) : 0;
         const pgProfitTarget = Math.max(pgStageProfitTarget, confGainTarget);
 
-        if (trade.strategy === 'pre-game-prediction' && profitPerContract >= pgProfitTarget && !trade.partialTakeAt) {
+        if (trade.strategy === 'pre-game-prediction' && profitPerContract >= pgProfitTarget && !trade.partialTakeAt && !trade.pgHoldToSettlement) {
           if (qty >= 1) {
             const gainPct = Math.round((profitPerContract / entryPrice) * 100);
             const anchorNote = confGainTarget > pgStageProfitTarget
