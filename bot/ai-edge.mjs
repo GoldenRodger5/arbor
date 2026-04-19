@@ -4722,6 +4722,16 @@ async function checkPreGamePredictions() {
       continue;
     }
 
+    // SOCCER MINIMUM PRICE: 55¢. Below 55¢ the payoff asymmetry is structurally unfavorable.
+    // At a 47¢ underdog entry, profit-lock at +20¢ = max gain of 43% on stake. A loss = -100%.
+    // You need >70% win rate to be +EV — no one hits that on MLS/EPL underdogs.
+    // Real data: MLS pre-game 2W-2L, -$34.83, with both losses being full wipeouts.
+    // At 55¢+, the favorite framing reduces loss severity and the payoff ratio improves.
+    if ((pgSportKey === 'mls' || pgSportKey === 'epl' || pgSportKey === 'laliga') && price < 0.55) {
+      console.log(`[pre-game] 🚫 SOCCER FLOOR: ${market.base} — ${pgSportKey.toUpperCase()} at ${(price*100).toFixed(0)}¢ below 55¢ minimum (underdog payoff asymmetry unfavorable below 55¢)`);
+      continue;
+    }
+
     const pgReqMargin = getRequiredMargin(price, { sport: pgSportKey, live: false });
     // Price-tiered minimum confidence — the required certainty scales with entry price.
     // Buying a 70¢ favorite requires high confidence (market has priced it well, little margin for error).
@@ -4863,6 +4873,25 @@ async function checkPreGamePredictions() {
         console.log(`[pre-game] ⏳ ESPN GATE: no starters confirmed for ${market.base} yet — deferring to paper-only until ESPN loads`);
         // Fall through to paper logging below (don't place real bet)
       } else {
+
+      // MLB ERA GAP GATE — require ≥2.5 ERA difference between confirmed starters.
+      // Data: MLB pre-game 4W-10L, -$60 net. The ERA mismatch signal is real (STL vs
+      // Burrows 6.55, TEX vs Crochet 7.58 worked) but marginal matchups (4.2 vs 3.8 ERA)
+      // add noise without edge. 2.5 gap filters those out. Only skips if BOTH ERAs are
+      // confirmed — if one is missing, let Claude decide.
+      if (pgSportKey === 'mlb') {
+        const t1ERA = parseFloat(espnT1?.era ?? 'NaN');
+        const t2ERA = parseFloat(espnT2?.era ?? 'NaN');
+        if (!isNaN(t1ERA) && !isNaN(t2ERA)) {
+          const eraGap = Math.abs(t1ERA - t2ERA);
+          if (eraGap < 2.5) {
+            console.log(`[pre-game] 🚫 MLB ERA GAP: ${market.base} — gap ${eraGap.toFixed(2)} (${espnT1?.name ?? '?'} ${t1ERA} ERA vs ${espnT2?.name ?? '?'} ${t2ERA} ERA) below 2.5 threshold — skipping`);
+            continue; // skip to next market — no paper log needed for hard filter
+          }
+          console.log(`[pre-game] ✅ MLB ERA GAP: ${market.base} — gap ${eraGap.toFixed(2)} clears 2.5 threshold (${espnT1?.name ?? '?'} ${t1ERA} vs ${espnT2?.name ?? '?'} ${t2ERA})`);
+        }
+      }
+
       // ── MLB STARTER CROSS-VALIDATION ──────────────────────────────────────
       // ESPN provides probable starters, but they can be wrong (late scratches,
       // bullpen games announced after ESPN updates). Before risking real money,
