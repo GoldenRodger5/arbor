@@ -3416,6 +3416,9 @@ async function checkLiveScoreEdges() {
               try {
                 const jt = JSON.parse(l);
                 if (jt.status === 'testing-void') continue;
+                // Fully exited positions are off the exchange — don't block new entries.
+                // Only open and closed-manual (may still be physically on exchange) should block.
+                if (jt.status !== 'open' && jt.status !== 'closed-manual') continue;
                 const jtMs = jt.timestamp ? Date.parse(jt.timestamp) : 0;
                 if (jtMs < dupStartMs || jtMs >= dupEndMs) continue;
                 const jticker = (jt.ticker ?? '').toLowerCase();
