@@ -4129,7 +4129,14 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
-        console.log(`[comeback] 🔄 Candidate: ${trailingAbbr} trailing ${g.awayScore}-${g.homeScore} inn${g.period} | ace ${trailingStarterName} (${trailingStarterERA} ERA) | opp ${leadingStarterName} (${leadingStarterERA} ERA) | ${inningsLeft} innings left | ${Math.round(trailingPrice*100)}¢ vs model ${comebackWinPct}%`);
+        // Code gate: trailing team's starter ERA > 5.5 means their pitcher is actively
+        // giving up runs — the deficit will grow, not shrink. No comeback edge.
+        if (!isNaN(parseFloat(trailingStarterERA)) && parseFloat(trailingStarterERA) > 5.5) {
+          console.log(`[comeback] 🚫 Skip ${trailingAbbr}: trailing starter ${trailingStarterName} ERA ${trailingStarterERA} > 5.5 — deficit likely to grow, not shrink`);
+          continue;
+        }
+
+        console.log(`[comeback] 🔄 Candidate: ${trailingAbbr} trailing ${g.awayScore}-${g.homeScore} inn${g.period} | trailing starter ${trailingStarterName} (${trailingStarterERA} ERA) | opp starter ${leadingStarterName} (${leadingStarterERA} ERA) | ${inningsLeft} innings left | ${Math.round(trailingPrice*100)}¢ vs model ${comebackWinPct}%`);
 
         // Sonnet evaluation — lightweight, no web search needed
         const cbPrompt =
@@ -4139,17 +4146,20 @@ async function checkLiveScoreEdges() {
           `Market prices ${trailingAbbr} YES at ${Math.round(trailingPrice*100)}¢ (implies ${Math.round(trailingPrice*100)}% win probability)\n` +
           `Statistical comeback rate for this deficit/inning: ${comebackWinPct}%\n\n` +
           `PITCHER DATA (ESPN confirmed):\n` +
-          `${trailingAbbr} starter: ${trailingStarterName} — ERA ${trailingStarterERA} (innings 2-5, expected still on mound)\n` +
-          `${leadingAbbr} starter: ${leadingStarterName} — ERA ${leadingStarterERA}\n\n` +
+          `${trailingAbbr} starter (OUR team, the one we're betting on): ${trailingStarterName} ERA ${trailingStarterERA}\n` +
+          `  → This ERA tells you whether OUR pitcher can hold the deficit from growing. Low ERA = deficit stable. High ERA = deficit likely widens.\n` +
+          `${leadingAbbr} starter (OPPONENT, the team we're betting against): ${leadingStarterName} ERA ${leadingStarterERA}\n` +
+          `  → This ERA tells you whether OUR offense can score. High opponent ERA = our lineup can break through. Low opponent ERA = hard to score.\n\n` +
           `STRATEGY: We buy the trailing team NOW and SELL when they tie or take the lead — price spikes from ${Math.round(trailingPrice*100)}¢ back to 48-56¢. We do NOT hold to settlement.\n\n` +
           `HARD NOs:\n` +
           `❌ ${inningsLeft} innings remaining is not realistically enough for a ${g.diff}-run comeback given lineup quality → NO\n` +
           `❌ Leading team has a dominant closer (ERA < 2.0) who will enter in the 8th/9th regardless → NO if inning ≥ 5\n` +
-          `❌ The ${comebackWinPct}% comeback rate is already priced in at ${Math.round(trailingPrice*100)}¢ (gap < 5pts) → NO\n\n` +
-          `BUY if: ace keeping it close + innings available + market underprice vs base rate ≥ 5pts + no dominant closer looming\n\n` +
+          `❌ The ${comebackWinPct}% comeback rate is already priced in at ${Math.round(trailingPrice*100)}¢ (gap < 5pts) → NO\n` +
+          `❌ Our starter ERA is high (already filtered above 5.5) — but if ERA is 4.5-5.5, be very skeptical: deficit will likely grow before it shrinks → lean NO\n\n` +
+          `BUY signal: Our starter keeping it close (ERA < 4.0) + opponent starter is hittable (ERA > 4.5) + innings available + market underprices base rate by ≥ 5pts\n\n` +
           `JSON only:\n` +
           `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-          `{"trade":true,"confidence":0.XX,"reasoning":"one sentence — the specific reason the comeback is likely"}`;
+          `{"trade":true,"confidence":0.XX,"reasoning":"one sentence — cite which pitcher ERA creates the edge and why"}`;
 
         const cbText = await claudeSonnet(cbPrompt, { maxTokens: 250, timeout: 15000 });
         if (!cbText) continue;
@@ -5079,8 +5089,21 @@ async function checkPreGamePredictions() {
           const pickedStarterERA = pickedIsTeam1 ? t1ERA : t2ERA;
           const oppStarterERA = pickedIsTeam1 ? t2ERA : t1ERA;
           const pickedStarterName = pickedIsTeam1 ? (espnT1?.name ?? '?') : (espnT2?.name ?? '?');
-          if (pickedStarterERA > oppStarterERA + 1.0) {
-            console.log(`[pre-game] 🚫 ERA DIRECTION: ${market.base} — Claude backed ${chosenTeam} (${pickedStarterName} ERA ${pickedStarterERA.toFixed(2)}) but opponent ERA is lower at ${oppStarterERA.toFixed(2)} — wrong side of the ERA gap, skipping`);
+          const dirSlack = getBankroll() < 500 ? 0.5 : 1.0;
+          if (pickedStarterERA > oppStarterERA + dirSlack) {
+            console.log(`[pre-game] 🚫 ERA DIRECTION: ${market.base} — Claude backed ${chosenTeam} (${pickedStarterName} ERA ${pickedStarterERA.toFixed(2)}) but opponent ERA is lower at ${oppStarterERA.toFixed(2)} — wrong side of the ERA gap (slack=${dirSlack}), skipping`);
+            continue;
+          }
+
+          // ELITE ACE CODE GATE — if the opponent starter is elite (ERA < 2.5 AND WHIP < 1.0),
+          // hard-block regardless of what Claude's prompt reasoning says. This turns the
+          // "Hard NO" from a prompt suggestion into an enforced rule — Claude's March 2026
+          // TEX@SEA error (misreading Woo WHIP 0.92 as "barely clears" the < 1.0 threshold)
+          // showed prompt-only guards can be silently overridden by bad reasoning.
+          const oppWhip = parseFloat((pickedIsTeam1 ? espnT2 : espnT1)?.whip ?? 'NaN');
+          const oppStarterName = pickedIsTeam1 ? (espnT2?.name ?? '?') : (espnT1?.name ?? '?');
+          if (!isNaN(oppStarterERA) && !isNaN(oppWhip) && oppStarterERA < 2.5 && oppWhip < 1.0) {
+            console.log(`[pre-game] 🚫 ELITE ACE BLOCK: ${market.base} — opponent ${oppStarterName} ERA ${oppStarterERA.toFixed(2)} WHIP ${oppWhip.toFixed(2)} qualifies as elite ace — lineup won't score, price won't rise, skipping`);
             continue;
           }
         }
