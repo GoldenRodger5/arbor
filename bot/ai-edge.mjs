@@ -6294,8 +6294,20 @@ async function managePositions() {
           : stage === 'early' ? -0.70
           : stage === 'mid' ? -0.60
           : -0.50;
-        if (trade.strategy === 'pre-game-prediction' && pctChange < pgNuclearFloor) {
-          console.log(`[exit] 🛑 PRE-GAME NUCLEAR (${stage}, entry ${(entryPrice*100).toFixed(0)}¢): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — ${stage} floor ${Math.round(pgNuclearFloor*100)}% hit`);
+        // TIME GATE: don't fire nuclear before ~55% of game has elapsed.
+        // Early-game volatility is normal — a 1-run MLB deficit in inning 2 or a 1-goal
+        // MLS deficit in the first half is not a lost cause. The WE-reversal stop handles
+        // true early blowouts (WE ≤ 30%). If ctx is unavailable, allow nuclear to fire.
+        //   Soccer: 2nd half (period >= 2)  |  MLB: inning 5+  |  NBA: Q3+ (period >= 3)  |  NHL: P2+ (period >= 2)
+        const pgNuclearTimeGated = ctx == null || (
+          isSoccerLeague ? (ctx.period >= 2) :
+          league === 'mlb' ? (ctx.period >= 5) :
+          league === 'nba' ? (ctx.period >= 3) :
+          league === 'nhl' ? (ctx.period >= 2) :
+          true
+        );
+        if (trade.strategy === 'pre-game-prediction' && pctChange < pgNuclearFloor && pgNuclearTimeGated) {
+          console.log(`[exit] 🛑 PRE-GAME NUCLEAR (${stage}, period ${ctx?.period ?? '?'}, entry ${(entryPrice*100).toFixed(0)}¢): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — ${stage} floor ${Math.round(pgNuclearFloor*100)}% hit`);
           const result = await executeSell(trade, qty, currentPrice, 'pre-game-nuclear');
           if (result) anyUpdated = true;
           continue;
