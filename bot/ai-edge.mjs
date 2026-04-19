@@ -2818,7 +2818,9 @@ async function checkLiveScoreEdges() {
                 } catch {}
               }
 
-              const maxBet = Math.min(getPositionSize('kalshi', margin), getBankroll() * 0.10);
+              // 1.5x sizing at minute 75+ with 0-0 scoreline — highest draw probability tier (85-88%)
+              const drawSizingMultiplier = (effectiveMin >= 75 && homeScore === 0 && awayScore === 0) ? 1.5 : 1.0;
+              const maxBet = Math.min(getPositionSize('kalshi', margin) * drawSizingMultiplier, getBankroll() * (0.10 * drawSizingMultiplier));
               const qty = Math.max(1, Math.floor(maxBet / tiePrice));
               if (!canDeployMore(qty * tiePrice)) continue;
 
@@ -4237,7 +4239,7 @@ async function checkLiveScoreEdges() {
 
 // lastPreGameScan declared at top (before loadState) to avoid TDZ
 const PREGAME_SCAN_INTERVAL = 15 * 60 * 1000; // every 15 min
-const MAX_PREGAME_PER_CYCLE = 8;   // Analyze up to 8 markets per scan cycle
+const MAX_PREGAME_PER_CYCLE = 5;   // Analyze up to 5 markets per scan cycle (quality > volume)
 const MAX_PREGAME_PAPER_PER_DAY = 999; // Paper mode: no real cap — log every qualifying pick for calibration
 const PREGAME_HOURS_WINDOW = 2;    // Only place real bet when game starts within this many hours
 let preGameTradesToday = 0;
@@ -5061,8 +5063,9 @@ async function checkPreGamePredictions() {
         const t2ERA = parseFloat(espnT2?.era ?? 'NaN');
         if (!isNaN(t1ERA) && !isNaN(t2ERA)) {
           const eraGap = Math.abs(t1ERA - t2ERA);
-          if (eraGap < 2.5) {
-            console.log(`[pre-game] 🚫 MLB ERA GAP: ${market.base} — gap ${eraGap.toFixed(2)} (${espnT1?.name ?? '?'} ${t1ERA} ERA vs ${espnT2?.name ?? '?'} ${t2ERA} ERA) below 2.5 threshold — skipping`);
+          const eraGapThreshold = getBankroll() < 500 ? 3.0 : 2.5;
+          if (eraGap < eraGapThreshold) {
+            console.log(`[pre-game] 🚫 MLB ERA GAP: ${market.base} — gap ${eraGap.toFixed(2)} (${espnT1?.name ?? '?'} ${t1ERA} ERA vs ${espnT2?.name ?? '?'} ${t2ERA} ERA) below ${eraGapThreshold} threshold (bankroll ${getBankroll() < 500 ? '<$500 → 3.0' : '≥$500 → 2.5'}) — skipping`);
             continue; // skip to next market — no paper log needed for hard filter
           }
           console.log(`[pre-game] ✅ MLB ERA GAP: ${market.base} — gap ${eraGap.toFixed(2)} clears 2.5 threshold (${espnT1?.name ?? '?'} ${t1ERA} vs ${espnT2?.name ?? '?'} ${t2ERA})`);
