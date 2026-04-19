@@ -4032,6 +4032,23 @@ async function checkLiveScoreEdges() {
           (1 - (getWinExpectancy('mlb', g.diff, g.period, !trailingIsHome) ?? 0.65)) * 100
         );
 
+        // KALSHI-ESPN SYNC CHECK: If Kalshi's leading-team price implies a win prob
+        // 12+ points higher than ESPN's game state would predict, ESPN is lagging real-time
+        // scoring. Skip and wait for ESPN to catch up — the "edge" is just a data artifact.
+        // Example: ESPN says 0-1 (comebackWinPct=31% → leading team should be ~69¢) but
+        // Kalshi is pricing WSH at 84¢ (15-point gap) → WSH already scored more runs.
+        const leadingTicker = [...cachedPrices.keys()].find(t =>
+          tickerHasTeam(t.toLowerCase(), leadingAbbr) &&
+          tickerHasTeam(t.toLowerCase(), trailingAbbr)
+        );
+        const leadingKalshiPrice = leadingTicker ? (cachedPrices.get(leadingTicker)?.yes ?? 0) : 0;
+        const kalshiLeadingPct  = Math.round(leadingKalshiPrice * 100);
+        const espnLeadingPct    = 100 - comebackWinPct;
+        if (leadingKalshiPrice > 0 && (kalshiLeadingPct - espnLeadingPct) >= 12) {
+          console.log(`[comeback] ⚠️ Skip ${trailingAbbr}: Kalshi/ESPN mismatch — Kalshi prices ${leadingAbbr} at ${kalshiLeadingPct}¢ but ESPN model says ${espnLeadingPct}¢ (${kalshiLeadingPct - espnLeadingPct}pt gap) — ESPN lagging, waiting for sync`);
+          continue;
+        }
+
         console.log(`[comeback] 🔄 Candidate: ${trailingAbbr} trailing ${g.awayScore}-${g.homeScore} inn${g.period} | ace ${trailingStarterName} (${trailingStarterERA} ERA) | opp ${leadingStarterName} (${leadingStarterERA} ERA) | ${inningsLeft} innings left | ${Math.round(trailingPrice*100)}¢ vs model ${comebackWinPct}%`);
 
         // Sonnet evaluation — lightweight, no web search needed
@@ -4100,6 +4117,7 @@ async function checkLiveScoreEdges() {
             title: cachedPrices.get(trailingTicker)?.title ?? `${trailingAbbr} vs ${leadingAbbr}`,
             side: 'yes',
             entryPrice: trailingPrice,
+            entryDiff: g.diff,  // run deficit at entry — exit if this grows
             quantity: cbFill,
             deployCost: cbDeployed,
             confidence: cbConf,
@@ -6239,6 +6257,57 @@ async function managePositions() {
           continue;
         }
 
+        // === COMEBACK-BUY EXIT PATHS ===
+        if (trade.strategy === 'comeback-buy') {
+          const cbProfit = currentPrice - entryPrice;
+
+          // 1. PROFIT-LOCK: swing thesis hit — team tied/led, price spiked, lock it.
+          // Strategy was never "hold to settlement." The edge was in the mispricing at deficit,
+          // not in the final outcome. Once the tie happens, it's a 50/50 coin flip.
+          if (cbProfit >= 0.15) {
+            const gainPct = Math.round((cbProfit / entryPrice) * 100);
+            console.log(`[exit] 🔄💰 COMEBACK PROFIT-LOCK: ${trade.ticker} up ${(cbProfit*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
+            const result = await executeSell(trade, qty, currentPrice, 'comeback-profit-lock');
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `🔄💰 <b>COMEBACK PROFIT-LOCK</b>\n\n` +
+                `${trade.title}\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(cbProfit*100).toFixed(0)}¢, +${gainPct}%)\n` +
+                `Profit: <b>+$${(qty * cbProfit).toFixed(2)}</b>\n\n` +
+                `💬 Comeback swing target hit — locked before reversal risk`
+              );
+            }
+            continue;
+          }
+
+          // 2. SCORE-WORSENING EXIT: if the deficit grew since entry, the ace thesis broke.
+          // We entered because the ace was keeping it close. If he gave up another run,
+          // the original premise is gone — exit immediately, don't hold a broken thesis.
+          if (trade.entryDiff != null && ctx?.diff != null && ctx.diff > trade.entryDiff) {
+            const lossAmt = (qty * cbProfit).toFixed(2);
+            console.log(`[exit] 🔄🛑 COMEBACK THESIS BROKEN: ${trade.ticker} deficit grew ${trade.entryDiff}→${ctx.diff} runs — exiting`);
+            const result = await executeSell(trade, qty, currentPrice, 'comeback-thesis-broken');
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `🔄🛑 <b>COMEBACK THESIS BROKEN</b>\n\n` +
+                `${trade.title}\n` +
+                `Entry deficit: ${trade.entryDiff} run(s) → Now: ${ctx.diff} run(s)\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢\n` +
+                `${cbProfit >= 0 ? `Profit: +$${(qty * cbProfit).toFixed(2)}` : `Loss: $${lossAmt}`}\n\n` +
+                `💬 Ace gave up more runs — thesis invalidated`
+              );
+            }
+            continue;
+          }
+
+          // Comeback trades skip all other exit logic except nuclear and WE-reversal
+          // (which have their own comeback-aware adjustments below)
+          // No pre-game hard stop, no pg-guard, no WE-drop, no Claude stop.
+          // Falls through to nuclear + WE-reversal below.
+        }
+
         // PRE-GAME PRICE DROP MONITOR — exit before game starts if market reprices sharply.
         // When a pre-game position's price drops 20¢+ and the game hasn't started (stage unknown),
         // it almost certainly means news broke: pitcher scratched, goalie pulled, injury, lineup change.
@@ -6368,6 +6437,7 @@ async function managePositions() {
           const ourTeam = trade.ticker?.split('-').pop() ?? '';
           const ourWE = ctx.leading === ourTeam ? ctx.baselineWE : (1 - ctx.baselineWE);
           const isPreGame = trade.strategy === 'pre-game-prediction';
+          const isComeback = trade.strategy === 'comeback-buy';
           // Grace period: don't fire WE-reversal on pre-game positions within 30 min of entry.
           // Also require game to be genuinely in progress (stage known) — stale ESPN data
           // returning 0-0 pre-start can compute 3% WE and trigger an erroneous sell.
@@ -6376,10 +6446,20 @@ async function managePositions() {
           const gameIsLive = stage !== 'unknown';
           if (isPreGame && (minsSinceEntry < 30 || !gameIsLive)) {
             // Too soon or game not confirmed live — skip WE-reversal, let pg-guard handle it
+          } else if (isComeback && minsSinceEntry < 15) {
+            // COMEBACK GRACE PERIOD: comeback entries are at 10-44¢ with WE already low.
+            // The 30% standard floor would fire on almost any valid entry immediately.
+            // Give 15 min for the trade to breathe — score-worsening exit above handles
+            // thesis failures during this window. After 15 min, lower floor of 15% applies.
           } else {
-            const weFloor = isPreGame && stage !== 'late' ? 0.20 : 0.30;
+            // Pre-game early/mid: 20% floor (pg-guard handles it).
+            // Comeback: 15% floor — these are valid low-probability entries, only exit on true blowout.
+            // Everything else: 30% floor.
+            const weFloor = isPreGame && stage !== 'late' ? 0.20
+              : isComeback ? 0.15
+              : 0.30;
             if (ourWE <= weFloor) {
-              console.log(`[exit] 🔄 WE-REVERSAL (${(ourWE*100).toFixed(0)}% WE ≤${Math.round(weFloor*100)}%${isPreGame ? ' pre-game' : ''}): ${trade.ticker} — game reversed, selling at ${(currentPrice*100).toFixed(0)}¢`);
+              console.log(`[exit] 🔄 WE-REVERSAL (${(ourWE*100).toFixed(0)}% WE ≤${Math.round(weFloor*100)}%${isPreGame ? ' pre-game' : isComeback ? ' comeback' : ''}): ${trade.ticker} — game reversed, selling at ${(currentPrice*100).toFixed(0)}¢`);
               const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
               if (result) anyUpdated = true;
               continue;
