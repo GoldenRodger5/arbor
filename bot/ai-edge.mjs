@@ -549,6 +549,7 @@ function saveState() {
       highConvictionDeployed,
       lastHCLossAt,
       stopLocks: Object.fromEntries([...stopLocks.entries()].filter(([, v]) => v > Date.now())),
+      stoppedBets: Object.fromEntries([...stoppedBets.entries()].filter(([, v]) => Date.now() - v.stoppedAt < 4 * 60 * 60 * 1000)),
       savedAt: Date.now(),
     }));
   } catch (e) { console.error('[state] save error:', e.message); }
@@ -578,6 +579,14 @@ function loadState() {
         }
       }
     }
+    if (s.stoppedBets) {
+      for (const [base, info] of Object.entries(s.stoppedBets)) {
+        if (Date.now() - info.stoppedAt < 4 * 60 * 60 * 1000) {
+          stoppedBets.set(base, info);
+          console.log(`[state] Restored stopped-bet on ${base} (${info.team}) — eligible for thesis-vindicated re-entry`);
+        }
+      }
+    }
     const broadWait = Math.max(0, Math.round((s.lastBroadScan + 1800000 - Date.now()) / 1000));
     const preWait = Math.max(0, Math.round((s.lastPreGameScan + 900000 - Date.now()) / 1000));
     console.log(`[state] Restored — broad scan in ${broadWait}s, pre-game in ${preWait}s`);
@@ -585,6 +594,7 @@ function loadState() {
 }
 const tradeCooldowns = new Map(); // ticker → lastTradedMs
 const stopLocks = new Map();      // gameBase → unlockTimestampMs (persisted across restarts)
+const stoppedBets = new Map();    // gameBase → { team, stoppedAt, entryPrice } (persisted — enables thesis-vindicated re-entry)
 const lastGameStates = new Map(); // "ATH@NYM" → "1-0-5" (score-period, for change detection)
 const gameEntries = new Map();    // "game:ATH@NYM" → { count: 2, lastPrice: 0.62, totalDeployed: 24.36 }
 const lastSeenPrices = new Map(); // ticker → { price, ts } for line movement detection
@@ -2912,6 +2922,7 @@ async function checkLiveScoreEdges() {
     // If baseline WE < 65%, Claude can't reach 65% min confidence (Claude rarely exceeds baseline
     // in early games). Games between SWING_WE_FLOOR and MIN_WE_FOR_SONNET enter swing mode.
     let isSwingMode = false;
+    let isThesisVindicated = false;
     // If baseline WE < 65%, Claude can't reach 65% min confidence (Claude rarely exceeds baseline
     // in early games). This naturally handles every situation:
     //   - 1-run lead inn 2 (58% WE) → skip (noise)
@@ -2927,17 +2938,42 @@ async function checkLiveScoreEdges() {
     //   - NBA Q3: 73% floor — requires 8+ pt lead (5-7pt Q3 is too volatile, MIA/CHA proved it)
     //   - NBA/Soccer: 65% floor otherwise
     {
+      // THESIS-VINDICATED RE-ENTRY: if we got stopped out on this game but the stopped
+      // team is now LEADING (tied or ahead), the thesis survived adversity — lower the WE
+      // floor to allow re-entry at what's likely a better price than our original entry.
+      // Only applies after the 30-min stop-lock has expired.
+      const ha = home.team?.abbreviation ?? '';
+      const aa = away.team?.abbreviation ?? '';
+      const priorStop = [...stoppedBets.entries()].find(([base]) =>
+        base.includes(ha) && base.includes(aa) && Date.now() - stoppedBets.get(base).stoppedAt < 4 * 60 * 60 * 1000
+      );
+      isThesisVindicated = !!(priorStop && (() => {
+        const stoppedTeam = priorStop[1].team;
+        const stoppedBase = priorStop[0];
+        const lockExpired = !stopLocks.has(stoppedBase) || Date.now() >= stopLocks.get(stoppedBase);
+        if (!lockExpired) return false;
+        // Check if the stopped team is now the leading team
+        const leadingAbbr2 = leading?.team?.abbreviation ?? '';
+        return stoppedTeam === leadingAbbr2;
+      })());
+
+      if (isThesisVindicated) {
+        console.log(`[live-edge] 🔁 THESIS VINDICATED: ${aa}@${ha} — stopped on ${priorStop[1].team}, now leading — lowering WE floor for re-entry`);
+      }
+
       // NHL 1-goal P1 block — 62% WE is too low with 40min remaining. High variance,
       // a single bounce goal erases it. 2+ goal P1 leads (80%/92%) pass through to the
       // standard WE floor below — 2-goal P1 is real edge; market often prices at 70-74¢.
-      if (league === 'nhl' && period === 1 && diff === 1) {
-        console.log(`[live-edge] Skipping NHL 1-goal P1: ${away.team?.abbreviation}@${home.team?.abbreviation} — 62% WE with 40min remaining, too early for 1-goal leads`);
-        logScreen({ stage: 'live-edge-skip', result: 'skip-we-floor', league, homeAbbr: home.team?.abbreviation ?? '', awayAbbr: away.team?.abbreviation ?? '', homeScore, awayScore, diff, period, winExpectancy: 0.62, reasoning: 'NHL 1-goal P1 blocked — 62% WE with 40 minutes remaining. 2+ goal P1 leads are allowed (80%+ WE).' });
+      // Exception: thesis-vindicated re-entry bypasses this block.
+      if (league === 'nhl' && period === 1 && diff === 1 && !isThesisVindicated) {
+        console.log(`[live-edge] Skipping NHL 1-goal P1: ${aa}@${ha} — 62% WE with 40min remaining, too early for 1-goal leads`);
+        logScreen({ stage: 'live-edge-skip', result: 'skip-we-floor', league, homeAbbr: ha, awayAbbr: aa, homeScore, awayScore, diff, period, winExpectancy: 0.62, reasoning: 'NHL 1-goal P1 blocked — 62% WE with 40 minutes remaining. 2+ goal P1 leads are allowed (80%+ WE).' });
         continue;
       }
 
       const baseWE = getWinExpectancy(league, diff, period) ?? 0.50;
-      const MIN_WE_FOR_SONNET = (() => {
+      // Thesis-vindicated: drop floor to 60% (team recovered from a deficit we stopped out of)
+      const MIN_WE_FOR_SONNET = isThesisVindicated ? 0.60 : (() => {
         if (league === 'mlb') return 0.75;
         if (league === 'nhl' && diff === 1) return 0.75; // 1-goal P3=79% passes, P2=68% blocked
         if (league === 'nba' && period <= 3) return 0.73; // Q1/Q2/Q3 needs 12pt+ lead — marginal early leads too volatile (POR/PHX Q2 8pt, MIA/CHA Q3 5pt)
@@ -3731,7 +3767,7 @@ async function checkLiveScoreEdges() {
           prompt: livePrompt, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period,
           leadingAbbr, gameDetail, price, ticker, gameBase, title, targetAbbr, targetTeam,
           targetIsHome: targetAbbr === homeAbbr, leading, hasPosition,
-          currentScoreKey, isSwingMode,
+          currentScoreKey, isSwingMode, isThesisVindicated,
           _lineMove, _scoreChanged,
         });
 
@@ -3759,7 +3795,7 @@ async function checkLiveScoreEdges() {
 
       // Destructure back the context we need
       const { league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, leadingAbbr,
-              gameDetail, price, ticker, gameBase, title, targetAbbr, hasPosition, currentScoreKey, isSwingMode } = item;
+              gameDetail, price, ticker, gameBase, title, targetAbbr, hasPosition, currentScoreKey, isSwingMode, isThesisVindicated } = item;
 
       try {
         const jsonMatch = extractJSON(cText);
@@ -3954,7 +3990,7 @@ async function checkLiveScoreEdges() {
 
           logTrade({
             exchange: best.platform,
-            strategy: isSwingMode ? 'live-swing' : hcCheck.isHighConv ? 'high-conviction' : 'live-prediction',
+            strategy: isThesisVindicated ? 'thesis-reentry' : isSwingMode ? 'live-swing' : hcCheck.isHighConv ? 'high-conviction' : 'live-prediction',
             ticker: best.platform === 'polymarket' ? best.slug : ticker,
             title, side: 'yes',
             quantity: actualFill, entryPrice: bestPrice, deployCost: actualDeployed,
@@ -3975,9 +4011,17 @@ async function checkLiveScoreEdges() {
             isLeadingTeam: isLeadingTeamTarget, // true = betting leader, false = betting underdog
           });
 
+          // Clear thesis-vindicated flag after successful re-entry (one shot only)
+          if (isThesisVindicated) {
+            stoppedBets.delete(gameBase);
+            saveState();
+            console.log(`[live-edge] 🔁 Thesis-vindicated re-entry complete on ${gameBase} — cleared stoppedBets`);
+          }
+
           const savedMsg = best.platform === 'polymarket' ? `\n💡 Bought on Poly (${(price*100).toFixed(0)}¢ Kalshi → ${priceInCents}¢ Poly)` : '';
           const hcMsg = hcCheck.isHighConv ? `\n🔥 HIGH CONVICTION — ${hcCheck.reason}` : '';
-          const betLabel = isSwingMode ? '🔄 SWING TRADE' :
+          const betLabel = isThesisVindicated ? '🔁 THESIS RE-ENTRY' :
+            isSwingMode ? '🔄 SWING TRADE' :
             hcCheck.isHighConv ? '🔥 HIGH CONVICTION' :
             targetAbbr === leadingAbbr ? '🎯 PREDICTION' : '🐕 UNDERDOG';
           await tg(
@@ -6964,12 +7008,17 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
       const stoppedBase = trade.ticker.lastIndexOf('-') > 0
         ? trade.ticker.slice(0, trade.ticker.lastIndexOf('-'))
         : trade.ticker;
+      // Track which team we were on — enables thesis-vindicated re-entry after lock expires
+      const stoppedTeam = trade.ticker.lastIndexOf('-') > 0
+        ? trade.ticker.slice(trade.ticker.lastIndexOf('-') + 1)
+        : '';
+      stoppedBets.set(stoppedBase, { team: stoppedTeam, stoppedAt: Date.now(), entryPrice });
       const STOP_REENTRY_COOLDOWN = 30 * 60 * 1000;
       const unlockAt = Date.now() + STOP_REENTRY_COOLDOWN;
       stopLocks.set(stoppedBase, unlockAt);
       tradeCooldowns.set(stoppedBase, unlockAt - COOLDOWN_MS);
       saveState();
-      console.log(`[exit] 🔒 Re-entry locked on ${stoppedBase} for 30 min after stop (persisted)`);
+      console.log(`[exit] 🔒 Re-entry locked on ${stoppedBase} (${stoppedTeam}) for 30 min after stop (persisted)`);
     }
   } else {
     // Partial exit — update quantity and cost, keep open
