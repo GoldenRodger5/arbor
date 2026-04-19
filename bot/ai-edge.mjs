@@ -2536,6 +2536,7 @@ async function checkLiveScoreEdges() {
                 }
               } else {
                 console.log(`[pg-guard] 🧠 HOLD (${estPct}): ${trade.ticker} (${stage}) | ${d.reasoning?.slice(0, 80)}`);
+                tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
               }
             }
           } catch { /* skip */ }
@@ -3730,7 +3731,7 @@ async function checkLiveScoreEdges() {
           prompt: livePrompt, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period,
           leadingAbbr, gameDetail, price, ticker, gameBase, title, targetAbbr, targetTeam,
           targetIsHome: targetAbbr === homeAbbr, leading, hasPosition,
-          currentScoreKey,
+          currentScoreKey, isSwingMode,
           _lineMove, _scoreChanged,
         });
 
@@ -3758,7 +3759,7 @@ async function checkLiveScoreEdges() {
 
       // Destructure back the context we need
       const { league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, leadingAbbr,
-              gameDetail, price, ticker, gameBase, title, targetAbbr, hasPosition, currentScoreKey } = item;
+              gameDetail, price, ticker, gameBase, title, targetAbbr, hasPosition, currentScoreKey, isSwingMode } = item;
 
       try {
         const jsonMatch = extractJSON(cText);
@@ -6667,11 +6668,22 @@ async function managePositions() {
           && ctx?.period >= 7
           && profitPerContract > 0  // we are currently winning on price
           && (ctx?.diff ?? 0) >= 3; // 3+ run lead
+        // CLAUDE HOLD OVERRIDE: if Claude (pg-guard or loss eval) said HOLD within the last
+        // 10 minutes, skip the mechanical hard stop. Claude has live context (score, goalie,
+        // WE, sport-specific comeback rates) — the mechanical stop doesn't. This prevents
+        // the MTL@TB P1→P2 race condition where Claude says HOLD 4x then the time gate
+        // arms and fires mechanically without re-consulting Claude.
+        const lastClaudeHold = tradeCooldowns.get('claude-hold:' + trade.ticker) ?? 0;
+        const claudeHoldRecent = Date.now() - lastClaudeHold < 10 * 60 * 1000; // 10 min window
         if (pgHardStopReady && !mlbBlowoutLock && (entryPrice - currentPrice) >= pgHardStopCents) {
-          console.log(`[exit] 🛑 PRE-GAME HARD STOP (${stage}): ${trade.ticker} down ${Math.round((entryPrice - currentPrice)*100)}¢ (limit ${Math.round(pgHardStopCents*100)}¢) | entry ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢`);
-          const result = await executeSell(trade, qty, currentPrice, 'pre-game-hard-stop');
-          if (result) anyUpdated = true;
-          continue;
+          if (claudeHoldRecent) {
+            console.log(`[exit] 🛡️ HARD STOP DEFERRED: ${trade.ticker} down ${Math.round((entryPrice - currentPrice)*100)}¢ but Claude said HOLD ${Math.round((Date.now() - lastClaudeHold) / 60000)}min ago — waiting for next Claude eval`);
+          } else {
+            console.log(`[exit] 🛑 PRE-GAME HARD STOP (${stage}): ${trade.ticker} down ${Math.round((entryPrice - currentPrice)*100)}¢ (limit ${Math.round(pgHardStopCents*100)}¢) | entry ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢`);
+            const result = await executeSell(trade, qty, currentPrice, 'pre-game-hard-stop');
+            if (result) anyUpdated = true;
+            continue;
+          }
         }
         if (mlbBlowoutLock && pgHardStopReady && (entryPrice - currentPrice) >= pgHardStopCents) {
           console.log(`[exit] 🔒 MLB BLOWOUT LOCK: suppressing hard stop — inning ${ctx.period}, +${ctx.diff} run lead, WE ≥93% — holding to settlement`);
@@ -6844,6 +6856,7 @@ async function managePositions() {
                   if (result) anyUpdated = true;
                 } else {
                   console.log(`[exit] 🧠 CLAUDE HOLD (losing): ${trade.ticker} ${(pctChange*100).toFixed(0)}% (${stage}) | ${d.reasoning?.slice(0, 60)}`);
+                  tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
                 }
               }
             } catch { /* skip */ }
