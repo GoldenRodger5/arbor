@@ -2750,6 +2750,24 @@ async function checkLiveScoreEdges() {
                 continue;
               }
 
+              // Draw-bet bankroll cap: max 40% deployed across all concurrent draw-bets.
+              // One 0-0 soccer goal wipes all draw positions simultaneously — concentration risk.
+              // Tottenham-Brighton stacked $167 on one game; this prevents a multi-game version.
+              if (existsSync(TRADES_LOG)) {
+                try {
+                  const dbLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+                  const dbTrades = dbLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+                  const openDrawDeployed = dbTrades
+                    .filter(t => t.strategy === 'draw-bet' && t.status === 'open')
+                    .reduce((sum, t) => sum + (t.deployCost ?? 0), 0);
+                  const drawBetCap = getBankroll() * 0.40;
+                  if (openDrawDeployed >= drawBetCap) {
+                    console.log(`[draw-bet] ⚠️ BANKROLL CAP: draw-bet exposure $${openDrawDeployed.toFixed(2)} ≥ 40% of bankroll ($${drawBetCap.toFixed(2)}) — skipping until positions close`);
+                    continue;
+                  }
+                } catch {}
+              }
+
               const maxBet = Math.min(getPositionSize('kalshi', margin), getBankroll() * 0.10);
               const qty = Math.max(1, Math.floor(maxBet / tiePrice));
               if (!canDeployMore(qty * tiePrice)) continue;
@@ -4457,7 +4475,7 @@ async function checkPreGamePredictions() {
         `WIN PROBABILITY BASELINE: NHL home teams win (in regulation + OT) ~55% of games. An elite goalie vs. a backup can push that to 62%+. A team on back-to-back drops to ~47%.\n\n` +
         `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
         `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} goalie confirmed injury news" and use results to assess:\n` +
-        `A) GOALIES: Goalies confirmed above from ESPN. Verify with search results — any late goalie changes? Assess each goalie's win probability impact: career SV%, GAA tier, known strengths. An elite goalie (SV% > .920) vs. a backup (.890) is a 10-15% win probability swing.\n` +
+        `A) GOALIES: Goalies confirmed above from ESPN. Verify with search results — any late goalie changes? Assess each goalie's win probability impact using 2026 SEASON save percentage (not career average — form matters). An elite goalie (SV% > .920) vs. a backup (.890) is a 10-15% win probability swing. In playoff context: search for the goalie's 2026 PLAYOFF SV% specifically — playoff goaltending is higher-leverage and elite goalies (Bobrovsky, Hellebuyck, etc.) outperform their regular-season numbers in elimination games. A 0.01 SV% difference at the playoff level (~30 shots/game) is worth 3-4% WP shift.\n` +
         `B) SPECIAL TEAMS: From search + training knowledge, assess power play and penalty kill quality. Top-5 PP teams convert at a higher rate and generate scoring momentum.\n` +
         `C) FATIGUE: Is either team on a back-to-back? NHL back-to-back teams win at ~8% lower rates.\n` +
         `D) MOTIVATION: Playoff race intensity for each team. Teams fighting for seeding play harder in regulation.\n\n` +
@@ -4697,6 +4715,16 @@ async function checkPreGamePredictions() {
     // NHL: first-goal baseline ~56% home
     // Soccer: first-goal baseline ~55% home — draws are irrelevant, we exit on first goal
     const pgSportKey = expectedSport.toLowerCase();
+
+    // MLS winner-bet block — only draw-bets for MLS, no pre-game winner contracts.
+    // Data: MLS pre-game winner bets 1W-3L, -$36.83. Root cause: ~27% draw rate means
+    // a MLS "win" contract loses on draws too, and 55¢ entries still lose 27% of the time
+    // to a draw outcome on top of normal loss variance. Draw-bet strategy handles MLS correctly.
+    if (pgSportKey === 'mls') {
+      console.log(`[pre-game] 🚫 MLS WINNER-BET BLOCKED: ${market.base} — MLS winner bets disabled (draw rate ~27% makes winner contracts -EV; draw-bet strategy handles MLS instead)`);
+      continue;
+    }
+
     const preGameBaselines = { mlb: 0.45, nba: 0.72, nhl: 0.56, mls: 0.55, epl: 0.55, laliga: 0.55 };
     const pgBaseline = preGameBaselines[pgSportKey] ?? 0.55;
     // Cap: how far above early-event baseline Claude can go.
@@ -4752,9 +4780,11 @@ async function checkPreGamePredictions() {
     const PRE_GAME_MIN_CONF = isNhlNba
       ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.70 : 0.72)
       : pgSportKey === 'mlb'
-        // MLB: raise the middle tier (50-65¢ entries) from 65% to 68% — actual MLB win rate has been
-        // 43% at 65% confidence, indicating overconfidence on two-average-starters matchups.
-        ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.68 : 0.68)
+        // MLB: raise all tiers — actual MLB win rate has been 43% at 65% confidence.
+        //   <50¢ (underdog):   63% → 65% — even low-confidence underdog entries need real conviction
+        //   50-65¢ (mid):      65% → 68% — eliminates marginal "just clears the bar" entries
+        //   >65¢ (favorite):   68% — unchanged, favorites already need conviction
+        ? (price < 0.50 ? 0.65 : price <= 0.65 ? 0.68 : 0.68)
         : isSoccer
           ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68) // Soccer: unchanged
           : 0.65; // fallback for other sports
