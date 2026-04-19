@@ -466,7 +466,10 @@ Rules:
 
       const settled = trades.filter(t => {
         const at = new Date(t.settledAt ?? t.timestamp).getTime();
-        return at >= start && at < end && (t.status === 'settled' || t.status?.startsWith('sold-'));
+        return at >= start && at < end &&
+          (t.status === 'settled' || t.status?.startsWith('sold-')) &&
+          t.status !== 'sold-sync-bug' && t.status !== 'failed-bug' &&
+          t.status !== 'closed-manual' && t.status !== 'sold-manual';
       });
       const placed = trades.filter(t => {
         const at = new Date(t.timestamp).getTime();
@@ -609,12 +612,14 @@ Write the recap.`
         return true;
       });
 
-      // 'sold-sync-bug' and 'failed-bug' are technical artifacts — not real game outcomes.
-      // Exclude them from all win/loss/PnL stats so they don't pollute the record.
+      // 'sold-sync-bug', 'failed-bug', 'closed-manual', 'sold-manual' are excluded from
+      // win/loss stats — sync bugs are artifacts, manual exits are user overrides not bot decisions.
+      const isExcludedStatus = (s) =>
+        s === 'sold-sync-bug' || s === 'failed-bug' ||
+        s === 'closed-manual' || s === 'sold-manual';
       const settled = trades.filter(t =>
         (t.status === 'settled' || t.status?.startsWith('sold-')) &&
-        t.status !== 'sold-sync-bug' &&
-        t.status !== 'failed-bug'
+        !isExcludedStatus(t.status)
       );
       const open = trades.filter(t => t.status === 'open');
       // closed-manual = bot confirmed the position is gone from Kalshi but didn't
@@ -656,7 +661,7 @@ Write the recap.`
         if (!stratMap[strat]) stratMap[strat] = { strategy: strat, trades: 0, settled: 0, wins: 0, losses: 0, pnl: 0 };
         stratMap[strat].trades++;
         if ((t.status === 'settled' || t.status?.startsWith('sold-')) &&
-            t.status !== 'sold-sync-bug' && t.status !== 'failed-bug') {
+            !isExcludedStatus(t.status)) {
           stratMap[strat].settled++;
           if ((t.realizedPnL ?? 0) > 0) stratMap[strat].wins++;
           else stratMap[strat].losses++;
@@ -747,6 +752,18 @@ Write the recap.`
         sportPerformance: Object.values(sportMap),
         strategyPerformance: Object.values(stratMap),
         calibration,
+        // Prediction accuracy: were we directionally right, regardless of P&L?
+        // Excludes manual exits — only trades where the bot made the exit decision.
+        directionAccuracy: (() => {
+          const withOutcome = settled.filter(t => t.gameOutcome != null);
+          const correct = withOutcome.filter(t => t.gameOutcome === 'correct');
+          return {
+            total: withOutcome.length,
+            correct: correct.length,
+            incorrect: withOutcome.length - correct.length,
+            rate: withOutcome.length > 0 ? Math.round((correct.length / withOutcome.length) * 100) : null,
+          };
+        })(),
         latestSnapshot: lastSnap,
         livePortfolio,
         liveBankroll: Math.round(liveBankroll * 100) / 100,

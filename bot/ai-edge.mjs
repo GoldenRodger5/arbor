@@ -1185,11 +1185,13 @@ function saveDailySnapshot() {
             if (t.settledAt && Date.parse(t.settledAt) > cutoff24h) todayPnL += pnl;
           }
           if (t.timestamp && Date.parse(t.timestamp) > cutoff24h) todayTrades++;
-          // Per-strategy
+          // Per-strategy — exclude manual exits so stats reflect bot decisions only
           const strat = t.strategy ?? 'unknown';
+          const isManualExit = t.status === 'closed-manual' || t.status === 'sold-manual';
           if (!strategyStats[strat]) strategyStats[strat] = { trades: 0, settled: 0, wins: 0, losses: 0, pnl: 0 };
           strategyStats[strat].trades++;
-          if (t.status === 'settled') {
+          if ((t.status === 'settled' || t.status?.startsWith('sold-')) &&
+              t.status !== 'sold-sync-bug' && t.status !== 'failed-bug' && !isManualExit) {
             strategyStats[strat].settled++;
             if ((t.realizedPnL ?? 0) >= 0) strategyStats[strat].wins++;
             else strategyStats[strat].losses++;
@@ -7136,7 +7138,39 @@ async function checkSettlements() {
       } catch { /* market not found or not settled yet — skip */ }
     }
 
-    if (settlements.length === 0) return;
+    // Also backfill gameOutcome for already-sold trades that don't have it yet.
+    // This lets us ask "were we directionally right?" independent of whether we made money.
+    const soldNeedingOutcome = trades.filter(t =>
+      t.exchange === 'kalshi' &&
+      t.gameOutcome == null &&
+      t.status != null &&
+      t.status !== 'open' &&
+      t.status !== 'closed-manual' &&
+      t.status !== 'testing-void' &&
+      t.status !== 'failed-bug' &&
+      t.status !== 'sold-sync-bug' &&
+      t.realizedPnL != null // already closed — just need game result
+    );
+    for (const trade of soldNeedingOutcome) {
+      try {
+        const mktData = await kalshiGet(`/markets/${trade.ticker}`);
+        const market = mktData?.market ?? mktData;
+        if (!market?.result) continue;
+        const won = (trade.side === 'yes' && market.result === 'yes') ||
+                    (trade.side === 'no' && market.result === 'no');
+        trade.gameOutcome = won ? 'correct' : 'incorrect';
+        trade.gameResult = market.result;
+        updated = true;
+      } catch { /* market not settled yet or not found */ }
+    }
+
+    if (settlements.length === 0) {
+      if (updated) {
+        const newContent = trades.map(t => JSON.stringify(t)).join('\n') + '\n';
+        writeFileSync(TRADES_LOG, newContent);
+      }
+      return;
+    }
 
     // Build map: ticker → settlement data
     const settlementMap = new Map();
@@ -7178,6 +7212,8 @@ async function checkSettlements() {
         trade.realizedPnL = Math.round(totalPartialProfit * 100) / 100;
         trade.settledAt = settlement.settled_time ?? new Date().toISOString();
         trade.result = settlement.market_result;
+        trade.gameOutcome = won ? 'correct' : 'incorrect';
+        trade.gameResult = settlement.market_result;
         updated = true;
         const icon = totalPartialProfit >= 0 ? '✅' : '❌';
         const pnlStr = totalPartialProfit >= 0 ? `+$${totalPartialProfit.toFixed(2)}` : `-$${Math.abs(totalPartialProfit).toFixed(2)}`;
@@ -7209,6 +7245,8 @@ async function checkSettlements() {
       trade.realizedPnL = Math.round(pnl * 100) / 100;
       trade.settledAt = settlement.settled_time ?? new Date().toISOString();
       trade.result = settlement.market_result;
+      trade.gameOutcome = won ? 'correct' : 'incorrect';
+      trade.gameResult = settlement.market_result;
       updated = true;
       // HC cooldown on natural-settlement losses too
       if (trade.highConviction && trade.realizedPnL < 0) {
