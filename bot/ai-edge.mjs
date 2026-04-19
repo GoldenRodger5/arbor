@@ -6081,19 +6081,19 @@ async function managePositions() {
           if (qty >= 1) {
             const gainPct = Math.round((profitPerContract / entryPrice) * 100);
             console.log(`[exit] 💰 PRE-GAME TARGET HIT: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty} @ ${(currentPrice*100).toFixed(0)}¢, profit ~$${(qty * profitPerContract).toFixed(2)}`);
-            await tg(
-              `💰 <b>PRE-GAME TARGET HIT</b>\n\n` +
-              `📋 <b>POSITION</b>\n` +
-              `${trade.title}\n\n` +
-              `📊 <b>METRICS</b>\n` +
-              `Selling ALL ${qty} contracts @ ${(currentPrice*100).toFixed(0)}¢\n` +
-              `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
-              `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
-            );
             const result = await executeSell(trade, qty, currentPrice, 'pre-game-profit-lock');
             if (result) {
               trade.partialTakeAt = new Date().toISOString();
               anyUpdated = true;
+              await tg(
+                `💰 <b>PRE-GAME TARGET HIT</b>\n\n` +
+                `📋 <b>POSITION</b>\n` +
+                `${trade.title}\n\n` +
+                `📊 <b>METRICS</b>\n` +
+                `Sold ALL ${qty} contracts @ ${(currentPrice*100).toFixed(0)}¢\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
+                `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
+              );
             }
             continue;
           }
@@ -6105,14 +6105,16 @@ async function managePositions() {
         if (trade.strategy === 'draw-bet' && profitPerContract >= 0.12) {
           const gainPct = Math.round((profitPerContract / entryPrice) * 100);
           console.log(`[exit] ⚽💰 DRAW-BET PROFIT-LOCK: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
-          await tg(
-            `⚽💰 <b>DRAW-BET PROFIT-LOCK</b>\n\n` +
-            `${trade.title}\n` +
-            `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
-            `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
-          );
           const result = await executeSell(trade, qty, currentPrice, 'draw-bet-profit-lock');
-          if (result) anyUpdated = true;
+          if (result) {
+            anyUpdated = true;
+            await tg(
+              `⚽💰 <b>DRAW-BET PROFIT-LOCK</b>\n\n` +
+              `${trade.title}\n` +
+              `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
+              `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
+            );
+          }
           continue;
         }
 
@@ -6141,15 +6143,17 @@ async function managePositions() {
         if (trade.strategy === 'live-prediction' && profitPerContract >= 0.15) {
           const gainPct = Math.round((profitPerContract / entryPrice) * 100);
           console.log(`[exit] 🎯💰 LIVE PROFIT-LOCK: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
-          await tg(
-            `🎯💰 <b>LIVE PROFIT-LOCK</b>\n\n` +
-            `${trade.title}\n` +
-            `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
-            `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>\n\n` +
-            `💬 +${gainPct}% return locked — at this bankroll, locking beats holding to settlement`
-          );
           const result = await executeSell(trade, qty, currentPrice, 'live-profit-lock');
-          if (result) anyUpdated = true;
+          if (result) {
+            anyUpdated = true;
+            await tg(
+              `🎯💰 <b>LIVE PROFIT-LOCK</b>\n\n` +
+              `${trade.title}\n` +
+              `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
+              `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>\n\n` +
+              `💬 +${gainPct}% return locked — at this bankroll, locking beats holding to settlement`
+            );
+          }
           continue;
         }
 
@@ -6158,14 +6162,16 @@ async function managePositions() {
         if (trade.strategy === 'high-conviction' && profitPerContract >= 0.20) {
           const gainPct = Math.round((profitPerContract / entryPrice) * 100);
           console.log(`[exit] 🔥💰 HC PROFIT-LOCK: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
-          await tg(
-            `🔥💰 <b>HIGH-CONVICTION PROFIT-LOCK</b>\n\n` +
-            `${trade.title}\n` +
-            `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
-            `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
-          );
           const result = await executeSell(trade, qty, currentPrice, 'hc-profit-lock');
-          if (result) anyUpdated = true;
+          if (result) {
+            anyUpdated = true;
+            await tg(
+              `🔥💰 <b>HIGH-CONVICTION PROFIT-LOCK</b>\n\n` +
+              `${trade.title}\n` +
+              `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
+              `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
+            );
+          }
           continue;
         }
 
@@ -6180,14 +6186,16 @@ async function managePositions() {
           if (swingProfit >= 0.12) {
             const gainPct = Math.round((swingProfit / entryPrice) * 100);
             console.log(`[exit] 🔄💰 SWING PROFIT-LOCK: ${trade.ticker} up ${(swingProfit*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
-            await tg(
-              `🔄💰 <b>SWING PROFIT-LOCK</b>\n\n` +
-              `${trade.title}\n` +
-              `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(swingProfit*100).toFixed(0)}¢, +${gainPct}%)\n` +
-              `Profit: <b>+$${(qty * swingProfit).toFixed(2)}</b>`
-            );
             const result = await executeSell(trade, qty, currentPrice, 'swing-profit-lock');
-            if (result) anyUpdated = true;
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `🔄💰 <b>SWING PROFIT-LOCK</b>\n\n` +
+                `${trade.title}\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(swingProfit*100).toFixed(0)}¢, +${gainPct}%)\n` +
+                `Profit: <b>+$${(qty * swingProfit).toFixed(2)}</b>`
+              );
+            }
             continue;
           }
 
@@ -6485,10 +6493,13 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
     console.log(`[exit] Position check failed (${posErr.message}) — proceeding with tracked qty`);
   }
 
-  // For stop-loss: sell at 1¢ (market order — get out immediately)
-  // For profit-take: sell at current price - 2¢ (want a good exit)
-  const isStopLoss = reason.includes('stop');
-  const sellPrice = isStopLoss ? 1 : Math.max(1, priceInCents - 2);
+  // For stop-loss / nuclear / hard-stop: sell at 1¢ (market order — get out immediately, price doesn't matter)
+  // For profit-takes / scale-outs: sell at exactly the observed price — Kalshi limit orders
+  //   at the current best bid fill as taker orders immediately. The old -2¢ haircut was eating
+  //   ~$0.78/trade on a 39-contract position and caused Telegram to show a different price than
+  //   what Kalshi actually filled at.
+  const isStopLoss = reason.includes('stop') || reason.includes('nuclear') || reason.includes('reversal');
+  const sellPrice = isStopLoss ? 1 : Math.max(1, priceInCents);
 
   const result = await kalshiPost('/portfolio/orders', {
     ticker: trade.ticker,
