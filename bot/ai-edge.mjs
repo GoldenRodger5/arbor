@@ -147,11 +147,11 @@ const MAX_PRICE = 0.75;           // Default ceiling — use getMaxPrice(league,
 //   2-run:  82¢ — 2-run late (P5+) = 85-88% WE, real edge at 79-82¢
 //   3-run:  86¢ — 3-run P7+ = 90-92% WE, ATL-type situations with elite bullpen
 //   4+ run: 88¢ — 93-95% WE, only catastrophic collapses flip these
-// NHL P3: 82¢ — 2-goal leads with <10min left are genuinely 93%+ WE
+// NHL P3: 85¢ — 2-goal leads with <10min left are genuinely 93%+ WE, 85¢ still has edge
 // NHL P1/P2: tiered by goal differential (a 2-goal P2 lead is 82-85% WE, very different from 1-goal 68%)
-//   1-goal:   75¢ — blocked by low-WE floor anyway, keep defensive
-//   2-goal:   78¢ — 82-85% WE, real edge exists at 76-78¢ prices for elite teams
-//   3+ goal:  82¢ — 90%+ WE even mid-game, only overwhelming comebacks flip these
+//   1-goal:   78¢ — P2 1-goal now passes WE floor (68%), needs room to enter at 65-75¢
+//   2-goal:   82¢ — 82-85% WE, real edge exists at 76-82¢ for strong teams
+//   3+ goal:  85¢ — 90%+ WE even mid-game, only overwhelming comebacks flip these
 // NBA Q4: 80¢ — 15-pt comeback in Q4 happens only 8%, 20-pt is <2%
 // NBA Q1-Q3: tiered by point differential
 //   1-9 pt:   75¢ — swingy modern NBA, keep the blanket cap
@@ -168,11 +168,11 @@ function getMaxPrice(league, period, diff = 1) {
     return 0.78;
   }
   if (league === 'nhl') {
-    if (period >= 3) return 0.82;
+    if (period >= 3) return 0.85;
     // P1/P2
-    if (diff >= 3) return 0.82;
-    if (diff >= 2) return 0.78;
-    return 0.75;
+    if (diff >= 3) return 0.85;
+    if (diff >= 2) return 0.82;
+    return 0.78; // 1-goal P2 now passes WE floor (68%), needs room to enter at 65-75¢
   }
   if (league === 'nba') {
     if (period >= 4) return 0.80;
@@ -2974,19 +2974,20 @@ async function checkLiveScoreEdges() {
       const baseWE = getWinExpectancy(league, diff, period) ?? 0.50;
       // Thesis-vindicated: drop floor to 60% (team recovered from a deficit we stopped out of)
       const MIN_WE_FOR_SONNET = isThesisVindicated ? 0.60 : (() => {
-        if (league === 'mlb') return 0.75;
-        if (league === 'nhl' && diff === 1) return 0.75; // 1-goal P3=79% passes, P2=68% blocked
-        if (league === 'nba' && period <= 3) return 0.73; // Q1/Q2/Q3 needs 12pt+ lead — marginal early leads too volatile (POR/PHX Q2 8pt, MIA/CHA Q3 5pt)
-        return 0.65;
+        if (league === 'mlb') return 0.70; // 2-run leads in inn 5+ (70% WE) now qualify — was 75% which only caught 3+ run leads already priced at 80¢+
+        if (league === 'nhl' && diff === 1) return 0.68; // P2 1-goal (68% WE) now passes — was 75% which only allowed P3 1-goal. P1 still blocked by separate check above.
+        if (league === 'nba' && period <= 2) return 0.73; // Q1/Q2 stays strict — early NBA leads are genuinely volatile
+        if (league === 'nba' && period === 3) return 0.68; // Q3: 10pt leads (68% WE) are meaningful — was 73% blocking everything under 15pt
+        return 0.62; // default — was 65%, opens up soccer and other sports slightly
       })();
 
       // SWING MODE: games between SWING_WE_FLOOR and MIN_WE_FOR_SONNET are candidates
       // for live swing trades — buy at ≤65¢, exit at +12¢ profit (not hold to settlement).
       const SWING_WE_FLOOR = (() => {
-        if (league === 'mlb') return 0.65;
-        if (league === 'nba') return 0.62;
-        if (league === 'nhl') return 0.65;
-        return 0.60; // soccer
+        if (league === 'mlb') return 0.62;
+        if (league === 'nba') return 0.60;
+        if (league === 'nhl') return 0.60;
+        return 0.55; // soccer
       })();
       if (baseWE < MIN_WE_FOR_SONNET) {
         if (baseWE >= SWING_WE_FLOOR && _scoreChanged) {
@@ -3401,7 +3402,7 @@ async function checkLiveScoreEdges() {
               ? `❌ MLB BULLPEN HARD NO: 1-run lead in the ${period}th with a below-average bullpen (ERA 4.5-5.0). Margin of safety too thin — Respond {"trade":false}. CLOSER EXCEPTION: Confirmed elite closer (2026 ERA < 2.0, available) → treat as −3% adjustment, not Hard NO.\n`
               : '')
           : '') +
-          `❌ You find yourself saying "modest," "marginal," "just clears the bar," or "only X points of edge" → NO\n\n` +
+          `⚠️ If edge is 4-7 points, proceed carefully — small but real. Do NOT reject solely because the edge "feels modest." The numerical edge check is what matters, not vibes.\n\n` +
           `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs triggered) ═══\n` +
           `Start from the historical baseline. Adjust based on what you found:\n` +
           `+ Leading team clearly better (record, talent, home) → UP 2-5%\n` +
@@ -3448,11 +3449,11 @@ async function checkLiveScoreEdges() {
           `- Leading team win rate below 35% → DOWN 6-10% (weak teams protect leads less reliably)\n` +
           `- Trailing team is at HOME with loud playoff/crucial crowd → DOWN 3-5% (home crowd lifts desperate teams)\n` +
           `- Time remaining: 3 min left with a lead ≠ 10 min left with same lead. Adjust accordingly.\n\n` +
-          `═══ STEP 3.5 — STEEL-MAN THE MARKET ═══\n` +
-          `Before deciding, you MUST answer in one sentence: what does a SHARP BETTOR see at this price that you don't?\n` +
-          `The market is ${(price*100).toFixed(0)}¢ for a reason. Sharp money — professional bettors, syndicates, market makers — has the same score and timeline we do, plus information we often can't see (specific reliever warming, bench injuries reported to beat writers, in-venue observations, weather micro-shifts). If they're pricing this team at ${(price*100).toFixed(0)}¢, what's their thesis?\n` +
-          `Put that thesis in your reasoning field as "STEEL-MAN: [their argument in one sentence]". Then answer: does your edge-reason beat their thesis, or is it just different?\n` +
-          `If you cannot articulate a real counter-argument — if you catch yourself dismissing the market as "wrong" without naming what they see — pass. A pro bettor who can't steel-man the other side hasn't done the work.\n\n` +
+          `═══ STEP 3.5 — MARKET CHECK ═══\n` +
+          `The market is ${(price*100).toFixed(0)}¢. Briefly consider: is there a SPECIFIC concrete reason the market is lower than your estimate?\n` +
+          `Look for: confirmed injury news, lineup change, weather, rest day, goalie switch — something factual.\n` +
+          `If you can identify a specific reason, adjust your confidence for it. If you CANNOT identify a concrete reason, trust your analysis — prediction markets on Kalshi are thin and often lag real game state by 1-3 minutes. The gap IS the edge.\n` +
+          `Do NOT invent hypothetical reasons to explain the gap. "The market must know something" without naming WHAT is not analysis.\n\n` +
           `═══ STEP 4 — DECISION ═══\n` +
           (isSwingMode
             ? `⚠️ SWING TRADE MODE: This is a swing trade — we exit at +12¢ profit, NOT hold to settlement.\n` +
@@ -3832,10 +3833,10 @@ async function checkLiveScoreEdges() {
         // Confidence-based gate — sport-specific floor if calibration override exists, else global
         let confidence = decision.confidence ?? 0;
         const sportMinConf = CAL.minConfidenceLive?.[league] ?? MIN_CONFIDENCE;
-        // Underdog entries (price < 50¢) require higher confidence (72% vs 65%).
-        // Data: 0-for-3 at standard floor on <50¢ live entries. Market prices underdogs
-        // correctly more often — need a clearer signal to override.
-        const effectiveMinConf = price < 0.50 ? Math.max(sportMinConf, 0.72) : sportMinConf;
+        // Underdog entries (price < 50¢): same confidence floor as standard.
+        // At 40¢, 65% confidence = 25pt edge — massive. The edge calc protects us,
+        // no need for a separate higher confidence floor that blocks real opportunities.
+        const effectiveMinConf = sportMinConf;
         if (confidence < effectiveMinConf) {
           const floorNote = price < 0.50 ? ' [underdog floor 72%]' : (CAL.minConfidenceLive?.[league] ? ' [calibrated]' : '');
           console.log(`[live-edge] Confidence too low on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(confidence*100).toFixed(0)}% < ${(effectiveMinConf*100).toFixed(0)}%${floorNote}`);
@@ -7091,6 +7092,21 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
         trade.realizedPnL = Math.round((currentPrice - (trade.entryPrice ?? 0)) * approxQty * 100) / 100;
         trade.settledAt = new Date().toISOString();
       }
+      // Persist to JSONL so both-sides check sees the closed status
+      if (existsSync(TRADES_LOG)) {
+        try {
+          const gLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+          const gTrades = gLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+          const gTrade = gTrades.find(t => t.id === trade.id);
+          if (gTrade) {
+            gTrade.status = trade.status;
+            gTrade.exitPrice = trade.exitPrice;
+            gTrade.realizedPnL = trade.realizedPnL;
+            gTrade.settledAt = trade.settledAt;
+            writeFileSync(TRADES_LOG, gTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
+          }
+        } catch (e) { console.error(`[exit] Failed to persist guard-sold status for ${trade.ticker}:`, e.message); }
+      }
       return false;
     }
     if (kalshiQty < sellQty) {
@@ -7147,6 +7163,23 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
       lastHCLossAt = Date.now();
       saveState();
       console.log(`[exit] 🔒 HC LOSS detected on ${trade.ticker} — HC locked for 24h`);
+    }
+    // Persist the sold status to TRADES_LOG so the both-sides check can detect
+    // that this position was exited (journalExited flag). Without this, the JSONL
+    // file still shows status:'open' and the bot blocks same-game re-entry.
+    if (existsSync(TRADES_LOG)) {
+      try {
+        const sLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+        const sTrades = sLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        const sTrade = sTrades.find(t => t.id === trade.id);
+        if (sTrade) {
+          sTrade.status = trade.status;
+          sTrade.exitPrice = trade.exitPrice;
+          sTrade.realizedPnL = trade.realizedPnL;
+          sTrade.settledAt = trade.settledAt;
+          writeFileSync(TRADES_LOG, sTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
+        }
+      } catch (e) { console.error(`[exit] Failed to persist sold status for ${trade.ticker}:`, e.message); }
     }
     // After any stop-loss, lock out re-entry on this game for 30 min (BOTH sides).
     // Persisted in state.json so restarts don't clear the lock.
