@@ -6074,13 +6074,17 @@ async function managePositions() {
         //   NHL: 75% — first-goal is strong signal; hold 25% in case team keeps scoring
         //   MLB: 50% — early lead; 6 innings left, worth holding half
         //   NBA: 50% — first-half lead; second half is the real game
-        if (trade.strategy === 'pre-game-prediction' && profitPerContract >= 0.12 && !trade.partialTakeAt) {
+        // Stage-aware profit target: early game is noisy — hold for bigger move.
+        // Mid game the thesis is partially resolved — +12¢ is fine. Late game
+        // lock anything meaningful before settlement variance.
+        const pgProfitTarget = stage === 'early' ? 0.20 : stage === 'late' ? 0.08 : 0.12;
+        if (trade.strategy === 'pre-game-prediction' && profitPerContract >= pgProfitTarget && !trade.partialTakeAt) {
           // Price target hit — sell the full position. Strategy is: buy team at a discount,
-          // sell when market agrees (+12¢). No partial holds; a held partial just exposes
+          // sell when market agrees. No partial holds; a held partial just exposes
           // us to full-game variance without the edge that justified the original entry.
           if (qty >= 1) {
             const gainPct = Math.round((profitPerContract / entryPrice) * 100);
-            console.log(`[exit] 💰 PRE-GAME TARGET HIT: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty} @ ${(currentPrice*100).toFixed(0)}¢, profit ~$${(qty * profitPerContract).toFixed(2)}`);
+            console.log(`[exit] 💰 PRE-GAME TARGET HIT (${stage}, target +${Math.round(pgProfitTarget*100)}¢): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty} @ ${(currentPrice*100).toFixed(0)}¢, profit ~$${(qty * profitPerContract).toFixed(2)}`);
             const result = await executeSell(trade, qty, currentPrice, 'pre-game-profit-lock');
             if (result) {
               trade.partialTakeAt = new Date().toISOString();
@@ -6092,6 +6096,7 @@ async function managePositions() {
                 `📊 <b>METRICS</b>\n` +
                 `Sold ALL ${qty} contracts @ ${(currentPrice*100).toFixed(0)}¢\n` +
                 `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
+                `Stage: ${stage} | Target was +${Math.round(pgProfitTarget*100)}¢\n` +
                 `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
               );
             }
@@ -6157,11 +6162,13 @@ async function managePositions() {
           continue;
         }
 
-        // LIVE HIGH-CONVICTION PROFIT-LOCK — same logic but +20¢ for high-conviction
-        // trades since they entered with bigger sizing and higher confidence.
-        if (trade.strategy === 'high-conviction' && profitPerContract >= 0.20) {
+        // LIVE HIGH-CONVICTION PROFIT-LOCK — stage-aware like pre-game but with
+        // higher bars since HC entries are sized bigger and carry more conviction.
+        // Early: +25¢ (hold through noise), Mid: +20¢ (unchanged), Late: +15¢ (lock it)
+        const hcProfitTarget = stage === 'early' ? 0.25 : stage === 'late' ? 0.15 : 0.20;
+        if (trade.strategy === 'high-conviction' && profitPerContract >= hcProfitTarget) {
           const gainPct = Math.round((profitPerContract / entryPrice) * 100);
-          console.log(`[exit] 🔥💰 HC PROFIT-LOCK: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
+          console.log(`[exit] 🔥💰 HC PROFIT-LOCK (${stage}, target +${Math.round(hcProfitTarget*100)}¢): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
           const result = await executeSell(trade, qty, currentPrice, 'hc-profit-lock');
           if (result) {
             anyUpdated = true;
@@ -6169,6 +6176,7 @@ async function managePositions() {
               `🔥💰 <b>HIGH-CONVICTION PROFIT-LOCK</b>\n\n` +
               `${trade.title}\n` +
               `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
+              `Stage: ${stage} | Target was +${Math.round(hcProfitTarget*100)}¢\n` +
               `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
             );
           }
