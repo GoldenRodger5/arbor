@@ -6274,11 +6274,24 @@ async function managePositions() {
 
         // PRE-GAME HARD STOP — cent-based, time-gated.
         // Swing-trade thesis: we exit at +12¢. Symmetric risk means we cut at -12¢.
-        // But early game is noisy — only fire after mid-game to avoid cutting on 1st-inning variance.
-        //   MLB: fire after inning 3+  |  NBA: fire after Q2+  |  NHL: fire after P1  |  Soccer: after min 30
-        const pgHardStopCents = entryPrice < 0.50 ? 0.12 : 0.10;
+        // But early game is noisy — only fire after enough game has elapsed.
+        //
+        // TIME GATE (raised for MLB):
+        //   MLB: inning 5+ (was inning 3+) — innings 3-4 fired prematurely on ATL@PHI and STL@HOU,
+        //     both games where a 1-run early deficit reversed into wins. pg-guard Claude (-35%)
+        //     and WE-reversal (WE ≤ 30%) cover innings 3-4 instead.
+        //   NBA: Q3+ (period 3+)  |  NHL: P2+  |  Soccer: min 60+
+        //
+        // CENT THRESHOLD (widened for cheap entries in mid stage):
+        //   < 50¢ entry in MLB mid (inning 5-6): 15¢ — at 45¢ entry, 12¢ = -26.7% which still
+        //     fires before pg-guard Claude (-35%). Widening to 15¢ = -33.3% ensures Claude
+        //     evaluates before the mechanical stop fires in mid-game underdog plays.
+        //   All other: < 50¢ entry → 12¢, ≥ 50¢ entry → 10¢
+        const pgHardStopCents = (entryPrice < 0.50 && league === 'mlb' && stage === 'mid') ? 0.15
+          : entryPrice < 0.50 ? 0.12
+          : 0.10;
         const pgHardStopReady = trade.strategy === 'pre-game-prediction' && (
-          (league === 'mlb' && ctx?.period >= 3) ||
+          (league === 'mlb' && ctx?.period >= 5) ||
           (league === 'nba' && ctx?.period >= 3) ||
           (league === 'nhl' && ctx?.period >= 2) ||
           (['mls','epl','laliga'].includes(league) && ctx?.period >= 60)
