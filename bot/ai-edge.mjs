@@ -6141,27 +6141,63 @@ async function managePositions() {
           continue;
         }
 
-        // PRE-GAME PROFIT-LOCK — sport-specific exit % when up ≥12¢ from entry.
-        // Strategy is sell-into-lead: we exit when the price spike from the early event occurs.
-        // Soccer/NHL: the spike is temporary — sell most/all immediately.
-        // MLB/NBA: the game has more time; hold a portion to participate in further upside.
+        // EPL/LA LIGA 70-MINUTE HARD EXIT — draw probability spikes past 25% in final 20 minutes.
+        // WE tables assume win-or-loss; they don't model the draw outcome. A 1-0 EPL lead at 70'
+        // has ~25% draw risk — that's 25% chance of full position loss on top of normal L odds.
+        // Sell everything at minute 70 regardless of P&L. If losing: stops handle it earlier anyway.
+        if (trade.strategy === 'pre-game-prediction' && (league === 'epl' || league === 'laliga')
+            && ctx?.period != null && ctx.period >= 70) {
+          const gainPct = Math.round((profitPerContract / entryPrice) * 100);
+          const verb = profitPerContract >= 0 ? 'locking profit' : 'cutting loss';
+          console.log(`[exit] ⚽⏰ EPL 70-MIN EXIT: ${trade.ticker} @ ${(currentPrice*100).toFixed(0)}¢ — minute ${ctx.period}, ${verb} before draw cliff (draw rate ~25%+ after min 70)`);
+          const result = await executeSell(trade, qty, currentPrice, 'epl-70min-exit');
+          if (result) {
+            anyUpdated = true;
+            await tg(
+              `⚽⏰ <b>EPL 70-MIN EXIT</b>\n\n` +
+              `${trade.title}\n` +
+              `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (${gainPct >= 0 ? '+' : ''}${gainPct}%)\n` +
+              `Minute: ${ctx.period} — selling before draw probability spikes\n` +
+              `P&L: <b>${profitPerContract >= 0 ? '+' : ''}$${(qty * profitPerContract).toFixed(2)}</b>`
+            );
+          }
+          continue;
+        }
+
+        // PRE-GAME PROFIT-LOCK — exit when the market agrees with our entry estimate.
         //
-        // Exit % by sport:
-        //   Soccer (MLS/EPL/La Liga): 90% — first-goal spike is brief; game can draw and price drifts back
-        //   NHL: 75% — first-goal is strong signal; hold 25% in case team keeps scoring
-        //   MLB: 50% — early lead; 6 innings left, worth holding half
-        //   NBA: 50% — first-half lead; second half is the real game
-        // Stage-aware profit target: early game is noisy — hold for bigger move.
-        // Mid game the thesis is partially resolved — +12¢ is fine. Late game
-        // lock anything meaningful before settlement variance.
-        const pgProfitTarget = stage === 'early' ? 0.20 : stage === 'late' ? 0.08 : 0.12;
+        // CONFIDENCE-ANCHORED EXIT (NHL/NBA/EPL): don't sell below own entry confidence.
+        // Data: PHI@PIT sold at 64¢ with 72% confidence (left $22.68), MN@DAL sold at 62¢
+        // with 72% confidence (left $22.80). Both teams won. We exited 8¢ below our own estimate.
+        // The pre-game thesis (elite goalie, home ice, back-to-back opponent) persists through
+        // the game — the entry confidence stays valid until the game state clearly contradicts it.
+        //
+        // Exit formula:
+        //   NHL/EPL/LaLiga: price ≥ max(stage_target, entry_confidence)  — full anchor
+        //   NBA:            price ≥ max(stage_target, entry_confidence - 2%)  — 2% buffer for volatility
+        //   MLB:            stage targets only — MLB wins come from quiet holds to settlement,
+        //                   not price spikes. Confidence anchor doesn't help here.
+        //   Late stage (P3/inn8+/Q4): revert to stage target only (+8¢) — don't hold for
+        //                   confidence in final period, too much settlement variance.
+        const pgStageProfitTarget = stage === 'early' ? 0.20 : stage === 'late' ? 0.08 : 0.12;
+
+        const entryConf = trade.confidence ?? 0;
+        // Confidence floor price (what we thought the team was worth at entry)
+        const confFloorPrice = (league === 'mlb' || stage === 'late') ? 0  // MLB + late: stage targets only
+          : league === 'nba' ? Math.max(0, entryConf - 0.02)              // NBA: -2% volatility buffer
+          : entryConf;                                                       // NHL, EPL, LaLiga: full anchor
+
+        // Convert floor price to gain-per-contract — positive only (don't lower stage floor)
+        const confGainTarget = (confFloorPrice > entryPrice) ? (confFloorPrice - entryPrice) : 0;
+        const pgProfitTarget = Math.max(pgStageProfitTarget, confGainTarget);
+
         if (trade.strategy === 'pre-game-prediction' && profitPerContract >= pgProfitTarget && !trade.partialTakeAt) {
-          // Price target hit — sell the full position. Strategy is: buy team at a discount,
-          // sell when market agrees. No partial holds; a held partial just exposes
-          // us to full-game variance without the edge that justified the original entry.
           if (qty >= 1) {
             const gainPct = Math.round((profitPerContract / entryPrice) * 100);
-            console.log(`[exit] 💰 PRE-GAME TARGET HIT (${stage}, target +${Math.round(pgProfitTarget*100)}¢): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty} @ ${(currentPrice*100).toFixed(0)}¢, profit ~$${(qty * profitPerContract).toFixed(2)}`);
+            const anchorNote = confGainTarget > pgStageProfitTarget
+              ? ` [conf-anchor: ${Math.round(confFloorPrice*100)}¢ > stage +${Math.round(pgStageProfitTarget*100)}¢]`
+              : ` [stage target +${Math.round(pgStageProfitTarget*100)}¢]`;
+            console.log(`[exit] 💰 PRE-GAME TARGET HIT (${stage}${anchorNote}): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty} @ ${(currentPrice*100).toFixed(0)}¢, profit ~$${(qty * profitPerContract).toFixed(2)}`);
             const result = await executeSell(trade, qty, currentPrice, 'pre-game-profit-lock');
             if (result) {
               trade.partialTakeAt = new Date().toISOString();
@@ -6173,7 +6209,7 @@ async function managePositions() {
                 `📊 <b>METRICS</b>\n` +
                 `Sold ALL ${qty} contracts @ ${(currentPrice*100).toFixed(0)}¢\n` +
                 `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
-                `Stage: ${stage} | Target was +${Math.round(pgProfitTarget*100)}¢\n` +
+                `Stage: ${stage} | Target: ${confGainTarget > pgStageProfitTarget ? `conf ${Math.round(confFloorPrice*100)}¢` : `+${Math.round(pgStageProfitTarget*100)}¢`}\n` +
                 `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
               );
             }
@@ -6432,11 +6468,21 @@ async function managePositions() {
           (league === 'nhl' && ctx?.period >= 2) ||
           (['mls','epl','laliga'].includes(league) && ctx?.period >= 60)
         );
-        if (pgHardStopReady && (entryPrice - currentPrice) >= pgHardStopCents) {
+        // MLB LATE-GAME LEAD LOCK: suppress hard stop when leading by 3+ runs in inning 7+.
+        // WE ≥ 93% at 3-run inning-7 lead — game is statistically over. Price fluctuations
+        // at 85-90¢ are noise. A stop-loss here would exit a near-certain win.
+        const mlbBlowoutLock = league === 'mlb'
+          && ctx?.period >= 7
+          && profitPerContract > 0  // we are currently winning on price
+          && (ctx?.diff ?? 0) >= 3; // 3+ run lead
+        if (pgHardStopReady && !mlbBlowoutLock && (entryPrice - currentPrice) >= pgHardStopCents) {
           console.log(`[exit] 🛑 PRE-GAME HARD STOP (${stage}): ${trade.ticker} down ${Math.round((entryPrice - currentPrice)*100)}¢ (limit ${Math.round(pgHardStopCents*100)}¢) | entry ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢`);
           const result = await executeSell(trade, qty, currentPrice, 'pre-game-hard-stop');
           if (result) anyUpdated = true;
           continue;
+        }
+        if (mlbBlowoutLock && pgHardStopReady && (entryPrice - currentPrice) >= pgHardStopCents) {
+          console.log(`[exit] 🔒 MLB BLOWOUT LOCK: suppressing hard stop — inning ${ctx.period}, +${ctx.diff} run lead, WE ≥93% — holding to settlement`);
         }
 
         // PRE-GAME NUCLEAR STOP — stage-aware hard floor, no Claude.
@@ -6463,7 +6509,7 @@ async function managePositions() {
           league === 'nhl' ? (ctx.period >= 2) :
           true
         );
-        if (trade.strategy === 'pre-game-prediction' && pctChange < pgNuclearFloor && pgNuclearTimeGated) {
+        if (trade.strategy === 'pre-game-prediction' && pctChange < pgNuclearFloor && pgNuclearTimeGated && !mlbBlowoutLock) {
           console.log(`[exit] 🛑 PRE-GAME NUCLEAR (${stage}, period ${ctx?.period ?? '?'}, entry ${(entryPrice*100).toFixed(0)}¢): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — ${stage} floor ${Math.round(pgNuclearFloor*100)}% hit`);
           const result = await executeSell(trade, qty, currentPrice, 'pre-game-nuclear');
           if (result) anyUpdated = true;
