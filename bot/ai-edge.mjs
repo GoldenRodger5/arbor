@@ -3520,6 +3520,7 @@ async function checkLiveScoreEdges() {
         // the live-edge is allowed to add a fresh same-direction bet up to the game cap.
         let pgPositionFraction = 1.0; // assume full position until we find otherwise
         let pgPositionTeam = null;
+        let journalExited = false; // true if journal shows a trade on this game was sold/stopped
 
         if (!hasPosition && existsSync(TRADES_LOG)) {
           try {
@@ -3530,13 +3531,17 @@ async function checkLiveScoreEdges() {
               try {
                 const jt = JSON.parse(l);
                 if (jt.status === 'testing-void') continue;
-                // Fully exited positions are off the exchange — don't block new entries.
-                // Only open and closed-manual (may still be physically on exchange) should block.
-                if (jt.status !== 'open' && jt.status !== 'closed-manual') continue;
                 const jtMs = jt.timestamp ? Date.parse(jt.timestamp) : 0;
                 if (jtMs < dupStartMs || jtMs >= dupEndMs) continue;
                 const jticker = (jt.ticker ?? '').toLowerCase();
                 if (tickerHasTeam(jticker, homeAbbr) && tickerHasTeam(jticker, awayAbbr)) {
+                  // Fully exited positions (sold/stopped) are off the exchange — don't block new entries.
+                  // Only open and closed-manual (may still be physically on exchange) should block.
+                  if (jt.status !== 'open' && jt.status !== 'closed-manual') {
+                    journalExited = true;
+                    console.log(`[live-edge] ℹ️ Journal shows exited trade on ${homeAbbr}@${awayAbbr} (status: ${jt.status}) — position closed, not blocking`);
+                    break;
+                  }
                   // For pre-game positions, check how much is still open.
                   // partialTakeAt means we've already taken ≥50% profit —
                   // in that case allow a fresh same-direction live entry up to game cap.
@@ -3578,10 +3583,12 @@ async function checkLiveScoreEdges() {
                   }
                   const paperTeam = (pt.teamAbbr ?? pt.ticker?.split('-').pop() ?? '?').toUpperCase();
                   if (paperTeam !== targetAbbr?.toUpperCase()) {
-                    if (PREGAME_LIVE) {
-                      // Real pre-game position exists on the other side — block the live bet
+                    if (PREGAME_LIVE && !journalExited) {
+                      // Real pre-game position still open on the other side — block the live bet
                       hasPosition = true;
                       console.log(`[live-edge] 🚫 BLOCKED: pre-game bet on ${paperTeam}, live-edge wants ${targetAbbr} on same game — refusing both-sides bet`);
+                    } else if (PREGAME_LIVE && journalExited) {
+                      console.log(`[live-edge] ✅ Pre-game ${paperTeam} position was already exited (stop-loss/sold) — ${targetAbbr} side is clear for entry`);
                     } else {
                       console.log(`[live-edge] ⚠️ PAPER/LIVE CONFLICT on ${homeAbbr}@${awayAbbr}: paper pre-game picked ${paperTeam}, live-edge favoring ${targetAbbr} — proceeding (paper is not real money)`);
                     }
