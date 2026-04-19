@@ -6564,18 +6564,51 @@ async function managePositions() {
             continue;
           }
 
-          // 2. HARD-STOP: sell at -10¢ after 1+ period elapsed
+          // 2. STOP THRESHOLD: -10¢ after 1+ period → Claude evaluates
           if (periodsElapsed >= 1 && swingProfit <= -0.10) {
-            console.log(`[exit] 🔄🛑 SWING HARD-STOP: ${trade.ticker} down ${Math.round(-swingProfit*100)}¢ after ${periodsElapsed} period(s) — cutting loss`);
-            await tg(
-              `🔄🛑 <b>SWING HARD-STOP</b>\n\n` +
-              `${trade.title}\n` +
-              `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (${(swingProfit*100).toFixed(0)}¢)\n` +
-              `Loss: <b>$${(qty * swingProfit).toFixed(2)}</b> — ${periodsElapsed} period(s) elapsed, thesis failed`
-            );
-            const result = await executeSell(trade, qty, currentPrice, 'swing-hard-stop');
-            if (result) anyUpdated = true;
-            continue;
+            const swingStopKey = 'swing-stop-eval:' + trade.ticker;
+            const lastSwingEval = tradeCooldowns.get(swingStopKey) ?? 0;
+            if (Date.now() - lastSwingEval >= 5 * 60 * 1000) {
+              tradeCooldowns.set(swingStopKey, Date.now());
+              const ticker = trade.ticker ?? '';
+              const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
+                : ticker.includes('NHL') ? 'NHL' : 'Soccer';
+              const swingStopPrompt =
+                `Live ${sport} swing trade hit stop threshold (-${Math.round(-swingProfit*100)}¢ after ${periodsElapsed} period(s)). SELL or HOLD?\n\n` +
+                `POSITION: Entry ${(entryPrice*100).toFixed(0)}¢ → Now ${(currentPrice*100).toFixed(0)}¢ (${(swingProfit*100).toFixed(0)}¢).\n` +
+                `Game: ${trade.title}\n` +
+                (ctx ? `LIVE: ${ctx.detail} | Period: ${ctx.period}\n` : '') +
+                (ctx?.baselineWE != null ? `Win expectancy: ${(((ctx?.leading === (ticker.split('-').pop() ?? '')) ? ctx.baselineWE : (1 - ctx.baselineWE))*100).toFixed(0)}%\n` : '') +
+                `\nThis is a swing trade (short-term momentum play). Is the momentum thesis still alive?\n` +
+                `SELL if the momentum has clearly reversed and recovery is unlikely.\n` +
+                `HOLD if the team still has a realistic path and the game situation supports a comeback.\n\n` +
+                `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
+              const swingText = await claudeScreen(swingStopPrompt, { maxTokens: 200, timeout: 8000 });
+              if (swingText) {
+                try {
+                  const match = extractJSON(swingText);
+                  if (match) {
+                    const d = JSON.parse(match);
+                    if (d.action === 'sell') {
+                      console.log(`[exit] 🧠🔄🛑 CLAUDE SWING-STOP: ${trade.ticker} down ${Math.round(-swingProfit*100)}¢ — selling | ${d.reasoning?.slice(0,80)}`);
+                      await tg(
+                        `🔄🛑 <b>SWING STOP (Claude)</b>\n\n` +
+                        `${trade.title}\n` +
+                        `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (${(swingProfit*100).toFixed(0)}¢)\n` +
+                        `Loss: <b>$${(qty * swingProfit).toFixed(2)}</b>\n` +
+                        `Claude: ${d.reasoning?.slice(0,100) ?? 'thesis failed'}`
+                      );
+                      const result = await executeSell(trade, qty, currentPrice, 'swing-hard-stop');
+                      if (result) anyUpdated = true;
+                      continue;
+                    } else {
+                      console.log(`[exit] 🧠🛡️ CLAUDE HOLD swing-stop: ${trade.ticker} down ${Math.round(-swingProfit*100)}¢ — holding | ${d.reasoning?.slice(0,80)}`);
+                      tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                    }
+                  }
+                } catch { /* skip */ }
+              }
+            }
           }
 
           // 3. THESIS-EXPIRY: sell if <+8¢ after 2+ periods (didn't spike, momentum gone)
@@ -6719,21 +6752,65 @@ async function managePositions() {
           && ctx?.period >= 7
           && profitPerContract > 0  // we are currently winning on price
           && (ctx?.diff ?? 0) >= 3; // 3+ run lead
-        // CLAUDE HOLD OVERRIDE: if Claude (pg-guard or loss eval) said HOLD within the last
-        // 10 minutes, skip the mechanical hard stop. Claude has live context (score, goalie,
-        // WE, sport-specific comeback rates) — the mechanical stop doesn't. This prevents
-        // the MTL@TB P1→P2 race condition where Claude says HOLD 4x then the time gate
-        // arms and fires mechanically without re-consulting Claude.
-        const lastClaudeHold = tradeCooldowns.get('claude-hold:' + trade.ticker) ?? 0;
-        const claudeHoldRecent = Date.now() - lastClaudeHold < 10 * 60 * 1000; // 10 min window
+        // CLAUDE STOP EVALUATION: when the cent-based threshold is hit, ASK Claude
+        // instead of mechanically selling. Claude has live context (score, comeback rates,
+        // time remaining) — the mechanical stop doesn't. This prevents premature exits
+        // like MTL@TB where a 1-goal NHL deficit in P2 (30% comeback rate) was sold at
+        // -10¢ and the team came back to win.
         if (pgHardStopReady && !mlbBlowoutLock && (entryPrice - currentPrice) >= pgHardStopCents) {
-          if (claudeHoldRecent) {
-            console.log(`[exit] 🛡️ HARD STOP DEFERRED: ${trade.ticker} down ${Math.round((entryPrice - currentPrice)*100)}¢ but Claude said HOLD ${Math.round((Date.now() - lastClaudeHold) / 60000)}min ago — waiting for next Claude eval`);
+          const hardStopKey = 'hard-stop-eval:' + trade.ticker;
+          const lastHardStopEval = tradeCooldowns.get(hardStopKey) ?? 0;
+          if (Date.now() - lastHardStopEval >= 5 * 60 * 1000) {
+            tradeCooldowns.set(hardStopKey, Date.now());
+            const ticker = trade.ticker ?? '';
+            const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
+              : ticker.includes('NHL') ? 'NHL' : ticker.includes('MLS') || ticker.includes('EPL')
+              || ticker.includes('LALIGA') ? 'Soccer' : 'Sport';
+            const comebackCtx = {
+              NBA: 'NBA: 10pt comeback = 25%. 15pt = 13%. 20pt = 4%. 25+ = <1%.',
+              MLB: 'MLB: 1-run = 40%. 2-run = 25%. 3-run = 20% thru 6 inn. 5+ after 6th = <3%.',
+              NHL: 'NHL: 1-goal = 30%. 2-goal = 15%. 3-goal = 5%. Down 3+ in 3rd = over.',
+              Soccer: '1-goal = 20% equalize. 2-goal = 5%. Down 2+ after 75min = over.',
+              Sport: 'Comebacks depend on deficit size and time remaining.',
+            }[sport] ?? '';
+            const timeLeft = sport === 'NHL' ? `${Math.max(0, 3 - (ctx?.period ?? 2))} period(s) left (~${Math.max(0, 3 - (ctx?.period ?? 2)) * 20}min)`
+              : sport === 'MLB' ? `~${Math.max(0, 9 - (ctx?.period ?? 5))} innings left`
+              : sport === 'NBA' ? `${Math.max(0, 4 - (ctx?.period ?? 3))} quarter(s) left (~${Math.max(0, 4 - (ctx?.period ?? 3)) * 12}min)`
+              : `~${Math.max(0, 90 - (ctx?.period ?? 60))}min left`;
+            const hardStopPrompt =
+              `Live ${sport} bet hit stop-loss threshold. Should we SELL or HOLD?\n\n` +
+              `POSITION: Bought at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢ (down ${Math.round((entryPrice-currentPrice)*100)}¢, ${(pctChange*100).toFixed(0)}%).\n` +
+              `Game: ${trade.title}\n` +
+              (ctx ? `LIVE: ${ctx.detail} | Stage: ${stage.toUpperCase()} | Period: ${ctx.period}\n` : '') +
+              (ctx?.baselineWE != null ? `Win expectancy: ${(((ctx.leading === (ticker.split('-').pop() ?? '')) ? ctx.baselineWE : (1 - ctx.baselineWE))*100).toFixed(0)}%\n` : '') +
+              `TIME LEFT: ${timeLeft}\n\n` +
+              `COMEBACK RATES: ${comebackCtx}\n\n` +
+              `DECIDE based on: (1) score deficit vs ${sport} comeback rates at this stage, (2) time remaining, (3) is the deficit recoverable?\n` +
+              `HOLD if realistic comeback chance (WE > 20%, manageable deficit for the stage).\n` +
+              `SELL if game is effectively over (large deficit late, WE < 15%, or blowout).\n\n` +
+              `JSON: {"action":"sell"/"hold","reasoning":"1 sentence on comeback viability given score and time left"}`;
+            const evalText = await claudeScreen(hardStopPrompt, { maxTokens: 200, timeout: 8000 });
+            if (evalText) {
+              try {
+                const match = extractJSON(evalText);
+                if (match) {
+                  const d = JSON.parse(match);
+                  if (d.action === 'sell') {
+                    console.log(`[exit] 🧠🛑 CLAUDE STOP-EVAL (${stage}): ${trade.ticker} down ${Math.round((entryPrice-currentPrice)*100)}¢ — selling | ${d.reasoning?.slice(0,80)}`);
+                    const result = await executeSell(trade, qty, currentPrice, 'claude-hard-stop');
+                    if (result) anyUpdated = true;
+                    continue;
+                  } else {
+                    console.log(`[exit] 🧠🛡️ CLAUDE HOLD at stop (${stage}): ${trade.ticker} down ${Math.round((entryPrice-currentPrice)*100)}¢ — holding | ${d.reasoning?.slice(0,80)}`);
+                    tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                  }
+                }
+              } catch { /* skip */ }
+            } else {
+              console.log(`[exit] ⏳ Hard-stop threshold hit on ${trade.ticker} but Claude unavailable — deferring to next cycle`);
+            }
           } else {
-            console.log(`[exit] 🛑 PRE-GAME HARD STOP (${stage}): ${trade.ticker} down ${Math.round((entryPrice - currentPrice)*100)}¢ (limit ${Math.round(pgHardStopCents*100)}¢) | entry ${(entryPrice*100).toFixed(0)}¢→${(currentPrice*100).toFixed(0)}¢`);
-            const result = await executeSell(trade, qty, currentPrice, 'pre-game-hard-stop');
-            if (result) anyUpdated = true;
-            continue;
+            console.log(`[exit] ⏳ Hard-stop threshold active on ${trade.ticker} — Claude eval cooling down (${Math.round((Date.now() - lastHardStopEval)/60000)}min ago)`);
           }
         }
         if (mlbBlowoutLock && pgHardStopReady && (entryPrice - currentPrice) >= pgHardStopCents) {
@@ -6782,25 +6859,19 @@ async function managePositions() {
           continue;
         }
 
-        // WE-REVERSAL SELL — when the game situation has fully flipped against us.
-        // If our team's current win expectancy has dropped to ≤30%, the thesis is dead.
-        // Sell immediately — no Claude, no cooldown. Fills the gap between claudeStop
-        // (~55¢) and nuclear (~16¢) where we were bleeding out on reversed games.
-        // Example: KC P7 we bet at 65¢, DET took a 3-run lead → KC WE drops to ~15% → sell.
+        // WE-REVERSAL — when the game situation has flipped against us.
+        // Instead of mechanical sell, Claude evaluates with sport-specific comeback context.
+        // SAFETY NET: WE ≤ 10% = mechanical sell (game is statistically over, no comeback).
         //
         // PRE-GAME EXCEPTION: Don't fire WE-REVERSAL on pre-game bets in early/mid game.
         // The Pre-Game Guardian (pg-guard) runs every 60s with full thesis-aware Claude
         // evaluation. Blunt WE-REVERSAL here would cancel positions before the thesis
         // has even been tested — e.g. COL down 2-0 in inning 2 while Weiss hasn't imploded yet.
-        // Only allow WE-REVERSAL on pre-game bets in late game (or at a deeper floor: ≤20%).
         if (ctx?.diff > 0 && ctx.baselineWE != null) {
           const ourTeam = trade.ticker?.split('-').pop() ?? '';
           const ourWE = ctx.leading === ourTeam ? ctx.baselineWE : (1 - ctx.baselineWE);
           const isPreGame = trade.strategy === 'pre-game-prediction';
           const isComeback = trade.strategy === 'comeback-buy';
-          // Grace period: don't fire WE-reversal on pre-game positions within 30 min of entry.
-          // Also require game to be genuinely in progress (stage known) — stale ESPN data
-          // returning 0-0 pre-start can compute 3% WE and trigger an erroneous sell.
           const entryMs = trade.timestamp ? Date.parse(trade.timestamp) : 0;
           const minsSinceEntry = entryMs ? (Date.now() - entryMs) / 60000 : 99;
           const gameIsLive = stage !== 'unknown';
@@ -6808,45 +6879,113 @@ async function managePositions() {
             // Too soon or game not confirmed live — skip WE-reversal, let pg-guard handle it
           } else if (isComeback && minsSinceEntry < 15) {
             // COMEBACK GRACE PERIOD: comeback entries are at 10-44¢ with WE already low.
-            // The 30% standard floor would fire on almost any valid entry immediately.
-            // Give 15 min for the trade to breathe — score-worsening exit above handles
-            // thesis failures during this window. After 15 min, lower floor of 15% applies.
+            // Give 15 min for the trade to breathe.
           } else {
-            // Pre-game early/mid: 20% floor (pg-guard handles it).
-            // Comeback: 15% floor — these are valid low-probability entries, only exit on true blowout.
-            // Everything else: 30% floor.
             const weFloor = isPreGame && stage !== 'late' ? 0.20
               : isComeback ? 0.15
               : 0.30;
             if (ourWE <= weFloor) {
-              console.log(`[exit] 🔄 WE-REVERSAL (${(ourWE*100).toFixed(0)}% WE ≤${Math.round(weFloor*100)}%${isPreGame ? ' pre-game' : isComeback ? ' comeback' : ''}): ${trade.ticker} — game reversed, selling at ${(currentPrice*100).toFixed(0)}¢`);
-              const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
-              if (result) anyUpdated = true;
-              continue;
+              // MECHANICAL SAFETY NET: WE ≤ 10% = game is over, no Claude needed
+              if (ourWE <= 0.10) {
+                console.log(`[exit] 🔄🛑 WE-REVERSAL SAFETY NET (${(ourWE*100).toFixed(0)}% WE ≤10%): ${trade.ticker} — game is over, selling at ${(currentPrice*100).toFixed(0)}¢`);
+                const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
+                if (result) anyUpdated = true;
+                continue;
+              }
+              // Claude evaluates WE-reversal instead of auto-selling
+              const weRevKey = 'we-rev-eval:' + trade.ticker;
+              const lastWeRevEval = tradeCooldowns.get(weRevKey) ?? 0;
+              if (Date.now() - lastWeRevEval >= 5 * 60 * 1000) {
+                tradeCooldowns.set(weRevKey, Date.now());
+                const ticker = trade.ticker ?? '';
+                const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
+                  : ticker.includes('NHL') ? 'NHL' : 'Soccer';
+                const weRevPrompt =
+                  `Live ${sport} bet — win expectancy dropped to ${(ourWE*100).toFixed(0)}%. Should we SELL or HOLD?\n\n` +
+                  `POSITION: Bought at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢.\n` +
+                  `Game: ${trade.title}\n` +
+                  (ctx ? `LIVE: ${ctx.detail} | Stage: ${stage.toUpperCase()} | Period: ${ctx.period}\n` : '') +
+                  `Win expectancy: ${(ourWE*100).toFixed(0)}% | Score diff: ${ctx.diff}\n\n` +
+                  `At ${(ourWE*100).toFixed(0)}% WE, is a comeback realistic for ${sport} at this stage?\n` +
+                  `HOLD if deficit is recoverable (1-goal NHL with period+ left, small MLB deficit mid-game).\n` +
+                  `SELL if game is effectively decided (large deficit late, blowout).\n\n` +
+                  `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
+                const weText = await claudeScreen(weRevPrompt, { maxTokens: 200, timeout: 8000 });
+                if (weText) {
+                  try {
+                    const match = extractJSON(weText);
+                    if (match) {
+                      const d = JSON.parse(match);
+                      if (d.action === 'sell') {
+                        console.log(`[exit] 🧠🔄 CLAUDE WE-REVERSAL (${(ourWE*100).toFixed(0)}% WE): ${trade.ticker} — selling | ${d.reasoning?.slice(0,80)}`);
+                        const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
+                        if (result) anyUpdated = true;
+                        continue;
+                      } else {
+                        console.log(`[exit] 🧠🛡️ CLAUDE HOLD at WE-reversal (${(ourWE*100).toFixed(0)}% WE): ${trade.ticker} — holding | ${d.reasoning?.slice(0,80)}`);
+                        tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                      }
+                    }
+                  } catch { /* skip */ }
+                }
+              }
             }
           }
         }
 
-        // WE-DROP SELL — catches slow deterioration that WE-reversal misses.
-        // When the game ties (50% WE) we don't sell — but then if opponent takes the lead
-        // we're already at 25-30% WE and the price has collapsed. This fires earlier.
-        // Rule: if our current WE has dropped ≥35pt from the WE when we entered, sell.
-        // Example: entered ARI with 76% WE (5-4 lead P7), game ties → ARI WE=50%,
-        //   drop = 26pt (no fire). BAL takes lead → ARI WE=24%, drop = 52pt → SELL.
-        //   With 60s polling the tie-then-reversal fires ~1 cycle after the lead changes,
-        //   catching it faster than waiting for the ≤30% threshold.
-        // Note: weAtEntry stored on trade at entry time (null for pre-game or old trades).
+        // WE-DROP — catches slow deterioration that WE-reversal misses.
+        // When WE drops ≥35pt from entry, Claude evaluates instead of auto-selling.
+        // SAFETY NET: ≥50pt drop = mechanical sell (catastrophic deterioration).
         if (ctx?.baselineWE != null && trade.weAtEntry != null) {
           const ourTeam = trade.ticker?.split('-').pop() ?? '';
-          // Handle tied game (diff=0): WE = 50%
           const ourCurrentWE = ctx.diff === 0 ? 0.50 :
             (ctx.leading === ourTeam ? ctx.baselineWE : (1 - ctx.baselineWE));
           const weDrop = trade.weAtEntry - ourCurrentWE;
           if (weDrop >= 0.35) {
-            console.log(`[exit] 📉 WE-DROP (dropped ${(weDrop*100).toFixed(0)}pt from ${(trade.weAtEntry*100).toFixed(0)}% entry → ${(ourCurrentWE*100).toFixed(0)}%): ${trade.ticker} — position deteriorating, selling at ${(currentPrice*100).toFixed(0)}¢`);
-            const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
-            if (result) anyUpdated = true;
-            continue;
+            // MECHANICAL SAFETY NET: ≥50pt WE drop = catastrophic, no Claude needed
+            if (weDrop >= 0.50) {
+              console.log(`[exit] 📉🛑 WE-DROP SAFETY NET (${(weDrop*100).toFixed(0)}pt drop ≥50pt): ${trade.ticker} — catastrophic deterioration, selling at ${(currentPrice*100).toFixed(0)}¢`);
+              const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
+              if (result) anyUpdated = true;
+              continue;
+            }
+            // Claude evaluates the 35-49pt WE drop
+            const weDropKey = 'we-drop-eval:' + trade.ticker;
+            const lastWeDropEval = tradeCooldowns.get(weDropKey) ?? 0;
+            if (Date.now() - lastWeDropEval >= 5 * 60 * 1000) {
+              tradeCooldowns.set(weDropKey, Date.now());
+              const ticker = trade.ticker ?? '';
+              const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
+                : ticker.includes('NHL') ? 'NHL' : 'Soccer';
+              const weDropPrompt =
+                `Live ${sport} bet — WE dropped ${(weDrop*100).toFixed(0)} points (from ${(trade.weAtEntry*100).toFixed(0)}% at entry → ${(ourCurrentWE*100).toFixed(0)}% now). SELL or HOLD?\n\n` +
+                `POSITION: Bought at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢.\n` +
+                `Game: ${trade.title}\n` +
+                (ctx ? `LIVE: ${ctx.detail} | Stage: ${stage.toUpperCase()} | Period: ${ctx.period}\n` : '') +
+                `Current WE: ${(ourCurrentWE*100).toFixed(0)}% | Score diff: ${ctx.diff ?? '?'}\n\n` +
+                `The position has deteriorated significantly. Is recovery realistic at this stage of a ${sport} game?\n` +
+                `HOLD if the deficit is still recoverable for ${sport} at this stage.\n` +
+                `SELL if the WE drop reflects a real shift the team can't overcome.\n\n` +
+                `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
+              const dropText = await claudeScreen(weDropPrompt, { maxTokens: 200, timeout: 8000 });
+              if (dropText) {
+                try {
+                  const match = extractJSON(dropText);
+                  if (match) {
+                    const d = JSON.parse(match);
+                    if (d.action === 'sell') {
+                      console.log(`[exit] 🧠📉 CLAUDE WE-DROP (${(weDrop*100).toFixed(0)}pt): ${trade.ticker} — selling | ${d.reasoning?.slice(0,80)}`);
+                      const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
+                      if (result) anyUpdated = true;
+                      continue;
+                    } else {
+                      console.log(`[exit] 🧠🛡️ CLAUDE HOLD at WE-drop (${(weDrop*100).toFixed(0)}pt): ${trade.ticker} — holding | ${d.reasoning?.slice(0,80)}`);
+                      tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                    }
+                  }
+                } catch { /* skip */ }
+              }
+            }
           }
         }
 
