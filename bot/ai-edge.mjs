@@ -4067,6 +4067,14 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
+        // ENTRY WE FLOOR: don't enter if price is already below the WE-reversal exit floor (30%).
+        // SF@WSH entered at 16¢ (below the 30% exit floor) → immediately sold 3 min later at break-even.
+        // A 25¢ minimum ensures we have room to run before the exit floor kicks in.
+        if (trailingPrice < 0.25) {
+          console.log(`[comeback] ⚠️ Skip ${trailingAbbr}: price ${Math.round(trailingPrice*100)}¢ < 25¢ minimum — already near WE exit floor, no room to run`);
+          continue;
+        }
+
         console.log(`[comeback] 🔄 Candidate: ${trailingAbbr} trailing ${g.awayScore}-${g.homeScore} inn${g.period} | ace ${trailingStarterName} (${trailingStarterERA} ERA) | opp ${leadingStarterName} (${leadingStarterERA} ERA) | ${inningsLeft} innings left | ${Math.round(trailingPrice*100)}¢ vs model ${comebackWinPct}%`);
 
         // Sonnet evaluation — lightweight, no web search needed
@@ -4687,9 +4695,9 @@ async function checkPreGamePredictions() {
       const bettingOnTeam = matchedSide.teamName;
       const expectedSport = batchItems[i].sport;
       const wrongSport =
-        (expectedSport === 'MLB' && (reasoning.includes('nba') || reasoning.includes('nhl') || reasoning.includes('playoff series') || reasoning.includes('world series winner'))) ||
-        (expectedSport === 'NBA' && (reasoning.includes('mlb') || reasoning.includes('pitcher') || reasoning.includes('era ') || reasoning.includes('inning'))) ||
-        (expectedSport === 'NHL' && (reasoning.includes('nba') || reasoning.includes('mlb') || reasoning.includes('pitcher')));
+        (expectedSport === 'MLB' && (reasoning.includes('nba') || reasoning.includes('nhl') || reasoning.includes('basketball') || reasoning.includes('hockey') || reasoning.includes('goalie') || reasoning.includes('power play') || reasoning.includes('world series winner'))) ||
+        (expectedSport === 'NBA' && (reasoning.includes('mlb') || reasoning.includes('nhl') || reasoning.includes('pitcher') || reasoning.includes('era ') || reasoning.includes('inning') || reasoning.includes('goalie'))) ||
+        (expectedSport === 'NHL' && (reasoning.includes('nba') || reasoning.includes('mlb') || reasoning.includes('pitcher') || reasoning.includes('basketball') || reasoning.includes('inning')));
       if (wrongSport) {
         console.log(`[pre-game] BLOCKED: Claude confused sport for ${market.base}. Expected ${expectedSport}, reasoning mentions wrong sport.`);
         continue;
@@ -6689,6 +6697,13 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
       console.log(`[exit] POSITION GUARD: Kalshi shows 0 contracts for ${trade.ticker} — already sold, skipping`);
       // Mark trade as sold so we don't keep retrying
       trade.status = trade.status === 'open' ? `sold-${reason}` : trade.status;
+      // Record approximate P&L at current price if not already set (prevents null P&L in trades log)
+      if (trade.realizedPnL == null) {
+        const approxQty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / (trade.entryPrice || 1));
+        trade.exitPrice = currentPrice;
+        trade.realizedPnL = Math.round((currentPrice - (trade.entryPrice ?? 0)) * approxQty * 100) / 100;
+        trade.settledAt = new Date().toISOString();
+      }
       return false;
     }
     if (kalshiQty < sellQty) {
@@ -7021,10 +7036,11 @@ async function checkSettlements() {
       }
 
       // Use Kalshi's actual revenue if available (includes accurate fill count)
-      // Note: revenue is computed from fills in dollar terms (price * count), NOT cents
+      // Note: revenue = totalSellProceeds - totalBuyCost — already a NET figure.
+      // Do NOT subtract deployCost here: buyCost is already accounted for inside revenue.
       let pnl;
       if (settlement.revenue && settlement.revenue > 0) {
-        pnl = settlement.revenue - (trade.deployCost ?? 0);
+        pnl = settlement.revenue;
       } else {
         pnl = (qty * exitPrice) - (trade.deployCost ?? 0);
       }
