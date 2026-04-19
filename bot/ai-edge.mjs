@@ -2335,10 +2335,14 @@ async function checkLiveScoreEdges() {
         const pctChange = (currentPrice - entryPrice) / entryPrice;
 
         // Stage-aware price threshold — early games have high variance, don't panic-sell on normal scoring.
-        //   early (MLB inn 1-4 / NHL P1 / NBA Q1): require -25% before calling Claude
+        //   early MLB (inn 1-4): require -35% — a single run only moves price ~10-15¢, -25% fires too fast
+        //   early other (NHL P1 / NBA Q1): require -25%
         //   mid   (MLB inn 5-7 / NHL P2 / NBA Q2-Q3): require -15%
         //   late  (MLB inn 8+ / NHL P3 / NBA Q4): require -10%
-        const PG_CLAUDE_THRESHOLD = stage === 'early' ? -0.25 : stage === 'mid' ? -0.15 : -0.10;
+        const PG_CLAUDE_THRESHOLD = (stage === 'early' && league === 'mlb') ? -0.35
+          : stage === 'early' ? -0.25
+          : stage === 'mid' ? -0.15
+          : -0.10;
 
         // WE-based trigger — also fire when game situation has deteriorated significantly
         // even if price hasn't moved enough. Markets can lag WE shifts by 1-2 cycles.
@@ -2761,6 +2765,7 @@ async function checkLiveScoreEdges() {
                 `TIE PRICE: ${priceInCents}¢ (margin: ${(margin*100).toFixed(0)}%)\n` +
                 `DEPLOY: $${(qty * tiePrice).toFixed(2)} (${qty} contracts)\n\n` +
                 `SWING-TRADE LOGIC: TIE price rises as clock ticks without a goal. Every goalless minute = higher TIE price. We sell at +12¢. We stop-loss at -50%.\n\n` +
+                `STATISTICAL BASE RATE: Tied EPL/MLS games after minute 70 end as draws approximately 65% of the time, regardless of team quality, rivalry intensity, or motivation. This is the statistical floor — weigh narrative risk against it. Do NOT override this base rate without strong, specific evidence (e.g. a red card just issued, a confirmed injury to the leading scorer).\n\n` +
                 `Consider:\n` +
                 `- Is the game OPEN (end-to-end, both teams attacking) or CLOSED (defensive, low-energy, time-wasting)? Closed = TIE price rises faster.\n` +
                 `- At ${effectiveMin}', will the next 10-15 minutes likely be goalless? That's all we need for profit.\n` +
@@ -4718,9 +4723,13 @@ async function checkPreGamePredictions() {
     const isNhlNba = pgSportKey === 'nhl' || pgSportKey === 'nba';
     const PRE_GAME_MIN_CONF = isNhlNba
       ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.70 : 0.72)
-      : (pgSportKey === 'mlb' || isSoccer)
-        ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68)
-        : 0.65; // fallback for other sports
+      : pgSportKey === 'mlb'
+        // MLB: raise the middle tier (50-65¢ entries) from 65% to 68% — actual MLB win rate has been
+        // 43% at 65% confidence, indicating overconfidence on two-average-starters matchups.
+        ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.68 : 0.68)
+        : isSoccer
+          ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68) // Soccer: unchanged
+          : 0.65; // fallback for other sports
     if (confidence < PRE_GAME_MIN_CONF || (confidence - price) < pgReqMargin) {
       console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${((confidence-price)*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% min=${(PRE_GAME_MIN_CONF*100).toFixed(0)}% (${pgSportKey})`);
       continue;
@@ -4772,7 +4781,9 @@ async function checkPreGamePredictions() {
 
     preGameTradesToday++;
     preGameTradesThisCycle++;
-    preGameBetGames.add(market.base);
+    // NOTE: preGameBetGames.add() is called ONLY after a trade is actually placed (real or paper).
+    // Moving it here (before gate checks) caused overnight-analyzed markets to be permanently locked
+    // for the day, preventing daytime re-analysis with fresh ESPN starter data.
 
     // ESPN GATE — only place real money when ESPN has confirmed at least one starter.
     // The pre-game scan runs overnight (2-5 AM ET) when ESPN's scoreboard doesn't yet
@@ -5053,6 +5064,8 @@ Respond in EXACTLY this JSON:
               (decision.exitScenario ? `\n\n📍 <b>EXIT SCENARIO</b>\n${decision.exitScenario}` : '')
             );
             console.log(`[pre-game] ✅ Filled ${pgFill}/${betQty} @ ${pgPriceInCents}¢ deployed=$${pgDeployed.toFixed(2)}`);
+            // Lock this game now that we've actually placed a real bet.
+            preGameBetGames.add(market.base);
             // Deduct from cached balance so subsequent orders in this batch
             // know how much cash remains (prevents insufficient_balance 400s)
             kalshiBalance = Math.max(0, kalshiBalance - pgDeployed);
@@ -5082,6 +5095,8 @@ Respond in EXACTLY this JSON:
       });
       logScreen({ stage: 'pre-game-paper', ticker: market.base, result: 'PAPER', confidence, price, reasoning: decision.reasoning });
       console.log(`[pre-game] 📋 PAPER: ${market.base} → ${matchedSide.team} @${Math.round(price*100)}¢ conf=${Math.round(confidence*100)}% wouldBet=$${betAmount.toFixed(2)} (${preGameTradesToday} today)`);
+      // Lock this game after paper trade is logged — prevents re-analysis within same day.
+      preGameBetGames.add(market.base);
     }
     }
   }
@@ -6269,10 +6284,16 @@ async function managePositions() {
 
         // PRE-GAME NUCLEAR STOP — stage-aware hard floor, no Claude.
         // Catches extreme blowouts that the cent-based stop hasn't reached yet (early game).
-        //   Early (MLB inn 1-4 / NHL P1 / NBA Q1-Q2): -70% floor — plenty of game left
+        //   Early soccer (MLS/EPL first half): -80% floor — 1 goal in first half is not game over,
+        //     NE@CLB fired at -72% in H1 and NE came back to win 2-1. Soccer comebacks are common.
+        //   Early other (MLB inn 1-4 / NHL P1 / NBA Q1-Q2): -70% floor — plenty of game left
         //   Mid   (MLB inn 5-7 / NHL P2 / NBA Q3):    -60% floor — still recoverable
         //   Late  (MLB inn 8+ / NHL P3 / NBA Q4):     -50% floor — game nearly over
-        const pgNuclearFloor = stage === 'early' ? -0.70 : stage === 'mid' ? -0.60 : -0.50;
+        const isSoccerLeague = ['mls','epl','laliga'].includes(league);
+        const pgNuclearFloor = (stage === 'early' && isSoccerLeague) ? -0.80
+          : stage === 'early' ? -0.70
+          : stage === 'mid' ? -0.60
+          : -0.50;
         if (trade.strategy === 'pre-game-prediction' && pctChange < pgNuclearFloor) {
           console.log(`[exit] 🛑 PRE-GAME NUCLEAR (${stage}, entry ${(entryPrice*100).toFixed(0)}¢): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — ${stage} floor ${Math.round(pgNuclearFloor*100)}% hit`);
           const result = await executeSell(trade, qty, currentPrice, 'pre-game-nuclear');
