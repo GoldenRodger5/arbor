@@ -112,7 +112,7 @@ function getRequiredMargin(price, { sport = '', live = false, scoreChanged = fal
     nhl: 0.03,    // low-scoring, binary outcomes, goalie variance
     nba: 0.04,    // high-scoring but 15-pt comebacks happen 13%
     mlb: 0.05,    // most random sport — best team wins 60% over a season
-    mls: 0.05, epl: 0.05, laliga: 0.05,  // draws kill, need conviction
+    mls: 0.05, epl: 0.05, laliga: 0.05, seriea: 0.05, bundesliga: 0.05, ligue1: 0.05,  // draws kill, need conviction
     ufc: 0.02,    // least efficient market, biggest edges
     crypto: 0.04, economics: 0.04, politics: 0.04,
   }[sport] ?? 0.04;
@@ -181,7 +181,7 @@ function getMaxPrice(league, period, diff = 1) {
     if (diff >= 10) return 0.78;
     return 0.75;
   }
-  if (['mls', 'epl', 'laliga'].includes(league)) return 0.75;
+  if (['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league)) return 0.75;
   return MAX_PRICE;
 }
 const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — live-edge base fraction
@@ -1609,8 +1609,8 @@ const NHL_WIN_EXPECTANCY = {
 
 // Home advantage adjustments applied after table lookup
 // Leading team that is also the home team gets a boost; away-team leaders get slight reduction
-const HOME_ADJ = { mlb: 0.02, nba: 0.03, nhl: 0.02, mls: 0.02, epl: 0.02, laliga: 0.02 };
-const AWAY_ADJ = { mlb: -0.01, nba: -0.01, nhl: -0.01, mls: -0.01, epl: -0.01, laliga: -0.01 };
+const HOME_ADJ = { mlb: 0.02, nba: 0.03, nhl: 0.02, mls: 0.02, epl: 0.02, laliga: 0.02, seriea: 0.02, bundesliga: 0.02, ligue1: 0.02 };
+const AWAY_ADJ = { mlb: -0.01, nba: -0.01, nhl: -0.01, mls: -0.01, epl: -0.01, laliga: -0.01, seriea: -0.01, bundesliga: -0.01, ligue1: -0.01 };
 
 function getWinExpectancy(league, lead, period, isHome = null) {
   let table, leadKey, periodKey;
@@ -1619,7 +1619,7 @@ function getWinExpectancy(league, lead, period, isHome = null) {
     table = MLB_WIN_EXPECTANCY;
     leadKey = Math.min(lead, 8);
     periodKey = Math.min(Math.max(period, 1), 9);
-  } else if (league === 'mls' || league === 'epl' || league === 'laliga') {
+  } else if (['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league)) {
     // Soccer: goal lead by half (1=first half, 2=second half)
     // Source: brendansudol.github.io, EPL/MLS data
     table = { 1: { 1: 0.65, 2: 0.78 }, 2: { 1: 0.82, 2: 0.92 }, 3: { 1: 0.94, 2: 0.98 } };
@@ -1727,7 +1727,7 @@ function timeAdjustWE(league, period, gameDetail, diff = 1) {
     return { adjustment: adj, minutesLeft: null, label };
   }
 
-  if (['mls', 'epl', 'laliga'].includes(league)) {
+  if (['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league)) {
     // Parse minute from "72'" or "2nd - 72'" or just a number
     const minMatch = (gameDetail ?? '').match(/(\d+)/);
     if (!minMatch) return none;
@@ -1751,7 +1751,7 @@ function getWinExpectancyText(league, lead, period, isHome) {
   const trailing = Math.max(0.01, 1 - adjusted);
   const periodName = league === 'mlb' ? `inning ${period}` : league === 'nba' ? `Q${period}` : `period ${period}`;
   const unitName = league === 'nba' ? 'points' : league === 'mlb' ? 'runs' : 'goals';
-  const isSoccer = ['mls', 'epl', 'laliga'].includes(league);
+  const isSoccer = ['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league);
   const drawWarning = isSoccer ? '\n⚠️ DRAW WARNING: Soccer draws ~25% of games. Your team must WIN outright — a draw means your contract LOSES.' : '';
   return `MATHEMATICAL WIN EXPECTANCY (WE) — YOUR ANCHOR\n` +
     `Leading team wins: ${(adjusted * 100).toFixed(0)}%  |  Trailing team wins: ${(trailing * 100).toFixed(0)}%\n` +
@@ -2008,8 +2008,9 @@ async function getThesisStatus(trade, game) {
     }
 
     // ── MLS/Soccer: has a key forward been subbed out before 60'? ─────────────
-    if (['mls', 'epl', 'laliga'].includes(league)) {
-      const sportPath = league === 'mls' ? 'soccer/usa.1' : league === 'epl' ? 'soccer/eng.1' : 'soccer/esp.1';
+    if (['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league)) {
+      const soccerPathMap = { mls: 'soccer/usa.1', epl: 'soccer/eng.1', laliga: 'soccer/esp.1', seriea: 'soccer/ita.1', bundesliga: 'soccer/ger.1', ligue1: 'soccer/fra.1' };
+      const sportPath = soccerPathMap[league] ?? 'soccer/usa.1';
       const summaryUrl = `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/summary?event=${eventId}`;
       const summaryRes = await fetch(summaryUrl, {
         headers: { 'User-Agent': 'arbor-ai/1' },
@@ -2076,6 +2077,9 @@ async function checkLiveScoreEdges() {
     { league: 'mls', path: 'soccer/usa.1', series: 'KXMLSGAME' },
     { league: 'epl', path: 'soccer/eng.1', series: 'KXEPLGAME' },
     { league: 'laliga', path: 'soccer/esp.1', series: 'KXLALIGAGAME' },
+    { league: 'seriea', path: 'soccer/ita.1', series: 'KXSERIAA' },
+    { league: 'bundesliga', path: 'soccer/ger.1', series: 'KXBUNDESLIGA' },
+    { league: 'ligue1', path: 'soccer/fra.1', series: 'KXLIGUE1' },
   ];
 
   // === PHASE 1: Collect all games with leads (parallel ESPN fetch) ===
@@ -2102,7 +2106,7 @@ async function checkLiveScoreEdges() {
       const homeScore = parseInt(home.score ?? '0');
       const awayScore = parseInt(away.score ?? '0');
       const diff = Math.abs(homeScore - awayScore);
-      const isSoccer = ['mls', 'epl', 'laliga'].includes(league);
+      const isSoccer = ['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league);
       // Skip tied games UNLESS it's soccer (draw is a valid bet)
       if (diff === 0 && !isSoccer) continue;
       const leading = diff > 0 ? (homeScore > awayScore ? home : away) : home; // tied = home as placeholder
@@ -2298,7 +2302,7 @@ async function checkLiveScoreEdges() {
         // Determine sport + game context — needed for stage-aware thresholds and thesis check
         const league = game.league;
         const sport = league === 'nhl' ? 'NHL' : league === 'nba' ? 'NBA' : league === 'mlb' ? 'MLB' :
-          ['mls', 'epl', 'laliga'].includes(league) ? 'Soccer' : 'Sport';
+          ['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league) ? 'Soccer' : 'Sport';
         const stage = league === 'mlb' ? (game.period <= 4 ? 'early' : game.period <= 6 ? 'mid' : 'late') :
           league === 'nba' ? (game.period <= 2 ? 'early' : game.period === 3 ? 'mid' : 'late') :
           league === 'nhl' ? (game.period === 1 ? 'early' : game.period === 2 ? 'mid' : 'late') :
@@ -2645,7 +2649,7 @@ async function checkLiveScoreEdges() {
   const sonnetQueue = [];
 
   for (const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail, isSoccer, _scoreChanged, _lineMove } of candidates) {
-    const seriesMap = { mlb: 'KXMLBGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME', mls: 'KXMLSGAME', epl: 'KXEPLGAME', laliga: 'KXLALIGAGAME' };
+    const seriesMap = { mlb: 'KXMLBGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME', mls: 'KXMLSGAME', epl: 'KXEPLGAME', laliga: 'KXLALIGAGAME', seriea: 'KXSERIAA', bundesliga: 'KXBUNDESLIGA', ligue1: 'KXLIGUE1' };
     const series = seriesMap[league] ?? 'KXMLBGAME';
 
     // === DRAW BET CHECK (soccer only, tied games, 2nd half or late 1st half 0-0) ===
@@ -3032,7 +3036,7 @@ async function checkLiveScoreEdges() {
           if (league === 'nhl' && diff === 1 && period === 1) underdogAllowed = true;  // EXACTLY 1 goal, EXACTLY P1
           else if (league === 'nba' && diff <= 10 && period <= 2) underdogAllowed = true;
           else if (league === 'mlb' && diff <= 2 && period <= 5) underdogAllowed = true;
-          else if ((league === 'mls' || league === 'epl' || league === 'laliga') && diff === 1 && period <= 1) underdogAllowed = true;
+          else if (['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league) && diff === 1 && period <= 1) underdogAllowed = true;
         }
 
         if (underdogAllowed) {
@@ -4724,16 +4728,17 @@ async function checkPreGamePredictions() {
     // Soccer: first-goal baseline ~55% home — draws are irrelevant, we exit on first goal
     const pgSportKey = expectedSport.toLowerCase();
 
-    // MLS winner-bet block — only draw-bets for MLS, no pre-game winner contracts.
-    // Data: MLS pre-game winner bets 1W-3L, -$36.83. Root cause: ~27% draw rate means
-    // a MLS "win" contract loses on draws too, and 55¢ entries still lose 27% of the time
-    // to a draw outcome on top of normal loss variance. Draw-bet strategy handles MLS correctly.
-    if (pgSportKey === 'mls') {
-      console.log(`[pre-game] 🚫 MLS WINNER-BET BLOCKED: ${market.base} — MLS winner bets disabled (draw rate ~27% makes winner contracts -EV; draw-bet strategy handles MLS instead)`);
+    // Soccer winner-bet block — draw-bet strategy handles all soccer leagues, no pre-game winner contracts.
+    // Draw rates: MLS ~27%, Serie A ~28%, Bundesliga ~26%, Ligue 1 ~27%, EPL ~25%, La Liga ~22%.
+    // At these draw rates, a "win" contract has a 22-28% chance of full loss on a draw outcome
+    // on top of normal loss variance. Draw-bet strategy captures the actual edge in these markets.
+    // EPL/La Liga allowed at 55¢+ since draw rates are slightly lower and Kalshi has liquid markets.
+    if (['mls', 'seriea', 'bundesliga', 'ligue1'].includes(pgSportKey)) {
+      console.log(`[pre-game] 🚫 SOCCER WINNER-BET BLOCKED: ${market.base} — ${pgSportKey.toUpperCase()} winner bets disabled (draw rate ~26-28% makes winner contracts -EV; draw-bet strategy handles soccer instead)`);
       continue;
     }
 
-    const preGameBaselines = { mlb: 0.45, nba: 0.72, nhl: 0.56, mls: 0.55, epl: 0.55, laliga: 0.55 };
+    const preGameBaselines = { mlb: 0.45, nba: 0.72, nhl: 0.56, mls: 0.55, epl: 0.55, laliga: 0.55, seriea: 0.55, bundesliga: 0.55, ligue1: 0.55 };
     const pgBaseline = preGameBaselines[pgSportKey] ?? 0.55;
     // Cap: how far above early-event baseline Claude can go.
     // MLB: +25% (45% + 25% = 70% max) — was 20% but created a dead zone where
@@ -4741,7 +4746,7 @@ async function checkPreGamePredictions() {
     // NBA: +15% (72% + 15% = 87% max) — dominant mismatch e.g. opponent resting all starters
     // NHL: +18% (56% + 18% = 74% max) — elite goalie vs backup + PP edge
     // Soccer: +15% (55% + 15% = 70% max) — opens soccer since we exit on first goal (draws irrelevant)
-    const sportCapBonus = { mlb: 0.25, nba: 0.15, nhl: 0.18, mls: 0.15, epl: 0.15, laliga: 0.15 }[pgSportKey] ?? 0.15;
+    const sportCapBonus = { mlb: 0.25, nba: 0.15, nhl: 0.18, mls: 0.15, epl: 0.15, laliga: 0.15, seriea: 0.15, bundesliga: 0.15, ligue1: 0.15 }[pgSportKey] ?? 0.15;
     const pgTargetBaseline = pick.side === 'yes' ? pgBaseline : (1 - pgBaseline);
     const pgMaxAllowed = Math.min(0.85, pgTargetBaseline + sportCapBonus);
     if (confidence > pgMaxAllowed) {
@@ -4763,7 +4768,7 @@ async function checkPreGamePredictions() {
     // You need >70% win rate to be +EV — no one hits that on MLS/EPL underdogs.
     // Real data: MLS pre-game 2W-2L, -$34.83, with both losses being full wipeouts.
     // At 55¢+, the favorite framing reduces loss severity and the payoff ratio improves.
-    if ((pgSportKey === 'mls' || pgSportKey === 'epl' || pgSportKey === 'laliga') && price < 0.55) {
+    if (['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(pgSportKey) && price < 0.55) {
       console.log(`[pre-game] 🚫 SOCCER FLOOR: ${market.base} — ${pgSportKey.toUpperCase()} at ${(price*100).toFixed(0)}¢ below 55¢ minimum (underdog payoff asymmetry unfavorable below 55¢)`);
       continue;
     }
@@ -4783,7 +4788,7 @@ async function checkPreGamePredictions() {
     //   Under 50¢:  63% — matches NHL/NBA, opens highest-edge swing trades (18pt edge at 44¢)
     //   50–65¢:     65% — lowered from 67% to work with the 70% cap
     //   Above 65¢:  68% — expensive favorites need conviction but not an impossible bar
-    const isSoccer = pgSportKey === 'mls' || pgSportKey === 'epl' || pgSportKey === 'laliga';
+    const isSoccer = ['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(pgSportKey);
     const isNhlNba = pgSportKey === 'nhl' || pgSportKey === 'nba';
     const PRE_GAME_MIN_CONF = isNhlNba
       ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.70 : 0.72)
@@ -4840,7 +4845,13 @@ async function checkPreGamePredictions() {
     }
 
     const edge = confidence - price;
-    const pgMaxTrade = Math.min(getBankroll() * PRE_GAME_TRADE_FRACTION, getAvailableCash('kalshi'));
+    // PRE-GAME SIZING CAP — tiered by bankroll to prevent over-exposure on small accounts.
+    // At $167 bankroll, 15% + 2.5x confidence multiplier → $41 bet = 25% of bankroll on one game.
+    // Hard caps: <$500 → max $20 (12% effective cap), <$1K → max $50. Larger accounts unchanged.
+    const bkr = getBankroll();
+    const pgFraction = bkr < 500 ? 0.10 : PRE_GAME_TRADE_FRACTION;
+    const pgAbsCap = bkr < 500 ? 20 : bkr < 1000 ? 50 : Infinity;
+    const pgMaxTrade = Math.min(bkr * pgFraction, pgAbsCap, getAvailableCash('kalshi'));
     const betAmount = Math.min(getPositionSize('kalshi', edge), pgMaxTrade);
     const betQty = betAmount >= 1 ? Math.max(1, Math.floor(betAmount / price)) : 0;
     if (betAmount < 1) continue;
@@ -4927,6 +4938,18 @@ async function checkPreGamePredictions() {
             continue; // skip to next market — no paper log needed for hard filter
           }
           console.log(`[pre-game] ✅ MLB ERA GAP: ${market.base} — gap ${eraGap.toFixed(2)} clears 2.5 threshold (${espnT1?.name ?? '?'} ${t1ERA} vs ${espnT2?.name ?? '?'} ${t2ERA})`);
+          // ERA DIRECTION CHECK — verify Claude backed the lower-ERA (better) pitcher.
+          // The gap gate ensures there IS a real quality difference; this ensures we're
+          // on the right side of it. Allow up to 1.0 ERA slack for park/defense factors.
+          // t1 = team1 (away), t2 = team2 (home) — matches market.team1 / market.team2.
+          const pickedIsTeam1 = matchedSide === market.team1;
+          const pickedStarterERA = pickedIsTeam1 ? t1ERA : t2ERA;
+          const oppStarterERA = pickedIsTeam1 ? t2ERA : t1ERA;
+          const pickedStarterName = pickedIsTeam1 ? (espnT1?.name ?? '?') : (espnT2?.name ?? '?');
+          if (pickedStarterERA > oppStarterERA + 1.0) {
+            console.log(`[pre-game] 🚫 ERA DIRECTION: ${market.base} — Claude backed ${chosenTeam} (${pickedStarterName} ERA ${pickedStarterERA.toFixed(2)}) but opponent ERA is lower at ${oppStarterERA.toFixed(2)} — wrong side of the ERA gap, skipping`);
+            continue;
+          }
         }
       }
 
@@ -5778,9 +5801,11 @@ async function claudeBroadScan() {
       // HARD CAP: Sports broad-scan confidence capped at baseline + 20%
       const bsSportKey = decision.ticker.includes('MLB') ? 'mlb' : decision.ticker.includes('NBA') ? 'nba' :
         decision.ticker.includes('NHL') ? 'nhl' : decision.ticker.includes('MLS') ? 'mls' :
-        decision.ticker.includes('EPL') ? 'epl' : decision.ticker.includes('LALIGA') ? 'laliga' : '';
+        decision.ticker.includes('EPL') ? 'epl' : decision.ticker.includes('LALIGA') ? 'laliga' :
+        decision.ticker.includes('SERIAA') ? 'seriea' : decision.ticker.includes('BUNDESLIGA') ? 'bundesliga' :
+        decision.ticker.includes('LIGUE1') ? 'ligue1' : '';
       if (bsSportKey) {
-        const bsBaselines = { mlb: 0.54, nba: 0.63, nhl: 0.59, mls: 0.49, epl: 0.45, laliga: 0.45 };
+        const bsBaselines = { mlb: 0.54, nba: 0.63, nhl: 0.59, mls: 0.49, epl: 0.45, laliga: 0.45, seriea: 0.45, bundesliga: 0.45, ligue1: 0.45 };
         const bsBaseline = bsBaselines[bsSportKey] ?? 0.55;
         // Approximate: YES = home team, NO = away. Not perfect but good enough for a cap.
         const bsTargetBaseline = decision.side === 'yes' ? bsBaseline : (1 - bsBaseline);
@@ -5924,9 +5949,12 @@ async function getGameContext(trade) {
   else if (ticker.includes('MLS')) league = 'mls';
   else if (ticker.includes('EPL')) league = 'epl';
   else if (ticker.includes('LALIGA')) league = 'laliga';
+  else if (ticker.includes('SERIAA')) league = 'seriea';
+  else if (ticker.includes('BUNDESLIGA')) league = 'bundesliga';
+  else if (ticker.includes('LIGUE1')) league = 'ligue1';
   else return null;
 
-  const pathMap = { mlb: 'baseball/mlb', nba: 'basketball/nba', nhl: 'hockey/nhl', mls: 'soccer/usa.1', epl: 'soccer/eng.1', laliga: 'soccer/esp.1' };
+  const pathMap = { mlb: 'baseball/mlb', nba: 'basketball/nba', nhl: 'hockey/nhl', mls: 'soccer/usa.1', epl: 'soccer/eng.1', laliga: 'soccer/esp.1', seriea: 'soccer/ita.1', bundesliga: 'soccer/ger.1', ligue1: 'soccer/fra.1' };
   try {
     const res = await fetch(`http://site.api.espn.com/apis/site/v2/sports/${pathMap[league]}/scoreboard`,
       { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(5000) });
@@ -5953,7 +5981,7 @@ async function getGameContext(trade) {
       else if (league === 'mlb') stage = period <= 4 ? 'early' : period <= 6 ? 'mid' : 'late';
       else if (league === 'nba') stage = period <= 2 ? 'early' : period === 3 ? 'mid' : 'late';
       else if (league === 'nhl') stage = period === 1 ? 'early' : period === 2 ? 'mid' : 'late';
-      else if (league === 'mls') stage = period === 1 ? 'early' : 'late'; // soccer: 1st half = early, 2nd half = late
+      else if (['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league)) stage = period === 1 ? 'early' : 'late'; // soccer: 1st half = early, 2nd half = late
 
       const homeScore = parseInt(home?.score ?? '0');
       const awayScore = parseInt(away?.score ?? '0');
@@ -6110,7 +6138,7 @@ async function managePositions() {
         // Fetch game context (stage, score, ESPN data)
         const ctx = await getGameContext(trade);
         const stage = ctx?.stage ?? 'unknown';
-        const league = ctx?.league ?? (trade.ticker?.includes('MLB') ? 'mlb' : trade.ticker?.includes('NBA') ? 'nba' : trade.ticker?.includes('NHL') ? 'nhl' : trade.ticker?.includes('MLS') ? 'mls' : trade.ticker?.includes('EPL') ? 'epl' : trade.ticker?.includes('LALIGA') ? 'laliga' : '');
+        const league = ctx?.league ?? (trade.ticker?.includes('MLB') ? 'mlb' : trade.ticker?.includes('NBA') ? 'nba' : trade.ticker?.includes('NHL') ? 'nhl' : trade.ticker?.includes('MLS') ? 'mls' : trade.ticker?.includes('EPL') ? 'epl' : trade.ticker?.includes('LALIGA') ? 'laliga' : trade.ticker?.includes('SERIAA') ? 'seriea' : trade.ticker?.includes('BUNDESLIGA') ? 'bundesliga' : trade.ticker?.includes('LIGUE1') ? 'ligue1' : '');
         const thresholds = getExitThresholds(stage, entryPrice);
 
         // === TIER 1: Rule-based auto-exits ===
@@ -6153,11 +6181,11 @@ async function managePositions() {
         // WE tables assume win-or-loss; they don't model the draw outcome. A 1-0 EPL lead at 70'
         // has ~25% draw risk — that's 25% chance of full position loss on top of normal L odds.
         // Sell everything at minute 70 regardless of P&L. If losing: stops handle it earlier anyway.
-        if (trade.strategy === 'pre-game-prediction' && (league === 'epl' || league === 'laliga')
+        if (trade.strategy === 'pre-game-prediction' && ['epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league)
             && ctx?.period != null && ctx.period >= 70) {
           const gainPct = Math.round((profitPerContract / entryPrice) * 100);
           const verb = profitPerContract >= 0 ? 'locking profit' : 'cutting loss';
-          console.log(`[exit] ⚽⏰ EPL 70-MIN EXIT: ${trade.ticker} @ ${(currentPrice*100).toFixed(0)}¢ — minute ${ctx.period}, ${verb} before draw cliff (draw rate ~25%+ after min 70)`);
+          console.log(`[exit] ⚽⏰ SOCCER 70-MIN EXIT: ${trade.ticker} @ ${(currentPrice*100).toFixed(0)}¢ — minute ${ctx.period}, ${verb} before draw cliff (draw rate ~25%+ after min 70)`);
           const result = await executeSell(trade, qty, currentPrice, 'epl-70min-exit');
           if (result) {
             anyUpdated = true;
@@ -6474,7 +6502,7 @@ async function managePositions() {
           (league === 'mlb' && ctx?.period >= 5) ||
           (league === 'nba' && ctx?.period >= 3) ||
           (league === 'nhl' && ctx?.period >= 2) ||
-          (['mls','epl','laliga'].includes(league) && ctx?.period >= 60)
+          (['mls','epl','laliga','seriea','bundesliga','ligue1'].includes(league) && ctx?.period >= 60)
         );
         // MLB LATE-GAME LEAD LOCK: suppress hard stop when leading by 3+ runs in inning 7+.
         // WE ≥ 93% at 3-run inning-7 lead — game is statistically over. Price fluctuations
@@ -7135,6 +7163,9 @@ async function reviewStopLossOutcomes() {
       else if (ticker.includes('MLS')) league = 'mls';
       else if (ticker.includes('EPL')) league = 'epl';
       else if (ticker.includes('LALIGA')) league = 'laliga';
+      else if (ticker.includes('SERIAA')) league = 'seriea';
+      else if (ticker.includes('BUNDESLIGA')) league = 'bundesliga';
+      else if (ticker.includes('LIGUE1')) league = 'ligue1';
       else continue;
 
       // Check if the Kalshi market has settled
