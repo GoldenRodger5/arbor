@@ -463,6 +463,12 @@ serve(async (req) => {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
       return new Response('missing telegram env', { status: 500 });
     }
+    // Kill switch — set DISABLE_ARB_ALERTS=true in Supabase env to silence all arb notifications
+    if (Deno.env.get('DISABLE_ARB_ALERTS') === 'true') {
+      return new Response(JSON.stringify({ ok: true, sent: 0, paused: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
     const body = await req.json().catch(() => ({} as any));
     const record = body?.record ?? body?.new ?? {};
     const opportunities: Opportunity[] = Array.isArray(record?.opportunities)

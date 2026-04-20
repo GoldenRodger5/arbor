@@ -2480,7 +2480,11 @@ async function checkLiveScoreEdges() {
         //     but 45% was too aggressive — a 1-run deficit in inning 5 easily hits 44% WE.
         //     We want Claude to evaluate real deterioration, not normal early variance.
         //   Late game + WE ≤ 50%: trailing at all in late game = urgent
-        const weTrigger = (stage === 'late' && ourWE <= 0.50) || (stage === 'mid' && ourWE <= 0.40);
+        // PLAYOFF ADJUSTMENT: Playoff teams fight back harder — VGK was at 22% WE in P3 and won.
+        //   Lower thresholds so we don't trigger too early in close playoff games.
+        const isPlayoffPG = /Game \d/i.test(trade.title ?? '');
+        const weTrigger = (stage === 'late' && ourWE <= (isPlayoffPG ? 0.35 : 0.50))
+                       || (stage === 'mid' && ourWE <= (isPlayoffPG ? 0.28 : 0.40));
 
         // Bypass price threshold if thesis has been invalidated (e.g. starter pulled, goalie changed)
         if (pctChange >= PG_CLAUDE_THRESHOLD && !weTrigger && !thesisIsKiller) {
@@ -2503,7 +2507,7 @@ async function checkLiveScoreEdges() {
         //   MLB playoff: 3-run (from 2) in innings 1-6 | Soccer knockout: 1-goal until 80'
         if (!thesisIsKiller) {
           const isSoccer = ['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league);
-          const isPlayoffGame = /Game \d/i.test(trade.title ?? '');
+          const isPlayoffGame = isPlayoffPG; // already computed above
           const isSmallDeficit = (
             (league === 'nhl' && deficit <= (isPlayoffGame ? 2 : 1) && stage !== 'late') ||
             (league === 'nba' && deficit <= (isPlayoffGame ? 15 : 10) && stage !== 'late') ||
@@ -7210,13 +7214,19 @@ async function managePositions() {
             // COMEBACK GRACE PERIOD: comeback entries are at 10-44¢ with WE already low.
             // Give 15 min for the trade to breathe.
           } else {
-            const weFloor = isPreGame && stage !== 'late' ? 0.20
+            const isPlayoffWER = /Game \d/i.test(trade.title ?? '');
+            // Playoff games have more comebacks — lower the WE floor before we even ask Claude.
+            // VGK was at 22% WE in P3 (below 30% regular floor) and came back to win.
+            const weFloor = isPreGame && stage !== 'late'
+              ? (isPlayoffWER ? 0.15 : 0.20)
               : isComeback ? 0.15
-              : 0.30;
+              : (isPlayoffWER ? 0.20 : 0.30);
             if (ourWE <= weFloor) {
-              // MECHANICAL SAFETY NET: WE ≤ 10% = game is over, no Claude needed
-              if (ourWE <= 0.10) {
-                console.log(`[exit] 🔄🛑 WE-REVERSAL SAFETY NET (${(ourWE*100).toFixed(0)}% WE ≤10%): ${trade.ticker} — game is over, selling at ${(currentPrice*100).toFixed(0)}¢`);
+              // MECHANICAL SAFETY NET: truly over — no Claude needed.
+              // Playoff: raise to 8% (elite teams can score at 10%, VGK lesson).
+              const mechanicalFloor = isPlayoffWER ? 0.08 : 0.10;
+              if (ourWE <= mechanicalFloor) {
+                console.log(`[exit] 🔄🛑 WE-REVERSAL SAFETY NET (${(ourWE*100).toFixed(0)}% WE ≤${Math.round(mechanicalFloor*100)}%): ${trade.ticker} — game is over, selling at ${(currentPrice*100).toFixed(0)}¢`);
                 const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
                 if (result) anyUpdated = true;
                 continue;
@@ -7229,14 +7239,30 @@ async function managePositions() {
                 const ticker = trade.ticker ?? '';
                 const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
                   : ticker.includes('NHL') ? 'NHL' : 'Soccer';
+                const playoffComebacks = isPlayoffWER ? {
+                  NHL: 'NHL PLAYOFFS: 1-goal comebacks happen ~35% of the time — elite teams find ways in the third. 2-goal comebacks happen ~22%. 3-goal comebacks ~8%. 4+ goals in regulation = essentially over.',
+                  NBA: 'NBA PLAYOFFS: 10pt comebacks happen ~30%. 15pt comebacks ~18%. 20pt comebacks ~8%. 25+ = 2%. Playoff intensity drives bigger swings than regular season.',
+                  MLB: 'MLB PLAYOFFS: 1-run comebacks happen ~45%. 2-run comebacks ~30%. 3-run comebacks ~22% through 6 innings. Playoff bullpens are sharper but starters are also stretched harder.',
+                  Soccer: 'CUP/KNOCKOUT PLAYOFFS: 1-goal deficit equalizes ~25% of the time. 2-goal deficit ~8%. Down 2+ after 75th = essentially over.',
+                }[sport] ?? `PLAYOFFS: Comeback rates are meaningfully higher than regular season — teams are elite and desperate.`
+                : {
+                  NHL: 'NHL: 1-goal comebacks happen 30%. 2-goal comebacks ~15%. 3-goal comebacks ~5%. Down 3+ in the 3rd = essentially over.',
+                  NBA: 'NBA: 15-point comebacks happen 13%. 20-point comebacks happen 4%. 25+ is essentially over (<1%).',
+                  MLB: 'MLB: 3-run comebacks happen 20% through 6 innings, 10% in the 7th+. 5+ run deficit after 6th = <3%.',
+                  Soccer: 'Soccer: 1-goal deficits equalize ~20%. 2-goal deficit comeback ~5%. Down 2+ after 75th = essentially over.',
+                }[sport] ?? 'Comebacks get less likely as deficit grows and time runs out.';
                 const weRevPrompt =
-                  `Live ${sport} bet — win expectancy dropped to ${(ourWE*100).toFixed(0)}%. Should we SELL or HOLD?\n\n` +
+                  `${isPlayoffWER ? `⚠️ THIS IS A PLAYOFF GAME — comeback rates are significantly higher than regular season. APPLY A STRONG HOLD BIAS.\n\n` : ''}` +
+                  `Live ${sport}${isPlayoffWER ? ' PLAYOFF' : ''} bet — win expectancy dropped to ${(ourWE*100).toFixed(0)}%. Should we SELL or HOLD?\n\n` +
                   `POSITION: Bought at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢.\n` +
                   `Game: ${trade.title}\n` +
                   (ctx ? `LIVE: ${ctx.detail} | Stage: ${stage.toUpperCase()} | Period: ${ctx.period}\n` : '') +
                   `Win expectancy: ${(ourWE*100).toFixed(0)}% | Score diff: ${ctx.diff}\n\n` +
+                  `SPORT-SPECIFIC COMEBACK RATES:\n${playoffComebacks}\n\n` +
                   `At ${(ourWE*100).toFixed(0)}% WE, is a comeback realistic for ${sport} at this stage?\n` +
-                  `HOLD if deficit is recoverable (1-goal NHL with period+ left, small MLB deficit mid-game).\n` +
+                  (isPlayoffWER
+                    ? `HOLD unless WE is below 12% OR it is the final 5 minutes/period and the deficit is 3+. Playoff WE underestimates comeback potential.\n`
+                    : `HOLD if deficit is recoverable (1-goal NHL with period+ left, small MLB deficit mid-game).\n`) +
                   `SELL if game is effectively decided (large deficit late, blowout).\n\n` +
                   `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
                 const weText = await claudeScreen(weRevPrompt, { maxTokens: 200, timeout: 8000 });
@@ -7265,20 +7291,23 @@ async function managePositions() {
         // WE-DROP — catches slow deterioration that WE-reversal misses.
         // When WE drops ≥35pt from entry, Claude evaluates instead of auto-selling.
         // SAFETY NET: ≥50pt drop = mechanical sell (catastrophic deterioration).
+        // PLAYOFF ADJUSTMENT: Raise thresholds — playoff swings are wider, comebacks more common.
         if (ctx?.baselineWE != null && trade.weAtEntry != null) {
           const ourTeam = trade.ticker?.split('-').pop() ?? '';
           const ourCurrentWE = ctx.diff === 0 ? 0.50 :
             (ctx.leading === ourTeam ? ctx.baselineWE : (1 - ctx.baselineWE));
           const weDrop = trade.weAtEntry - ourCurrentWE;
-          if (weDrop >= 0.35) {
-            // MECHANICAL SAFETY NET: ≥50pt WE drop = catastrophic, no Claude needed
-            if (weDrop >= 0.50) {
-              console.log(`[exit] 📉🛑 WE-DROP SAFETY NET (${(weDrop*100).toFixed(0)}pt drop ≥50pt): ${trade.ticker} — catastrophic deterioration, selling at ${(currentPrice*100).toFixed(0)}¢`);
+          const isPlayoffWED = /Game \d/i.test(trade.title ?? '');
+          // Playoffs: require a bigger WE drop before asking Claude (40pt vs 35pt)
+          // Playoff mechanical sell: 60pt drop (vs 50pt regular) — VGK-type situations need more room
+          if (weDrop >= (isPlayoffWED ? 0.40 : 0.35)) {
+            if (weDrop >= (isPlayoffWED ? 0.60 : 0.50)) {
+              console.log(`[exit] 📉🛑 WE-DROP SAFETY NET (${(weDrop*100).toFixed(0)}pt drop ≥${isPlayoffWED ? 60 : 50}pt${isPlayoffWED ? ' PLAYOFF' : ''}): ${trade.ticker} — catastrophic deterioration, selling at ${(currentPrice*100).toFixed(0)}¢`);
               const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
               if (result) anyUpdated = true;
               continue;
             }
-            // Claude evaluates the 35-49pt WE drop
+            // Claude evaluates the WE drop
             const weDropKey = 'we-drop-eval:' + trade.ticker;
             const lastWeDropEval = tradeCooldowns.get(weDropKey) ?? 0;
             if (Date.now() - lastWeDropEval >= 5 * 60 * 1000) {
@@ -7286,14 +7315,30 @@ async function managePositions() {
               const ticker = trade.ticker ?? '';
               const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
                 : ticker.includes('NHL') ? 'NHL' : 'Soccer';
+              const weDropComebacks = isPlayoffWED ? {
+                NHL: 'NHL PLAYOFFS: A 40pt WE drop from a 1-goal deficit is normal early-game variance. Elite playoff teams rally — 1-goal comebacks ~35%, 2-goal ~22%. Only sell if deficit is 3+ goals in the 3rd.',
+                NBA: 'NBA PLAYOFFS: WE swings of 40pt happen on single big runs. Playoff teams have elite closers and adjust between quarters. 10pt deficit comeback ~30%, 15pt ~18%.',
+                MLB: 'MLB PLAYOFFS: WE drops of 40pt on 2-run deficits are routine in the first 5 innings. Playoff lineups battle back — 2-run comeback ~30% through inning 6.',
+                Soccer: 'PLAYOFF/CUP: A 40pt WE drop from 1-goal down is significant but still live — 1-goal deficit equalizes ~25% in cup play.',
+              }[sport] ?? 'PLAYOFF: WE drops are more volatile and comebacks more common than regular season.'
+              : {
+                NHL: 'NHL: 1-goal comebacks happen 30%. 2-goal comebacks ~15%. 3-goal comebacks ~5%. Down 3+ in the 3rd = essentially over.',
+                NBA: 'NBA: 15-point comebacks happen 13%. 20-point comebacks happen 4%. 25+ is essentially over (<1%).',
+                MLB: 'MLB: 3-run comebacks happen 20% through 6 innings, 10% in the 7th+. 5+ run deficit after 6th = <3%.',
+                Soccer: 'Soccer: 1-goal deficits equalize ~20%. 2-goal deficit comeback ~5%. Down 2+ after 75th = essentially over.',
+              }[sport] ?? 'Comebacks get less likely as deficit grows and time runs out.';
               const weDropPrompt =
-                `Live ${sport} bet — WE dropped ${(weDrop*100).toFixed(0)} points (from ${(trade.weAtEntry*100).toFixed(0)}% at entry → ${(ourCurrentWE*100).toFixed(0)}% now). SELL or HOLD?\n\n` +
+                `${isPlayoffWED ? `⚠️ THIS IS A PLAYOFF GAME — WE swings are normal, comeback rates are higher. Apply a HOLD bias.\n\n` : ''}` +
+                `Live ${sport}${isPlayoffWED ? ' PLAYOFF' : ''} bet — WE dropped ${(weDrop*100).toFixed(0)} points (from ${(trade.weAtEntry*100).toFixed(0)}% at entry → ${(ourCurrentWE*100).toFixed(0)}% now). SELL or HOLD?\n\n` +
                 `POSITION: Bought at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢.\n` +
                 `Game: ${trade.title}\n` +
                 (ctx ? `LIVE: ${ctx.detail} | Stage: ${stage.toUpperCase()} | Period: ${ctx.period}\n` : '') +
                 `Current WE: ${(ourCurrentWE*100).toFixed(0)}% | Score diff: ${ctx.diff ?? '?'}\n\n` +
-                `The position has deteriorated significantly. Is recovery realistic at this stage of a ${sport} game?\n` +
-                `HOLD if the deficit is still recoverable for ${sport} at this stage.\n` +
+                `SPORT-SPECIFIC COMEBACK CONTEXT:\n${weDropComebacks}\n\n` +
+                `The position has deteriorated significantly. Is recovery realistic at this stage?\n` +
+                (isPlayoffWED
+                  ? `HOLD unless the current WE is below 15% OR it's the final period/quarter/inning and deficit is large.\n`
+                  : `HOLD if the deficit is still recoverable for ${sport} at this stage.\n`) +
                 `SELL if the WE drop reflects a real shift the team can't overcome.\n\n` +
                 `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
               const dropText = await claudeScreen(weDropPrompt, { maxTokens: 200, timeout: 8000 });
@@ -7338,8 +7383,16 @@ async function managePositions() {
           const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB' :
             ticker.includes('NHL') ? 'NHL' : ticker.includes('MLS') || ticker.includes('EPL') || ticker.includes('LALIGA') ? 'Soccer' : 'Sport';
 
-          // Sport-specific comeback context
-          const comebackContext = {
+          const isPlayoffT2 = /Game \d/i.test(trade.title ?? '');
+
+          // Sport-specific comeback context — playoff rates are higher
+          const comebackContext = isPlayoffT2 ? {
+            NBA: 'NBA PLAYOFFS: 10pt comebacks happen ~30%. 15pt comebacks ~18%. 20pt comebacks ~8%. 25+ = 2%. Elite playoff teams are resilient — apply a HOLD bias.',
+            MLB: 'MLB PLAYOFFS: 2-run comebacks happen ~30% through 6 innings. 3-run comebacks ~22%. Playoff lineups are dangerous — apply a HOLD bias.',
+            NHL: 'NHL PLAYOFFS: 1-goal comebacks happen ~35%. 2-goal comebacks ~22%. 3-goal comebacks ~8%. Playoff teams fight hard — apply a HOLD bias.',
+            Soccer: 'PLAYOFF/CUP: 1-goal deficit equalizes ~25% in cup play. Very much alive with any time remaining.',
+            Sport: 'PLAYOFFS: Comeback rates are meaningfully higher than regular season. Apply a HOLD bias unless the situation is truly hopeless.',
+          }[sport] ?? '' : {
             NBA: 'NBA: 15-point comebacks happen 13% in the 3-point era. 20-point comebacks happen 4%. 25+ is essentially over (<1%).',
             MLB: 'MLB: 3-run comebacks happen 20% through 6 innings, 10% in the 7th+. 5+ run deficit after 6th inning = <3% comeback.',
             NHL: 'NHL: 1-goal comebacks happen 30%. 2-goal comebacks ~15%. 3-goal comebacks ~5%. Down 3+ in the 3rd = essentially over.',
@@ -7348,16 +7401,22 @@ async function managePositions() {
           }[sport] ?? '';
 
           const lossPrompt =
-            `You manage a live ${sport} bet that's DOWN. Should you SELL or HOLD?\n\n` +
+            `${isPlayoffT2 ? `⚠️ THIS IS A PLAYOFF GAME — elite teams fight back. Comeback rates are higher than regular season. Apply a STRONG HOLD BIAS unless the situation is clearly hopeless.\n\n` : ''}` +
+            `You manage a live ${sport}${isPlayoffT2 ? ' PLAYOFF' : ''} bet that's DOWN. Should you SELL or HOLD?\n\n` +
             `POSITION: Bought ${trade.side?.toUpperCase()} at ${(entryPrice*100).toFixed(0)}¢. Now ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}% loss, -$${Math.abs(qty * profitPerContract).toFixed(2)}).\n` +
             `Game: ${trade.title}\n` +
             `${ctx ? `LIVE: ${ctx.detail}\nGame stage: ${stage.toUpperCase()} | Win expectancy: ${ctx.baselineWE ? (ctx.baselineWE*100).toFixed(0) + '%' : 'unknown'}` : 'No live data available'}\n\n` +
             `SPORT-SPECIFIC CONTEXT:\n${comebackContext}\n\n` +
             `DECISION FRAMEWORK:\n` +
-            `- If win expectancy > 25%: HOLD (team still has a real shot)\n` +
-            `- If win expectancy 10-25%: consider selling if it's late in the game\n` +
-            `- If win expectancy < 10%: SELL (game is over)\n` +
-            `- Key player injury/ejection on OUR team: SELL\n` +
+            (isPlayoffT2
+              ? `- If win expectancy > 15%: HOLD (playoff teams come back from here regularly)\n` +
+                `- If win expectancy 8-15%: HOLD unless it's the final period/quarter and deficit is 3+\n` +
+                `- If win expectancy < 8%: SELL (game is over even for playoffs)\n` +
+                `- Key player injury/ejection on OUR team: SELL\n`
+              : `- If win expectancy > 25%: HOLD (team still has a real shot)\n` +
+                `- If win expectancy 10-25%: consider selling if it's late in the game\n` +
+                `- If win expectancy < 10%: SELL (game is over)\n` +
+                `- Key player injury/ejection on OUR team: SELL\n`) +
             `- Score suggests blowout but it's early: HOLD (lots of game left)\n\n` +
             `A) SELL: Lock in loss of $${Math.abs(qty * profitPerContract).toFixed(2)}. Free up $${currentPrice > 0 ? (qty * currentPrice).toFixed(2) : '0'} capital.\n` +
             `B) HOLD: If team wins → +$${(qty * (1 - entryPrice)).toFixed(2)}. If loses → -$${(qty * entryPrice).toFixed(2)}.\n\n` +
