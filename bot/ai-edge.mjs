@@ -4659,8 +4659,8 @@ async function checkPreGamePredictions() {
   const toShort = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
   const todayStr = toShort(etNow);
   // Only include tomorrow's date after 10pm ET (late games that cross midnight)
-  const etHour = etNow.getHours();
-  const tonightStr = etHour >= 22 ? toShort(etTmrw) : null;
+  const etHr = etNow.getHours();
+  const tonightStr = etHr >= 22 ? toShort(etTmrw) : null;
 
   // Collect today's pre-game markets — group both tickers per game
   const gameMap = new Map(); // base → { tickers: [{ticker, team, yesAsk}], title, base, series }
