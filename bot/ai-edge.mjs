@@ -1182,19 +1182,55 @@ function netEdge(confidence, price) {
 
 // Strip markdown code blocks and extract JSON from Claude responses
 // Handles: ```json {...} ```, ```{...}```, or raw {...}
-function extractJSON(text) {
+// Brace-balanced extractor: returns the FIRST fully-balanced {...} (or [...]) object.
+// Fixes failures where Sonnet emits `{json}\n\nprose with {...}` — greedy regex used
+// to grab everything first-{ to last-}, causing "Unexpected non-whitespace after JSON".
+function extractBalanced(text, open, close) {
   if (!text) return null;
-  // Remove markdown code block wrappers
   const cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
-  const match = cleaned.match(/\{[\s\S]*\}/);
-  return match ? match[0] : null;
+  const start = cleaned.indexOf(open);
+  if (start === -1) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === open) depth++;
+    else if (ch === close) {
+      depth--;
+      if (depth === 0) return cleaned.slice(start, i + 1);
+    }
+  }
+  return null; // unbalanced
 }
+function extractJSON(text) { return extractBalanced(text, '{', '}'); }
+function extractJSONArray(text) { return extractBalanced(text, '[', ']'); }
 
-function extractJSONArray(text) {
-  if (!text) return null;
-  const cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
-  const match = cleaned.match(/\[[\s\S]*\]/);
-  return match ? match[0] : null;
+// Throttled error telemetry — sends a batched Telegram alert per error-kind at most
+// once every 30 min, with up to 3 sample detail strings. Every error also logs locally.
+const ERROR_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
+const errorAlertState = new Map();
+async function reportError(kind, detail, { throttle = true } = {}) {
+  const now = Date.now();
+  const state = errorAlertState.get(kind) ?? { lastAlert: 0, count: 0, samples: [] };
+  state.count += 1;
+  if (state.samples.length < 3) state.samples.push(String(detail));
+  console.log(`[error:${kind}] ${detail}`);
+  const due = !throttle || (now - state.lastAlert >= ERROR_ALERT_COOLDOWN_MS);
+  if (due) {
+    const head = `⚠️ <b>Bot error: ${kind}</b> (x${state.count} since last alert)`;
+    const samples = state.samples.map(s => `• ${s.slice(0, 220)}`).join('\n');
+    try { await tg(`${head}\n${samples}`); } catch {}
+    state.lastAlert = now;
+    state.count = 0;
+    state.samples = [];
+  }
+  errorAlertState.set(kind, state);
 }
 
 // Extract actual fill count from order response — Kalshi returns 0 on initial POST, fills async
@@ -3950,7 +3986,7 @@ async function checkLiveScoreEdges() {
       const item = batchItems[i];
       const batchResult = batchResults[i];
       const cText = batchResult.status === 'fulfilled' ? batchResult.value : null;
-      if (!cText) { console.log(`[live-edge] Sonnet returned empty for ${item.targetAbbr} (${item.league.toUpperCase()} ${item.awayAbbr}@${item.homeAbbr})`); continue; }
+      if (!cText) { await reportError('live-edge:sonnet-empty', `${item.targetAbbr} ${item.league.toUpperCase()} ${item.awayAbbr}@${item.homeAbbr}${batchResult.status === 'rejected' ? ': ' + batchResult.reason?.message : ''}`); continue; }
 
       // Destructure back the context we need
       const { league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, leadingAbbr,
@@ -3958,10 +3994,10 @@ async function checkLiveScoreEdges() {
 
       try {
         const jsonMatch = extractJSON(cText);
-        if (!jsonMatch) { console.log(`[live-edge] Sonnet response not JSON for ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${cText.slice(0, 100)}`); continue; }
+        if (!jsonMatch) { await reportError('live-edge:no-json', `${targetAbbr} ${league.toUpperCase()} ${awayAbbr}@${homeAbbr}: ${cText.slice(0, 120)}`); continue; }
 
         let decision;
-        try { decision = JSON.parse(jsonMatch); } catch (e) { console.log(`[live-edge] JSON parse failed for ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${e.message}`); continue; }
+        try { decision = JSON.parse(jsonMatch); } catch (e) { await reportError('live-edge:parse-fail', `${targetAbbr} ${league.toUpperCase()} ${awayAbbr}@${homeAbbr}: ${e.message} | head=${jsonMatch.slice(0, 120)}`); continue; }
 
         // Normalize reasoning: accept structured object (new format) OR string (fallback).
         // For TRADE responses we want the structured object; we'll also render it to a
@@ -4378,7 +4414,7 @@ async function checkLiveScoreEdges() {
         const cbMatch = extractJSON(cbText);
         if (!cbMatch) continue;
         let cbDecision;
-        try { cbDecision = JSON.parse(cbMatch); } catch { continue; }
+        try { cbDecision = JSON.parse(cbMatch); } catch (e) { await reportError('comeback:parse-fail', `${e.message} | head=${cbMatch.slice(0, 120)}`); continue; }
 
         const cbConf = cbDecision.confidence ?? 0;
         const cbEdge = cbConf - trailingPrice;
@@ -5028,18 +5064,18 @@ async function checkPreGamePredictions() {
       const batchRes = batchResults[i];
       const decideText = batchRes.status === 'fulfilled' ? batchRes.value : null;
       if (!decideText) {
-        console.log(`[pre-game] Sonnet returned empty for ${market.base}${batchRes.status === 'rejected' ? ': ' + batchRes.reason?.message : ''}`);
+        await reportError('pre-game:sonnet-empty', `${market.base}${batchRes.status === 'rejected' ? ': ' + batchRes.reason?.message : ''}`);
         continue;
       }
 
       const jsonMatch = extractJSON(decideText);
       if (!jsonMatch) {
-        console.log(`[pre-game] No JSON in Sonnet response for ${market.base}: ${decideText.slice(0, 120)}`);
+        await reportError('pre-game:no-json', `${market.base}: ${decideText.slice(0, 160)}`);
         continue;
       }
       let decision;
       try { decision = JSON.parse(jsonMatch); } catch (e) {
-        console.log(`[pre-game] JSON parse failed for ${market.base}: ${e.message}`);
+        await reportError('pre-game:parse-fail', `${market.base}: ${e.message} | head=${jsonMatch.slice(0, 160)}`);
         continue;
       }
 
@@ -5770,12 +5806,12 @@ async function checkUFCPredictions() {
       `OR {"trade":true,"fighter":"exact name","side":"side0" or "side1","confidence":0.XX,"betAmount":N,"reasoning":"who wins and why"}`,
       { maxTokens: 800, maxSearches: 3 }
     );
-    if (!decideText) continue;
+    if (!decideText) { await reportError('ufc:sonnet-empty', 'UFC decider returned empty'); continue; }
 
     const jsonMatch = extractJSON(decideText);
-    if (!jsonMatch) continue;
+    if (!jsonMatch) { await reportError('ufc:no-json', decideText.slice(0, 160)); continue; }
     let decision;
-    try { decision = JSON.parse(jsonMatch); } catch { continue; }
+    try { decision = JSON.parse(jsonMatch); } catch (e) { await reportError('ufc:parse-fail', `${e.message} | head=${jsonMatch.slice(0, 160)}`); continue; }
 
     if (!decision.trade) {
       console.log(`[ufc] Sonnet rejected (${market.title}): conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
@@ -6228,12 +6264,12 @@ async function claudeBroadScan() {
           `OR {"trade":true,"ticker":"${market.ticker}","side":"yes"/"no","confidence":0.XX,"betAmount":N,"reasoning":"why market is wrong"}`;
 
       const cText = await claudeWithSearch(decidePrompt, { maxTokens: 800, maxSearches: 3 });
-      if (!cText) continue;
+      if (!cText) { await reportError('broad-scan:sonnet-empty', `${candidate.ticker}`); continue; }
       const jsonMatch = extractJSON(cText);
-      if (!jsonMatch) continue;
+      if (!jsonMatch) { await reportError('broad-scan:no-json', `${candidate.ticker}: ${cText.slice(0, 160)}`); continue; }
 
       let decision;
-      try { decision = JSON.parse(jsonMatch); } catch { continue; }
+      try { decision = JSON.parse(jsonMatch); } catch (e) { await reportError('broad-scan:parse-fail', `${candidate.ticker}: ${e.message} | head=${jsonMatch.slice(0, 160)}`); continue; }
 
       if (!decision.trade) {
         console.log(`[broad-scan] Sonnet rejected ${candidate.ticker}: ${decision.reasoning?.slice(0, 100)}`);
