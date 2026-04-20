@@ -6436,16 +6436,19 @@ async function managePositions() {
         const confGainTarget = (confFloorPrice > entryPrice) ? (confFloorPrice - entryPrice) : 0;
         const pgProfitTarget = Math.max(pgStageProfitTarget, confGainTarget);
 
-        // MLB HOLD-TO-SETTLEMENT: skip profit-lock when our team is winning.
-        // Only take profit in late stage (inning 8+) if price ≥ 90¢ (game is nearly settled anyway).
-        const mlbHoldToSettle = league === 'mlb' && profitPerContract > 0 && (
+        // HOLD-TO-SETTLEMENT (ALL SPORTS): skip profit-lock when our team is winning.
+        // Data: pre-game settled wins avg +$21.35/trade vs profit-locks at +$5-8. Holding
+        // when winning is strictly better EV across all sports. The 97¢ late-game lock and
+        // soccer 70-min exit still fire as safety nets above this.
+        // Only take profit in late stage if price ≥ 90¢ (game is nearly settled anyway).
+        const holdToSettle = profitPerContract > 0 && (
           stage !== 'late' || currentPrice < 0.90
         );
-        if (mlbHoldToSettle && trade.strategy === 'pre-game-prediction' && profitPerContract >= pgProfitTarget && !trade.pgHoldToSettlement) {
-          console.log(`[exit] 🧘 MLB HOLD-TO-SETTLEMENT: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ (${(currentPrice*100).toFixed(0)}¢) — holding for settlement instead of profit-locking (67% settled win rate, avg win +$21)`);
+        if (holdToSettle && trade.strategy === 'pre-game-prediction' && profitPerContract >= pgProfitTarget && !trade.pgHoldToSettlement) {
+          console.log(`[exit] 🧘 HOLD-TO-SETTLEMENT: ${trade.ticker} [${league.toUpperCase()}] up ${(profitPerContract*100).toFixed(0)}¢ (${(currentPrice*100).toFixed(0)}¢) — holding for settlement, team is winning`);
         }
 
-        if (trade.strategy === 'pre-game-prediction' && profitPerContract >= pgProfitTarget && !trade.partialTakeAt && !trade.pgHoldToSettlement && !mlbHoldToSettle) {
+        if (trade.strategy === 'pre-game-prediction' && profitPerContract >= pgProfitTarget && !trade.partialTakeAt && !trade.pgHoldToSettlement && !holdToSettle) {
           if (qty >= 1) {
             const gainPct = Math.round((profitPerContract / entryPrice) * 100);
             const anchorNote = confGainTarget > pgStageProfitTarget
@@ -6507,47 +6510,133 @@ async function managePositions() {
           continue;
         }
 
-        // LIVE-PREDICTION PROFIT-LOCK — sell at +15¢. At typical 72-75¢ entry,
-        // you need 87%+ WR for hold-to-settlement to beat locking +15¢. Our WE
-        // floor is 75% (wins ~79% historically) — below that threshold. The
-        // asymmetry kills us: a loss at 75¢ entry costs 3x what a +15¢ lock gains.
-        // At $200 bankroll, variance protection > theoretical EV optimization.
+        // LIVE-PREDICTION PROFIT-LOCK — Claude-evaluated.
+        // Mechanical sells left money on the table: ORL was winning by 8 in Q4 at 71¢,
+        // holding to settlement would have paid +46¢/contract vs the +17¢ locked.
+        // Let Claude see score, time, momentum, and EV math before deciding.
         if (trade.strategy === 'live-prediction' && profitPerContract >= 0.15) {
           const gainPct = Math.round((profitPerContract / entryPrice) * 100);
-          console.log(`[exit] 🎯💰 LIVE PROFIT-LOCK: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
-          const result = await executeSell(trade, qty, currentPrice, 'live-profit-lock');
-          if (result) {
-            anyUpdated = true;
-            await tg(
-              `🎯💰 <b>LIVE PROFIT-LOCK</b>\n\n` +
-              `${trade.title}\n` +
-              `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
-              `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>\n\n` +
-              `💬 +${gainPct}% return locked — at this bankroll, locking beats holding to settlement`
-            );
+          const lockProfit = (profitPerContract * 100).toFixed(0);
+          const profitLockKey = 'profit-lock-eval:' + trade.ticker;
+          const lastProfitEval = tradeCooldowns.get(profitLockKey) ?? 0;
+          if (Date.now() - lastProfitEval >= 5 * 60 * 1000) {
+            tradeCooldowns.set(profitLockKey, Date.now());
+            const ourTeam = trade.ticker?.split('-').pop() ?? '';
+            const ourWE = ctx?.leading === ourTeam ? (ctx?.baselineWE ?? 0.5) : (1 - (ctx?.baselineWE ?? 0.5));
+            const weLeading = ctx?.leading === ourTeam;
+            const holdEV = Math.round((ourWE * (1 - entryPrice) - (1 - ourWE) * entryPrice) * 100);
+
+            const profitLockPrompt =
+              `Live bet UP ${lockProfit}¢ (+${gainPct}%). Should we SELL to lock profit or HOLD for settlement?\n\n` +
+              `POSITION: Bought ${ourTeam} at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢.\n` +
+              `Game: ${trade.title}\n` +
+              (ctx ? `LIVE: ${ctx.detail} | Stage: ${stage.toUpperCase()} | Period: ${ctx.period}\n` : '') +
+              (ctx ? `Our team: ${ourTeam} | ${weLeading ? 'WE ARE LEADING' : 'WE ARE TRAILING'} | Score diff: ${ctx.diff}\n` : '') +
+              `Win expectancy: ${(ourWE * 100).toFixed(0)}%\n\n` +
+              `EV MATH:\n` +
+              `• SELL NOW: Lock +${lockProfit}¢/contract (guaranteed $${(qty * profitPerContract).toFixed(2)})\n` +
+              `• HOLD TO WIN: +${((1 - entryPrice) * 100).toFixed(0)}¢/contract ($${(qty * (1 - entryPrice)).toFixed(2)}) at ${(ourWE * 100).toFixed(0)}% probability\n` +
+              `• HOLD EV: ${holdEV > 0 ? '+' : ''}${holdEV}¢/contract vs guaranteed +${lockProfit}¢\n\n` +
+              `BIAS: HOLD when leading. Teams winning by 5+ in NBA Q4 win >90%. MLB leads of 3+ in 7th+ win >85%.\n` +
+              `SELL only if: momentum has clearly shifted (opponent on a big run), WE < 60%, or score is within 1-2 AND late game.\n` +
+              `HOLD if: we are leading comfortably, WE > 70%, or settlement upside (${((1 - entryPrice) * 100).toFixed(0)}¢) >> lock profit (${lockProfit}¢).\n\n` +
+              `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
+
+            const evalText = await claudeScreen(profitLockPrompt, { maxTokens: 200, timeout: 8000 });
+            if (evalText) {
+              try {
+                const match = extractJSON(evalText);
+                if (match) {
+                  const d = JSON.parse(match);
+                  if (d.action === 'sell') {
+                    console.log(`[exit] 🧠💰 CLAUDE PROFIT-LOCK (live, ${stage}): ${trade.ticker} up ${lockProfit}¢ / +${gainPct}% — selling | ${d.reasoning?.slice(0,80)}`);
+                    const result = await executeSell(trade, qty, currentPrice, 'live-profit-lock');
+                    if (result) {
+                      anyUpdated = true;
+                      await tg(
+                        `🧠💰 <b>CLAUDE PROFIT-LOCK (LIVE)</b>\n\n` +
+                        `${trade.title}\n` +
+                        `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${lockProfit}¢, +${gainPct}%)\n` +
+                        `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>\n\n` +
+                        `🧠 ${d.reasoning?.slice(0, 120) ?? ''}`
+                      );
+                    }
+                    continue;
+                  } else {
+                    console.log(`[exit] 🧠🛡️ CLAUDE HOLD at profit-lock (live, ${stage}): ${trade.ticker} up ${lockProfit}¢ — holding for settlement | ${d.reasoning?.slice(0,80)}`);
+                    tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                  }
+                }
+              } catch { /* skip */ }
+            } else {
+              console.log(`[exit] ⏳ Live profit-lock threshold on ${trade.ticker} but Claude unavailable — deferring (bias: hold)`);
+            }
           }
-          continue;
         }
 
-        // LIVE HIGH-CONVICTION PROFIT-LOCK — stage-aware like pre-game but with
-        // higher bars since HC entries are sized bigger and carry more conviction.
-        // Early: +25¢ (hold through noise), Mid: +20¢ (unchanged), Late: +15¢ (lock it)
+        // LIVE HIGH-CONVICTION PROFIT-LOCK — Claude-evaluated.
+        // HC entries are sized bigger and carry more conviction — let Claude decide
+        // whether the game context supports holding for settlement vs locking profit.
         const hcProfitTarget = stage === 'early' ? 0.25 : stage === 'late' ? 0.15 : 0.20;
         if (trade.strategy === 'high-conviction' && profitPerContract >= hcProfitTarget) {
           const gainPct = Math.round((profitPerContract / entryPrice) * 100);
-          console.log(`[exit] 🔥💰 HC PROFIT-LOCK (${stage}, target +${Math.round(hcProfitTarget*100)}¢): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
-          const result = await executeSell(trade, qty, currentPrice, 'hc-profit-lock');
-          if (result) {
-            anyUpdated = true;
-            await tg(
-              `🔥💰 <b>HIGH-CONVICTION PROFIT-LOCK</b>\n\n` +
-              `${trade.title}\n` +
-              `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
-              `Stage: ${stage} | Target was +${Math.round(hcProfitTarget*100)}¢\n` +
-              `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
-            );
+          const lockProfit = (profitPerContract * 100).toFixed(0);
+          const hcLockKey = 'hc-profit-lock-eval:' + trade.ticker;
+          const lastHcEval = tradeCooldowns.get(hcLockKey) ?? 0;
+          if (Date.now() - lastHcEval >= 5 * 60 * 1000) {
+            tradeCooldowns.set(hcLockKey, Date.now());
+            const ourTeam = trade.ticker?.split('-').pop() ?? '';
+            const ourWE = ctx?.leading === ourTeam ? (ctx?.baselineWE ?? 0.5) : (1 - (ctx?.baselineWE ?? 0.5));
+            const weLeading = ctx?.leading === ourTeam;
+            const holdEV = Math.round((ourWE * (1 - entryPrice) - (1 - ourWE) * entryPrice) * 100);
+
+            const hcLockPrompt =
+              `High-conviction bet UP ${lockProfit}¢ (+${gainPct}%). Should we SELL to lock profit or HOLD for settlement?\n\n` +
+              `POSITION: Bought ${ourTeam} at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢. HC entry = larger position size.\n` +
+              `Game: ${trade.title}\n` +
+              (ctx ? `LIVE: ${ctx.detail} | Stage: ${stage.toUpperCase()} | Period: ${ctx.period}\n` : '') +
+              (ctx ? `Our team: ${ourTeam} | ${weLeading ? 'WE ARE LEADING' : 'WE ARE TRAILING'} | Score diff: ${ctx.diff}\n` : '') +
+              `Win expectancy: ${(ourWE * 100).toFixed(0)}%\n\n` +
+              `EV MATH:\n` +
+              `• SELL NOW: Lock +${lockProfit}¢/contract (guaranteed $${(qty * profitPerContract).toFixed(2)})\n` +
+              `• HOLD TO WIN: +${((1 - entryPrice) * 100).toFixed(0)}¢/contract ($${(qty * (1 - entryPrice)).toFixed(2)}) at ${(ourWE * 100).toFixed(0)}% probability\n` +
+              `• HOLD EV: ${holdEV > 0 ? '+' : ''}${holdEV}¢/contract vs guaranteed +${lockProfit}¢\n\n` +
+              `This is a HIGH-CONVICTION entry — we had strong reasons to bet big. BIAS: HOLD when leading.\n` +
+              `SELL only if: momentum has clearly shifted, WE < 60%, or score is dangerously close late.\n` +
+              `HOLD if: we are leading, WE > 70%, or settlement upside >> lock profit.\n\n` +
+              `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
+
+            const evalText = await claudeScreen(hcLockPrompt, { maxTokens: 200, timeout: 8000 });
+            if (evalText) {
+              try {
+                const match = extractJSON(evalText);
+                if (match) {
+                  const d = JSON.parse(match);
+                  if (d.action === 'sell') {
+                    console.log(`[exit] 🧠🔥 CLAUDE HC PROFIT-LOCK (${stage}): ${trade.ticker} up ${lockProfit}¢ / +${gainPct}% — selling | ${d.reasoning?.slice(0,80)}`);
+                    const result = await executeSell(trade, qty, currentPrice, 'hc-profit-lock');
+                    if (result) {
+                      anyUpdated = true;
+                      await tg(
+                        `🧠🔥 <b>CLAUDE HC PROFIT-LOCK</b>\n\n` +
+                        `${trade.title}\n` +
+                        `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${lockProfit}¢, +${gainPct}%)\n` +
+                        `Stage: ${stage} | Target was +${Math.round(hcProfitTarget*100)}¢\n` +
+                        `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>\n\n` +
+                        `🧠 ${d.reasoning?.slice(0, 120) ?? ''}`
+                      );
+                    }
+                    continue;
+                  } else {
+                    console.log(`[exit] 🧠🛡️ CLAUDE HOLD at HC profit-lock (${stage}): ${trade.ticker} up ${lockProfit}¢ — holding for settlement | ${d.reasoning?.slice(0,80)}`);
+                    tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                  }
+                }
+              } catch { /* skip */ }
+            } else {
+              console.log(`[exit] ⏳ HC profit-lock threshold on ${trade.ticker} but Claude unavailable — deferring (bias: hold)`);
+            }
           }
-          continue;
         }
 
         // === LIVE SWING EXIT PATHS ===
@@ -7197,6 +7286,13 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
   const actualFill = parseFloat(orderData.fill_count_fp) || orderData.quantity_filled || 0;
   if (actualFill === 0) {
     console.log(`[exit] Sell order accepted but 0 filled for ${trade.ticker} — position likely already sold`);
+    await tg(
+      `⚠️ <b>SELL ATTEMPTED — 0 FILLS</b>\n\n` +
+      `${trade.title ?? trade.ticker}\n` +
+      `Reason: ${reason}\n` +
+      `Price: ${(currentPrice*100).toFixed(0)}¢ | Entry: ${Math.round(entryPrice*100)}¢\n\n` +
+      `Position may have already settled or been sold. Investigating.`
+    );
     return false;
   }
 
