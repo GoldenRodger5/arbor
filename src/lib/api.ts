@@ -22,8 +22,8 @@ function buildPostUrl(apiPath: string): string {
   return `/api/proxy?path=${encodeURIComponent(apiPath)}`;
 }
 
-async function get<T>(apiPath: string): Promise<T> {
-  const res = await fetch(buildGetUrl(apiPath), { signal: AbortSignal.timeout(10000) });
+async function get<T>(apiPath: string, timeoutMs = 10000): Promise<T> {
+  const res = await fetch(buildGetUrl(apiPath), { signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`API ${apiPath}: ${res.status}`);
   return res.json();
 }
@@ -59,9 +59,9 @@ export const api = {
   sellPosition: (args: { tradeId?: string; ticker?: string; reason?: string }) =>
     post<any>('/api/control/sell', args),
   getSummary: (hours = 1) =>
-    get<{ summary: string; generatedAt: string | null; lines?: number; hours?: number }>(`/api/summary?hours=${hours}`),
+    get<{ summary: string; generatedAt: string | null; lines?: number; hours?: number }>(`/api/summary?hours=${hours}`, 60000),
   getRecap: (period: 'daily' | 'weekly' = 'daily') =>
-    get<RecapData>(`/api/recap?period=${period}`),
+    get<RecapData>(`/api/recap?period=${period}`, 60000),
   getLiveInsight: () =>
     get<LiveInsightData>('/api/live-insight'),
   getPaperTrades: (date?: string) =>
