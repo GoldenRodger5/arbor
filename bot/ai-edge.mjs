@@ -2418,6 +2418,25 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
+        // SMALL-DEFICIT PATIENCE GATE — pro bettors don't sell on normal game variance.
+        // A 1-goal NHL deficit in P1-P2, a ≤10pt NBA deficit in Q1-Q3, a ≤2-run MLB deficit
+        // before the 7th, or a 1-goal soccer deficit before the 75th minute is just the game
+        // playing out. The thesis hasn't been invalidated — hold everything.
+        // Only thesis-killers (goalie pulled, starter yanked) bypass this gate.
+        if (!thesisIsKiller) {
+          const isSoccer = ['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league);
+          const isSmallDeficit = (
+            (league === 'nhl' && deficit <= 1 && stage !== 'late') ||
+            (league === 'nba' && deficit <= 10 && stage !== 'late') ||
+            (league === 'mlb' && deficit <= 2 && stage !== 'late') ||
+            (isSoccer && deficit <= 1 && (game.period ?? 0) < 75)
+          );
+          if (isSmallDeficit) {
+            console.log(`[pg-guard] 🧘 PATIENCE: ${ticker} trailing by ${deficit} (${league.toUpperCase()} ${stage}) — small deficit, thesis intact, auto-HOLD`);
+            continue;
+          }
+        }
+
         const triggerReason = thesisIsKiller
           ? `thesis-killer (${thesisAlert?.slice(0, 80)})`
           : weTrigger
