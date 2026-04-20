@@ -20,6 +20,7 @@
  */
 
 import { readFileSync, appendFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { execSync } from 'child_process';
 import { getBullpenStats, formatBullpenLine, bullpenTier, logBullpenLookup } from './bullpen-stats.mjs';
 import { createPrivateKey, sign as cryptoSign, constants as cryptoConstants } from 'crypto';
 import 'dotenv/config';
@@ -82,6 +83,77 @@ try {
   const n = CAL._tradesAnalyzed ?? '?';
   console.log(`[calibration] Loaded overrides from calibration-overrides.json (${n} trades analyzed)`);
 } catch { /* no overrides file — all defaults apply */ }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rolling Calibration Feedback — tells Claude its own recent track record
+// Refreshed every 2 hours, injected into live-edge + pre-game prompts.
+// ─────────────────────────────────────────────────────────────────────────────
+let calibrationFeedback = '';
+let lastCalFeedbackAt = 0;
+const CAL_FEEDBACK_INTERVAL = 2 * 60 * 60 * 1000;
+
+function computeCalibrationFeedback() {
+  if (!existsSync(TRADES_LOG)) return '';
+  try {
+    const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+    const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const cutoff = Date.now() - 14 * 864e5; // last 14 days
+    const settled = trades.filter(t =>
+      (t.status === 'settled' || t.status?.startsWith('sold-')) &&
+      t.confidence != null &&
+      new Date(t.settledAt ?? t.timestamp).getTime() > cutoff
+    );
+    if (settled.length < 10) return '';
+
+    const sportData = {};
+    for (const t of settled) {
+      const tk = (t.ticker ?? '').toUpperCase();
+      const sport = t.league ?? (tk.includes('NHL') ? 'nhl' : tk.includes('NBA') ? 'nba' : tk.includes('MLB') ? 'mlb' : tk.includes('MLS') ? 'mls' : tk.includes('EPL') ? 'epl' : tk.includes('LALIGA') ? 'laliga' : null);
+      if (!sport) continue;
+      if (!sportData[sport]) sportData[sport] = { wins: 0, losses: 0, confSum: 0, buckets: {} };
+      const won = (t.realizedPnL ?? 0) > 0;
+      sportData[sport][won ? 'wins' : 'losses']++;
+      sportData[sport].confSum += t.confidence;
+      // Bucket by confidence band
+      const band = t.confidence < 0.70 ? '65-69' : t.confidence < 0.75 ? '70-74' : '75+';
+      if (!sportData[sport].buckets[band]) sportData[sport].buckets[band] = { w: 0, l: 0 };
+      sportData[sport].buckets[band][won ? 'w' : 'l']++;
+    }
+
+    const lines2 = [];
+    for (const [sport, d] of Object.entries(sportData)) {
+      const total = d.wins + d.losses;
+      if (total < 3) continue;
+      const actualWR = Math.round((d.wins / total) * 100);
+      const avgConf = Math.round((d.confSum / total) * 100);
+      const calError = actualWR - avgConf;
+      let verdict;
+      if (Math.abs(calError) <= 5) verdict = 'well-calibrated';
+      else if (calError < -10) verdict = 'OVERCONFIDENT — lower your confidence by ' + Math.abs(calError) + ' points';
+      else if (calError < -5) verdict = 'slightly overconfident';
+      else verdict = 'underconfident — you can be bolder';
+
+      let bucketDetail = '';
+      for (const [band, b] of Object.entries(d.buckets)) {
+        const bt = b.w + b.l;
+        if (bt >= 2) bucketDetail += ` | ${band}%: ${b.w}W/${b.l}L (${Math.round(b.w/bt*100)}%)`;
+      }
+      lines2.push(`${sport.toUpperCase()}: ${d.wins}W/${d.losses}L (${actualWR}% actual vs ${avgConf}% predicted) — ${verdict}${bucketDetail}`);
+    }
+
+    if (lines2.length === 0) return '';
+    return `\n📊 YOUR RECENT TRACK RECORD (last 14 days, ${settled.length} trades):\n${lines2.join('\n')}\nAdjust your confidence based on this data. If a sport shows OVERCONFIDENT, subtract the indicated points from your initial estimate.\n`;
+  } catch { return ''; }
+}
+
+function getCalibrationFeedback() {
+  if (Date.now() - lastCalFeedbackAt >= CAL_FEEDBACK_INTERVAL) {
+    lastCalFeedbackAt = Date.now();
+    calibrationFeedback = computeCalibrationFeedback();
+    if (calibrationFeedback) console.log('[calibrate] Refreshed calibration feedback for Claude prompts');
+  }
+  return calibrationFeedback;
+}
 
 // Dynamic confidence margin — sport-aware, price-aware, situation-aware
 //
@@ -2423,16 +2495,23 @@ async function checkLiveScoreEdges() {
         // before the 7th, or a 1-goal soccer deficit before the 75th minute is just the game
         // playing out. The thesis hasn't been invalidated — hold everything.
         // Only thesis-killers (goalie pulled, starter yanked) bypass this gate.
+        //
+        // PLAYOFF WIDENING: Playoff teams are elite and fight harder. Coaching adjustments
+        // between periods, deeper rotations, and desperation create more comebacks.
+        // DATA: BUF@BOS Game 1 — bot sold a 2-goal P2 deficit, BUF came back to win 4-2.
+        //   NHL playoff: 2-goal (from 1) in P1-P2 | NBA playoff: 15pt (from 10) in Q1-Q3
+        //   MLB playoff: 3-run (from 2) in innings 1-6 | Soccer knockout: 1-goal until 80'
         if (!thesisIsKiller) {
           const isSoccer = ['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league);
+          const isPlayoffGame = /Game \d/i.test(trade.title ?? '');
           const isSmallDeficit = (
-            (league === 'nhl' && deficit <= 1 && stage !== 'late') ||
-            (league === 'nba' && deficit <= 10 && stage !== 'late') ||
-            (league === 'mlb' && deficit <= 2 && stage !== 'late') ||
-            (isSoccer && deficit <= 1 && (game.period ?? 0) < 75)
+            (league === 'nhl' && deficit <= (isPlayoffGame ? 2 : 1) && stage !== 'late') ||
+            (league === 'nba' && deficit <= (isPlayoffGame ? 15 : 10) && stage !== 'late') ||
+            (league === 'mlb' && deficit <= (isPlayoffGame ? 3 : 2) && stage !== 'late') ||
+            (isSoccer && deficit <= 1 && (game.period ?? 0) < (isPlayoffGame ? 80 : 75))
           );
           if (isSmallDeficit) {
-            console.log(`[pg-guard] 🧘 PATIENCE: ${ticker} trailing by ${deficit} (${league.toUpperCase()} ${stage}) — small deficit, thesis intact, auto-HOLD`);
+            console.log(`[pg-guard] 🧘 PATIENCE: ${ticker} trailing by ${deficit} (${league.toUpperCase()} ${stage}${isPlayoffGame ? ' PLAYOFF' : ''}) — small deficit, thesis intact, auto-HOLD`);
             continue;
           }
         }
@@ -3472,6 +3551,7 @@ async function checkLiveScoreEdges() {
           `Look for: confirmed injury news, lineup change, weather, rest day, goalie switch — something factual.\n` +
           `If you can identify a specific reason, adjust your confidence for it. If you CANNOT identify a concrete reason, trust your analysis — prediction markets on Kalshi are thin and often lag real game state by 1-3 minutes. The gap IS the edge.\n` +
           `Do NOT invent hypothetical reasons to explain the gap. "The market must know something" without naming WHAT is not analysis.\n\n` +
+          (getCalibrationFeedback() ? `═══ YOUR TRACK RECORD ═══\n${getCalibrationFeedback()}\n` : '') +
           `═══ STEP 4 — DECISION ═══\n` +
           (isSwingMode
             ? `⚠️ SWING TRADE MODE: This is a swing trade — we exit at +12¢ profit, NOT hold to settlement.\n` +
@@ -4647,12 +4727,21 @@ async function checkPreGamePredictions() {
         `✓ Confidence beats current price by 4+ points\n` +
         `✓ You have a SPECIFIC edge catalyst — not just "better team"\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
+        (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
         `📊 CONFIDENCE CALIBRATION — use this scale precisely:\n` +
         `  0.65 = marginal edge (1 weak factor confirmed)\n` +
         `  0.70 = clear edge (2+ independently confirmed factors)\n` +
         `  0.75 = strong edge (3 factors — injury, rest advantage, AND motivation/matchup)\n` +
         `  0.80+ = exceptional (reserved for opponent missing 2+ stars + confirmed tanking/rest + blowout matchup — all must be verified from your search, not assumed)\n` +
         `⛔ If you reach 0.75+, you MUST list each factor as a separate sentence in your reasoning. Stacking adjustments without independent confirmation = cap at 0.72.\n\n` +
+        `⚠️ UNDERDOG REALITY CHECK — If the team you want to bet is priced below 35¢:\n` +
+        `  The market says this team loses 65%+ of the time. NBA markets are the MOST efficient — seeding, talent, and home court are already priced in.\n` +
+        `  YOUR MAX CONFIDENCE = market price + 15 points. Example: team at 18¢ → max 33%. Team at 30¢ → max 45%.\n` +
+        `  • "Star is DOUBTFUL" ≠ "star is OUT." Doubtful players play ~40% of the time. Apply +5-8% bump for injury risk, NOT +30%.\n` +
+        `  • A 62-win team at home does NOT lose to a 7-seed 75% of the time — even without their best player.\n` +
+        `  • Playoff seeding gaps (1-4 seed vs 5-8 seed) are the strongest win predictor in NBA. Respect them.\n` +
+        `  • If opponent is on a hot streak (5+ consecutive wins), that is CONFIRMED momentum the market has priced. Subtract 3-5% from your estimate.\n` +
+        `  If your confidence exceeds price + 15 for a sub-35¢ team, you are delusional — re-anchor to the market.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. opponent resting 3 starters, team motivated for playoff seeding — price rises when they build Q1 lead","reasoning":"one sentence"}`
@@ -4692,12 +4781,20 @@ async function checkPreGamePredictions() {
         `✓ Confidence ≥ 70% (win probability)\n` +
         `✓ Confidence beats current price by 4+ points\n` +
         `✓ Goalie is confirmed AND you have a specific win-probability edge\n\n` +
+        (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
         `📊 CONFIDENCE CALIBRATION — use this scale precisely:\n` +
         `  0.65 = slight edge (goalie mismatch alone, or back-to-back alone)\n` +
         `  0.70 = clear edge (elite goalie SV% > .920 vs backup, confirmed)\n` +
         `  0.75 = strong edge (elite goalie + fatigue disadvantage for opponent + motivation)\n` +
         `  0.80+ = exceptional (dominant goalie in playoff context + opponent depleted + home ice — all must be verified from search, not assumed)\n` +
         `⛔ SV%/GAA values above are from ESPN — use them exactly. If your search returns a different SV%, note both values.\n\n` +
+        `⚠️ UNDERDOG REALITY CHECK — If the team you want to bet is priced below 35¢:\n` +
+        `  YOUR MAX CONFIDENCE = market price + 18 points. Example: team at 25¢ → max 43%. Team at 30¢ → max 48%.\n` +
+        `  NHL has more parity than NBA (goalie variance), but a team priced below 35¢ is a heavy underdog for a reason.\n` +
+        `  • Goalie matchup alone justifies at most +12% uplift — not +40%.\n` +
+        `  • Playoff series context matters: higher-seeded home teams win Game 1 ~60% historically. Respect home ice.\n` +
+        `  • If opponent is on a hot streak (5+ game point streak), the market has priced that momentum in.\n` +
+        `  If your confidence exceeds price + 18 for a sub-35¢ team, re-anchor to the market.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. elite goalie SV .928 vs backup .891 — price rises when they score first","reasoning":"one sentence"}`
@@ -4739,12 +4836,20 @@ async function checkPreGamePredictions() {
         `✓ Confidence ≥ 65% (win probability)\n` +
         `✓ Confidence beats current price by 4+ points\n` +
         `✓ Both starters confirmed AND there's a clear pitching/matchup edge\n\n` +
+        (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
         `📊 CONFIDENCE CALIBRATION — MLB scale (MLB is the most random sport):\n` +
         `  0.65 = slight edge (ERA gap 2.5-3.5, lineup is solid but not dominant)\n` +
         `  0.68 = clear edge (ERA gap 3.5+ confirmed from ESPN stats, or opponent ERA > 6.0)\n` +
         `  0.72 = strong edge (ace ERA < 3.0 vs ERA > 5.5 confirmed + lineup has clear run-scoring advantage)\n` +
         `  0.75+ = exceptional (ace ERA < 2.5 + opponent ERA > 6.5 + confirmed injuries to opponent lineup — all three independently verified from ESPN + search)\n` +
         `⛔ ESPN ERA/WHIP above are ground truth. If you write a different ERA in your reasoning than what ESPN shows, your analysis is invalid. Use the ESPN number.\n\n` +
+        `⚠️ UNDERDOG REALITY CHECK — If the team you want to bet is priced below 35¢:\n` +
+        `  YOUR MAX CONFIDENCE = market price + 20 points. Example: team at 25¢ → max 45%. Team at 30¢ → max 50%.\n` +
+        `  MLB is the most random sport, so underdogs win more often — but the market knows that too.\n` +
+        `  • A pitching mismatch (ace vs journeyman) justifies at most +12-15% uplift, not +30%.\n` +
+        `  • If opponent is on a hot streak (5+ consecutive wins), their lineup is locked in — subtract 3-5% from your estimate.\n` +
+        `  • Even the worst MLB team wins ~38% of its games. A team priced at 30¢ is already below that floor — there's a specific reason.\n` +
+        `  If your confidence exceeds price + 20 for a sub-35¢ team, re-anchor to the market.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. ace ERA 2.8 vs ERA 5.1 starter — price rises when they score first and market reprices win probability","reasoning":"one sentence"}`
@@ -4783,12 +4888,19 @@ async function checkPreGamePredictions() {
         `✓ Confidence ≥ 65% (win probability)\n` +
         `✓ Confidence beats current price by 4+ points\n` +
         `✓ You have a specific confirmed win-probability catalyst\n\n` +
+        (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
         `📊 CONFIDENCE CALIBRATION — Soccer scale (draw rate ~25% is a major suppressor):\n` +
         `  0.65 = marginal edge (home favorite + leaky opponent defense)\n` +
         `  0.70 = clear edge (prolific attack 2+/game vs defense conceding 1.5+/game, confirmed)\n` +
         `  0.75 = strong edge (dominant home side + opponent missing key striker + motivation gap)\n` +
         `  0.80+ = exceptional (all three: dominant attack, confirmed injuries to opponent, must-win context — all from search, not assumed)\n` +
         `⛔ ROSTER INTEGRITY: Only cite players confirmed on ${market.team1.teamName} or ${market.team2.teamName} rosters. Do NOT reference players from other clubs.\n\n` +
+        `⚠️ UNDERDOG REALITY CHECK — If the team you want to bet is priced below 35¢:\n` +
+        `  YOUR MAX CONFIDENCE = market price + 15 points. Example: team at 25¢ → max 40%.\n` +
+        `  Soccer underdogs face a double penalty: they must beat the opponent AND avoid a draw (~25% of games draw).\n` +
+        `  • Away underdogs win only ~15-20% of matches against top-half home sides. The market knows this.\n` +
+        `  • A key absence for the opponent adds at most +5-8% — not enough to flip an underdog into a favorite.\n` +
+        `  If your confidence exceeds price + 15 for a sub-35¢ team, re-anchor to the market.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. prolific attack vs defense conceding 1.8/game — price rises when they score first goal","reasoning":"one sentence"}`;
@@ -4931,6 +5043,28 @@ async function checkPreGamePredictions() {
       }
     }
 
+    // UNDERDOG CONFIDENCE CAP — prevents Claude from claiming an 18¢ team has 75% win probability.
+    // DATA: POR at 18¢ was assigned 75% confidence (57pt claimed edge), SAS was a 62-win 2-seed
+    // on a hot streak at home. Claude cited Wembanyama "doubtful" to justify a 75% win prob
+    // for the 7-seed. That's delusional — doubtful ≠ out, and SAS has depth beyond one player.
+    // The market isn't perfect but it's not off by 57 points.
+    //
+    // Sport-specific max edge above market for heavy underdogs (price < 35¢):
+    //   NBA: +15 (most efficient market, seeding gaps are strongest predictor)
+    //   NHL: +18 (goalie variance creates real upsets, slightly more room)
+    //   MLB: +20 (most random sport, any team can win, pitching mismatches are real)
+    //   Soccer: +15 (draw rate ~25% makes underdog wins even harder to predict)
+    const pgSportKey = expectedSport.toLowerCase();
+    if (price < 0.35) {
+      const maxEdgeMap = { nba: 0.15, nhl: 0.18, mlb: 0.20, epl: 0.15, laliga: 0.15, mls: 0.15, seriea: 0.15, bundesliga: 0.15, ligue1: 0.15 };
+      const maxEdge = maxEdgeMap[pgSportKey] ?? 0.15;
+      const maxUnderdogConf = price + maxEdge;
+      if (confidence > maxUnderdogConf) {
+        console.log(`[pre-game] ⚠️ UNDERDOG CAP: ${market.base} at ${(price*100).toFixed(0)}¢ — Claude said ${(confidence*100).toFixed(0)}% but max = ${(maxUnderdogConf*100).toFixed(0)}% (${pgSportKey.toUpperCase()} heavy-underdog cap: price + ${(maxEdge*100).toFixed(0)}pt)`);
+        confidence = maxUnderdogConf;
+      }
+    }
+
     // HARD CAP: Pre-game confidence capped at early-event baseline + sport-specific bonus.
     // Baselines are now EARLY-EVENT probabilities (first-goal / early-lead / early-scoring),
     // not full-game win rates. These are higher than win rates because we only need a
@@ -4939,7 +5073,6 @@ async function checkPreGamePredictions() {
     // NBA: early-lead baseline ~72% home (builds 8+ pt lead at some point in first half)
     // NHL: first-goal baseline ~56% home
     // Soccer: first-goal baseline ~55% home — draws are irrelevant, we exit on first goal
-    const pgSportKey = expectedSport.toLowerCase();
 
     // Soccer winner-bet block — draw-bet strategy handles all soccer leagues, no pre-game winner contracts.
     // Draw rates: MLS ~27%, Serie A ~28%, Bundesliga ~26%, Ligue 1 ~27%, EPL ~25%, La Liga ~22%.
@@ -4960,7 +5093,12 @@ async function checkPreGamePredictions() {
     // NHL: +18% (56% + 18% = 74% max) — elite goalie vs backup + PP edge
     // Soccer: +15% (55% + 15% = 70% max) — opens soccer since we exit on first goal (draws irrelevant)
     const sportCapBonus = { mlb: 0.25, nba: 0.15, nhl: 0.18, mls: 0.15, epl: 0.15, laliga: 0.15, seriea: 0.15, bundesliga: 0.15, ligue1: 0.15 }[pgSportKey] ?? 0.15;
-    const pgTargetBaseline = pick.side === 'yes' ? pgBaseline : (1 - pgBaseline);
+    // Detect home/away: "X at Y" → team1=away, team2=home. "X vs Y" → team1=home, team2=away.
+    // Baselines are HOME team probabilities — invert for away bets.
+    const titleLower = (market.title ?? '').toLowerCase();
+    const isAwayBet = (titleLower.includes(' at ') && matchedSide === market.team1) ||
+                      (titleLower.includes(' vs ') && matchedSide === market.team2);
+    const pgTargetBaseline = isAwayBet ? (1 - pgBaseline) : pgBaseline;
     const pgMaxAllowed = Math.min(0.85, pgTargetBaseline + sportCapBonus);
     if (confidence > pgMaxAllowed) {
       console.log(`[pre-game] Confidence capped: Claude said ${(confidence*100).toFixed(0)}% but pre-game baseline is ${(pgTargetBaseline*100).toFixed(0)}% → capped at ${(pgMaxAllowed*100).toFixed(0)}%`);
@@ -6873,8 +7011,11 @@ async function managePositions() {
         // CLAUDE STOP EVALUATION: when the cent-based threshold is hit, ASK Claude
         // instead of mechanically selling. Claude has live context (score, comeback rates,
         // time remaining) — the mechanical stop doesn't. This prevents premature exits
-        // like MTL@TB where a 1-goal NHL deficit in P2 (30% comeback rate) was sold at
-        // -10¢ and the team came back to win.
+        // like BUF@BOS Game 1 where a 2-goal NHL playoff deficit in P2 was sold at -28¢
+        // and BUF came back to win 4-2.
+        //
+        // v2 UPGRADE: Now includes (1) playoff detection, (2) original entry reasoning,
+        // (3) sport-specific playoff comeback rates, (4) HOLD bias for playoff games.
         if (pgHardStopReady && !mlbBlowoutLock && (entryPrice - currentPrice) >= pgHardStopCents) {
           const hardStopKey = 'hard-stop-eval:' + trade.ticker;
           const lastHardStopEval = tradeCooldowns.get(hardStopKey) ?? 0;
@@ -6884,29 +7025,54 @@ async function managePositions() {
             const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
               : ticker.includes('NHL') ? 'NHL' : ticker.includes('MLS') || ticker.includes('EPL')
               || ticker.includes('LALIGA') ? 'Soccer' : 'Sport';
-            const comebackCtx = {
+
+            // Detect playoff / postseason games — Kalshi titles use "Game N:" prefix
+            const isPlayoff = /Game \d/i.test(trade.title ?? '');
+
+            // Comeback rates — REGULAR SEASON vs PLAYOFF (playoff teams fight harder, deeper rosters)
+            const comebackCtx = isPlayoff ? {
+              NBA: 'NBA PLAYOFFS: 10pt = 30%. 15pt = 18%. 20pt = 8%. 25+ = 2%. Playoff teams are elite — deeper rotations, coaching adjustments, and crowd energy drive bigger comebacks than regular season.',
+              MLB: 'MLB PLAYOFFS: 1-run = 45%. 2-run = 30%. 3-run = 22%. Playoff teams have the deepest bullpens and most dangerous lineups. Momentum swings are sharper.',
+              NHL: 'NHL PLAYOFFS: 1-goal = 35%. 2-goal = 22%. 3-goal = 8%. Playoff hockey has higher comeback rates — desperation pulls, power plays are more frequent, goalies face more high-danger shots in desperate pushes.',
+              Soccer: 'CUP/KNOCKOUT: 1-goal = 25% equalize. 2-goal = 8%. Higher stakes = more aggressive tactics and substitutions.',
+              Sport: 'Playoff/knockout comebacks are more frequent than regular season.',
+            }[sport] ?? '' : {
               NBA: 'NBA: 10pt comeback = 25%. 15pt = 13%. 20pt = 4%. 25+ = <1%.',
               MLB: 'MLB: 1-run = 40%. 2-run = 25%. 3-run = 20% thru 6 inn. 5+ after 6th = <3%.',
               NHL: 'NHL: 1-goal = 30%. 2-goal = 15%. 3-goal = 5%. Down 3+ in 3rd = over.',
               Soccer: '1-goal = 20% equalize. 2-goal = 5%. Down 2+ after 75min = over.',
               Sport: 'Comebacks depend on deficit size and time remaining.',
             }[sport] ?? '';
+
             const timeLeft = sport === 'NHL' ? `${Math.max(0, 3 - (ctx?.period ?? 2))} period(s) left (~${Math.max(0, 3 - (ctx?.period ?? 2)) * 20}min)`
               : sport === 'MLB' ? `~${Math.max(0, 9 - (ctx?.period ?? 5))} innings left`
               : sport === 'NBA' ? `${Math.max(0, 4 - (ctx?.period ?? 3))} quarter(s) left (~${Math.max(0, 4 - (ctx?.period ?? 3)) * 12}min)`
               : `~${Math.max(0, 90 - (ctx?.period ?? 60))}min left`;
+
+            // Pass original entry reasoning so Claude knows WHY we bet — thesis context prevents
+            // selling when the original edge factors (goalie matchup, pitching mismatch, etc.) are still intact.
+            const entryReasoning = trade.reasoning ? trade.reasoning.slice(0, 300) : '';
+
             const hardStopPrompt =
-              `Live ${sport} bet hit stop-loss threshold. Should we SELL or HOLD?\n\n` +
+              `Live ${sport}${isPlayoff ? ' PLAYOFF' : ''} bet hit stop-loss threshold. Should we SELL or HOLD?\n\n` +
               `POSITION: Bought at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢ (down ${Math.round((entryPrice-currentPrice)*100)}¢, ${(pctChange*100).toFixed(0)}%).\n` +
               `Game: ${trade.title}\n` +
               (ctx ? `LIVE: ${ctx.detail} | Stage: ${stage.toUpperCase()} | Period: ${ctx.period}\n` : '') +
               (ctx?.baselineWE != null ? `Win expectancy: ${(((ctx.leading === (ticker.split('-').pop() ?? '')) ? ctx.baselineWE : (1 - ctx.baselineWE))*100).toFixed(0)}%\n` : '') +
               `TIME LEFT: ${timeLeft}\n\n` +
-              `COMEBACK RATES: ${comebackCtx}\n\n` +
-              `DECIDE based on: (1) score deficit vs ${sport} comeback rates at this stage, (2) time remaining, (3) is the deficit recoverable?\n` +
-              `HOLD if realistic comeback chance (WE > 20%, manageable deficit for the stage).\n` +
-              `SELL if game is effectively over (large deficit late, WE < 15%, or blowout).\n\n` +
-              `JSON: {"action":"sell"/"hold","reasoning":"1 sentence on comeback viability given score and time left"}`;
+              (entryReasoning ? `ORIGINAL THESIS (why we bet): ${entryReasoning}\n` +
+                `↑ Consider: is this thesis still intact? Key player still playing? Matchup edge still real?\n\n` : '') +
+              `COMEBACK RATES${isPlayoff ? ' (PLAYOFF — higher than regular season)' : ''}: ${comebackCtx}\n\n` +
+              (isPlayoff
+                ? `⚠️ PLAYOFF HOLD BIAS: This is a playoff game. Playoff teams are elite — they don't fold like regular-season teams. ` +
+                  `Coaching adjustments between periods, deeper rotations, and crowd energy create more comebacks. ` +
+                  `HOLD unless the deficit is truly insurmountable (${sport === 'NHL' ? '3+ goals in P3' : sport === 'NBA' ? '20+ pts in Q4' : sport === 'MLB' ? '4+ runs after inning 7' : '2+ goals after 80min'}).\n\n`
+                : '') +
+              `DECIDE based on: (1) score deficit vs ${sport}${isPlayoff ? ' PLAYOFF' : ''} comeback rates at this stage, ` +
+              `(2) time remaining, (3) is the original thesis still alive, (4) is the deficit recoverable?\n` +
+              `HOLD if comeback is plausible (WE > ${isPlayoff ? '15' : '20'}%, manageable deficit, thesis intact).\n` +
+              `SELL if game is effectively over (large deficit late, WE < ${isPlayoff ? '10' : '15'}%, or blowout with thesis dead).\n\n` +
+              `JSON: {"action":"sell"/"hold","reasoning":"1 sentence on comeback viability given score, time, and thesis status"}`;
             const evalText = await claudeScreen(hardStopPrompt, { maxTokens: 200, timeout: 8000 });
             if (evalText) {
               try {
@@ -6914,12 +7080,12 @@ async function managePositions() {
                 if (match) {
                   const d = JSON.parse(match);
                   if (d.action === 'sell') {
-                    console.log(`[exit] 🧠🛑 CLAUDE STOP-EVAL (${stage}): ${trade.ticker} down ${Math.round((entryPrice-currentPrice)*100)}¢ — selling | ${d.reasoning?.slice(0,80)}`);
+                    console.log(`[exit] 🧠🛑 CLAUDE STOP-EVAL (${stage}${isPlayoff ? '/playoff' : ''}): ${trade.ticker} down ${Math.round((entryPrice-currentPrice)*100)}¢ — selling | ${d.reasoning?.slice(0,80)}`);
                     const result = await executeSell(trade, qty, currentPrice, 'claude-hard-stop');
                     if (result) anyUpdated = true;
                     continue;
                   } else {
-                    console.log(`[exit] 🧠🛡️ CLAUDE HOLD at stop (${stage}): ${trade.ticker} down ${Math.round((entryPrice-currentPrice)*100)}¢ — holding | ${d.reasoning?.slice(0,80)}`);
+                    console.log(`[exit] 🧠🛡️ CLAUDE HOLD at stop (${stage}${isPlayoff ? '/playoff' : ''}): ${trade.ticker} down ${Math.round((entryPrice-currentPrice)*100)}¢ — holding | ${d.reasoning?.slice(0,80)}`);
                     tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
                   }
                 }
@@ -8183,20 +8349,37 @@ async function main() {
   }
   setTimeout(soccerExitLoop, 30 * 1000); // starts 30s after bot init
 
-  // Calibration engine — DISABLED per user request (2026-04-18).
-  // Was: runs once per day at 6am ET, sends Telegram report.
-  // Re-enable by uncommenting the setTimeout below.
-  // let lastCalibration = '';
-  // async function calibrationLoop() {
-  //   const today = etTodayStr();
-  //   if (etHour() === 6 && lastCalibration !== today) {
-  //     lastCalibration = today;
-  //     try { runCalibration(); } catch (e) { console.error('[calibrate] error:', e.message); }
-  //   }
-  //   setTimeout(calibrationLoop, 60 * 60 * 1000);
-  // }
-  // setTimeout(calibrationLoop, 10 * 60 * 1000);
-  console.log('[calibrate] Auto-calibration DISABLED');
+  // Calibration engine — runs daily at 6am ET.
+  // 1) runCalibration() — internal threshold analysis + Telegram report
+  // 2) suggest.mjs --apply — Wilson CI-based threshold suggestions, writes calibration-overrides.json
+  // 3) Hot-reload CAL overrides so the bot picks up new thresholds without restart
+  // 4) Refresh calibration feedback cache so Claude prompts get updated track record
+  let lastCalibration = '';
+  async function calibrationLoop() {
+    const today = etTodayStr();
+    if (etHour() === 6 && lastCalibration !== today) {
+      lastCalibration = today;
+      try {
+        runCalibration();
+        console.log('[calibrate] Running suggest.mjs --apply...');
+        try {
+          execSync('node bot/suggest.mjs --apply', { timeout: 30000, cwd: process.cwd() });
+          console.log('[calibrate] suggest.mjs --apply completed');
+        } catch (e) { console.error('[calibrate] suggest.mjs error:', e.message?.slice(0, 200)); }
+        // Hot-reload calibration overrides
+        try {
+          CAL = JSON.parse(readFileSync('./calibration-overrides.json', 'utf-8'));
+          console.log(`[calibrate] Reloaded overrides (${CAL._tradesAnalyzed ?? '?'} trades analyzed)`);
+        } catch { /* no file yet — fine */ }
+        // Refresh Claude prompt calibration feedback
+        calibrationFeedback = computeCalibrationFeedback();
+        if (calibrationFeedback) console.log('[calibrate] Refreshed calibration feedback for Claude prompts');
+      } catch (e) { console.error('[calibrate] error:', e.message); }
+    }
+    setTimeout(calibrationLoop, 60 * 60 * 1000);
+  }
+  setTimeout(calibrationLoop, 10 * 60 * 1000);
+  console.log('[calibrate] Auto-calibration enabled — runs daily at 6am ET');
 
   // Daily report — checks every hour, sends at midnight ET
   let lastDailyReport = '';
