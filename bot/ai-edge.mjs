@@ -85,6 +85,42 @@ try {
 } catch { /* no overrides file — all defaults apply */ }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Calibration helpers — consume CAL overrides written by suggest.mjs
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Returns true if calibration auto-disabled this strategy for a sustained -EV run.
+ *  NOTE: The primary `isStrategyDisabled()` (defined later) covers UI control disables.
+ *  This one is merged into that function below — do not call directly.
+ */
+function isStrategyAutoDisabledByCAL(strategy) {
+  return Array.isArray(CAL.disabledStrategies) && CAL.disabledStrategies.includes(strategy);
+}
+
+/** Tier 1: Per-sport/playoff exit thresholds from CAL. Falls back to caller defaults. */
+function getCALExitThresholds(sport, isPlayoff, defaults) {
+  const bucket = isPlayoff ? 'playoff' : 'regular';
+  const cal = CAL.exitThresholds?.[sport?.toLowerCase?.()]?.[bucket];
+  if (!cal) return defaults;
+  return {
+    weFloor: cal.weFloor ?? defaults.weFloor,
+    profitTake: cal.profitTake ?? defaults.profitTake,
+    weDrop: cal.weDrop ?? defaults.weDrop,
+  };
+}
+
+/** Tier 2: Per-sport Kelly fraction (0.25–0.50). Returns 0.50 if uncalibrated. */
+function getKellyFraction(sport) {
+  const f = CAL.kellyFraction?.[sport?.toLowerCase?.()];
+  return (typeof f === 'number' && f > 0 && f <= 0.50) ? f : 0.50;
+}
+
+/** Tier 2: Partial-take target price for sport/playoff (null = use existing logic). */
+function getPartialTakePrice(sport, isPlayoff) {
+  const bucket = isPlayoff ? 'playoff' : 'regular';
+  return CAL.partialTakePrice?.[sport?.toLowerCase?.()]?.[bucket] ?? null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Rolling Calibration Feedback — tells Claude its own recent track record
 // Refreshed every 2 hours, injected into live-edge + pre-game prompts.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -765,6 +801,9 @@ function renderStructuredReasoning(r) {
   }
   if (r.top_risk)         parts.push(`KEY RISK: ${r.top_risk}`);
   if (r.conviction)       parts.push(`CONVICTION: ${r.conviction}`);
+  if (Array.isArray(r.reasoning_tags) && r.reasoning_tags.length > 0) {
+    parts.push(`TAGS: ${r.reasoning_tags.filter(Boolean).join(',')}`);
+  }
   return parts.join(' | ');
 }
 
@@ -885,9 +924,13 @@ function getAvailableCash(exchange = 'kalshi') {
   return Math.max(0, bal - reserve);
 }
 
-function getDynamicMaxTrade(exchange = 'kalshi') {
+function getDynamicMaxTrade(exchange = 'kalshi', sport = null) {
   const bankroll = getBankroll();
-  const pctCap = bankroll * MAX_TRADE_FRACTION; // 10% of bankroll
+  // Tier 2: Per-sport Kelly fraction (downward-only; default 0.50 = half-Kelly)
+  // MAX_TRADE_FRACTION is the base cap; kellyFraction scales it further if
+  // realized edge for this sport is below expectations.
+  const kellyMult = sport ? (getKellyFraction(sport) / 0.50) : 1; // 1.0 = no change, 0.5 = half
+  const pctCap = bankroll * MAX_TRADE_FRACTION * kellyMult;
   const ceiling = getTradeCapCeiling();
   const available = getAvailableCash(exchange);
   return Math.min(pctCap, ceiling, available);
@@ -919,7 +962,10 @@ function readUIControl() {
 }
 function isStrategyDisabled(strategy) {
   const ctrl = readUIControl();
-  return (ctrl.disabledStrategies ?? []).includes(strategy);
+  if ((ctrl.disabledStrategies ?? []).includes(strategy)) return true;
+  // Tier 1 auto-calibration can also pause a strategy for sustained -EV runs
+  if (isStrategyAutoDisabledByCAL(strategy)) return true;
+  return false;
 }
 
 function canTrade() {
@@ -3590,7 +3636,8 @@ async function checkLiveScoreEdges() {
           `   "edge_argument": "our concrete reason the market is wrong, in one sentence",\n` +
           `   "key_facts": ["verifiable fact 1", "verifiable fact 2", "verifiable fact 3"],\n` +
           `   "top_risk": "what could still beat us, in one sentence",\n` +
-          `   "conviction": "the single factor that pushed you over threshold"\n` +
+          `   "conviction": "the single factor that pushed you over threshold",\n` +
+          `   "reasoning_tags": ["1-3 short lowercase tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, other"]\n` +
           ` }}\n\n` +
           `Every TRADE response MUST follow this exact schema. Do not substitute a string for the reasoning object.`;
         // Block if we already have a position on this game (check BOTH platforms)
@@ -3935,12 +3982,12 @@ async function checkLiveScoreEdges() {
         // Confidence-based gate — sport-specific floor if calibration override exists, else global
         let confidence = decision.confidence ?? 0;
         const sportMinConf = CAL.minConfidenceLive?.[league] ?? MIN_CONFIDENCE;
-        // Underdog entries (price < 50¢): same confidence floor as standard.
-        // At 40¢, 65% confidence = 25pt edge — massive. The edge calc protects us,
-        // no need for a separate higher confidence floor that blocks real opportunities.
-        const effectiveMinConf = sportMinConf;
+        // Tier 2: price×confidence floor (underdog/favorite band) if calibrated
+        const priceBand = price < 0.50 ? 'underdog' : 'favorite';
+        const priceBandFloor = CAL.priceConfFloors?.[league]?.[priceBand] ?? 0;
+        const effectiveMinConf = Math.max(sportMinConf, priceBandFloor);
         if (confidence < effectiveMinConf) {
-          const floorNote = price < 0.50 ? ' [underdog floor 72%]' : (CAL.minConfidenceLive?.[league] ? ' [calibrated]' : '');
+          const floorNote = priceBandFloor > sportMinConf ? ` [price-band ${priceBand} floor]` : (CAL.minConfidenceLive?.[league] ? ' [calibrated]' : '');
           console.log(`[live-edge] Confidence too low on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(confidence*100).toFixed(0)}% < ${(effectiveMinConf*100).toFixed(0)}%${floorNote}`);
           logScreen({ stage: 'live-edge-skip', result: 'skip-conf-low', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, confidence: decision.confidence, targetAbbr, reasoning: `Claude wanted to trade ${targetAbbr} at ${(confidence*100).toFixed(0)}% confidence but floor is ${(effectiveMinConf*100).toFixed(0)}%${floorNote} — ${decision.reasoning?.slice(0, 120) ?? ''}` });
           continue;
@@ -4050,6 +4097,14 @@ async function checkLiveScoreEdges() {
 
         const qty = Math.max(1, Math.floor(safeBet / bestPrice));
         const priceInCents = Math.round(bestPrice * 100);
+
+        // Tier 1: Strategy gating — if auto-calibration disabled this strategy, skip
+        const plannedStrategy = isThesisVindicated ? 'thesis-reentry' : isSwingMode ? 'live-swing' : hcCheck.isHighConv ? 'high-conviction' : 'live-prediction';
+        if (isStrategyDisabled(plannedStrategy)) {
+          console.log(`[live-edge] BLOCKED ${targetAbbr}: strategy "${plannedStrategy}" auto-disabled by calibration (Wilson-CI -EV)`);
+          logScreen({ stage: 'live-edge-skip', result: 'skip-strategy-disabled', ticker, reasoning: `strategy ${plannedStrategy} paused by auto-calibration — -EV over ${CAL._tradesAnalyzed ?? '?'} trades` });
+          continue;
+        }
 
         // Track high-conviction deployment
         if (hcCheck.isHighConv) {
@@ -7259,10 +7314,15 @@ async function managePositions() {
             const isPlayoffWER = /Game \d/i.test(trade.title ?? '');
             // Playoff games have more comebacks — lower the WE floor before we even ask Claude.
             // VGK was at 22% WE in P3 (below 30% regular floor) and came back to win.
+            // CAL override: Tier 1 calibration can loosen (never tighten) the floor per-sport.
+            const wer_tkr = (trade.ticker ?? '').toUpperCase();
+            const wer_sport = wer_tkr.includes('NBA') ? 'nba' : wer_tkr.includes('MLB') ? 'mlb' : wer_tkr.includes('MLS') ? 'mls' : wer_tkr.includes('EPL') ? 'epl' : wer_tkr.includes('NHL') ? 'nhl' : null;
+            const wer_defaults = { weFloor: isPlayoffWER ? 0.20 : 0.30, profitTake: 0.72, weDrop: isPlayoffWER ? 0.40 : 0.35 };
+            const wer_cal = getCALExitThresholds(wer_sport, isPlayoffWER, wer_defaults);
             const weFloor = isPreGame && stage !== 'late'
               ? (isPlayoffWER ? 0.15 : 0.20)
               : isComeback ? 0.15
-              : (isPlayoffWER ? 0.20 : 0.30);
+              : wer_cal.weFloor;
             if (ourWE <= weFloor) {
               // MECHANICAL SAFETY NET: truly over — no Claude needed.
               // Playoff: raise to 8% (elite teams can score at 10%, VGK lesson).
