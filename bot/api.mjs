@@ -227,10 +227,8 @@ async function generateRecap(period) {
   const now = new Date();
   const start = period === 'weekly'
     ? now.getTime() - 7 * 864e5
-    : etMidnightUTC(1).getTime();
-  const end = period === 'weekly'
-    ? now.getTime()
-    : etMidnightUTC(0).getTime();
+    : etMidnightUTC(0).getTime();  // today midnight ET
+  const end = now.getTime();  // right now
 
   const settled = trades.filter(t => {
     const at = new Date(t.settledAt ?? t.timestamp).getTime();
