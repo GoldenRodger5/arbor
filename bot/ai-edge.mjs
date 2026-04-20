@@ -4805,7 +4805,9 @@ async function checkPreGamePredictions() {
             const name = p.athlete?.displayName ?? '';
             if (!name) continue;
             const getStat = (abbrev) => p.statistics?.find(s => s.abbreviation === abbrev)?.displayValue ?? null;
-            espnStarterMap.set(abbr, {
+            // Key by `${sport}:${abbr}` so NHL PHI (Flyers) doesn't collide with
+            // MLB PHI (Phillies) — that collision put Dan Vladar in an MLB prompt.
+            espnStarterMap.set(`${key}:${abbr}`, {
               name,
               era:   getStat('ERA'),
               w:     getStat('W'),
@@ -4841,9 +4843,11 @@ async function checkPreGamePredictions() {
 
   // Build a per-market starter context string to inject at the top of each prompt.
   // These stats are ESPN ground truth — Claude must not contradict or hallucinate different numbers.
-  const buildStarterContext = (market) => {
-    const t1 = espnStarterMap.get(market.team1.team.toLowerCase());
-    const t2 = espnStarterMap.get(market.team2.team.toLowerCase());
+  const buildStarterContext = (market, sportKey) => {
+    // sportKey is 'MLB' | 'NHL' | 'NBA' | 'MLS' — scope the starter lookup so
+    // NHL PHI Flyers don't bleed into MLB PHI Phillies (Dan Vladar incident).
+    const t1 = espnStarterMap.get(`${sportKey}:${market.team1.team.toLowerCase()}`);
+    const t2 = espnStarterMap.get(`${sportKey}:${market.team2.team.toLowerCase()}`);
     const r1 = espnRosterMap.get(market.team1.team.toLowerCase());
     const r2 = espnRosterMap.get(market.team2.team.toLowerCase());
     const hasStarters = t1 || t2;
@@ -4894,7 +4898,7 @@ async function checkPreGamePredictions() {
       tk.includes('EPL') ? 'EPL' : tk.includes('LALIGA') ? 'La Liga' :
       tk.includes('SERIAA') ? 'Serie A' : tk.includes('BUNDESLIGA') ? 'Bundesliga' :
       tk.includes('LIGUE1') ? 'Ligue 1' : 'Sport';
-    const starterCtx = buildStarterContext(market);
+    const starterCtx = buildStarterContext(market, sport);
 
     const pgPromptText = sport === 'NBA'
       ? `You are a professional NBA swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
