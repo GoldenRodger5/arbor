@@ -134,9 +134,13 @@ function computeCalibrationFeedback() {
     const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
     const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
     const cutoff = Date.now() - 14 * 864e5; // last 14 days
+    // Use PICK ACCURACY (gameOutcome) not trade P&L. Stopped-out winners (BUF/VGK)
+    // should count as correct picks, since calibration is about prediction skill,
+    // not stop-loss timing. Fall back to P&L only when gameOutcome is missing.
     const settled = trades.filter(t =>
       (t.status === 'settled' || t.status?.startsWith('sold-')) &&
       t.confidence != null &&
+      (t.gameOutcome === 'correct' || t.gameOutcome === 'incorrect' || t.realizedPnL != null) &&
       new Date(t.settledAt ?? t.timestamp).getTime() > cutoff
     );
     if (settled.length < 10) return '';
@@ -147,10 +151,9 @@ function computeCalibrationFeedback() {
       const sport = t.league ?? (tk.includes('NHL') ? 'nhl' : tk.includes('NBA') ? 'nba' : tk.includes('MLB') ? 'mlb' : tk.includes('MLS') ? 'mls' : tk.includes('EPL') ? 'epl' : tk.includes('LALIGA') ? 'laliga' : null);
       if (!sport) continue;
       if (!sportData[sport]) sportData[sport] = { wins: 0, losses: 0, confSum: 0, buckets: {} };
-      const won = (t.realizedPnL ?? 0) > 0;
+      const won = t.gameOutcome ? t.gameOutcome === 'correct' : (t.realizedPnL ?? 0) > 0;
       sportData[sport][won ? 'wins' : 'losses']++;
       sportData[sport].confSum += t.confidence;
-      // Bucket by confidence band
       const band = t.confidence < 0.70 ? '65-69' : t.confidence < 0.75 ? '70-74' : '75+';
       if (!sportData[sport].buckets[band]) sportData[sport].buckets[band] = { w: 0, l: 0 };
       sportData[sport].buckets[band][won ? 'w' : 'l']++;
@@ -159,14 +162,19 @@ function computeCalibrationFeedback() {
     const lines2 = [];
     for (const [sport, d] of Object.entries(sportData)) {
       const total = d.wins + d.losses;
-      if (total < 3) continue;
+      if (total < 10) continue; // need real sample before issuing any verdict
       const actualWR = Math.round((d.wins / total) * 100);
       const avgConf = Math.round((d.confSum / total) * 100);
       const calError = actualWR - avgConf;
+      // Cap the penalty at -10pts. Only flag OVERCONFIDENT with a true sample
+      // (n ≥ 15) AND meaningful error (≤ -10). Smaller errors get soft nudges.
       let verdict;
-      if (Math.abs(calError) <= 5) verdict = 'well-calibrated';
-      else if (calError < -10) verdict = 'OVERCONFIDENT — lower your confidence by ' + Math.abs(calError) + ' points';
-      else if (calError < -5) verdict = 'slightly overconfident';
+      if (Math.abs(calError) <= 5) verdict = 'well-calibrated — trust your reads';
+      else if (calError < -10 && total >= 15) {
+        const trim = Math.min(10, Math.abs(calError));
+        verdict = `slightly overconfident — trim ~${trim}pts ONLY from claims ≥75% (leave 65-74% estimates alone)`;
+      }
+      else if (calError < -5) verdict = 'trending overconfident at the top end — be careful above 75%';
       else verdict = 'underconfident — you can be bolder';
 
       let bucketDetail = '';
@@ -178,7 +186,7 @@ function computeCalibrationFeedback() {
     }
 
     if (lines2.length === 0) return '';
-    return `\n📊 YOUR RECENT TRACK RECORD (last 14 days, ${settled.length} trades):\n${lines2.join('\n')}\nAdjust your confidence based on this data. If a sport shows OVERCONFIDENT, subtract the indicated points from your initial estimate.\n`;
+    return `\n📊 YOUR RECENT PICK ACCURACY (last 14 days, ${settled.length} trades; measured by game outcome, not stop-loss P&L):\n${lines2.join('\n')}\nUse this as a sanity check on your final confidence — do NOT flatly subtract points across the board. A 58% read on a clear mismatch stays 58%.\n`;
   } catch { return ''; }
 }
 
