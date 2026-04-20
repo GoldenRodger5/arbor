@@ -1058,7 +1058,7 @@ function checkHighConviction(confidence, league, stage, diff, period, price = nu
   return { isHighConv: true, tier, reason };
 }
 
-function getPositionSize(exchange = 'kalshi', confidenceMargin = 0, highConvTier = 0) {
+function getPositionSize(exchange = 'kalshi', confidenceMargin = 0, highConvTier = 0, sport = null) {
   const bankroll = getBankroll();
 
   // High-conviction tier: 25-30% of bankroll instead of 10%
@@ -1067,13 +1067,15 @@ function getPositionSize(exchange = 'kalshi', confidenceMargin = 0, highConvTier
   if (highConvTier > 0) {
     const hcSize = bankroll * highConvTier;
     const available = getAvailableCash(exchange);
-    const hcCeiling = bankroll * 0.50; // HC can go up to 50% bankroll
-    const size = Math.min(hcSize, available, hcCeiling);
-    console.log(`[sizing] 🔥 HIGH CONVICTION: ${(highConvTier*100).toFixed(0)}% of $${bankroll.toFixed(0)} → $${size.toFixed(2)}`);
+    // HC still honors per-sport Kelly dampening
+    const kellyMult = sport ? (getKellyFraction(sport) / 0.50) : 1;
+    const hcCeiling = bankroll * 0.50 * kellyMult;
+    const size = Math.min(hcSize * kellyMult, available, hcCeiling);
+    console.log(`[sizing] 🔥 HIGH CONVICTION: ${(highConvTier*100).toFixed(0)}% of $${bankroll.toFixed(0)} → $${size.toFixed(2)}${kellyMult < 1 ? ` [kelly ${kellyMult.toFixed(2)}x ${sport}]` : ''}`);
     return Math.max(1, size);
   }
 
-  let size = getDynamicMaxTrade(exchange);
+  let size = getDynamicMaxTrade(exchange, sport);
 
   // Scale UP for high-confidence trades — bigger margin = bigger bet
   // margin 5% = 1x (base), 10% = 1.5x, 15% = 2x, 20%+ = 2.5x (max)
@@ -2980,7 +2982,7 @@ async function checkLiveScoreEdges() {
 
               // 1.5x sizing at minute 75+ with 0-0 scoreline — highest draw probability tier (85-88%)
               const drawSizingMultiplier = (effectiveMin >= 75 && homeScore === 0 && awayScore === 0) ? 1.5 : 1.0;
-              const maxBet = Math.min(getPositionSize('kalshi', margin) * drawSizingMultiplier, getBankroll() * (0.10 * drawSizingMultiplier));
+              const maxBet = Math.min(getPositionSize('kalshi', margin, 0, league) * drawSizingMultiplier, getBankroll() * (0.10 * drawSizingMultiplier));
               const qty = Math.max(1, Math.floor(maxBet / tiePrice));
               if (!canDeployMore(qty * tiePrice)) continue;
 
@@ -4077,8 +4079,8 @@ async function checkLiveScoreEdges() {
           period === 1 ? 'early' : 'late';
         const hcCheck = isSwingMode ? { isHighConv: false } : checkHighConviction(confidence, league, liveStage, diff, period, bestPrice);
         let maxBetLE = hcCheck.isHighConv
-          ? getPositionSize(best.platform, bestEdge, hcCheck.tier)
-          : getPositionSize(best.platform, bestEdge);
+          ? getPositionSize(best.platform, bestEdge, hcCheck.tier, league)
+          : getPositionSize(best.platform, bestEdge, 0, league);
         if (isSwingMode) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for swing trades
         const claudeBet = decision.betAmount ?? 0;
         const safeBet = hcCheck.isHighConv ? maxBetLE : Math.min(claudeBet > 0 ? claudeBet : maxBetLE, maxBetLE);
@@ -4390,7 +4392,7 @@ async function checkLiveScoreEdges() {
 
         // Size conservatively — comeback has higher variance than leading-team bets
         const cbMaxTrade = Math.min(getBankroll() * 0.08, getAvailableCash('kalshi'));
-        const cbQty = Math.max(1, Math.round(Math.min(getPositionSize('kalshi', cbEdge) * 0.60, cbMaxTrade) / trailingPrice));
+        const cbQty = Math.max(1, Math.round(Math.min(getPositionSize('kalshi', cbEdge, 0, game?.league ?? null) * 0.60, cbMaxTrade) / trailingPrice));
         const cbBetAmount = cbQty * trailingPrice;
         if (cbBetAmount < 5) { console.log(`[comeback] Bet too small ($${cbBetAmount.toFixed(2)}), skipping`); continue; }
 
@@ -4845,7 +4847,7 @@ async function checkPreGamePredictions() {
         `  If your confidence exceeds price + 15 for a sub-35¢ team, you are delusional — re-anchor to the market.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. opponent resting 3 starters, team motivated for playoff seeding — price rises when they build Q1 lead","reasoning":"one sentence"}`
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. opponent resting 3 starters, team motivated for playoff seeding — price rises when they build Q1 lead","reasoning":"one sentence","reasoning_tags":["1-3 lowercase hyphen-delimited tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, back-to-back, rest-advantage, home-court, motivation, other"]}`
 
       : sport === 'NHL'
       ? `You are a professional NHL swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
@@ -4898,7 +4900,7 @@ async function checkPreGamePredictions() {
         `  If your confidence exceeds price + 18 for a sub-35¢ team, re-anchor to the market.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. elite goalie SV .928 vs backup .891 — price rises when they score first","reasoning":"one sentence"}`
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. elite goalie SV .928 vs backup .891 — price rises when they score first","reasoning":"one sentence","reasoning_tags":["1-3 lowercase hyphen-delimited tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, back-to-back, rest-advantage, home-court, motivation, other"]}`
 
       : /* MLB */
       sport === 'MLB'
@@ -4953,7 +4955,7 @@ async function checkPreGamePredictions() {
         `  If your confidence exceeds price + 20 for a sub-35¢ team, re-anchor to the market.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. ace ERA 2.8 vs ERA 5.1 starter — price rises when they score first and market reprices win probability","reasoning":"one sentence"}`
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. ace ERA 2.8 vs ERA 5.1 starter — price rises when they score first and market reprices win probability","reasoning":"one sentence","reasoning_tags":["1-3 lowercase hyphen-delimited tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, back-to-back, rest-advantage, home-court, motivation, other"]}`
 
       : /* Soccer (MLS / EPL / La Liga) */
       `You are a professional soccer swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
@@ -5004,7 +5006,7 @@ async function checkPreGamePredictions() {
         `  If your confidence exceeds price + 15 for a sub-35¢ team, re-anchor to the market.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
-        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. prolific attack vs defense conceding 1.8/game — price rises when they score first goal","reasoning":"one sentence"}`;
+        `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. prolific attack vs defense conceding 1.8/game — price rises when they score first goal","reasoning":"one sentence","reasoning_tags":["1-3 lowercase hyphen-delimited tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, back-to-back, rest-advantage, home-court, motivation, other"]}`;
 
     return {
       market,
@@ -5306,7 +5308,7 @@ async function checkPreGamePredictions() {
     const pgFraction = bkr < 500 ? (isUnderdog ? 0.15 : 0.10) : PRE_GAME_TRADE_FRACTION;
     const pgAbsCap = bkr < 500 ? (isUnderdog ? 30 : 20) : bkr < 1000 ? 50 : Infinity;
     const pgMaxTrade = Math.min(bkr * pgFraction, pgAbsCap, getAvailableCash('kalshi'));
-    const betAmount = Math.min(getPositionSize('kalshi', edge), pgMaxTrade);
+    const betAmount = Math.min(getPositionSize('kalshi', edge, 0, pgSportKey), pgMaxTrade);
     const betQty = betAmount >= 1 ? Math.max(1, Math.floor(betAmount / price)) : 0;
     if (betAmount < 1) continue;
 
@@ -5612,6 +5614,9 @@ Respond in EXACTLY this JSON:
               confidence,
               reasoning: decision.reasoning,
               exitScenario: decision.exitScenario ?? null,
+              reasoningTags: Array.isArray(decision.reasoning_tags)
+                ? decision.reasoning_tags.filter(x => typeof x === 'string').map(x => x.toLowerCase().replace(/_/g, '-').trim()).slice(0, 3)
+                : null,
               pgBaseline: pgTargetBaseline,
               sport: pgSportKey,
             });
@@ -5808,7 +5813,7 @@ async function checkUFCPredictions() {
 
     if (!canTrade()) break;
     const ufcEdge = confidence - price;
-    const maxBet = getPositionSize('polymarket', ufcEdge);
+    const maxBet = getPositionSize('polymarket', ufcEdge, 0, 'ufc');
     const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
     if (safeBet < 1) continue;
     if (!canDeployMore(safeBet)) continue;
@@ -6297,7 +6302,7 @@ async function claudeBroadScan() {
       if (!canTrade()) continue;
       // Sport exposure cap removed — sports are our main revenue driver
 
-      const maxBet = getPositionSize('kalshi');
+      const maxBet = getPositionSize('kalshi', 0, 0, bsSport);
       const safeBet = Math.min(decision.betAmount ?? 0, maxBet);
       if (safeBet < 1 || price <= 0) continue;
 
@@ -6692,7 +6697,16 @@ async function managePositions() {
           : entryConf;
 
         const confGainTarget = (confFloorPrice > entryPrice) ? (confFloorPrice - entryPrice) : 0;
-        const pgProfitTarget = Math.max(pgStageProfitTarget, confGainTarget);
+        // CAL partial-take price override: if suggest.mjs calibrated a per-sport/playoff
+        // partial-take price, honor it when it yields a smaller gain target (take profit earlier)
+        // on winners — we never override upward, only earlier lock-in.
+        const pgIsPlayoff = /Game \d/i.test(trade.title ?? '');
+        const calPartialPrice = getPartialTakePrice(league, pgIsPlayoff);
+        const calGainTarget = (calPartialPrice != null && calPartialPrice > entryPrice)
+          ? (calPartialPrice - entryPrice) : null;
+        const pgProfitTarget = calGainTarget != null
+          ? Math.min(Math.max(pgStageProfitTarget, confGainTarget), calGainTarget)
+          : Math.max(pgStageProfitTarget, confGainTarget);
 
         // HOLD-TO-SETTLEMENT (ALL SPORTS): skip profit-lock when our team is winning.
         // Data: pre-game settled wins avg +$21.35/trade vs profit-locks at +$5-8. Holding
@@ -7065,7 +7079,18 @@ async function managePositions() {
         // BANKROLL-GATED: only fires at $1K+. At small bankroll, full winners
         // need to compound — leaving 17% of profit on the table costs more in
         // growth than the variance protection saves. Revisit at $1K+.
-        if (getBankroll() >= 1000 && profitPerContract >= 0.15 && stage === 'late' && !trade.partialTakeAt) {
+        // CAL override: if partial-take price is calibrated for this sport/playoff,
+        // use (calPrice - entryPrice) as the gain trigger when lower than the 15¢ default.
+        const livePartTkr = (trade.ticker ?? '').toUpperCase();
+        const livePartSport = livePartTkr.includes('NBA') ? 'nba' : livePartTkr.includes('MLB') ? 'mlb'
+          : livePartTkr.includes('NHL') ? 'nhl' : livePartTkr.includes('MLS') ? 'mls'
+          : livePartTkr.includes('EPL') ? 'epl' : null;
+        const livePartPlayoff = /Game \d/i.test(trade.title ?? '');
+        const livePartCalPrice = getPartialTakePrice(livePartSport, livePartPlayoff);
+        const livePartCalGain = (livePartCalPrice != null && livePartCalPrice > entryPrice)
+          ? (livePartCalPrice - entryPrice) : null;
+        const livePartTrigger = livePartCalGain != null ? Math.min(0.15, livePartCalGain) : 0.15;
+        if (getBankroll() >= 1000 && profitPerContract >= livePartTrigger && stage === 'late' && !trade.partialTakeAt) {
           const sellQty = Math.max(1, Math.floor(qty * 0.25));
           if (qty - sellQty >= 2) {
             console.log(`[exit] 📊 PARTIAL PROFIT-TAKE (${stage}): ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ → selling ${sellQty} of ${qty} contracts at ${(currentPrice*100).toFixed(0)}¢ (locking ~$${(sellQty * profitPerContract).toFixed(2)}, keeping ${qty - sellQty} running)`);
@@ -7402,9 +7427,16 @@ async function managePositions() {
           const isPlayoffWED = /Game \d/i.test(trade.title ?? '');
           // Playoffs: require a bigger WE drop before asking Claude (40pt vs 35pt)
           // Playoff mechanical sell: 60pt drop (vs 50pt regular) — VGK-type situations need more room
-          if (weDrop >= (isPlayoffWED ? 0.40 : 0.35)) {
-            if (weDrop >= (isPlayoffWED ? 0.60 : 0.50)) {
-              console.log(`[exit] 📉🛑 WE-DROP SAFETY NET (${(weDrop*100).toFixed(0)}pt drop ≥${isPlayoffWED ? 60 : 50}pt${isPlayoffWED ? ' PLAYOFF' : ''}): ${trade.ticker} — catastrophic deterioration, selling at ${(currentPrice*100).toFixed(0)}¢`);
+          // CAL override: Tier 1 calibration can loosen the drop threshold per-sport.
+          const wed_tkr = (trade.ticker ?? '').toUpperCase();
+          const wed_sport = wed_tkr.includes('NBA') ? 'nba' : wed_tkr.includes('MLB') ? 'mlb' : wed_tkr.includes('MLS') ? 'mls' : wed_tkr.includes('EPL') ? 'epl' : wed_tkr.includes('NHL') ? 'nhl' : null;
+          const wed_defaults = { weFloor: isPlayoffWED ? 0.20 : 0.30, profitTake: 0.72, weDrop: isPlayoffWED ? 0.40 : 0.35 };
+          const wed_cal = getCALExitThresholds(wed_sport, isPlayoffWED, wed_defaults);
+          const wedTrigger = wed_cal.weDrop;
+          const wedMechanical = Math.min(0.70, wedTrigger + (isPlayoffWED ? 0.20 : 0.15));
+          if (weDrop >= wedTrigger) {
+            if (weDrop >= wedMechanical) {
+              console.log(`[exit] 📉🛑 WE-DROP SAFETY NET (${(weDrop*100).toFixed(0)}pt drop ≥${Math.round(wedMechanical*100)}pt${isPlayoffWED ? ' PLAYOFF' : ''}): ${trade.ticker} — catastrophic deterioration, selling at ${(currentPrice*100).toFixed(0)}¢`);
               const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
               if (result) anyUpdated = true;
               continue;
@@ -8527,10 +8559,22 @@ async function main() {
           execSync('node bot/suggest.mjs --apply', { timeout: 30000, cwd: process.cwd() });
           console.log('[calibrate] suggest.mjs --apply completed');
         } catch (e) { console.error('[calibrate] suggest.mjs error:', e.message?.slice(0, 200)); }
-        // Hot-reload calibration overrides
+        // Hot-reload calibration overrides + diff vs prior state so we can alert
+        // on newly disabled or re-enabled strategies (auto-revival signal).
         try {
-          CAL = JSON.parse(readFileSync('./calibration-overrides.json', 'utf-8'));
+          const priorDisabled = new Set(Array.isArray(CAL.disabledStrategies) ? CAL.disabledStrategies : []);
+          const nextCAL = JSON.parse(readFileSync('./calibration-overrides.json', 'utf-8'));
+          const nextDisabled = new Set(Array.isArray(nextCAL.disabledStrategies) ? nextCAL.disabledStrategies : []);
+          CAL = nextCAL;
           console.log(`[calibrate] Reloaded overrides (${CAL._tradesAnalyzed ?? '?'} trades analyzed)`);
+          const newlyDisabled = [...nextDisabled].filter(s => !priorDisabled.has(s));
+          const newlyRevived = [...priorDisabled].filter(s => !nextDisabled.has(s));
+          if (newlyDisabled.length > 0) {
+            await tg(`🛑 <b>STRATEGY AUTO-DISABLED</b>\n\nCalibration detected sustained -EV:\n${newlyDisabled.map(s => `  • ${s}`).join('\n')}\n\nWilson 95% CI upper bound fell below breakeven. Trading will skip these until the sample recovers.`);
+          }
+          if (newlyRevived.length > 0) {
+            await tg(`✅ <b>STRATEGY RE-ENABLED</b>\n\nCalibration CI upper now above breakeven:\n${newlyRevived.map(s => `  • ${s}`).join('\n')}\n\nTrading resumed for these strategies.`);
+          }
         } catch { /* no file yet — fine */ }
         // Refresh Claude prompt calibration feedback
         calibrationFeedback = computeCalibrationFeedback();

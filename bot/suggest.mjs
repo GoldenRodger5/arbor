@@ -21,9 +21,37 @@
  *   node bot/suggest.mjs --apply          # analyze + write calibration-overrides.json
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, renameSync } from 'fs';
 import { resolve } from 'path';
 import crypto from 'crypto';
+
+// Atomic write: write to .tmp then rename. Prevents partial file being
+// picked up by ai-edge's hot-reload mid-write.
+function atomicWrite(path, contents) {
+  const tmp = path + '.tmp';
+  writeFileSync(tmp, contents);
+  renameSync(tmp, path);
+}
+
+// Validate structure of generated overrides before writing. Any issue → abort.
+function validateOverrides(o) {
+  if (!o || typeof o !== 'object') return 'not an object';
+  for (const key of ['minConfidenceLive', 'requiredMarginLive', 'kellyFraction']) {
+    if (o[key] != null) {
+      if (typeof o[key] !== 'object') return `${key} must be an object`;
+      for (const [sport, v] of Object.entries(o[key])) {
+        if (typeof v !== 'number' || !isFinite(v)) return `${key}.${sport} must be a number`;
+      }
+    }
+  }
+  if (Array.isArray(o.disabledStrategies)) {
+    if (o.disabledStrategies.some(s => typeof s !== 'string')) return 'disabledStrategies must be strings';
+  }
+  if (o.exitThresholds && typeof o.exitThresholds !== 'object') return 'exitThresholds must be an object';
+  if (o.priceConfFloors && typeof o.priceConfFloors !== 'object') return 'priceConfFloors must be an object';
+  if (o.partialTakePrice && typeof o.partialTakePrice !== 'object') return 'partialTakePrice must be an object';
+  return null;
+}
 
 const APPLY = process.argv.includes('--apply');
 const logArg = process.argv.find(a => !a.startsWith('--') && a.endsWith('.jsonl'));
@@ -86,14 +114,19 @@ async function fetchKalshiBalance() {
 }
 
 // ─── Outcome helpers ──────────────────────────────────────────────────────────
+// For strategy calibration, a stop-loss exit is an expression that the
+// thesis broke — we count it as a loss regardless of whether the realized P&L
+// happened to be slightly positive (rare: exit above entry after stop trigger).
+// This matches how the strategy-gate logic used stops pre-refactor.
 function isWin(t) {
-  if (t.status?.startsWith('sold-stop') || t.status?.startsWith('sold-claude-stop') ||
+  if (t.status?.startsWith('sold-stop') || t.status === 'sold-claude-stop' ||
       t.status === 'sold-pre-game-claude-stop' || t.status === 'sold-pre-game-nuclear' ||
       t.status === 'sold-we-reversal' || t.status === 'sold-we-drop') {
-    // Exit trades: win only if realizedPnL > 0
-    return (t.realizedPnL ?? 0) > 0;
+    return false; // exits are thesis-failure signals — always LOSS for strategy stats
   }
   if (t.status === 'sold-profit-take') return (t.realizedPnL ?? 0) > 0;
+  if (t.gameOutcome === 'correct') return true;
+  if (t.gameOutcome === 'incorrect') return false;
   if (t.result === 'yes') return true;
   if (t.result === 'no') return false;
   if (t.realizedPnL != null) return t.realizedPnL > 0;
@@ -106,6 +139,16 @@ function calibratable(t) {
 
 function isLiveSport(t) {
   return ['live-prediction', 'high-conviction'].includes(t.strategy);
+}
+
+function isPreGame(t) {
+  return t.strategy === 'pre-game-prediction';
+}
+
+// Normalize tag taxonomy: lowercase, underscores → hyphens, trim.
+function normalizeTag(tag) {
+  if (typeof tag !== 'string') return null;
+  return tag.toLowerCase().replace(/_/g, '-').trim() || null;
 }
 
 function getSport(t) {
@@ -243,10 +286,12 @@ function analyzeExits(trades) {
 
       if (stopExits.length < EXIT_MIN_SAMPLES) continue;
 
-      // Flag stops that subsequently settled profitably (if settlementResult field exists)
+      // A "bad stop" is one where we sold but the game ultimately went our way —
+      // `gameOutcome` is backfilled by checkSettlements() for all closed trades.
+      // If gameOutcome === 'correct', we exited a position that would have paid.
       const recoveredStops = stopExits.filter(t =>
-        t.settlementResult === 'yes' ||
-        t.marketFinalPrice > (t.exitPrice ?? 0.30) + 0.15);
+        t.gameOutcome === 'correct' ||
+        t.result === (t.side ?? 'yes'));
 
       const badStopRate = stopExits.length > 0 ? recoveredStops.length / stopExits.length : 0;
 
@@ -314,8 +359,8 @@ function analyzeReasoningTags(trades) {
     const tags = t.reasoningStructured?.reasoning_tags ?? t.reasoningTags ?? [];
     if (!Array.isArray(tags)) continue;
     for (const tag of tags) {
-      if (typeof tag !== 'string') continue;
-      const key = tag.toLowerCase().trim();
+      const key = normalizeTag(tag);
+      if (!key) continue;
       if (!byTag[key]) byTag[key] = { n: 0, wins: 0, entryPriceSum: 0 };
       byTag[key].n++;
       byTag[key].entryPriceSum += t.entryPrice ?? 0;
@@ -363,7 +408,9 @@ function analyzeKellyFraction(trades) {
 function analyzePriceConfFloors(trades) {
   const out = {};
   for (const sport of ['nhl', 'nba', 'mlb', 'mls', 'epl']) {
-    const live = trades.filter(t => getSport(t) === sport && calibratable(t) && isLiveSport(t));
+    // Include pre-game + live — both have the same underdog/favorite edge structure
+    // and the combined sample improves confidence-bucket coverage.
+    const live = trades.filter(t => getSport(t) === sport && calibratable(t) && (isLiveSport(t) || isPreGame(t)));
     if (live.length < CONFIDENT_THRESHOLD) continue;
 
     for (const band of ['underdog', 'favorite']) {
@@ -408,17 +455,21 @@ function analyzePartialTake(trades) {
         ((isPlayoff(t) ? 'playoff' : 'regular') === bucket));
       if (sportTrades.length < 15) continue;
 
-      // Among winners, look at peakPrice vs entryPrice. Partial-take price
-      // should sit at ~70% of average peak gain above entry.
-      const winners = sportTrades.filter(t => isWin(t));
-      if (winners.length < 8) continue;
-      const avgPeakGain = winners
-        .map(t => (t.peakPrice ?? t.exitPrice ?? 0.65) - (t.entryPrice ?? 0.50))
+      // peakPrice is not logged on our trades. Use realized exitPrice on
+      // winners that already took partial profit as the best available proxy —
+      // these reflect prices at which we actually locked gains historically.
+      // Fall back to conservative 65¢ when the sample is sparse.
+      const winnersWithExit = sportTrades.filter(t => isWin(t) && t.exitPrice != null && t.entryPrice != null);
+      if (winnersWithExit.length < 8) continue;
+      const avgExitGain = winnersWithExit
+        .map(t => (t.exitPrice ?? 0.65) - (t.entryPrice ?? 0.50))
         .filter(g => g > 0)
-        .reduce((s, g, _, arr) => s + g / arr.length, 0);
+        .reduce((s, g, _, arr) => arr.length ? s + g / arr.length : s, 0);
 
-      const avgEntry = winners.reduce((s, t) => s + (t.entryPrice ?? 0.50), 0) / winners.length;
-      const suggested = Math.min(0.85, Math.max(0.60, avgEntry + avgPeakGain * 0.70));
+      const avgEntry = winnersWithExit.reduce((s, t) => s + (t.entryPrice ?? 0.50), 0) / winnersWithExit.length;
+      // Lock at 80% of the historical average profitable exit gain — keeps
+      // most of the upside while taking profit earlier when variance is high.
+      const suggested = Math.min(0.85, Math.max(0.60, avgEntry + avgExitGain * 0.80));
       out[sport] = out[sport] ?? {};
       out[sport][bucket] = parseFloat(suggested.toFixed(2));
     }
@@ -620,7 +671,12 @@ if (!hasAnySuggestion) {
   console.log('\nPROPOSED calibration-overrides.json:');
   console.log(JSON.stringify(newOverrides, null, 2));
   if (APPLY) {
-    writeFileSync(overridesPath, JSON.stringify(newOverrides, null, 2) + '\n');
+    const err = validateOverrides(newOverrides);
+    if (err) {
+      console.error(`\n✗ Validation failed — not written: ${err}\n`);
+      process.exit(1);
+    }
+    atomicWrite(overridesPath, JSON.stringify(newOverrides, null, 2) + '\n');
     console.log(`\n✓ Written to ${overridesPath}`);
     console.log('  ai-edge.mjs hot-reloads the file each calibration cycle.\n');
   } else {
