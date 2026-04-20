@@ -88,7 +88,7 @@ setInterval(() => broadcast('ping', { t: Date.now() }), 25_000);
 // ─────────────────────────────────────────────────────────────────────────────
 const ANTHROPIC_KEY = process.env.VITE_ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_API_KEY ?? '';
 const llmCache = new Map(); // key → { at, text }
-const LLM_CACHE_TTL_MS = 5 * 60 * 1000;
+const LLM_CACHE_TTL_MS = 30 * 60 * 1000;
 
 async function callLLM({ model = 'claude-sonnet-4-6', system, user, maxTokens = 900 }) {
   if (!ANTHROPIC_KEY) throw new Error('ANTHROPIC_API_KEY missing');
@@ -216,6 +216,109 @@ function getSportFromTicker(ticker) {
   if (ticker.includes('LALIGA')) return 'laliga';
   if (ticker.toLowerCase().includes('ufc')) return 'ufc';
   return 'other';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Recap generator — used by both the API handler and the 30-min pre-warm timer
+// ─────────────────────────────────────────────────────────────────────────────
+async function generateRecap(period) {
+  const trades = readJsonl(TRADES_LOG).filter(t => t.status !== 'testing-void' && t.exchange === 'kalshi');
+
+  const now = new Date();
+  const start = period === 'weekly'
+    ? now.getTime() - 7 * 864e5
+    : etMidnightUTC(1).getTime();
+  const end = period === 'weekly'
+    ? now.getTime()
+    : etMidnightUTC(0).getTime();
+
+  const settled = trades.filter(t => {
+    const at = new Date(t.settledAt ?? t.timestamp).getTime();
+    return at >= start && at < end &&
+      (t.status === 'settled' || t.status?.startsWith('sold-')) &&
+      t.status !== 'sold-sync-bug' && t.status !== 'failed-bug' &&
+      t.status !== 'closed-manual' && t.status !== 'sold-manual';
+  });
+  const placed = trades.filter(t => {
+    const at = new Date(t.timestamp).getTime();
+    return at >= start && at < end;
+  });
+
+  const wins = settled.filter(t => (t.realizedPnL ?? 0) > 0);
+  const losses = settled.filter(t => (t.realizedPnL ?? 0) < 0);
+  const totalPnL = settled.reduce((s, t) => s + (t.realizedPnL ?? 0), 0);
+
+  const best = settled.reduce((b, t) => (t.realizedPnL ?? 0) > (b?.realizedPnL ?? -Infinity) ? t : b, null);
+  const worst = settled.reduce((w, t) => (t.realizedPnL ?? 0) < (w?.realizedPnL ?? Infinity) ? t : w, null);
+
+  const sportMap = {};
+  for (const t of settled) {
+    const sport = getSportFromTicker(t.ticker);
+    if (!sportMap[sport]) sportMap[sport] = { sport, trades: 0, wins: 0, pnl: 0 };
+    sportMap[sport].trades++;
+    if ((t.realizedPnL ?? 0) > 0) sportMap[sport].wins++;
+    sportMap[sport].pnl += t.realizedPnL ?? 0;
+  }
+
+  const sportLine = Object.values(sportMap)
+    .map(s => `${s.sport.toUpperCase()} ${s.trades}t ${s.wins}W ${s.pnl >= 0 ? '+' : ''}$${s.pnl.toFixed(2)}`)
+    .join(' · ') || '(no settlements)';
+
+  let commentary = null;
+  try {
+    const compact = settled.slice(-30).map(t => {
+      const r = t.reasoning?.slice(0, 200) ?? '';
+      const pnl = t.realizedPnL?.toFixed(2) ?? '?';
+      return `[${t.ticker}] ${t.title} · ${t.side?.toUpperCase()} @ ${Math.round((t.entryPrice ?? 0) * 100)}¢ · ${pnl != null ? `PnL $${pnl}` : 'open'} · conf ${Math.round((t.confidence ?? 0) * 100)}% · ${r}`;
+    }).join('\n');
+    const key = `recap:${period}:${start}:${end}:${settled.length}`;
+    commentary = await cachedLLM(key, {
+      model: 'claude-sonnet-4-6',
+      maxTokens: 900,
+      system:
+        `You are a pro sports bettor reviewing a trading bot's recent performance for its operator. Your goal is an honest, specific, actionable recap. No cheerleading, no hedging.
+
+Output (markdown, ~4 short sections with clear headings):
+
+**What went right** — 2-3 bullets. Name specific trades or patterns. Tie decisions to outcomes.
+**What went wrong** — 2-3 bullets. Same standard. Call out process-vs-outcome clearly (a lucky win is not the same as a well-reasoned one).
+**The pattern to watch** — 1 bullet. Is the bot systematically over/underconfident in any sport, price band, or game state?
+**One concrete action** — 1 sentence. A single, testable change or thing to monitor next period.
+
+Rules:
+- Quote actual numbers (tickers, confidence %, prices, PnL). Avoid vague language.
+- If the sample is small (<5 settlements), say so and keep conclusions tentative.
+- Distinguish outcome from process. "Lost money on a good trade" is valid feedback.
+- No preamble, no sign-off.`,
+      user:
+        `Recap period: ${period} (${new Date(start).toISOString().slice(0, 10)} → ${new Date(end).toISOString().slice(0, 10)})
+Placed: ${placed.length} · Settled: ${settled.length} · ${wins.length}W/${losses.length}L · Win% ${settled.length ? Math.round((wins.length / settled.length) * 100) : '—'}
+Total PnL: $${totalPnL.toFixed(2)}
+Per sport: ${sportLine}
+
+Settled trades (most recent last):
+${compact || '(no settled trades this period)'}
+
+Write the recap.`
+    });
+  } catch (e) { commentary = null; }
+
+  return {
+    period,
+    start: new Date(start).toISOString(),
+    end: new Date(end).toISOString(),
+    placed: placed.length,
+    settled: settled.length,
+    wins: wins.length,
+    losses: losses.length,
+    winRate: settled.length ? Math.round((wins.length / settled.length) * 100) : null,
+    totalPnL: Math.round(totalPnL * 100) / 100,
+    best: best ? { title: best.title, pnl: best.realizedPnL, ticker: best.ticker } : null,
+    worst: worst ? { title: worst.title, pnl: worst.realizedPnL, ticker: worst.ticker } : null,
+    sportBreakdown: Object.values(sportMap).map(s => ({ ...s, pnl: Math.round(s.pnl * 100) / 100, winRate: s.trades ? Math.round((s.wins / s.trades) * 100) : 0 })),
+    commentary,
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 async function handleRequest(req, res) {
@@ -453,107 +556,7 @@ Rules:
     if (path === '/api/recap') {
       const raw = (url.searchParams.get('period') ?? 'daily').toLowerCase();
       const period = raw === 'weekly' ? 'weekly' : 'daily';
-      const trades = readJsonl(TRADES_LOG).filter(t => t.status !== 'testing-void' && t.exchange === 'kalshi');
-
-      // ET day boundaries — so "yesterday" means the ET day, not UTC.
-      const now = new Date();
-      const start = period === 'weekly'
-        ? now.getTime() - 7 * 864e5
-        : etMidnightUTC(1).getTime();
-      const end = period === 'weekly'
-        ? now.getTime()
-        : etMidnightUTC(0).getTime();
-
-      const settled = trades.filter(t => {
-        const at = new Date(t.settledAt ?? t.timestamp).getTime();
-        return at >= start && at < end &&
-          (t.status === 'settled' || t.status?.startsWith('sold-')) &&
-          t.status !== 'sold-sync-bug' && t.status !== 'failed-bug' &&
-          t.status !== 'closed-manual' && t.status !== 'sold-manual';
-      });
-      const placed = trades.filter(t => {
-        const at = new Date(t.timestamp).getTime();
-        return at >= start && at < end;
-      });
-
-      const wins = settled.filter(t => (t.realizedPnL ?? 0) > 0);
-      const losses = settled.filter(t => (t.realizedPnL ?? 0) < 0);
-      const totalPnL = settled.reduce((s, t) => s + (t.realizedPnL ?? 0), 0);
-
-      const best = settled.reduce((b, t) => (t.realizedPnL ?? 0) > (b?.realizedPnL ?? -Infinity) ? t : b, null);
-      const worst = settled.reduce((w, t) => (t.realizedPnL ?? 0) < (w?.realizedPnL ?? Infinity) ? t : w, null);
-
-      // Per sport
-      const sportMap = {};
-      for (const t of settled) {
-        const sport = getSportFromTicker(t.ticker);
-        if (!sportMap[sport]) sportMap[sport] = { sport, trades: 0, wins: 0, pnl: 0 };
-        sportMap[sport].trades++;
-        if ((t.realizedPnL ?? 0) > 0) sportMap[sport].wins++;
-        sportMap[sport].pnl += t.realizedPnL ?? 0;
-      }
-
-      // Per-sport summary for context in the prompt
-      const sportLine = Object.values(sportMap)
-        .map(s => `${s.sport.toUpperCase()} ${s.trades}t ${s.wins}W ${s.pnl >= 0 ? '+' : ''}$${s.pnl.toFixed(2)}`)
-        .join(' · ') || '(no settlements)';
-
-      // LLM commentary — Sonnet, richer prompt
-      let commentary = null;
-      try {
-        const compact = settled.slice(-30).map(t => {
-          const r = t.reasoning?.slice(0, 200) ?? '';
-          const pnl = t.realizedPnL?.toFixed(2) ?? '?';
-          return `[${t.ticker}] ${t.title} · ${t.side?.toUpperCase()} @ ${Math.round((t.entryPrice ?? 0) * 100)}¢ · ${pnl != null ? `PnL $${pnl}` : 'open'} · conf ${Math.round((t.confidence ?? 0) * 100)}% · ${r}`;
-        }).join('\n');
-        const key = `recap:${period}:${start}:${end}:${settled.length}`;
-        commentary = await cachedLLM(key, {
-          model: 'claude-sonnet-4-6',
-          maxTokens: 900,
-          system:
-            `You are a pro sports bettor reviewing a trading bot's recent performance for its operator. Your goal is an honest, specific, actionable recap. No cheerleading, no hedging.
-
-Output (markdown, ~4 short sections with clear headings):
-
-**What went right** — 2-3 bullets. Name specific trades or patterns. Tie decisions to outcomes.
-**What went wrong** — 2-3 bullets. Same standard. Call out process-vs-outcome clearly (a lucky win is not the same as a well-reasoned one).
-**The pattern to watch** — 1 bullet. Is the bot systematically over/underconfident in any sport, price band, or game state?
-**One concrete action** — 1 sentence. A single, testable change or thing to monitor next period.
-
-Rules:
-- Quote actual numbers (tickers, confidence %, prices, PnL). Avoid vague language.
-- If the sample is small (<5 settlements), say so and keep conclusions tentative.
-- Distinguish outcome from process. "Lost money on a good trade" is valid feedback.
-- No preamble, no sign-off.`,
-          user:
-            `Recap period: ${period} (${new Date(start).toISOString().slice(0, 10)} → ${new Date(end).toISOString().slice(0, 10)})
-Placed: ${placed.length} · Settled: ${settled.length} · ${wins.length}W/${losses.length}L · Win% ${settled.length ? Math.round((wins.length / settled.length) * 100) : '—'}
-Total PnL: $${totalPnL.toFixed(2)}
-Per sport: ${sportLine}
-
-Settled trades (most recent last):
-${compact || '(no settled trades this period)'}
-
-Write the recap.`
-        });
-      } catch (e) { commentary = null; }
-
-      json(res, {
-        period,
-        start: new Date(start).toISOString(),
-        end: new Date(end).toISOString(),
-        placed: placed.length,
-        settled: settled.length,
-        wins: wins.length,
-        losses: losses.length,
-        winRate: settled.length ? Math.round((wins.length / settled.length) * 100) : null,
-        totalPnL: Math.round(totalPnL * 100) / 100,
-        best: best ? { title: best.title, pnl: best.realizedPnL, ticker: best.ticker } : null,
-        worst: worst ? { title: worst.title, pnl: worst.realizedPnL, ticker: worst.ticker } : null,
-        sportBreakdown: Object.values(sportMap).map(s => ({ ...s, pnl: Math.round(s.pnl * 100) / 100, winRate: s.trades ? Math.round((s.wins / s.trades) * 100) : 0 })),
-        commentary,
-        generatedAt: new Date().toISOString(),
-      });
+      json(res, await generateRecap(period));
       return;
     }
 
@@ -979,4 +982,16 @@ function json(res, data) {
 const server = createServer(handleRequest);
 server.listen(PORT, () => {
   console.log(`[api] Arbor data API running on port ${PORT}`);
+
+  // Pre-warm recap cache every 30 min so the page loads instantly
+  async function prewarmRecaps() {
+    try {
+      await generateRecap('daily');
+      await generateRecap('weekly');
+      console.log('[api] Recap cache pre-warmed (daily + weekly)');
+    } catch (e) { console.error('[api] Recap pre-warm error:', e.message); }
+  }
+  // Warm on startup (after 10s delay to let things settle), then every 30 min
+  setTimeout(prewarmRecaps, 10_000);
+  setInterval(prewarmRecaps, 30 * 60 * 1000);
 });
