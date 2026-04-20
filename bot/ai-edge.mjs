@@ -761,6 +761,11 @@ function loadState() {
   } catch (e) { console.error('[state] load error:', e.message); }
 }
 const tradeCooldowns = new Map(); // ticker → lastTradedMs
+// After a swing trade exits (stop, thesis-expiry, or profit-lock), record the
+// state it exited in. For the next 20 min, a re-entry on the same gameBase
+// is blocked UNLESS the score has changed OR price has moved ≥5¢ better than
+// the exit price. Prevents chasing the same dead thesis scan after scan.
+const swingExitState = new Map(); // gameBase → { ts, scoreKey, exitPrice, reason }
 const stopLocks = new Map();      // gameBase → unlockTimestampMs (persisted across restarts)
 const stoppedBets = new Map();    // gameBase → { team, stoppedAt, entryPrice } (persisted — enables thesis-vindicated re-entry)
 const lastGameStates = new Map(); // "ATH@NYM" → "1-0-5" (score-period, for change detection)
@@ -3886,6 +3891,27 @@ async function checkLiveScoreEdges() {
         const timeSinceLastTrade = Date.now() - (tradeCooldowns.get(gameBase) ?? 0);
         if (timeSinceLastTrade < COOLDOWN_MS && !hasPosition) {
           continue; // within cooldown and no existing position to scale into
+        }
+
+        // Post-swing-exit re-entry gate: if we just exited this game on a swing
+        // (stop/expiry/profit-lock) within the last 20 min, require genuinely
+        // new state before allowing re-entry. Prevents chasing the same dead
+        // thesis scan after scan.
+        {
+          const recentExit = swingExitState.get(gameBase);
+          if (recentExit && Date.now() - recentExit.ts < 20 * 60 * 1000) {
+            const nowScoreKey = `${homeScore}-${awayScore}`;
+            const scoreChanged = recentExit.scoreKey && recentExit.scoreKey !== nowScoreKey;
+            const priceBetter = price <= (recentExit.exitPrice - 0.05); // 5¢ cheaper
+            if (!scoreChanged && !priceBetter) {
+              logScreen({ stage: 'live-edge-skip', result: 'skip-post-swing-exit', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, reasoning: `Recent swing ${recentExit.reason} exit at ${Math.round(recentExit.exitPrice*100)}¢ on score ${recentExit.scoreKey}. Blocking re-entry: score unchanged and price not ≥5¢ better.` });
+              continue;
+            }
+            // State genuinely changed — allow re-entry and clear the block so
+            // we don't gate again after this cycle.
+            swingExitState.delete(gameBase);
+            console.log(`[live-edge] ♻️ Post-exit re-entry allowed on ${gameBase}: ${scoreChanged ? `score ${recentExit.scoreKey}→${nowScoreKey}` : `price ${Math.round(recentExit.exitPrice*100)}¢→${Math.round(price*100)}¢`}`);
+          }
         }
 
         // Price filter — sport-specific ceiling, tiered by score differential where relevant.
@@ -7100,6 +7126,12 @@ async function managePositions() {
           if (swingProfit >= 0.12) {
             const gainPct = Math.round((swingProfit / entryPrice) * 100);
             console.log(`[exit] 🔄💰 SWING PROFIT-LOCK: ${trade.ticker} up ${(swingProfit*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
+            {
+              const lh = trade.ticker.lastIndexOf('-');
+              const gb = lh > 0 ? trade.ticker.slice(0, lh) : trade.ticker;
+              const sk = ctx?.homeScore != null ? `${ctx.homeScore}-${ctx.awayScore}` : null;
+              swingExitState.set(gb, { ts: Date.now(), scoreKey: sk, exitPrice: currentPrice, reason: 'profit-lock' });
+            }
             const result = await executeSell(trade, qty, currentPrice, 'swing-profit-lock');
             if (result) {
               anyUpdated = true;
@@ -7147,6 +7179,12 @@ async function managePositions() {
                         `Loss: <b>$${(qty * swingProfit).toFixed(2)}</b>\n` +
                         `Claude: ${d.reasoning?.slice(0,100) ?? 'thesis failed'}`
                       );
+                      {
+                        const lh = trade.ticker.lastIndexOf('-');
+                        const gb = lh > 0 ? trade.ticker.slice(0, lh) : trade.ticker;
+                        const sk = ctx?.homeScore != null ? `${ctx.homeScore}-${ctx.awayScore}` : null;
+                        swingExitState.set(gb, { ts: Date.now(), scoreKey: sk, exitPrice: currentPrice, reason: 'hard-stop' });
+                      }
                       const result = await executeSell(trade, qty, currentPrice, 'swing-hard-stop');
                       if (result) anyUpdated = true;
                       continue;
@@ -7193,6 +7231,12 @@ async function managePositions() {
                 `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(swingProfit*100).toFixed(0)}¢)\n` +
                 `${swingProfit > 0 ? `Small gain: +$${(qty * swingProfit).toFixed(2)}` : `Loss: $${(qty * swingProfit).toFixed(2)}`} — ${periodsElapsed}+ periods, no momentum, WE no longer supports hold`
               );
+              {
+                const lh = trade.ticker.lastIndexOf('-');
+                const gb = lh > 0 ? trade.ticker.slice(0, lh) : trade.ticker;
+                const sk = ctx?.homeScore != null ? `${ctx.homeScore}-${ctx.awayScore}` : null;
+                swingExitState.set(gb, { ts: Date.now(), scoreKey: sk, exitPrice: currentPrice, reason: 'thesis-expiry' });
+              }
               const result = await executeSell(trade, qty, currentPrice, 'swing-thesis-expiry');
               if (result) anyUpdated = true;
               continue;
