@@ -7160,18 +7160,43 @@ async function managePositions() {
             }
           }
 
-          // 3. THESIS-EXPIRY: sell if <+8¢ after 2+ periods (didn't spike, momentum gone)
-          if (periodsElapsed >= 2 && swingProfit < 0.08) {
-            console.log(`[exit] 🔄⏰ SWING THESIS-EXPIRY: ${trade.ticker} only +${(swingProfit*100).toFixed(0)}¢ after ${periodsElapsed} periods — exiting (need +12¢, got <+8¢)`);
-            await tg(
-              `🔄⏰ <b>SWING THESIS-EXPIRY</b>\n\n` +
-              `${trade.title}\n` +
-              `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(swingProfit*100).toFixed(0)}¢)\n` +
-              `${swingProfit > 0 ? `Small gain: +$${(qty * swingProfit).toFixed(2)}` : `Loss: $${(qty * swingProfit).toFixed(2)}`} — 2+ periods, no momentum, exiting`
-            );
-            const result = await executeSell(trade, qty, currentPrice, 'swing-thesis-expiry');
-            if (result) anyUpdated = true;
-            continue;
+          // 3. THESIS-EXPIRY: sport-aware + EV-aware
+          //
+          // Old rule: cut if <+8¢ after 2+ periods. Flaws:
+          //  (a) For MLB, 2 innings is way too early — pitching theses reprice when
+          //      starters exit (inn 5-6), so cutting Lugo at 0-0 inn 2 kills the trade
+          //      while it's working.
+          //  (b) Price-only check ignores live WE. If our team is still leading and
+          //      live WE > current price + 3pt, the edge is alive — the market just
+          //      hasn't fully repriced yet. That's the whole reason we entered.
+          //
+          // New rule: longer wait for MLB + only cut if price AND edge both stale.
+          {
+            const tkr = trade.ticker ?? '';
+            const league = tkr.includes('MLB') ? 'mlb' : tkr.includes('NHL') ? 'nhl'
+              : tkr.includes('NBA') ? 'nba' : 'soccer';
+            const minPeriodsForExpiry = league === 'mlb' ? 4 : 2;
+            // Compute our team's live WE if available — if we're leading or the
+            // game state still implies our win probability > current price + 3pt,
+            // don't cut. The edge is still alive; give the market time to reprice.
+            let edgeStillAlive = false;
+            if (ctx?.baselineWE != null) {
+              const myTeam = (tkr.split('-').pop() ?? '').toUpperCase();
+              const myWE = ctx.leading === myTeam ? ctx.baselineWE : (1 - ctx.baselineWE);
+              if (myWE - currentPrice >= 0.03) edgeStillAlive = true;
+            }
+            if (periodsElapsed >= minPeriodsForExpiry && swingProfit < 0.08 && !edgeStillAlive) {
+              console.log(`[exit] 🔄⏰ SWING THESIS-EXPIRY: ${trade.ticker} only +${(swingProfit*100).toFixed(0)}¢ after ${periodsElapsed} periods (${league}, need ≥${minPeriodsForExpiry}) — WE-price edge stale, exiting`);
+              await tg(
+                `🔄⏰ <b>SWING THESIS-EXPIRY</b>\n\n` +
+                `${trade.title}\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(swingProfit*100).toFixed(0)}¢)\n` +
+                `${swingProfit > 0 ? `Small gain: +$${(qty * swingProfit).toFixed(2)}` : `Loss: $${(qty * swingProfit).toFixed(2)}`} — ${periodsElapsed}+ periods, no momentum, WE no longer supports hold`
+              );
+              const result = await executeSell(trade, qty, currentPrice, 'swing-thesis-expiry');
+              if (result) anyUpdated = true;
+              continue;
+            }
           }
 
           // Swing trades skip all other exit logic — they ONLY exit via the 3 paths above
