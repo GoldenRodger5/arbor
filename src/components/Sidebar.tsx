@@ -12,6 +12,7 @@ const navItems = [
   { label: 'Live Feed', path: '/live', icon: '📡' },
   { label: 'Games', path: '/games', icon: '🎮' },
   { label: 'Pre-Game Lab', path: '/pregame-lab', icon: '🧪' },
+  { label: 'API Costs', path: '/costs', icon: '💸' },
   { label: 'Settings', path: '/settings', icon: '⚙️' },
 ];
 

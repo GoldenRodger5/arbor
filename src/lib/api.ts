@@ -68,6 +68,37 @@ export const api = {
     get<PaperTrade[]>(`/api/paper-trades${date ? `?date=${date}` : ''}`),
   getPaperStats: () =>
     get<PaperStats>('/api/paper-stats'),
+  getApiCosts: (hours = 24) =>
+    get<ApiCostReport>(`/api/costs?hours=${hours}`),
+};
+
+export type ApiCostCategory = {
+  category: string;
+  calls: number;
+  inputTok: number;
+  outputTok: number;
+  cacheReadTok: number;
+  cacheWriteTok: number;
+  searches: number;
+  cents: number;
+  usd: number;
+  models: Record<string, number>;
+};
+
+export type ApiCostReport = {
+  windowHours: number;
+  totals: {
+    calls: number;
+    searches: number;
+    inputTok: number;
+    outputTok: number;
+    cacheReadTok: number;
+    cacheWriteTok: number;
+    cents: number;
+    usd: number;
+  };
+  byCategory: ApiCostCategory[];
+  hourly: { hour: string; calls: number; cents: number }[];
 };
 
 export type PaperTrade = {

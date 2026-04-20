@@ -11,6 +11,7 @@ import GamesPage from './pages/GamesPage';
 import TodayPage from './pages/TodayPage';
 import RecapPage from './pages/RecapPage';
 import PreGameLabPage from './pages/PreGameLabPage';
+import ApiCostsPage from './pages/ApiCostsPage';
 import { ArborProvider } from './context/ArborContext';
 import { Toaster } from '@/components/ui/sonner';
 import InstallPrompt from './components/InstallPrompt';
@@ -30,6 +31,7 @@ const App = () => (
           <Route path="/live" element={<LiveFeed />} />
           <Route path="/games" element={<GamesPage />} />
           <Route path="/pregame-lab" element={<PreGameLabPage />} />
+          <Route path="/costs" element={<ApiCostsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </Layout>

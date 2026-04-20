@@ -516,10 +516,65 @@ async function tg(text) {
 // Claude with Web Search — researches before deciding
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Cheap Haiku screen — no web search, fast, ~$0.002/call
-async function claudeScreen(prompt, { maxTokens = 300, timeout = 10000 } = {}) {
-  stats.claudeCalls++;
-  stats.apiSpendCents += 0.2; // ~$0.002
+// Prices in $/1M tokens. Keys match model IDs; substring fallbacks below.
+const MODEL_PRICING = {
+  'claude-haiku-4-5-20251001': { in: 1.00, out: 5.00, cwrite: 1.25, cread: 0.10 },
+  'claude-sonnet-4-6':         { in: 3.00, out: 15.00, cwrite: 3.75, cread: 0.30 },
+  'claude-sonnet-4-5-20250929':{ in: 3.00, out: 15.00, cwrite: 3.75, cread: 0.30 },
+  'claude-opus-4-7':           { in: 15.00, out: 75.00, cwrite: 18.75, cread: 1.50 },
+};
+const WEB_SEARCH_COST_USD = 0.01; // $10 / 1000 searches
+function priceFor(model) {
+  if (MODEL_PRICING[model]) return MODEL_PRICING[model];
+  if (/haiku/i.test(model)) return MODEL_PRICING['claude-haiku-4-5-20251001'];
+  if (/opus/i.test(model)) return MODEL_PRICING['claude-opus-4-7'];
+  return MODEL_PRICING['claude-sonnet-4-6'];
+}
+
+const API_USAGE_LOG = './logs/api-usage.jsonl';
+const apiCostByCategory = new Map(); // category -> { calls, inputTok, outputTok, cacheReadTok, cacheWriteTok, searches, cents }
+
+function recordUsage({ category, model, usage, searches = 0 }) {
+  const p = priceFor(model);
+  const inTok = usage?.input_tokens ?? 0;
+  const outTok = usage?.output_tokens ?? 0;
+  const cacheRead = usage?.cache_read_input_tokens ?? 0;
+  const cacheWrite = usage?.cache_creation_input_tokens ?? 0;
+  // Cents = tokens/1e6 × $/M × 100 cents
+  const cents =
+    (inTok * p.in + outTok * p.out + cacheWrite * p.cwrite + cacheRead * p.cread) / 10_000 +
+    searches * WEB_SEARCH_COST_USD * 100;
+
+  const key = category || 'uncategorized';
+  const b = apiCostByCategory.get(key) ?? {
+    calls: 0, inputTok: 0, outputTok: 0, cacheReadTok: 0, cacheWriteTok: 0, searches: 0, cents: 0,
+  };
+  b.calls += 1;
+  b.inputTok += inTok;
+  b.outputTok += outTok;
+  b.cacheReadTok += cacheRead;
+  b.cacheWriteTok += cacheWrite;
+  b.searches += searches;
+  b.cents += cents;
+  apiCostByCategory.set(key, b);
+
+  stats.claudeCalls += 1;
+  stats.apiSpendCents += cents;
+
+  // Append to JSONL for dashboard history
+  try {
+    appendFileSync(API_USAGE_LOG, JSON.stringify({
+      ts: new Date().toISOString(),
+      category: key, model,
+      inputTok: inTok, outputTok: outTok,
+      cacheReadTok: cacheRead, cacheWriteTok: cacheWrite,
+      searches, cents,
+    }) + '\n');
+  } catch { /* non-fatal */ }
+}
+
+// Cheap Haiku screen — no web search
+async function claudeScreen(prompt, { maxTokens = 300, timeout = 10000, category = 'screen' } = {}) {
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       signal: AbortSignal.timeout(timeout),
@@ -537,6 +592,7 @@ async function claudeScreen(prompt, { maxTokens = 300, timeout = 10000 } = {}) {
     });
     if (!res.ok) return null;
     const data = await res.json();
+    recordUsage({ category, model: CLAUDE_SCREENER, usage: data.usage });
     return data.content?.[0]?.text ?? '';
   } catch (e) {
     console.error('[claude-screen] error:', e.message);
@@ -544,11 +600,8 @@ async function claudeScreen(prompt, { maxTokens = 300, timeout = 10000 } = {}) {
   }
 }
 
-// Sonnet without web search — for decisions where we already have the data we need (ESPN starters,
-// bullpen stats, etc). ~$0.02/call vs $0.05+ with searches. Supports optional system prompt.
-async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system = null } = {}) {
-  stats.claudeCalls++;
-  stats.apiSpendCents += 2; // ~$0.02/call
+// Sonnet without web search — for decisions where we already have the data we need.
+async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system = null, category = 'sonnet' } = {}) {
   try {
     const body = {
       model: CLAUDE_DECIDER,
@@ -571,6 +624,7 @@ async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system 
       return null;
     }
     const data = await res.json();
+    recordUsage({ category, model: CLAUDE_DECIDER, usage: data.usage });
     const textBlocks = (data.content ?? []).filter(b => b.type === 'text');
     return textBlocks.length > 0 ? textBlocks[textBlocks.length - 1].text : '';
   } catch (e) {
@@ -579,10 +633,8 @@ async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system 
   }
 }
 
-// Expensive Sonnet + web search — only for final trade decisions, ~$0.03-0.05/call
-async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, timeout = 45000, system = null } = {}) {
-  stats.claudeCalls++;
-  stats.apiSpendCents += 3 + maxSearches; // ~$0.03 base + $0.01/search
+// Expensive Sonnet + web search — only for final trade decisions.
+async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, timeout = 45000, system = null, category = 'search' } = {}) {
   try {
     const body = {
       model: CLAUDE_DECIDER,
@@ -615,6 +667,7 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
     const textBlocks = (data.content ?? []).filter(b => b.type === 'text');
     const searches = (data.content ?? []).filter(b => b.type === 'server_tool_use').length;
     if (searches > 0) console.log(`[claude-search] Used ${searches} web searches`);
+    recordUsage({ category, model: CLAUDE_DECIDER, usage: data.usage, searches });
 
     // Return last text block (Claude's final answer after research)
     const finalText = textBlocks.length > 0 ? textBlocks[textBlocks.length - 1].text : '';
@@ -2408,7 +2461,7 @@ async function checkLiveScoreEdges() {
                   `Profit if locked now: +$${(gainCents * qty).toFixed(2)}. Profit if held to settlement win: +$${((1 - entryPg) * qty).toFixed(2)}.\n\n` +
                   `JSON ONLY: {"action": "hold"/"lock", "reasoning": "one sentence"}`;
                 try {
-                  const pgWinText = await claudeSonnet(pgWinPrompt, { maxTokens: 300, timeout: 15000 });
+                  const pgWinText = await claudeSonnet(pgWinPrompt, { maxTokens: 300, timeout: 15000, category: 'pg-win' });
                   if (pgWinText) {
                     const pgWinJson = extractJSON(pgWinText);
                     if (pgWinJson) {
@@ -2673,7 +2726,7 @@ async function checkLiveScoreEdges() {
           `C) hold — estimate is clearly 15+ points above market. Upside: +$${(qty * (1 - entryPrice)).toFixed(2)} if wins.\n\n` +
           `JSON ONLY: {"action": "sell_all"/"sell_half"/"hold", "myWinEstimate": 0.XX, "marketPrice": 0.XX, "reasoning": "one sentence on why estimate vs price justifies the action"}`;
 
-        const pgGuardText = await claudeSonnet(pgPrompt, { maxTokens: 500, timeout: 20000 });
+        const pgGuardText = await claudeSonnet(pgPrompt, { maxTokens: 500, timeout: 20000, category: 'pg-guard' });
         if (pgGuardText) {
           try {
             const match = extractJSON(pgGuardText);
@@ -3045,7 +3098,7 @@ async function checkLiveScoreEdges() {
                 `CONFIDENCE: <number 0-100>\n` +
                 `REASONING: <1-2 sentences focused on whether TIE PRICE will rise in the next 10-15 minutes>`;
 
-              const drawAnalysis = await claudeSonnet(drawPrompt, { maxTokens: 200, timeout: 15000 });
+              const drawAnalysis = await claudeSonnet(drawPrompt, { maxTokens: 200, timeout: 15000, category: 'draw-bet' });
               const drawVerdict = (drawAnalysis ?? '').toUpperCase().includes('VERDICT: BUY') ? 'BUY' : 'SKIP';
               const drawReasoning = (drawAnalysis ?? '').match(/REASONING:\s*(.+)/i)?.[1]?.trim() ?? 'No reasoning provided';
               const drawConf = parseInt((drawAnalysis ?? '').match(/CONFIDENCE:\s*(\d+)/i)?.[1] ?? '0');
@@ -3979,7 +4032,7 @@ async function checkLiveScoreEdges() {
   for (let batch = 0; batch < sonnetQueue.length; batch += 3) {
     const batchItems = sonnetQueue.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 1, system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
+      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 1, category: 'live-edge', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
     );
 
     for (let i = 0; i < batchItems.length; i++) {
@@ -4409,7 +4462,7 @@ async function checkLiveScoreEdges() {
           `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
           `{"trade":true,"confidence":0.XX,"reasoning":"one sentence — cite which pitcher ERA creates the edge and why"}`;
 
-        const cbText = await claudeSonnet(cbPrompt, { maxTokens: 250, timeout: 15000 });
+        const cbText = await claudeSonnet(cbPrompt, { maxTokens: 250, timeout: 15000, category: 'comeback' });
         if (!cbText) continue;
         const cbMatch = extractJSON(cbText);
         if (!cbMatch) continue;
@@ -4547,6 +4600,11 @@ async function checkPreGamePredictions() {
   if (Date.now() - lastPreGameScan < PREGAME_SCAN_INTERVAL) return;
   lastPreGameScan = Date.now();
   if (!canTrade()) return;
+
+  // Overnight pause: no actionable pre-game edges between 00:00 and 06:00 ET
+  // (rosters/weather/starters not firm, cache churns for nothing). Saves ~6h of calls/day.
+  const _etHour = etHour();
+  if (_etHour >= 0 && _etHour < 6) return;
 
   // No hard time cutoff — skip individual games that are already live instead.
   // This lets west-coast NHL/MLB games (9-10pm ET) get pre-game analysis
@@ -5056,7 +5114,7 @@ async function checkPreGamePredictions() {
     if (preGameTradesThisCycle >= MAX_PREGAME_PER_CYCLE) break;
     const batchItems = pgPrompts.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 2000, maxSearches: 1, system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
+      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 2000, maxSearches: 1, category: 'pre-game', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
     );
 
     for (let i = 0; i < batchItems.length; i++) {
@@ -5564,7 +5622,7 @@ Respond in EXACTLY this JSON:
   "conflictTeam": "HOME"/"AWAY"/"BOTH"/null,
   "note": "one sentence explanation"
 }`;
-            const xvalResult = await claudeWithSearch(xvalPrompt, { maxTokens: 512, maxSearches: 2, timeout: 30000 });
+            const xvalResult = await claudeWithSearch(xvalPrompt, { maxTokens: 512, maxSearches: 2, timeout: 30000, category: 'xval' });
             if (xvalResult) {
               const xvalJson = xvalResult.match(/\{[\s\S]*\}/)?.[0];
               if (xvalJson) {
@@ -5764,7 +5822,8 @@ async function checkUFCPredictions() {
     `UPCOMING UFC FIGHTS:\n${fightList}\n\n` +
     `For each pick, consider: fighter records, recent form, style matchup, weight class.\n` +
     `Only pick fights where you're genuinely confident (≥65%).\n\n` +
-    `JSON array: [{"slug":"exact slug","fighter":"name","side":"side0"/"side1","reason":"why they win"}] or []`
+    `JSON array: [{"slug":"exact slug","fighter":"name","side":"side0"/"side1","reason":"why they win"}] or []`,
+    { category: 'ufc-screen' }
   );
   if (!screenText) return;
 
@@ -5804,7 +5863,7 @@ async function checkUFCPredictions() {
       `JSON ONLY:\n` +
       `{"trade":false,"confidence":0.XX,"reasoning":"prediction"}\n` +
       `OR {"trade":true,"fighter":"exact name","side":"side0" or "side1","confidence":0.XX,"betAmount":N,"reasoning":"who wins and why"}`,
-      { maxTokens: 800, maxSearches: 3 }
+      { maxTokens: 800, maxSearches: 3, category: 'ufc' }
     );
     if (!decideText) { await reportError('ufc:sonnet-empty', 'UFC decider returned empty'); continue; }
 
@@ -6197,7 +6256,7 @@ async function claudeBroadScan() {
       `SKIP: $0.01-$0.05 (lottery tickets), $0.90+ (heavy favorites — usually correct), BTC ranges far from spot, YES+NO≈$1 (bid-ask spread).\n\n` +
       `Return JSON array (max 5): [{"ticker":"exact","reason":"why the price seems wrong"}] or []`;
 
-    const screenText = await claudeScreen(screenPrompt);
+    const screenText = await claudeScreen(screenPrompt, { category: 'broad-scan-screen' });
     if (!screenText) return;
 
     let candidates = [];
@@ -6263,7 +6322,7 @@ async function claudeBroadScan() {
           `JSON ONLY:\n{"trade":false,"confidence":0.XX,"reasoning":"analysis"}\n` +
           `OR {"trade":true,"ticker":"${market.ticker}","side":"yes"/"no","confidence":0.XX,"betAmount":N,"reasoning":"why market is wrong"}`;
 
-      const cText = await claudeWithSearch(decidePrompt, { maxTokens: 800, maxSearches: 3 });
+      const cText = await claudeWithSearch(decidePrompt, { maxTokens: 800, maxSearches: 3, category: 'broad-scan' });
       if (!cText) { await reportError('broad-scan:sonnet-empty', `${candidate.ticker}`); continue; }
       const jsonMatch = extractJSON(cText);
       if (!jsonMatch) { await reportError('broad-scan:no-json', `${candidate.ticker}: ${cText.slice(0, 160)}`); continue; }
@@ -6850,7 +6909,7 @@ async function managePositions() {
               `HOLD if: we are leading comfortably, WE > 70%, or settlement upside (${((1 - entryPrice) * 100).toFixed(0)}¢) >> lock profit (${lockProfit}¢).\n\n` +
               `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
 
-            const evalText = await claudeScreen(profitLockPrompt, { maxTokens: 200, timeout: 8000 });
+            const evalText = await claudeScreen(profitLockPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:profit-lock' });
             if (evalText) {
               try {
                 const match = extractJSON(evalText);
@@ -6914,7 +6973,7 @@ async function managePositions() {
               `HOLD if: we are leading, WE > 70%, or settlement upside >> lock profit.\n\n` +
               `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
 
-            const evalText = await claudeScreen(hcLockPrompt, { maxTokens: 200, timeout: 8000 });
+            const evalText = await claudeScreen(hcLockPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:hc-lock' });
             if (evalText) {
               try {
                 const match = extractJSON(evalText);
@@ -6990,7 +7049,7 @@ async function managePositions() {
                 `SELL if the momentum has clearly reversed and recovery is unlikely.\n` +
                 `HOLD if the team still has a realistic path and the game situation supports a comeback.\n\n` +
                 `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
-              const swingText = await claudeScreen(swingStopPrompt, { maxTokens: 200, timeout: 8000 });
+              const swingText = await claudeScreen(swingStopPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:swing-stop' });
               if (swingText) {
                 try {
                   const match = extractJSON(swingText);
@@ -7235,7 +7294,7 @@ async function managePositions() {
               `HOLD if comeback is plausible (WE > ${isPlayoff ? '15' : '20'}%, manageable deficit, thesis intact).\n` +
               `SELL if game is effectively over (large deficit late, WE < ${isPlayoff ? '10' : '15'}%, or blowout with thesis dead).\n\n` +
               `JSON: {"action":"sell"/"hold","reasoning":"1 sentence on comeback viability given score, time, and thesis status"}`;
-            const evalText = await claudeScreen(hardStopPrompt, { maxTokens: 200, timeout: 8000 });
+            const evalText = await claudeScreen(hardStopPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:hard-stop' });
             if (evalText) {
               try {
                 const match = extractJSON(evalText);
@@ -7316,7 +7375,7 @@ async function managePositions() {
               `SELL only if: WE < 10%, or deficit is insurmountable for the time remaining (e.g. down 5+ runs in 8th inning, down 4 goals in soccer 80th min).\n` +
               `HOLD if: ANY realistic comeback path exists. 1-2 run/goal deficits with time left = HOLD.\n\n` +
               `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
-            const evalText = await claudeScreen(nuclearPrompt, { maxTokens: 200, timeout: 8000 });
+            const evalText = await claudeScreen(nuclearPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:nuclear' });
             if (evalText) {
               try {
                 const match = extractJSON(evalText);
@@ -7428,7 +7487,7 @@ async function managePositions() {
                     : `HOLD if deficit is recoverable (1-goal NHL with period+ left, small MLB deficit mid-game).\n`) +
                   `SELL if game is effectively decided (large deficit late, blowout).\n\n` +
                   `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
-                const weText = await claudeScreen(weRevPrompt, { maxTokens: 200, timeout: 8000 });
+                const weText = await claudeScreen(weRevPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:we-reversal' });
                 if (weText) {
                   try {
                     const match = extractJSON(weText);
@@ -7511,7 +7570,7 @@ async function managePositions() {
                   : `HOLD if the deficit is still recoverable for ${sport} at this stage.\n`) +
                 `SELL if the WE drop reflects a real shift the team can't overcome.\n\n` +
                 `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
-              const dropText = await claudeScreen(weDropPrompt, { maxTokens: 200, timeout: 8000 });
+              const dropText = await claudeScreen(weDropPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:we-drop' });
               if (dropText) {
                 try {
                   const match = extractJSON(dropText);
@@ -7592,7 +7651,7 @@ async function managePositions() {
             `B) HOLD: If team wins → +$${(qty * (1 - entryPrice)).toFixed(2)}. If loses → -$${(qty * entryPrice).toFixed(2)}.\n\n` +
             `JSON ONLY: {"action": "sell"/"hold", "reasoning": "why"}`;
 
-          const lossText = await claudeScreen(lossPrompt, { maxTokens: 200, timeout: 8000 });
+          const lossText = await claudeScreen(lossPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:loss-check' });
           if (lossText) {
             try {
               const match = extractJSON(lossText);

@@ -23,6 +23,7 @@ const SCREENS_LOG = join(__dirname, 'logs/screens.jsonl');
 const PAPER_TRADES_LOG = join(__dirname, 'logs/paper-trades.jsonl');
 const CONTROL_FILE = join(__dirname, 'logs/control.json');
 const SELL_REQUESTS_FILE = join(__dirname, 'logs/sell-requests.jsonl');
+const API_USAGE_LOG = join(__dirname, 'logs/api-usage.jsonl');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Control state — persisted to disk so ai-edge.mjs can read it each cycle
@@ -959,6 +960,75 @@ Rules:
         impliedPnL: totalPnL,
         bySport: Object.values(bySport).sort((a, b) => b.total - a.total),
         byConfidence,
+      });
+
+    } else if (path === '/api/costs') {
+      // Aggregates api-usage.jsonl per category over a time window.
+      // Query params: hours (default 24), days (overrides hours if set)
+      const hours = Number(url.searchParams.get('hours') ?? '24');
+      const days = Number(url.searchParams.get('days') ?? '0');
+      const windowMs = days > 0 ? days * 24 * 3600 * 1000 : hours * 3600 * 1000;
+      const cutoff = Date.now() - windowMs;
+
+      const events = readJsonl(API_USAGE_LOG).filter(e => {
+        const ts = e.ts ? Date.parse(e.ts) : 0;
+        return ts >= cutoff;
+      });
+
+      const byCategory = {};
+      let totalCents = 0, totalCalls = 0, totalSearches = 0;
+      let totalInputTok = 0, totalOutputTok = 0, totalCacheReadTok = 0, totalCacheWriteTok = 0;
+      for (const e of events) {
+        const cat = e.category ?? 'uncategorized';
+        if (!byCategory[cat]) {
+          byCategory[cat] = { category: cat, calls: 0, inputTok: 0, outputTok: 0, cacheReadTok: 0, cacheWriteTok: 0, searches: 0, cents: 0, models: {} };
+        }
+        const b = byCategory[cat];
+        b.calls += 1;
+        b.inputTok += e.inputTok ?? 0;
+        b.outputTok += e.outputTok ?? 0;
+        b.cacheReadTok += e.cacheReadTok ?? 0;
+        b.cacheWriteTok += e.cacheWriteTok ?? 0;
+        b.searches += e.searches ?? 0;
+        b.cents += e.cents ?? 0;
+        const m = e.model ?? 'unknown';
+        b.models[m] = (b.models[m] ?? 0) + 1;
+
+        totalCalls += 1;
+        totalInputTok += e.inputTok ?? 0;
+        totalOutputTok += e.outputTok ?? 0;
+        totalCacheReadTok += e.cacheReadTok ?? 0;
+        totalCacheWriteTok += e.cacheWriteTok ?? 0;
+        totalSearches += e.searches ?? 0;
+        totalCents += e.cents ?? 0;
+      }
+
+      // Hourly series for chart
+      const hourlySeries = {};
+      for (const e of events) {
+        const hour = new Date(e.ts).toISOString().slice(0, 13) + ':00:00Z';
+        if (!hourlySeries[hour]) hourlySeries[hour] = { hour, calls: 0, cents: 0 };
+        hourlySeries[hour].calls += 1;
+        hourlySeries[hour].cents += e.cents ?? 0;
+      }
+      const hourly = Object.values(hourlySeries).sort((a, b) => a.hour.localeCompare(b.hour));
+
+      json(res, {
+        windowHours: days > 0 ? days * 24 : hours,
+        totals: {
+          calls: totalCalls,
+          searches: totalSearches,
+          inputTok: totalInputTok,
+          outputTok: totalOutputTok,
+          cacheReadTok: totalCacheReadTok,
+          cacheWriteTok: totalCacheWriteTok,
+          cents: Math.round(totalCents * 100) / 100,
+          usd: Math.round(totalCents) / 100,
+        },
+        byCategory: Object.values(byCategory)
+          .map(b => ({ ...b, cents: Math.round(b.cents * 100) / 100, usd: Math.round(b.cents) / 100 }))
+          .sort((a, b) => b.cents - a.cents),
+        hourly: hourly.map(h => ({ ...h, cents: Math.round(h.cents * 100) / 100 })),
       });
 
     } else {
