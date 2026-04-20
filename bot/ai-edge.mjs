@@ -4758,6 +4758,8 @@ async function checkPreGamePredictions() {
   const maxBetDisplay = getDynamicMaxTrade().toFixed(2);
 
   const todayDate = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'long', day: 'numeric' });
+  const nowET = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', weekday: 'long', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+  const currentSeasonYear = new Date().getFullYear();
 
   // ── ESPN starter enrichment ────────────────────────────────────────────────
   // Fetch confirmed starters/goalies from ESPN before calling Claude.
@@ -4899,6 +4901,15 @@ async function checkPreGamePredictions() {
       tk.includes('SERIAA') ? 'Serie A' : tk.includes('BUNDESLIGA') ? 'Bundesliga' :
       tk.includes('LIGUE1') ? 'Ligue 1' : 'Sport';
     const starterCtx = buildStarterContext(market, sport);
+    // Hard anti-hallucination preamble — injected before every prompt.
+    const antiHallucinationHeader =
+      `🛑 ZERO-FABRICATION RULES — violations invalidate your analysis and the trade will be blocked:\n` +
+      `1. SPORT: This is a ${sport} game — ${market.team1.teamName} vs ${market.team2.teamName}. Do NOT cite players, stats, starters, or storylines from any other sport.\n` +
+      `2. DATE/TIME: Right now is ${nowET} (${todayDate}). The current ${sport} season is ${currentSeasonYear}. Do NOT cite stats or standings from prior seasons as if they were current.\n` +
+      `3. PLAYERS: Only cite players who are CURRENTLY on the ${market.team1.teamName} or ${market.team2.teamName} roster in ${currentSeasonYear}. If you cannot confirm a player is on one of these two teams right now, do NOT name them. Same last-name on a different franchise is a different person.\n` +
+      `4. STATS: ERA/WHIP/SV%/GAA numbers in the ESPN GROUND TRUTH block (below) are authoritative. If you write a different value in your reasoning, your analysis is invalid.\n` +
+      `5. DO NOT MAKE ANYTHING UP. If a fact is not in ESPN ground truth and not confirmed by your web search, say "unconfirmed" and downgrade your confidence. Never invent names, numbers, records, or streaks.\n` +
+      `6. If your web search returns results for a DIFFERENT sport, game, or date than this game — ignore those results and note the conflict. Do not let cross-query contamination enter your reasoning.\n\n`;
 
     const pgPromptText = sport === 'NBA'
       ? `You are a professional NBA swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
@@ -5117,7 +5128,7 @@ async function checkPreGamePredictions() {
     return {
       market,
       sport,
-      prompt: starterCtx + pgPromptText,
+      prompt: antiHallucinationHeader + starterCtx + pgPromptText,
     };
   });
 
@@ -5227,6 +5238,66 @@ async function checkPreGamePredictions() {
         console.log(`[pre-game] BLOCKED: Claude confused sport for ${market.base}. Expected ${expectedSport}, reasoning mentions wrong sport.`);
         continue;
       }
+
+      // ── HALLUCINATION VALIDATION ───────────────────────────────────────────
+      // Cross-sport contamination: reject if reasoning cites any starter name
+      // that ESPN knows belongs to a DIFFERENT sport (e.g. Vladar/Flyers in
+      // a Phillies MLB prompt). Also reject if reasoning names a "starter"
+      // that doesn't match ESPN's confirmed starter for either team.
+      {
+        const fullText = ((decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? '')).toLowerCase();
+        const t1Starter = espnStarterMap.get(`${expectedSport}:${market.team1.team.toLowerCase()}`);
+        const t2Starter = espnStarterMap.get(`${expectedSport}:${market.team2.team.toLowerCase()}`);
+        const validLastNames = [t1Starter?.name, t2Starter?.name]
+          .filter(Boolean).map(n => (n.split(' ').slice(-1)[0] ?? '').toLowerCase()).filter(l => l.length >= 4);
+
+        // Block if a starter name from a different sport appears in reasoning.
+        let crossSportHit = null;
+        for (const [key, entry] of espnStarterMap.entries()) {
+          if (!entry?.sport || entry.sport === expectedSport) continue;
+          const last = (entry.name?.split(' ').slice(-1)[0] ?? '').toLowerCase();
+          if (last.length < 5) continue;
+          if (validLastNames.includes(last)) continue; // real collision on purpose — skip
+          if (new RegExp(`\\b${last}\\b`, 'i').test(fullText)) {
+            crossSportHit = `${entry.name} (${entry.sport}) cited in ${expectedSport} analysis`;
+            break;
+          }
+        }
+        if (crossSportHit) {
+          console.log(`[pre-game] BLOCKED: hallucination — ${crossSportHit} for ${market.base}`);
+          logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'blocked-hallucination', reasoning: crossSportHit, claudeReasoning: decision.reasoning?.slice(0, 200) });
+          continue;
+        }
+
+        // For MLB/NHL: if ESPN gave us a starter for the chosen team and Claude
+        // names a "starter/pitcher/ace/goalie" that isn't that person, block.
+        if ((expectedSport === 'MLB' || expectedSport === 'NHL')) {
+          const chosenStarter = matchedSide === market.team1 ? t1Starter : t2Starter;
+          if (chosenStarter?.name) {
+            const expectedLast = chosenStarter.name.split(' ').slice(-1)[0].toLowerCase();
+            // Extract capitalized "Firstname Lastname" patterns within 8 chars of starter/pitcher/goalie/ace keywords
+            const roleRegex = /(starter|starting pitcher|pitcher|ace|goalie|netminder)[^.]{0,60}?\b([A-Z][a-zA-Z'\-]+\s+[A-Z][a-zA-Z'\-]+)\b/g;
+            const rawText = (decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? '');
+            let m; let bad = null;
+            while ((m = roleRegex.exec(rawText)) !== null) {
+              const cited = m[2].toLowerCase();
+              const citedLast = cited.split(' ').slice(-1)[0];
+              // Ignore mentions of opposing starter (both are acceptable in reasoning)
+              const other = matchedSide === market.team1 ? t2Starter : t1Starter;
+              const otherLast = other?.name ? other.name.split(' ').slice(-1)[0].toLowerCase() : '';
+              if (citedLast === expectedLast || citedLast === otherLast) continue;
+              bad = m[2];
+              break;
+            }
+            if (bad) {
+              console.log(`[pre-game] BLOCKED: hallucinated starter "${bad}" — ESPN confirms ${chosenStarter.name} for ${matchedSide.team} in ${market.base}`);
+              logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'blocked-hallucination', reasoning: `cited starter "${bad}" ≠ ESPN starter "${chosenStarter.name}"`, claudeReasoning: decision.reasoning?.slice(0, 200) });
+              continue;
+            }
+          }
+        }
+      }
+      // ───────────────────────────────────────────────────────────────────────
 
       // Mark as analyzed regardless of trade/no-trade — don't re-analyze for 2 hours
       preGameAnalysisCache.set(market.base, Date.now());
