@@ -5039,12 +5039,14 @@ async function checkPreGamePredictions() {
     }
 
     const edge = confidence - price;
-    // PRE-GAME SIZING CAP — tiered by bankroll to prevent over-exposure on small accounts.
-    // At $167 bankroll, 15% + 2.5x confidence multiplier → $41 bet = 25% of bankroll on one game.
-    // Hard caps: <$500 → max $20 (12% effective cap), <$1K → max $50. Larger accounts unchanged.
+    // PRE-GAME SIZING CAP — tiered by bankroll, with underdog boost.
+    // DATA: <45¢ entries (underdogs) hit 75% win rate — strongest signal in the dataset.
+    // Underdogs also have higher payout per contract (55¢+ vs 43-50¢ for coin flips).
+    // Boost underdog sizing by 50% to capitalize on the edge.
     const bkr = getBankroll();
-    const pgFraction = bkr < 500 ? 0.10 : PRE_GAME_TRADE_FRACTION;
-    const pgAbsCap = bkr < 500 ? 20 : bkr < 1000 ? 50 : Infinity;
+    const isUnderdog = price < 0.45;
+    const pgFraction = bkr < 500 ? (isUnderdog ? 0.15 : 0.10) : PRE_GAME_TRADE_FRACTION;
+    const pgAbsCap = bkr < 500 ? (isUnderdog ? 30 : 20) : bkr < 1000 ? 50 : Infinity;
     const pgMaxTrade = Math.min(bkr * pgFraction, pgAbsCap, getAvailableCash('kalshi'));
     const betAmount = Math.min(getPositionSize('kalshi', edge), pgMaxTrade);
     const betQty = betAmount >= 1 ? Math.max(1, Math.floor(betAmount / price)) : 0;
@@ -6410,32 +6412,40 @@ async function managePositions() {
 
         // PRE-GAME PROFIT-LOCK — exit when the market agrees with our entry estimate.
         //
-        // CONFIDENCE-ANCHORED EXIT (NHL/NBA/EPL): don't sell below own entry confidence.
-        // Data: PHI@PIT sold at 64¢ with 72% confidence (left $22.68), MN@DAL sold at 62¢
-        // with 72% confidence (left $22.80). Both teams won. We exited 8¢ below our own estimate.
-        // The pre-game thesis (elite goalie, home ice, back-to-back opponent) persists through
-        // the game — the entry confidence stays valid until the game state clearly contradicts it.
+        // DATA-DRIVEN UPDATE: Pre-game settled MLB = 6W-3L (67%), avg win = +$21.35.
+        // Profit-locks were selling at +12-20¢/contract when settlement pays +43-57¢ on wins.
+        // At 67% win rate, EV of holding a 45¢ entry from 57¢: 0.67×55¢ - 0.33×45¢ = +22¢.
+        // EV of selling at 57¢: guaranteed +12¢. Holding is nearly 2x better.
         //
-        // Exit formula:
+        // MLB HOLD-TO-SETTLEMENT: When WE > 55% and price is rising, hold for settlement.
+        // MLB games resolve cleanly — the team either wins or loses, no draws.
+        // NHL/NBA/Soccer: keep profit-lock (faster-moving, more volatile, draws possible).
+        //
+        // CONFIDENCE-ANCHORED EXIT (NHL/NBA/EPL): don't sell below own entry confidence.
+        // The pre-game thesis persists through the game — exit only when price validates it.
         //   NHL/EPL/LaLiga: price ≥ max(stage_target, entry_confidence)  — full anchor
-        //   NBA:            price ≥ max(stage_target, entry_confidence - 2%)  — 2% buffer for volatility
-        //   MLB:            stage targets only — MLB wins come from quiet holds to settlement,
-        //                   not price spikes. Confidence anchor doesn't help here.
-        //   Late stage (P3/inn8+/Q4): revert to stage target only (+8¢) — don't hold for
-        //                   confidence in final period, too much settlement variance.
+        //   NBA:            price ≥ max(stage_target, entry_confidence - 2%)  — 2% buffer
+        //   Late stage (P3/inn8+/Q4): revert to stage target only (+8¢)
         const pgStageProfitTarget = stage === 'early' ? 0.20 : stage === 'late' ? 0.08 : 0.12;
 
         const entryConf = trade.confidence ?? 0;
-        // Confidence floor price (what we thought the team was worth at entry)
-        const confFloorPrice = (league === 'mlb' || stage === 'late') ? 0  // MLB + late: stage targets only
-          : league === 'nba' ? Math.max(0, entryConf - 0.02)              // NBA: -2% volatility buffer
-          : entryConf;                                                       // NHL, EPL, LaLiga: full anchor
+        const confFloorPrice = (league === 'mlb' || stage === 'late') ? 0
+          : league === 'nba' ? Math.max(0, entryConf - 0.02)
+          : entryConf;
 
-        // Convert floor price to gain-per-contract — positive only (don't lower stage floor)
         const confGainTarget = (confFloorPrice > entryPrice) ? (confFloorPrice - entryPrice) : 0;
         const pgProfitTarget = Math.max(pgStageProfitTarget, confGainTarget);
 
-        if (trade.strategy === 'pre-game-prediction' && profitPerContract >= pgProfitTarget && !trade.partialTakeAt && !trade.pgHoldToSettlement) {
+        // MLB HOLD-TO-SETTLEMENT: skip profit-lock when our team is winning.
+        // Only take profit in late stage (inning 8+) if price ≥ 90¢ (game is nearly settled anyway).
+        const mlbHoldToSettle = league === 'mlb' && profitPerContract > 0 && (
+          stage !== 'late' || currentPrice < 0.90
+        );
+        if (mlbHoldToSettle && trade.strategy === 'pre-game-prediction' && profitPerContract >= pgProfitTarget && !trade.pgHoldToSettlement) {
+          console.log(`[exit] 🧘 MLB HOLD-TO-SETTLEMENT: ${trade.ticker} up ${(profitPerContract*100).toFixed(0)}¢ (${(currentPrice*100).toFixed(0)}¢) — holding for settlement instead of profit-locking (67% settled win rate, avg win +$21)`);
+        }
+
+        if (trade.strategy === 'pre-game-prediction' && profitPerContract >= pgProfitTarget && !trade.partialTakeAt && !trade.pgHoldToSettlement && !mlbHoldToSettle) {
           if (qty >= 1) {
             const gainPct = Math.round((profitPerContract / entryPrice) * 100);
             const anchorNote = confGainTarget > pgStageProfitTarget
@@ -6817,23 +6827,17 @@ async function managePositions() {
           console.log(`[exit] 🔒 MLB BLOWOUT LOCK: suppressing hard stop — inning ${ctx.period}, +${ctx.diff} run lead, WE ≥93% — holding to settlement`);
         }
 
-        // PRE-GAME NUCLEAR STOP — stage-aware hard floor, no Claude.
-        // Catches extreme blowouts that the cent-based stop hasn't reached yet (early game).
-        //   Early soccer (MLS/EPL first half): -80% floor — 1 goal in first half is not game over,
-        //     NE@CLB fired at -72% in H1 and NE came back to win 2-1. Soccer comebacks are common.
-        //   Early other (MLB inn 1-4 / NHL P1 / NBA Q1-Q2): -70% floor — plenty of game left
-        //   Mid   (MLB inn 5-7 / NHL P2 / NBA Q3):    -60% floor — still recoverable
-        //   Late  (MLB inn 8+ / NHL P3 / NBA Q4):     -50% floor — game nearly over
+        // PRE-GAME NUCLEAR — Claude-evaluated instead of mechanical.
+        // DATA: 3 mechanical nuclear sells lost $59.05 total (COL -$19.55, DET -$21.30, NE -$18.20).
+        // Pre-game picks win 64% when held to settlement. At -70% down, the position has already
+        // lost most value — selling saves 15-18¢/contract but misses 82-85¢ upside if team wins.
+        // EV of holding at 18¢ with 64% WR: 0.64×82¢ - 0.36×18¢ = +46¢. Clearly better to hold.
+        // Only mechanical floor: WE ≤ 10% (true blowout, game is mathematically over).
         const isSoccerLeague = ['mls','epl','laliga'].includes(league);
         const pgNuclearFloor = (stage === 'early' && isSoccerLeague) ? -0.80
           : stage === 'early' ? -0.70
           : stage === 'mid' ? -0.60
           : -0.50;
-        // TIME GATE: don't fire nuclear before ~55% of game has elapsed.
-        // Early-game volatility is normal — a 1-run MLB deficit in inning 2 or a 1-goal
-        // MLS deficit in the first half is not a lost cause. The WE-reversal stop handles
-        // true early blowouts (WE ≤ 30%). If ctx is unavailable, allow nuclear to fire.
-        //   Soccer: 2nd half (period >= 2)  |  MLB: inning 5+  |  NBA: Q3+ (period >= 3)  |  NHL: P2+ (period >= 2)
         const pgNuclearTimeGated = ctx == null || (
           isSoccerLeague ? (ctx.period >= 2) :
           league === 'mlb' ? (ctx.period >= 5) :
@@ -6842,10 +6846,61 @@ async function managePositions() {
           true
         );
         if (trade.strategy === 'pre-game-prediction' && pctChange < pgNuclearFloor && pgNuclearTimeGated && !mlbBlowoutLock) {
-          console.log(`[exit] 🛑 PRE-GAME NUCLEAR (${stage}, period ${ctx?.period ?? '?'}, entry ${(entryPrice*100).toFixed(0)}¢): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — ${stage} floor ${Math.round(pgNuclearFloor*100)}% hit`);
-          const result = await executeSell(trade, qty, currentPrice, 'pre-game-nuclear');
-          if (result) anyUpdated = true;
-          continue;
+          const nuclearKey = 'nuclear-eval:' + trade.ticker;
+          const lastNuclearEval = tradeCooldowns.get(nuclearKey) ?? 0;
+          if (Date.now() - lastNuclearEval >= 5 * 60 * 1000) {
+            tradeCooldowns.set(nuclearKey, Date.now());
+            const ticker = trade.ticker ?? '';
+            const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
+              : ticker.includes('NHL') ? 'NHL' : ticker.includes('MLS') || ticker.includes('EPL')
+              || ticker.includes('LALIGA') ? 'Soccer' : 'Sport';
+            const comebackCtx = {
+              NBA: 'NBA: 10pt comeback = 25%. 15pt = 13%. 20pt = 4%. 25+ = <1%.',
+              MLB: 'MLB: 1-run = 40%. 2-run = 25%. 3-run = 20% thru 6 inn. 5+ after 6th = <3%.',
+              NHL: 'NHL: 1-goal = 30%. 2-goal = 15%. 3-goal = 5%. Down 3+ in 3rd = over.',
+              Soccer: '1-goal = 20% equalize. 2-goal = 5%. Down 2+ after 75min = over.',
+              Sport: 'Comebacks depend on deficit size and time remaining.',
+            }[sport] ?? '';
+            const timeLeft = sport === 'NHL' ? `${Math.max(0, 3 - (ctx?.period ?? 2))} period(s) left (~${Math.max(0, 3 - (ctx?.period ?? 2)) * 20}min)`
+              : sport === 'MLB' ? `~${Math.max(0, 9 - (ctx?.period ?? 5))} innings left`
+              : sport === 'NBA' ? `${Math.max(0, 4 - (ctx?.period ?? 3))} quarter(s) left (~${Math.max(0, 4 - (ctx?.period ?? 3)) * 12}min)`
+              : `~${Math.max(0, 90 - (ctx?.period ?? 60))}min left`;
+            const nuclearPrompt =
+              `Pre-game bet down ${(pctChange*100).toFixed(0)}%. Should we SELL or HOLD?\n\n` +
+              `CRITICAL CONTEXT: Our pre-game picks win 64% of the time when held to settlement. ` +
+              `At current price ${(currentPrice*100).toFixed(0)}¢, selling saves only ${(currentPrice*100).toFixed(0)}¢/contract ` +
+              `but if the team wins we gain ${((1-currentPrice)*100).toFixed(0)}¢/contract. ` +
+              `BIAS TOWARD HOLD unless the game is truly over.\n\n` +
+              `POSITION: Bought at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢ (down ${(pctChange*100).toFixed(0)}%).\n` +
+              `Game: ${trade.title}\n` +
+              (ctx ? `LIVE: ${ctx.detail} | Stage: ${stage.toUpperCase()} | Period: ${ctx.period}\n` : '') +
+              (ctx?.baselineWE != null ? `Win expectancy: ${(((ctx.leading === (ticker.split('-').pop() ?? '')) ? ctx.baselineWE : (1 - ctx.baselineWE))*100).toFixed(0)}%\n` : '') +
+              `TIME LEFT: ${timeLeft}\n\n` +
+              `COMEBACK RATES: ${comebackCtx}\n\n` +
+              `SELL only if: WE < 10%, or deficit is insurmountable for the time remaining (e.g. down 5+ runs in 8th inning, down 4 goals in soccer 80th min).\n` +
+              `HOLD if: ANY realistic comeback path exists. 1-2 run/goal deficits with time left = HOLD.\n\n` +
+              `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
+            const evalText = await claudeScreen(nuclearPrompt, { maxTokens: 200, timeout: 8000 });
+            if (evalText) {
+              try {
+                const match = extractJSON(evalText);
+                if (match) {
+                  const d = JSON.parse(match);
+                  if (d.action === 'sell') {
+                    console.log(`[exit] 🧠🛑 CLAUDE NUCLEAR (${stage}): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — selling | ${d.reasoning?.slice(0,80)}`);
+                    const result = await executeSell(trade, qty, currentPrice, 'pre-game-nuclear');
+                    if (result) anyUpdated = true;
+                    continue;
+                  } else {
+                    console.log(`[exit] 🧠🛡️ CLAUDE HOLD at nuclear (${stage}): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — holding | ${d.reasoning?.slice(0,80)}`);
+                    tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                  }
+                }
+              } catch { /* skip */ }
+            } else {
+              console.log(`[exit] ⏳ Nuclear threshold hit on ${trade.ticker} but Claude unavailable — deferring (bias: hold)`);
+            }
+          }
         }
 
         // NUCLEAR STOP — absolute floor, no Claude, just get out
