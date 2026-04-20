@@ -4412,8 +4412,41 @@ const PREGAME_HOURS_WINDOW = 2;    // Only place real bet when game starts withi
 let preGameTradesToday = 0;
 let preGameTradesDate = '';         // reset counter on new day
 const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
-const preGameAnalysisCache = new Map(); // marketBase → timestamp of last Claude analysis (2-hour TTL)
-const PREGAME_ANALYSIS_TTL = 1 * 60 * 60 * 1000; // re-analyze each market at most once every hour
+const preGameAnalysisCache = new Map(); // marketBase → timestamp of last Claude analysis
+const pgGameStartTimes = new Map();     // marketBase → game start (ms UTC), persists across scan cycles
+
+// Dynamic cache TTL based on time until game start.
+// Games far from starting (overnight scan) get a longer cache — no point asking Claude the same
+// question every hour when the starters/odds won't change until a few hours before game time.
+//   >8h to start → 4h cache  (overnight: re-analyze 2-3x vs 16-24x with flat 1h TTL)
+//   4-8h to start → 2h cache
+//   <4h to start → 1h cache  (current behavior near game time)
+function getPgCacheTtl(marketBase) {
+  let startMs = pgGameStartTimes.get(marketBase);
+
+  // Fallback for MLB: parse HHMM directly from ticker (KXMLBGAME-26APR201810HOUCLE → 1810)
+  // This works on first scan before ESPN data is available, covering the highest-volume case.
+  if (!startMs) {
+    const m = marketBase.match(/\d{2}[A-Z]{3}\d{2}(\d{4})[A-Z]/);
+    if (m) {
+      const h = parseInt(m[1].slice(0, 2), 10);
+      const mn = parseInt(m[1].slice(2, 4), 10);
+      const et = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+      const nowMins = et.getHours() * 60 + et.getMinutes();
+      const gameMins = h * 60 + mn;
+      const minsUntil = (gameMins + 24 * 60 - nowMins) % (24 * 60);
+      if (minsUntil > 8 * 60) return 4 * 60 * 60 * 1000;
+      if (minsUntil > 4 * 60) return 2 * 60 * 60 * 1000;
+      return 1 * 60 * 60 * 1000;
+    }
+    return 3 * 60 * 60 * 1000; // unknown start time → 3h default (NBA/NHL/Soccer first scan)
+  }
+
+  const minsUntil = (startMs - Date.now()) / 60000;
+  if (minsUntil > 8 * 60) return 4 * 60 * 60 * 1000;
+  if (minsUntil > 4 * 60) return 2 * 60 * 60 * 1000;
+  return 1 * 60 * 60 * 1000;
+}
 
 async function checkPreGamePredictions() {
   // PAPER MODE: Runs full pre-game analysis for all sports but logs to paper-trades.jsonl
@@ -4557,7 +4590,7 @@ async function checkPreGamePredictions() {
   // the same rejected games every 15 minutes overnight when no bets can be placed.
   const now = Date.now();
   const uncachedMarkets = eligibleMarkets.filter(m =>
-    !preGameAnalysisCache.has(m.base) || now - preGameAnalysisCache.get(m.base) > PREGAME_ANALYSIS_TTL
+    !preGameAnalysisCache.has(m.base) || now - preGameAnalysisCache.get(m.base) > getPgCacheTtl(m.base)
   );
   if (uncachedMarkets.length < eligibleMarkets.length) {
     console.log(`[pre-game] Analysis cache: skipping ${eligibleMarkets.length - uncachedMarkets.length} recently-analyzed markets (${uncachedMarkets.length} uncached)`);
@@ -4637,6 +4670,15 @@ async function checkPreGamePredictions() {
       }
     } catch { /* skip — ESPN down or timeout */ }
   }));
+
+  // Seed pgGameStartTimes with fresh ESPN start times so the TTL function has accurate data
+  // for non-MLB sports (NBA/NHL/Soccer) on the NEXT scan cycle. MLB already parses from ticker.
+  for (const mkt of preGameMarkets) {
+    const t1 = mkt.team1.team.toUpperCase();
+    const t2 = mkt.team2.team.toUpperCase();
+    const startDate = espnStartTimeMap.get(`${t1}-${t2}`) ?? espnStartTimeMap.get(`${t2}-${t1}`);
+    if (startDate) pgGameStartTimes.set(mkt.base, startDate.getTime());
+  }
 
   // Build a per-market starter context string to inject at the top of each prompt.
   // These stats are ESPN ground truth — Claude must not contradict or hallucinate different numbers.
