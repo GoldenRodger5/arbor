@@ -65,9 +65,8 @@ const KALSHI_ONLY = process.env.KALSHI_ONLY !== 'false'; // default: true
 if (KALSHI_ONLY) console.log('📊 KALSHI ONLY — Polymarket trading disabled');
 
 // PRE-GAME LIVE MODE: When true, pre-game picks place real Kalshi orders.
-// When false (default), all pre-game picks are paper-logged only (calibration mode).
-// To activate: set PREGAME_LIVE=true in .env or PM2 config and restart.
-const PREGAME_LIVE = process.env.PREGAME_LIVE === 'true';
+// When false, all pre-game picks are paper-logged only (calibration mode).
+const PREGAME_LIVE = process.env.PREGAME_LIVE !== 'false'; // default ON
 if (PREGAME_LIVE) console.log('🎯 PRE-GAME LIVE — real pre-game orders enabled');
 else console.log('📋 PRE-GAME PAPER — pre-game picks are paper-only (calibration mode)');
 
