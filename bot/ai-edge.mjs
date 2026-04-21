@@ -3716,23 +3716,11 @@ async function checkLiveScoreEdges() {
             ? `The WE baseline is ${_weTargetPct}% (period average) → **${_weTimeAdjPct}%** (adjusted for ${_timeAdj.label}). USE ${_weTimeAdjPct}% as your anchor — the period average overstates early-period situations.\n`
             : `The WE baseline is ${_weTargetPct != null ? _weTargetPct + '%' : 'computed'} for ${targetAbbr}.\n`) +
           `Market price is ${(price*100).toFixed(0)}¢. Edge = adjusted WE% − price%. If |edge| < 2 points → respond {"trade":false} immediately with reason "market efficient". If edge is 2-3 points, DO NOT reject yet — proceed to Step 1 research; a starter/goalie/lineup finding can often add the missing points of edge (downstream margin+confidence gates still enforce quality).\n\n` +
-          `═══ STEP 1 — ONE SEARCH ONLY ═══\n` +
-          `⚠️ SEARCH BUDGET: You have exactly ONE web search. Pick the single most important query from the options below and do only that one search. Prioritize: for MLB, search starter pitch count / closer availability. For NBA, search injury report. For NHL, search starting goalie.\n` +
-          `⚠️ RESEARCH RULES: Only state facts you found via web search. Never invent statistics, records, or lineup information. You may draw inferences from confirmed data (e.g., "team has clinched so they may be conserving energy") but flag all inferences explicitly. IMPORTANT: "Cannot confirm" is NOT a Hard NO and is NOT a reason to pass. If a stat is unavailable, apply a bounded uncertainty penalty (max −3%) and continue your analysis. The only things that block a trade are the Hard NOs listed in Step 2 — uncertainty about a secondary stat is not one of them.\n\n` +
-          `Your ONE search (pick the most important):\n` +
-          (league === 'mlb' ?
-            `A) STARTER STATE: Search "${leadingAbbr} starting pitcher tonight pitch count" — is the starter still in? Above what pitch count? Who is warming?\n` +
-            `   The BULLPEN section above shows the team's authoritative relief ERA (season / L30D / L7D) from the MLB Stats API. Do NOT web-search for bullpen ERA — use the numbers above. ${leadingBullpenTier !== 'unknown' ? `Leading team tier = ${leadingBullpenTier}.` : 'Bullpen data unavailable for this team — treat as average-tier (no penalty, no Hard NO).'}\n` +
-            (period >= 5 ? `B) CLOSER STATS: Search "${leadingAbbr} closer 2026 ERA saves" — get the specific closer's season ERA and save record. An elite closer (ERA < 2.0 in 2026) is a major risk-reducer and can override the team's broader bullpen tier. Also check "${leadingAbbr} closer usage last 3 days" — back-to-back appearances may mean he's unavailable, which is real market lag.\n` : '') +
-            `C) LINEUP: Search "${leadingAbbr} lineup tonight" — are key bats resting?\n` +
-            `D) STAKES: Search "${leadingAbbr} standings 2026" — where are they in the season? Must-win race, fighting for division/wildcard, comfortably in, already eliminated, or in a stretch where lineup rest or prospect callups are happening? Context shapes how hard this team is playing tonight.\n` +
-            `E) H2H: Head-to-head record this season and last 2 seasons.\n\n`
-          :
-            `A) STAKES FOR BOTH TEAMS: Search "[leading team] playoff standings 2026" and "[trailing team] playoff standings 2026". What does tonight mean for each team? Is either in a must-win? Already eliminated? Clinched and likely coasting? This context shapes everything below.\n` +
-            `B) LEADING TEAM LINEUP: Is the leading team resting or missing key players tonight? Search "[leading team] injury report tonight" or "[leading team] lineup [date]". Confirm starters are playing.\n` +
-            `C) ${league === 'nhl' ? `GOALIE: What is the leading team's starting goalie SV% this season? Confirm they are starting tonight.` : `KEY PLAYERS: What is the leading team's star player status tonight? Any notable injuries or hot/cold streaks?`}\n` +
-            `D) H2H: What is the head-to-head record between these teams this season and last 2 seasons?\n\n`
-          ) +
+          `═══ STEP 1 — WORK FROM THE DATA ABOVE ═══\n` +
+          `No web search in live-edge. The ESPN game state, score, line score, pitcher/bullpen block, and line-movement info above are your only inputs. Treat unavailable stats as neutral (no penalty, no Hard NO) — "cannot confirm" is NEVER a reason to reject. Only the Hard NOs in Step 2 block a trade.\n` +
+          (league === 'mlb' && leadingBullpenTier !== 'unknown'
+            ? `MLB bullpen tier for leading team: ${leadingBullpenTier} (from MLB Stats API above — authoritative, do not second-guess).\n\n`
+            : '\n') +
           `═══ STEP 2 — HARD NOs (if ANY apply, respond {"trade":false} immediately) ═══\n` +
           (league === 'nba' ? `❌ Leading team is resting 3+ key players tonight (confirmed load management, not just lineup rotation) → NO. This is NBA-specific — in the NBA, 3 resters = a fundamentally different team's talent level.\n` : '') +
           (league !== 'nba' ? `❌ Leading team has confirmed ≥3 STAR players ruled out tonight (not just backups or rotation) → NO. Routine rotation/rest does NOT qualify.\n` : '') +
@@ -4173,7 +4161,7 @@ async function checkLiveScoreEdges() {
   for (let batch = 0; batch < sonnetQueue.length; batch += 3) {
     const batchItems = sonnetQueue.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 1500, maxSearches: 1, category: 'live-edge', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
+      batchItems.map(item => claudeSonnet(item.prompt, { maxTokens: 1500, category: 'live-edge', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
     );
 
     for (let i = 0; i < batchItems.length; i++) {
