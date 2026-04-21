@@ -3273,9 +3273,10 @@ async function checkLiveScoreEdges() {
         return 0.55; // soccer
       })();
       if (baseWE < MIN_WE_FOR_SONNET) {
-        if (baseWE >= SWING_WE_FLOOR && _scoreChanged) {
+        if (baseWE >= SWING_WE_FLOOR) {
           isSwingMode = true;
-          console.log(`[live-swing] 🔄 Swing candidate: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} WE=${(baseWE*100).toFixed(0)}% (swing floor ${(SWING_WE_FLOOR*100).toFixed(0)}%, live floor ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%)`);
+          const trigger = _scoreChanged ? 'score-changed' : 'sub-floor-WE';
+          console.log(`[live-swing] 🔄 Swing candidate (${trigger}): ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} WE=${(baseWE*100).toFixed(0)}% (swing floor ${(SWING_WE_FLOOR*100).toFixed(0)}%, live floor ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%)`);
         } else {
           console.log(`[live-edge] Skipping low-WE: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} ${diff}-${league === 'nba' ? 'pt' : league === 'mlb' ? 'run' : 'goal'} lead P${period}, WE=${(baseWE*100).toFixed(0)}% (need ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%+ for ${league.toUpperCase()} ${diff === 1 ? '1-goal' : ''})`);
           logScreen({ stage: 'live-edge-skip', result: 'skip-we-floor', league, homeAbbr: home.team?.abbreviation ?? '', awayAbbr: away.team?.abbreviation ?? '', homeScore, awayScore, diff, period, winExpectancy: baseWE, reasoning: `WE=${(baseWE*100).toFixed(0)}% is below the ${(MIN_WE_FOR_SONNET*100).toFixed(0)}% floor for ${league.toUpperCase()}${diff === 1 && league === 'nhl' ? ' 1-goal leads' : ''} — need stronger lead or later period to justify analysis` });
