@@ -5675,14 +5675,31 @@ async function checkPreGamePredictions() {
         : isSoccer
           ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68) // Soccer: unchanged
           : 0.65; // fallback for other sports
-    if (confidence < PRE_GAME_MIN_CONF || (confidence - price) < pgReqMargin) {
-      console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${((confidence-price)*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% min=${(PRE_GAME_MIN_CONF*100).toFixed(0)}% (${pgSportKey})`);
+    // EDGE-FIRST TIER: a clear edge with moderate conviction is still a bet worth making,
+    // just at reduced size. Pros don't need 65% conf to bet a 51¢ line with 12pt edge —
+    // the math says +EV even after a 5pt calibration haircut. Sit-out days (like today)
+    // have starved the bot of real P&L data, which in turn starves calibration feedback.
+    // Placing half-size EV+ bets fixes both problems: captures edge, generates data.
+    //
+    // Qualifies if: conf ≥ 58% AND edge ≥ 10pt AND price ≤ 55¢ (underdog zone only —
+    // favorites at this conf level are actually risky, cheap edges are where the math works).
+    const _edgeAbs = confidence - price;
+    const isEdgeFirst = confidence >= 0.58 &&
+                        _edgeAbs >= 0.10 &&
+                        price <= 0.55 &&
+                        confidence < PRE_GAME_MIN_CONF; // only triggers when standard gate would reject on conf
+
+    if ((confidence < PRE_GAME_MIN_CONF || _edgeAbs < pgReqMargin) && !isEdgeFirst) {
+      console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(_edgeAbs*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% min=${(PRE_GAME_MIN_CONF*100).toFixed(0)}% (${pgSportKey})`);
       preGameRejectCache.set(market.base, Date.now());
       preGameRejectPrice.set(market.base, {
         team1Cents: Math.round((market.team1?.price ?? 0) * 100),
         team2Cents: Math.round((market.team2?.price ?? 0) * 100),
       });
       continue;
+    }
+    if (isEdgeFirst) {
+      console.log(`[pre-game] 🎯 EDGE-FIRST: ${market.base} conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(_edgeAbs*100).toFixed(1)}pt — below std floor (${(PRE_GAME_MIN_CONF*100).toFixed(0)}%) but EV+ at half-size`);
     }
 
     // Duplicate guard — one bet per game per day (survives restarts via JSONL)
@@ -5733,7 +5750,8 @@ async function checkPreGamePredictions() {
     const pgFraction = bkr < 500 ? (isUnderdog ? 0.15 : 0.10) : PRE_GAME_TRADE_FRACTION;
     const pgAbsCap = bkr < 500 ? (isUnderdog ? 30 : 20) : bkr < 1000 ? 50 : Infinity;
     const pgMaxTrade = Math.min(bkr * pgFraction, pgAbsCap, getAvailableCash('kalshi'));
-    const betAmount = Math.min(getPositionSize('kalshi', edge, 0, pgSportKey), pgMaxTrade);
+    // Edge-first tier: half-size — entry is EV+ but below standard conf floor, so size down.
+    const betAmount = Math.min(getPositionSize('kalshi', edge, 0, pgSportKey), pgMaxTrade) * (isEdgeFirst ? 0.5 : 1.0);
     const betQty = betAmount >= 1 ? Math.max(1, Math.floor(betAmount / price)) : 0;
     if (betAmount < 1) continue;
 
@@ -6026,7 +6044,7 @@ Respond in EXACTLY this JSON:
             const pgDeployed = pgFill * price;
             logTrade({
               exchange: 'kalshi',
-              strategy: 'pre-game-prediction',
+              strategy: isEdgeFirst ? 'pre-game-edge-first' : 'pre-game-prediction',
               ticker: matchedSide.ticker,
               title: market.title,
               side: 'yes',
