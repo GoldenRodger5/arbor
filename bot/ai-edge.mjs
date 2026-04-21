@@ -5505,7 +5505,8 @@ async function checkPreGamePredictions() {
     //
     // Tiers (NHL/NBA):
     //   Under 50¢:  63% — underdog entries, market already discounted, edge is EV-positive
-    //   50–65¢:     70% — mid-range, standard floor
+    //   50–65¢:     65% — mid-range. Lowered from 70% so playoff road-underdog cap (~64%)
+    //               doesn't collide with the floor and lock out every eligible trade.
     //   Above 65¢:  72% — expensive favorites, need strong conviction
     //
     // Tiers (MLB/Soccer):
@@ -5515,7 +5516,7 @@ async function checkPreGamePredictions() {
     const isSoccer = ['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(pgSportKey);
     const isNhlNba = pgSportKey === 'nhl' || pgSportKey === 'nba';
     const PRE_GAME_MIN_CONF = isNhlNba
-      ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.70 : 0.72)
+      ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.72)
       : pgSportKey === 'mlb'
         // MLB: post-calibration fix (penalty now ~7pts, not 35), relax mid/underdog tiers so
         // real edges (13-17pt) on under-50¢ underdogs don't get floored out by 1-3pts.
