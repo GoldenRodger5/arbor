@@ -159,34 +159,49 @@ function computeCalibrationFeedback() {
       sportData[sport].buckets[band][won ? 'w' : 'l']++;
     }
 
+    // Per-bucket verdicts. Overall cal-error can mislead (a losing 75%+ bucket
+    // drags the headline down even when the 65-69% bucket is winning). Give
+    // Sonnet bucket-specific guidance so it knows which confidence levels to
+    // trust and which to trim.
+    // Compare actual WR to the BAND LOWER BOUND, not midpoint. If you say 65-69%
+    // and win 62%, that's still profitable EV at entry prices ≤62¢ — don't trim.
+    // Only flag overconfidence when the band is losing relative to its floor.
+    const bandLower = { '65-69': 65, '70-74': 70, '75+': 75 };
     const lines2 = [];
     for (const [sport, d] of Object.entries(sportData)) {
       const total = d.wins + d.losses;
-      if (total < 10) continue; // need real sample before issuing any verdict
+      if (total < 10) continue;
       const actualWR = Math.round((d.wins / total) * 100);
-      const avgConf = Math.round((d.confSum / total) * 100);
-      const calError = actualWR - avgConf;
-      // Cap the penalty at -10pts. Only flag OVERCONFIDENT with a true sample
-      // (n ≥ 15) AND meaningful error (≤ -10). Smaller errors get soft nudges.
-      let verdict;
-      if (Math.abs(calError) <= 5) verdict = 'well-calibrated — trust your reads';
-      else if (calError < -10 && total >= 15) {
-        const trim = Math.min(10, Math.abs(calError));
-        verdict = `slightly overconfident — trim ~${trim}pts ONLY from claims ≥75% (leave 65-74% estimates alone)`;
-      }
-      else if (calError < -5) verdict = 'trending overconfident at the top end — be careful above 75%';
-      else verdict = 'underconfident — you can be bolder';
 
-      let bucketDetail = '';
-      for (const [band, b] of Object.entries(d.buckets)) {
+      const bucketVerdicts = [];
+      for (const band of ['65-69', '70-74', '75+']) {
+        const b = d.buckets[band];
+        if (!b) continue;
         const bt = b.w + b.l;
-        if (bt >= 2) bucketDetail += ` | ${band}%: ${b.w}W/${b.l}L (${Math.round(b.w/bt*100)}%)`;
+        if (bt < 3) {
+          if (bt >= 1) bucketVerdicts.push(`${band}%: ${b.w}W/${b.l}L (too small — no verdict)`);
+          continue;
+        }
+        const bWR = Math.round((b.w / bt) * 100);
+        const floor = bandLower[band];
+        let verdict;
+        if (bWR >= floor + 5) verdict = `CRUSHING at ${bWR}% — trust these reads aggressively, you are underconfident here`;
+        else if (bWR >= floor) verdict = `calibrated at ${bWR}% — trust your reads, do NOT trim`;
+        else if (bWR >= floor - 5) verdict = `within tolerance at ${bWR}% (profitable EV at market prices) — trust your reads, do NOT trim`;
+        else if (bWR >= floor - 15) verdict = `underperforming at ${bWR}% — trim ~${Math.min(8, floor - bWR)}pts from this band`;
+        else verdict = `losing at ${bWR}% — trim ~10pts or require much stronger evidence`;
+        bucketVerdicts.push(`${band}%: ${b.w}W/${b.l}L (${bWR}%) — ${verdict}`);
       }
-      lines2.push(`${sport.toUpperCase()}: ${d.wins}W/${d.losses}L (${actualWR}% actual vs ${avgConf}% predicted) — ${verdict}${bucketDetail}`);
+
+      if (bucketVerdicts.length === 0) {
+        lines2.push(`${sport.toUpperCase()}: ${d.wins}W/${d.losses}L overall (${actualWR}%) — sample too thin per band for verdicts`);
+      } else {
+        lines2.push(`${sport.toUpperCase()}: ${d.wins}W/${d.losses}L overall (${actualWR}%)\n  ${bucketVerdicts.join('\n  ')}`);
+      }
     }
 
     if (lines2.length === 0) return '';
-    return `\n📊 YOUR RECENT PICK ACCURACY (last 14 days, ${settled.length} trades; measured by game outcome, not stop-loss P&L):\n${lines2.join('\n')}\nUse this as a sanity check on your final confidence — do NOT flatly subtract points across the board. A 58% read on a clear mismatch stays 58%.\n`;
+    return `\n📊 YOUR RECENT PICK ACCURACY (last 14 days, ${settled.length} trades; measured by game outcome, not stop-loss P&L):\n${lines2.join('\n')}\nApply these verdicts PER BAND — if your 65-69% band is winning, a 66% read stays 66%. Do NOT blanket-trim. A confident read on a clear mismatch is what the bot needs.\n`;
   } catch { return ''; }
 }
 
