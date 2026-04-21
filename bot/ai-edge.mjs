@@ -8797,7 +8797,7 @@ async function main() {
         runCalibration();
         console.log('[calibrate] Running suggest.mjs --apply...');
         try {
-          execSync('node bot/suggest.mjs --apply', { timeout: 30000, cwd: process.cwd() });
+          execSync('node suggest.mjs --apply', { timeout: 30000, cwd: new URL('.', import.meta.url).pathname });
           console.log('[calibrate] suggest.mjs --apply completed');
         } catch (e) { console.error('[calibrate] suggest.mjs error:', e.message?.slice(0, 200)); }
         // Hot-reload calibration overrides + diff vs prior state so we can alert
