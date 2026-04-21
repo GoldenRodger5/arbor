@@ -5140,7 +5140,11 @@ async function checkPreGamePredictions() {
       `3. PLAYERS: Only cite players who are CURRENTLY on the ${market.team1.teamName} or ${market.team2.teamName} roster in ${currentSeasonYear}. If you cannot confirm a player is on one of these two teams right now, do NOT name them. Same last-name on a different franchise is a different person.\n` +
       `4. STATS: ERA/WHIP/SV%/GAA numbers in the ESPN GROUND TRUTH block (below) are authoritative. If you write a different value in your reasoning, your analysis is invalid.\n` +
       `5. DO NOT MAKE ANYTHING UP. If a fact is not in ESPN ground truth and not confirmed by your web search, say "unconfirmed" and downgrade your confidence. Never invent names, numbers, records, or streaks.\n` +
-      `6. If your web search returns results for a DIFFERENT sport, game, or date than this game — ignore those results and note the conflict. Do not let cross-query contamination enter your reasoning.\n\n`;
+      `6. If your web search returns results for a DIFFERENT sport, game, or date than this game — ignore those results and note the conflict. Do not let cross-query contamination enter your reasoning.\n` +
+      `7. 🚫 KNOWN-WRONG NAMES — these names have repeatedly shown up in wrong-sport analyses. If you catch yourself citing any of them outside their actual sport, STOP, delete the sentence, and re-read the game title:\n` +
+      `   • "Connelly Early" — MLB pitcher only. If this is NOT an MLB game and you cited him, you are hallucinating.\n` +
+      `   • "Dominic James" — not a current starter. Verify against ESPN ground truth before citing any goalie/pitcher.\n` +
+      `   Add this check BEFORE writing your reasoning — if a search result surfaces one of these names and it doesn't match ${sport}, discard it.\n\n`;
 
     const pgPromptText = sport === 'NBA'
       ? `You are a professional NBA swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
