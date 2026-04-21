@@ -5166,8 +5166,8 @@ async function checkPreGamePredictions() {
         `═══ STEP 4 — DECISION ═══\n` +
         `REMEMBER: confidence = P(this team wins the game). We exit at +12¢ — typically happens after they score early and the market reprices. A clear pitching edge translates to win probability and contract price movement.\n` +
         `BUY only if ALL are true:\n` +
-        `✓ Confidence ≥ 65% (win probability)\n` +
-        `✓ Confidence beats current price by 4+ points\n` +
+        `✓ Confidence meets the price-tiered floor: price<50¢ → ≥63%, price 50-65¢ → ≥66%, price>65¢ → ≥68%. Do NOT return exactly 65% for a mid-price favorite — either you have genuine 66%+ conviction or it's a pass.\n` +
+        `✓ Confidence beats current price by the required margin (typically 4+ points)\n` +
         `✓ Both starters confirmed AND there's a clear pitching/matchup edge\n\n` +
         (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
         `📊 CONFIDENCE CALIBRATION — MLB scale (MLB is the most random sport):\n` +
@@ -5394,9 +5394,16 @@ async function checkPreGamePredictions() {
             // "KC's Seth" (Seth Lugo) and "LAA's Reid" (Reid Detmers) that
             // previously blocked LEGITIMATE Claude picks. Last word is still
             // permissive for O'Brien, D'Angelo etc.
-            const roleRegex = /(starter|starting pitcher|pitcher|ace|goalie|netminder)[^.]{0,60}?\b([A-Z][a-z]{2,}\s+[A-Z][a-zA-Z'\-]+)\b/g;
+            // Require BOTH words to contain lowercase letters — filters out all-caps
+            // acronyms (NO, ERA, WHIP, SV, GAA, OUT, DNP, IL, TBD) that were causing
+            // false-positive blocks when Claude wrote "starter has Hard NO..." or
+            // "Messick ERA of 4.2..." in proximity to role keywords.
+            const roleRegex = /(starter|starting pitcher|pitcher|ace|goalie|netminder)[^.]{0,60}?\b([A-Z][a-z]{2,}\s+[A-Z][a-zA-Z'\-]*[a-z][a-zA-Z'\-]*)\b/g;
             const rawText = (decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? '');
             const venueWords = new Set(['place','arena','stadium','park','field','garden','center','centre','dome','coliseum','bowl','ballpark','grounds']);
+            // Stop-list of first-words that are sentence starters/qualifiers, not names.
+            // Caught "Hard NO" false positive (4/21 MILDET) — "Hard" passed [A-Z][a-z]{2,}.
+            const nonNameFirstWords = new Set(['Hard','Soft','Strong','Weak','Probable','Likely','Definite','Confirmed','Unconfirmed','Expected','Unknown','Unlisted','Reported','Rumored']);
             const other = matchedSide === market.team1 ? t2Starter : t1Starter;
             const otherLast = other?.name ? other.name.split(' ').slice(-1)[0].toLowerCase() : '';
             // Collect ALL hits — if ANY match expected/other starter, Claude is correct
@@ -5405,11 +5412,14 @@ async function checkPreGamePredictions() {
             const badCandidates = [];
             let m;
             while ((m = roleRegex.exec(rawText)) !== null) {
-              const cited = m[2].toLowerCase();
+              const citedRaw = m[2];
+              const firstWord = citedRaw.split(/\s+/)[0];
+              if (nonNameFirstWords.has(firstWord)) continue; // "Hard NO", "Likely Ace" etc.
+              const cited = citedRaw.toLowerCase();
               const citedLast = cited.split(' ').slice(-1)[0];
               if (venueWords.has(citedLast)) continue;
               if (citedLast === expectedLast || citedLast === otherLast) { matchedExpected = true; continue; }
-              badCandidates.push(m[2]);
+              badCandidates.push(citedRaw);
             }
             const bad = matchedExpected ? null : badCandidates[0];
             if (bad) {
