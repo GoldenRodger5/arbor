@@ -81,7 +81,22 @@ const EXIT_STATUSES = new Set([
 const SETTLED_STATUSES = new Set(['settled']);
 const REAL_STATUSES = new Set([...EXIT_STATUSES, ...SETTLED_STATUSES]);
 
-const real = allTrades.filter(t => REAL_STATUSES.has(t.status));
+const realRaw = allTrades.filter(t => REAL_STATUSES.has(t.status));
+// GAME DEDUPE: multiple bets on the same (game, side) are ONE correlated outcome,
+// not N independent samples. All Wilson-CI / WR analysis downstream (strategy gating,
+// reasoning tags, Kelly, price×conf floors) treats each trade as an independent Bernoulli
+// trial — that's wrong when 8 live-edge entries on BHA-draws all win/lose together.
+// Dedupe to earliest trade per (marketBase, side) before any WR analysis.
+const _seenGame = new Map();
+for (const t of realRaw) {
+  const gKey = `${t.marketBase ?? t.ticker ?? ''}|${t.side ?? 'yes'}`;
+  const existing = _seenGame.get(gKey);
+  const tTs = new Date(t.timestamp ?? t.settledAt ?? 0).getTime();
+  if (!existing || tTs < new Date(existing.timestamp ?? existing.settledAt ?? 0).getTime()) {
+    _seenGame.set(gKey, t);
+  }
+}
+const real = [..._seenGame.values()];
 
 // ─── Kalshi balance fetch for Tier 2 gate ─────────────────────────────────────
 async function fetchKalshiBalance() {

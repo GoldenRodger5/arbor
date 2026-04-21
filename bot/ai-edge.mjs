@@ -141,12 +141,27 @@ function computeCalibrationFeedback() {
     // Use PICK ACCURACY (gameOutcome) not trade P&L. Stopped-out winners (BUF/VGK)
     // should count as correct picks, since calibration is about prediction skill,
     // not stop-loss timing. Fall back to P&L only when gameOutcome is missing.
-    const settled = trades.filter(t =>
+    const settledRaw = trades.filter(t =>
       (t.status === 'settled' || t.status?.startsWith('sold-')) &&
       t.confidence != null &&
       (t.gameOutcome === 'correct' || t.gameOutcome === 'incorrect' || t.realizedPnL != null) &&
       new Date(t.settledAt ?? t.timestamp).getTime() > cutoff
     );
+    // GAME DEDUPE: multiple bets on the same game side are 1 correlated outcome,
+    // not N independent samples. Collapse to one trade per (marketBase, side) —
+    // pick the earliest so the confidence reflects the initial read, not a scale-in.
+    // Without this, 8 live bets on BHA → 8 "losses" if BHA drew, inflating sample
+    // size and letting one unlucky game dominate band verdicts.
+    const gameSeen = new Map();
+    for (const t of settledRaw) {
+      const gKey = `${t.marketBase ?? t.ticker ?? ''}|${t.side ?? 'yes'}`;
+      const existing = gameSeen.get(gKey);
+      const tTs = new Date(t.timestamp ?? t.settledAt).getTime();
+      if (!existing || tTs < new Date(existing.timestamp ?? existing.settledAt).getTime()) {
+        gameSeen.set(gKey, t);
+      }
+    }
+    const settled = [...gameSeen.values()];
     if (settled.length < 10) return '';
 
     const sportData = {};
