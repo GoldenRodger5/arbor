@@ -4654,6 +4654,12 @@ const pgGameStartTimes = new Map();     // marketBase → game start (ms UTC), p
 
 const preGameRejectCache = new Map(); // marketBase → timestamp of last REJECTED analysis (longer TTL)
 const PG_REJECT_TTL_MS = 2 * 60 * 60 * 1000; // 2h sticky for rejected markets
+// Markets that Claude rejected specifically because ESPN ground truth was missing.
+// ESPN fills in starters 4-6h before game time — we force a re-scan in the T-2h window
+// even if the cache/reject timer says skip. Reclaims ~10-12% of MLB games/week that
+// we previously refused to analyze because starter listings hadn't published yet.
+const preGameEspnMissSet = new Set(); // marketBase (cleared when analyzed again or game starts)
+const ESPN_MISS_PATTERNS = /NOT IN ESPN|no ESPN|ESPN Ground Truth|ESPN data|ESPN-confirmed|ESPN ERA|starter is (?:not|un)confirmed|No ESPN/i;
 
 // Dynamic cache TTL based on time until game start.
 // Games far from starting (overnight scan) get a longer cache — no point asking Claude the same
@@ -4835,6 +4841,16 @@ async function checkPreGamePredictions() {
   // the same rejected games every 15 minutes overnight when no bets can be placed.
   const now = Date.now();
   const uncachedMarkets = eligibleMarkets.filter(m => {
+    // ESPN-miss retry: if last rejection was ESPN-missing data AND game is now within
+    // 2h of start AND it's been ≥30min since last look, force re-scan. ESPN publishes
+    // starters in the T-6h → T-2h window; the overnight rejection is stale.
+    if (preGameEspnMissSet.has(m.base)) {
+      const startMs = pgGameStartTimes.get(m.base);
+      const lastAt = preGameAnalysisCache.get(m.base) ?? 0;
+      const withinRetryWindow = startMs && (startMs - now) > 0 && (startMs - now) <= 2 * 60 * 60 * 1000;
+      const waitedLongEnough = now - lastAt >= 30 * 60 * 1000;
+      if (withinRetryWindow && waitedLongEnough) return true;
+    }
     // Sticky reject cache: once margin/cap check rejects, don't burn tokens re-analyzing for 2h.
     const rejAt = preGameRejectCache.get(m.base);
     if (rejAt && now - rejAt < PG_REJECT_TTL_MS) return false;
@@ -4946,13 +4962,19 @@ async function checkPreGamePredictions() {
     if (!hasStarters && !hasRosters) return '';
 
     const fmt = (abbr, s) => {
-      if (!s) return `  ${abbr}: NOT IN ESPN — treat starter as unconfirmed`;
+      if (!s) return `  ${abbr}: NOT IN ESPN — confirm via web search (≥2 independent sources: MLB.com, Baseball-Reference, team official, ESPN.com article). If confirmed, treat as valid and cite sources.`;
       const mlbStats = s.era
         ? ` | Record: ${s.w ?? '?'}-${s.l ?? '?'} | ERA: ${s.era} | WHIP: ${s.whip ?? '?'}`
         : '';
       const nhlStats = s.svPct ? ` | SV%: ${s.svPct} | GAA: ${s.gaa ?? '?'}` : '';
       return `  ${abbr}: ${s.name}${mlbStats}${nhlStats}  ← ESPN confirmed starter`;
     };
+
+    // Bullpen-game detection (MLB only): when BOTH sides show NOT IN ESPN, this is
+    // often a genuine opener/bullpen game rather than missing data. Tell Claude to
+    // analyze at the team level (bullpen ERA, team OPS, form) instead of requiring
+    // a designated starter.
+    const isBullpenGame = sportKey === 'MLB' && !t1 && !t2 && (r1 || r2);
 
     const fmtRoster = (abbr, r) => {
       if (!r) return '';
@@ -4963,14 +4985,16 @@ async function checkPreGamePredictions() {
     };
 
     let out = `⚡ ESPN GROUND TRUTH — DO NOT CONTRADICT THESE NUMBERS IN YOUR REASONING:\n`;
-    if (hasStarters) {
+    if (isBullpenGame) {
+      out += `  ⚾ BULLPEN GAME — neither team has a designated starter in ESPN. This is not missing data; this is a genuine opener/bullpen day. Analyze at the team level: bullpen ERA, recent team form, lineup strength, home/road splits, motivation. Do NOT require starter confirmation to trade — there is no starter.\n`;
+    } else if (hasStarters) {
       out += fmt(market.team1.team, t1) + '\n';
       out += fmt(market.team2.team, t2) + '\n';
       out += `⛔ STAT INTEGRITY RULES:\n`;
       out += `  • The ERA/WHIP/SV% numbers above are the authoritative ground truth for today.\n`;
       out += `  • Do NOT cite different ERA/WHIP/SV% values in your reasoning — your training data may be stale.\n`;
       out += `  • If your web search returns a different ERA, explicitly note "ESPN shows X, search shows Y" and explain why you prefer one.\n`;
-      out += `  • Treat starters as confirmed. Only fire Hard NO for "unconfirmed" if ESPN shows "NOT IN ESPN."\n`;
+      out += `  • Treat ESPN-confirmed starters as confirmed. If ESPN shows "NOT IN ESPN" for one starter, your web search can still confirm them — require ≥2 independent sources (MLB.com, Baseball-Reference, team official, ESPN article) and cite them. Only fire Hard NO if neither ESPN nor 2+ web sources can confirm.\n`;
     }
     if (hasRosters) {
       out += `\n📋 ESPN ROSTER STATUS (confirmed active/inactive players):\n`;
@@ -5071,7 +5095,7 @@ async function checkPreGamePredictions() {
         `C) FATIGUE: Is either team on a back-to-back? NHL back-to-back teams win at ~8% lower rates.\n` +
         `D) MOTIVATION: Playoff race intensity for each team. Teams fighting for seeding play harder in regulation.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
-        `❌ Starting goalie for the team you want to bet is NOT confirmed → NO\n` +
+        `❌ Starting goalie for the team you want to bet cannot be confirmed by ESPN OR by ≥2 independent web sources (NHL.com, team official, major outlets) → NO. NOTE: if ESPN is silent but 2+ web sources name the goalie, that IS confirmed — proceed.\n` +
         `❌ Team has clinched everything AND cannot confirm starting goalie → NO\n` +
         `❌ Team on 3rd game in 4 nights AND opponent is rested → NO\n` +
         `❌ No specific edge — just "better team overall" → NO (already priced in)\n\n` +
@@ -5126,7 +5150,7 @@ async function checkPreGamePredictions() {
         `D) PARK FACTOR: Note the park for context only — do NOT add percentage points for park factors. The market already prices park factors in. A hitter's park at Coors doesn't give you an edge; the market knows Coors exists.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `⛔ THESE ARE ABSOLUTE. If ANY Hard NO applies, respond {"trade":false} immediately. Do NOT continue reasoning.\n` +
-        `❌ Starting pitcher for the team you want to bet is NOT confirmed → NO\n` +
+        `❌ Starting pitcher for the team you want to bet cannot be confirmed by ESPN OR by ≥2 independent web sources (MLB.com, Baseball-Reference, team site, ESPN article) → NO. NOTE: if ESPN is silent but 2+ web sources name the starter, that IS confirmed — proceed. Also NOTE: if this is an opener/bullpen game (both sides have no designated starter in ESPN), skip this rule and analyze at the team level.\n` +
         `❌ Your team's starter is ERA > 5.0 AND opponent starter is ERA < 3.5 → NO. Your bad starter vs their good one = your team falls behind early, price drops, no swing-trade opportunity.\n` +
         `❌ BOTH starters ERA 4.5–5.5 (mediocre matchup) → NO. The market prices coin-flip games correctly. Stacking adjustments on top of a mediocre matchup does NOT create edge — the market has seen all those stats too. Pass.\n` +
         `❌ Opponent starter is ERA < 2.5 AND WHIP < 1.0 → NO (will dominate your lineup, price won't rise)\n\n` +
@@ -5402,11 +5426,25 @@ async function checkPreGamePredictions() {
       preGameAnalysisCache.set(market.base, Date.now());
 
       if (!decision.trade) {
-        console.log(`[pre-game] Sonnet rejected ${market.base}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
+        const reasonText = decision.reasoning ?? '';
+        const isEspnMiss = ESPN_MISS_PATTERNS.test(reasonText);
+        const startMs = pgGameStartTimes.get(market.base);
+        const minsToStart = startMs ? (startMs - Date.now()) / 60000 : null;
+        if (isEspnMiss && (minsToStart === null || minsToStart > 120)) {
+          preGameEspnMissSet.add(market.base);
+          console.log(`[pre-game] Sonnet rejected ${market.base} (ESPN-miss, will retry at T-2h): conf=${((decision.confidence??0)*100).toFixed(0)}% | ${reasonText.slice(0, 80)}`);
+        } else {
+          preGameEspnMissSet.delete(market.base);
+          console.log(`[pre-game] Sonnet rejected ${market.base}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${reasonText.slice(0, 80)}`);
+        }
         logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'rejected', confidence: decision.confidence, reasoning: decision.reasoning });
-        preGameRejectCache.set(market.base, Date.now());
+        // Only set sticky reject cache if this wasn't an ESPN-miss retry candidate —
+        // otherwise the 2h reject TTL would block the T-2h retry we just queued up.
+        if (!preGameEspnMissSet.has(market.base)) preGameRejectCache.set(market.base, Date.now());
         continue;
       }
+      // Trade accepted — clear any stale ESPN-miss flag.
+      preGameEspnMissSet.delete(market.base);
 
     let confidence = decision.confidence ?? 0;
 
