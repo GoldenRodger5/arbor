@@ -1777,25 +1777,40 @@ function buildDynamicAliases(cachedPrices, espnGames) {
       const missingHome = !tu.includes(homeAbbr) && !(ABBR_MAP[homeAbbr] && tu.includes(ABBR_MAP[homeAbbr]));
       const missingAway = !tu.includes(awayAbbr) && !(ABBR_MAP[awayAbbr] && tu.includes(ABBR_MAP[awayAbbr]));
 
+      const addAlias = (espnAbbr, kalshiToken) => {
+        if (!kalshiToken || kalshiToken.length < 2 || kalshiToken.length > 5) return;
+        if (!dynamicAbbr.has(espnAbbr)) dynamicAbbr.set(espnAbbr, new Set());
+        if (!dynamicAbbr.get(espnAbbr).has(kalshiToken)) {
+          dynamicAbbr.get(espnAbbr).add(kalshiToken);
+          console.log(`[abbr-learn] Discovered alias: ESPN "${espnAbbr}" = Kalshi "${kalshiToken}" (from ${ticker})`);
+        }
+      };
+
       if (missingHome && !missingAway) {
         // Home abbr is the one Kalshi uses differently — extract it
         const knownAway = ABBR_MAP[awayAbbr] && tu.includes(ABBR_MAP[awayAbbr]) ? ABBR_MAP[awayAbbr] : awayAbbr;
-        const kalshiHome = teamsStr.replace(knownAway, '');
-        if (kalshiHome && kalshiHome.length >= 2 && kalshiHome.length <= 5) {
-          if (!dynamicAbbr.has(homeAbbr)) dynamicAbbr.set(homeAbbr, new Set());
-          if (!dynamicAbbr.get(homeAbbr).has(kalshiHome)) {
-            dynamicAbbr.get(homeAbbr).add(kalshiHome);
-            console.log(`[abbr-learn] Discovered alias: ESPN "${homeAbbr}" = Kalshi "${kalshiHome}" (from ${ticker})`);
-          }
-        }
+        addAlias(homeAbbr, teamsStr.replace(knownAway, ''));
       } else if (missingAway && !missingHome) {
         const knownHome = ABBR_MAP[homeAbbr] && tu.includes(ABBR_MAP[homeAbbr]) ? ABBR_MAP[homeAbbr] : homeAbbr;
-        const kalshiAway = teamsStr.replace(knownHome, '');
-        if (kalshiAway && kalshiAway.length >= 2 && kalshiAway.length <= 5) {
-          if (!dynamicAbbr.has(awayAbbr)) dynamicAbbr.set(awayAbbr, new Set());
-          if (!dynamicAbbr.get(awayAbbr).has(kalshiAway)) {
-            dynamicAbbr.get(awayAbbr).add(kalshiAway);
-            console.log(`[abbr-learn] Discovered alias: ESPN "${awayAbbr}" = Kalshi "${kalshiAway}" (from ${ticker})`);
+        addAlias(awayAbbr, teamsStr.replace(knownHome, ''));
+      } else if (missingHome && missingAway) {
+        // Both sides unmapped (e.g. Mallorca-Valencia: ESPN MLL@VAL vs Kalshi MALVCF).
+        // Title already confirmed both teams play here. Try each split of teamsStr
+        // into two tokens and assign via first-letter match against team displayNames.
+        // If both teams share a first letter, skip — ambiguous, wait for one-sided learn.
+        const homeInitial = homeName[0]?.toUpperCase();
+        const awayInitial = awayName[0]?.toUpperCase();
+        if (homeInitial && awayInitial && homeInitial !== awayInitial) {
+          for (let i = 2; i <= Math.min(5, teamsStr.length - 2); i++) {
+            const tok1 = teamsStr.slice(0, i);
+            const tok2 = teamsStr.slice(i);
+            if (tok2.length < 2 || tok2.length > 5) continue;
+            if (tok1[0] === homeInitial && tok2[0] === awayInitial) {
+              addAlias(homeAbbr, tok1); addAlias(awayAbbr, tok2); break;
+            }
+            if (tok1[0] === awayInitial && tok2[0] === homeInitial) {
+              addAlias(awayAbbr, tok1); addAlias(homeAbbr, tok2); break;
+            }
           }
         }
       }
