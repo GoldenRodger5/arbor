@@ -5305,9 +5305,14 @@ async function checkPreGamePredictions() {
             const roleRegex = /(starter|starting pitcher|pitcher|ace|goalie|netminder)[^.]{0,60}?\b([A-Z][a-zA-Z'\-]+\s+[A-Z][a-zA-Z'\-]+)\b/g;
             const rawText = (decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? '');
             let m; let bad = null;
+            // Exclude venue/arena/stadium names — capitalized two-word patterns
+            // like "Rogers Place" or "Yankee Stadium" match the regex but are
+            // not people. False-positive caught in production on ANA@EDM.
+            const venueWords = new Set(['place','arena','stadium','park','field','garden','center','centre','dome','coliseum','bowl','ballpark','grounds']);
             while ((m = roleRegex.exec(rawText)) !== null) {
               const cited = m[2].toLowerCase();
               const citedLast = cited.split(' ').slice(-1)[0];
+              if (venueWords.has(citedLast)) continue; // arena/stadium, not a person
               // Ignore mentions of opposing starter (both are acceptable in reasoning)
               const other = matchedSide === market.team1 ? t2Starter : t1Starter;
               const otherLast = other?.name ? other.name.split(' ').slice(-1)[0].toLowerCase() : '';
