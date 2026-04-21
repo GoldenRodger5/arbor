@@ -3323,15 +3323,10 @@ async function checkLiveScoreEdges() {
         console.log(`[live-edge] 🔁 THESIS VINDICATED: ${aa}@${ha} — stopped on ${priorStop[1].team}, now leading — lowering WE floor for re-entry`);
       }
 
-      // NHL 1-goal P1 block — 62% WE is too low with 40min remaining. High variance,
-      // a single bounce goal erases it. 2+ goal P1 leads (80%/92%) pass through to the
-      // standard WE floor below — 2-goal P1 is real edge; market often prices at 70-74¢.
-      // Exception: thesis-vindicated re-entry bypasses this block.
-      if (league === 'nhl' && period === 1 && diff === 1 && !isThesisVindicated) {
-        console.log(`[live-edge] Skipping NHL 1-goal P1: ${aa}@${ha} — 62% WE with 40min remaining, too early for 1-goal leads`);
-        logScreen({ stage: 'live-edge-skip', result: 'skip-we-floor', league, homeAbbr: ha, awayAbbr: aa, homeScore, awayScore, diff, period, winExpectancy: 0.62, reasoning: 'NHL 1-goal P1 blocked — 62% WE with 40 minutes remaining. 2+ goal P1 leads are allowed (80%+ WE).' });
-        continue;
-      }
+      // NHL 1-goal P1: previously blocked outright. Now let it pass — downstream gates
+      // (price ceiling, WE floor, Sonnet prompt, required margin) will reject if no edge.
+      // Blocking upstream missed every mispriced 1-goal P1 (which happen when market
+      // overreacts to the goal).
 
       const baseWE = getWinExpectancy(league, diff, period) ?? 0.50;
       // Thesis-vindicated: drop floor to 60% (team recovered from a deficit we stopped out of)
@@ -3369,11 +3364,11 @@ async function checkLiveScoreEdges() {
     // Bad teams DO protect leads 79% of the time (P3 1-goal). Let Claude assess
     // with full context instead of auto-blocking. Win rate is now a prompt adjustment.
 
-    // SWING MODE: max 2 concurrent swing trades
+    // SWING MODE: max 3 concurrent swing trades (raised from 2)
     if (isSwingMode) {
       const openSwingCount = openPositions.filter(p => p.strategy === 'live-swing').length;
-      if (openSwingCount >= 2) {
-        console.log(`[live-swing] BLOCKED: already ${openSwingCount} open swing trades (max 2)`);
+      if (openSwingCount >= 3) {
+        console.log(`[live-swing] BLOCKED: already ${openSwingCount} open swing trades (max 3)`);
         continue;
       }
     }
@@ -4249,8 +4244,8 @@ async function checkLiveScoreEdges() {
                                 (confidence < effectiveMinConf || (isSwingMode && confidence < 0.68));
         if (isEdgeFirstLive && !isSwingMode) {
           const openSwingCountEF = openPositions.filter(p => p.strategy === 'live-swing').length;
-          if (openSwingCountEF >= 2) {
-            console.log(`[live-edge] 🎯 EDGE-FIRST would trigger but max 2 swing positions open — skipping ${targetAbbr}`);
+          if (openSwingCountEF >= 3) {
+            console.log(`[live-edge] 🎯 EDGE-FIRST would trigger but max 3 swing positions open — skipping ${targetAbbr}`);
             continue;
           }
           isSwingMode = true;
@@ -4744,7 +4739,7 @@ async function checkLiveScoreEdges() {
 const PREGAME_SCAN_INTERVAL = 15 * 60 * 1000; // every 15 min
 const MAX_PREGAME_PER_CYCLE = 5;   // Analyze up to 5 markets per scan cycle (quality > volume)
 const MAX_PREGAME_PAPER_PER_DAY = 999; // Paper mode: no real cap — log every qualifying pick for calibration
-const PREGAME_HOURS_WINDOW = 2;    // Only place real bet when game starts within this many hours
+const PREGAME_HOURS_WINDOW = 6;    // Only place real bet when game starts within this many hours (was 2 — missed most pre-game shots on evening games)
 let preGameTradesToday = 0;
 let preGameTradesDate = '';         // reset counter on new day
 const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
