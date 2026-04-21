@@ -4226,7 +4226,26 @@ async function checkLiveScoreEdges() {
         const priceBand = price < 0.50 ? 'underdog' : 'favorite';
         const priceBandFloor = CAL.priceConfFloors?.[league]?.[priceBand] ?? 0;
         const effectiveMinConf = Math.max(sportMinConf, priceBandFloor);
-        if (confidence < effectiveMinConf) {
+        // EDGE-FIRST LIVE TIER: clear edge in the 50-55¢ underdog band with 63%+ conf bypasses
+        // the standard/swing conf floors. Routes through swing path (half size, +12¢ exit).
+        // Mirrors the pre-game edge-first tier — same EV math at half-size when market pricing lags.
+        const _edgeAbsLive = confidence - price;
+        const isEdgeFirstLive = confidence >= 0.63 &&
+                                _edgeAbsLive >= 0.10 &&
+                                price >= 0.50 && price <= 0.55 &&
+                                (confidence < effectiveMinConf || (isSwingMode && confidence < 0.68));
+        if (isEdgeFirstLive && !isSwingMode) {
+          const openSwingCountEF = openPositions.filter(p => p.strategy === 'live-swing').length;
+          if (openSwingCountEF >= 2) {
+            console.log(`[live-edge] 🎯 EDGE-FIRST would trigger but max 2 swing positions open — skipping ${targetAbbr}`);
+            continue;
+          }
+          isSwingMode = true;
+          console.log(`[live-edge] 🎯 EDGE-FIRST LIVE: ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}) conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(_edgeAbsLive*100).toFixed(1)}pt — promoted to swing (half-size, +12¢ exit)`);
+        } else if (isEdgeFirstLive) {
+          console.log(`[live-edge] 🎯 EDGE-FIRST LIVE: ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}) conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(_edgeAbsLive*100).toFixed(1)}pt — bypassing swing 68% floor`);
+        }
+        if (confidence < effectiveMinConf && !isEdgeFirstLive) {
           const floorNote = priceBandFloor > sportMinConf ? ` [price-band ${priceBand} floor]` : (CAL.minConfidenceLive?.[league] ? ' [calibrated]' : '');
           console.log(`[live-edge] Confidence too low on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(confidence*100).toFixed(0)}% < ${(effectiveMinConf*100).toFixed(0)}%${floorNote}`);
           liveEdgeRejectMemo.set(gameBase, { scoreKey: currentScoreKey, priceCents: Math.round(price * 100), ts: Date.now() });
@@ -4267,7 +4286,7 @@ async function checkLiveScoreEdges() {
             console.log(`[live-swing] BLOCKED ${targetAbbr}: price ${(price*100).toFixed(0)}¢ > 65¢ cap for swing trades`);
             continue;
           }
-          if (confidence < 0.68) {
+          if (confidence < 0.68 && !isEdgeFirstLive) {
             console.log(`[live-swing] BLOCKED ${targetAbbr}: confidence ${(confidence*100).toFixed(0)}% < 68% min for swing trades`);
             continue;
           }
