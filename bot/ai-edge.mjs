@@ -133,7 +133,11 @@ function computeCalibrationFeedback() {
   try {
     const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
     const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    const cutoff = Date.now() - 14 * 864e5; // last 14 days
+    // 7-day window: the bot is actively tuned (floors, prompts, gates change
+    // frequently), so trades older than a week were placed under a materially
+    // different regime and muddy the per-band WRs. 7d keeps samples
+    // regime-relevant; min-10 filter per sport drops anything too thin.
+    const cutoff = Date.now() - 7 * 864e5;
     // Use PICK ACCURACY (gameOutcome) not trade P&L. Stopped-out winners (BUF/VGK)
     // should count as correct picks, since calibration is about prediction skill,
     // not stop-loss timing. Fall back to P&L only when gameOutcome is missing.
@@ -201,7 +205,7 @@ function computeCalibrationFeedback() {
     }
 
     if (lines2.length === 0) return '';
-    return `\n📊 YOUR RECENT PICK ACCURACY (last 14 days, ${settled.length} trades; measured by game outcome, not stop-loss P&L):\n${lines2.join('\n')}\nApply these verdicts PER BAND — if your 65-69% band is winning, a 66% read stays 66%. Do NOT blanket-trim. A confident read on a clear mismatch is what the bot needs.\n`;
+    return `\n📊 YOUR RECENT PICK ACCURACY (last 7 days, ${settled.length} trades; measured by game outcome, not stop-loss P&L):\n${lines2.join('\n')}\nApply these verdicts PER BAND — if your 65-69% band is winning, a 66% read stays 66%. Do NOT blanket-trim. A confident read on a clear mismatch is what the bot needs.\n`;
   } catch { return ''; }
 }
 
