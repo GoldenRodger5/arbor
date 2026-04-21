@@ -2470,10 +2470,26 @@ async function checkLiveScoreEdges() {
                 // Sell to capture the late-game premium before a blown save wipes the gain.
                 sellFraction = 1.0;
                 sellReason = `pg-profit-late (${lead}-${lead === 0 ? 'tie' : 'run/goal/pt'} lead ${stage} game inn/pd ${game.period} — closing out)`;
+              } else if (league === 'mlb' && gainCents >= 0.18 && game.period >= 5 && lead >= 1 && await (async () => {
+                // MLB BULLPEN-LOCK: if leading team's bullpen is below/poor/unknown AND we're
+                // already +18¢ in inn 5+, auto-lock without asking Claude. KC-Lugo incident:
+                // Claude said HOLD at +18¢, bullpen gave up 4 runs in extras, BAL won. The
+                // windfall rule saved us at +31¢ — won't always bail us out.
+                try {
+                  const leadStats = await getBullpenStats(ourTeam);
+                  const tier = leadStats ? bullpenTier(leadStats) : 'unknown';
+                  if (tier === 'below' || tier === 'poor' || tier === 'unknown') {
+                    console.log(`[pg-win] 🔒 BULLPEN-LOCK: ${trade.ticker} +${Math.round(gainCents*100)}¢ ${stage} inn${game.period} — ${ourTeam} bullpen tier=${tier}, auto-lock`);
+                    return true;
+                  }
+                } catch (e) { console.log(`[pg-win] bullpen lookup failed for ${ourTeam}: ${e.message}`); }
+                return false;
+              })()) {
+                sellFraction = 1.0;
+                sellReason = `pg-bullpen-lock (+${Math.round(gainCents*100)}¢ — shaky bullpen in inn${game.period}, don't risk it)`;
               } else if (gainCents >= 0.10 && (stage === 'mid' || stage === 'early') && lead >= 1 && !trade.pgWinThesisChecked) {
                 // MILESTONE RE-EVALUATION: position profitable + leading + not yet milestone-evaluated.
                 // Ask Claude: thesis confirmed? Hold to settlement for maximum gain, or lock profits now?
-                // This captures "COL up +15¢ in inning 3 after scoring 2 early — should we ride this?"
                 tradeCooldowns.set(pgWinKey, Date.now());
                 trade.pgWinThesisChecked = true;
                 const pgWinThesisLeague = league;
@@ -4611,12 +4627,15 @@ const preGameBetGames = new Set();  // games we've already bet on today (prevent
 const preGameAnalysisCache = new Map(); // marketBase → timestamp of last Claude analysis
 const pgGameStartTimes = new Map();     // marketBase → game start (ms UTC), persists across scan cycles
 
+const preGameRejectCache = new Map(); // marketBase → timestamp of last REJECTED analysis (longer TTL)
+const PG_REJECT_TTL_MS = 2 * 60 * 60 * 1000; // 2h sticky for rejected markets
+
 // Dynamic cache TTL based on time until game start.
 // Games far from starting (overnight scan) get a longer cache — no point asking Claude the same
 // question every hour when the starters/odds won't change until a few hours before game time.
 //   >8h to start → 4h cache  (overnight: re-analyze 2-3x vs 16-24x with flat 1h TTL)
 //   4-8h to start → 2h cache
-//   <4h to start → 1h cache  (current behavior near game time)
+//   <4h to start → 2h cache  (was 1h — same game rejected 5-8× per day wastes tokens)
 function getPgCacheTtl(marketBase) {
   let startMs = pgGameStartTimes.get(marketBase);
 
@@ -4633,7 +4652,7 @@ function getPgCacheTtl(marketBase) {
       const minsUntil = (gameMins + 24 * 60 - nowMins) % (24 * 60);
       if (minsUntil > 8 * 60) return 4 * 60 * 60 * 1000;
       if (minsUntil > 4 * 60) return 2 * 60 * 60 * 1000;
-      return 1 * 60 * 60 * 1000;
+      return 2 * 60 * 60 * 1000;
     }
     return 3 * 60 * 60 * 1000; // unknown start time → 3h default (NBA/NHL/Soccer first scan)
   }
@@ -4641,7 +4660,7 @@ function getPgCacheTtl(marketBase) {
   const minsUntil = (startMs - Date.now()) / 60000;
   if (minsUntil > 8 * 60) return 4 * 60 * 60 * 1000;
   if (minsUntil > 4 * 60) return 2 * 60 * 60 * 1000;
-  return 1 * 60 * 60 * 1000;
+  return 2 * 60 * 60 * 1000;
 }
 
 async function checkPreGamePredictions() {
@@ -4790,9 +4809,12 @@ async function checkPreGamePredictions() {
   // Skip markets Claude already analyzed recently — prevents burning tokens re-analyzing
   // the same rejected games every 15 minutes overnight when no bets can be placed.
   const now = Date.now();
-  const uncachedMarkets = eligibleMarkets.filter(m =>
-    !preGameAnalysisCache.has(m.base) || now - preGameAnalysisCache.get(m.base) > getPgCacheTtl(m.base)
-  );
+  const uncachedMarkets = eligibleMarkets.filter(m => {
+    // Sticky reject cache: once margin/cap check rejects, don't burn tokens re-analyzing for 2h.
+    const rejAt = preGameRejectCache.get(m.base);
+    if (rejAt && now - rejAt < PG_REJECT_TTL_MS) return false;
+    return !preGameAnalysisCache.has(m.base) || now - preGameAnalysisCache.get(m.base) > getPgCacheTtl(m.base);
+  });
   if (uncachedMarkets.length < eligibleMarkets.length) {
     console.log(`[pre-game] Analysis cache: skipping ${eligibleMarkets.length - uncachedMarkets.length} recently-analyzed markets (${uncachedMarkets.length} uncached)`);
   }
@@ -5318,24 +5340,29 @@ async function checkPreGamePredictions() {
           if (chosenStarter?.name) {
             const expectedLast = chosenStarter.name.split(' ').slice(-1)[0].toLowerCase();
             // Extract capitalized "Firstname Lastname" patterns within 8 chars of starter/pitcher/goalie/ace keywords
-            const roleRegex = /(starter|starting pitcher|pitcher|ace|goalie|netminder)[^.]{0,60}?\b([A-Z][a-zA-Z'\-]+\s+[A-Z][a-zA-Z'\-]+)\b/g;
+            // First word must be a proper given name: capital + lowercase-only
+            // letters (no apostrophes). Rejects possessive team prefixes like
+            // "KC's Seth" (Seth Lugo) and "LAA's Reid" (Reid Detmers) that
+            // previously blocked LEGITIMATE Claude picks. Last word is still
+            // permissive for O'Brien, D'Angelo etc.
+            const roleRegex = /(starter|starting pitcher|pitcher|ace|goalie|netminder)[^.]{0,60}?\b([A-Z][a-z]{2,}\s+[A-Z][a-zA-Z'\-]+)\b/g;
             const rawText = (decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? '');
-            let m; let bad = null;
-            // Exclude venue/arena/stadium names — capitalized two-word patterns
-            // like "Rogers Place" or "Yankee Stadium" match the regex but are
-            // not people. False-positive caught in production on ANA@EDM.
             const venueWords = new Set(['place','arena','stadium','park','field','garden','center','centre','dome','coliseum','bowl','ballpark','grounds']);
+            const other = matchedSide === market.team1 ? t2Starter : t1Starter;
+            const otherLast = other?.name ? other.name.split(' ').slice(-1)[0].toLowerCase() : '';
+            // Collect ALL hits — if ANY match expected/other starter, Claude is correct
+            // even if other candidates are mentioned. Only flag when no valid hit exists.
+            let matchedExpected = false;
+            const badCandidates = [];
+            let m;
             while ((m = roleRegex.exec(rawText)) !== null) {
               const cited = m[2].toLowerCase();
               const citedLast = cited.split(' ').slice(-1)[0];
-              if (venueWords.has(citedLast)) continue; // arena/stadium, not a person
-              // Ignore mentions of opposing starter (both are acceptable in reasoning)
-              const other = matchedSide === market.team1 ? t2Starter : t1Starter;
-              const otherLast = other?.name ? other.name.split(' ').slice(-1)[0].toLowerCase() : '';
-              if (citedLast === expectedLast || citedLast === otherLast) continue;
-              bad = m[2];
-              break;
+              if (venueWords.has(citedLast)) continue;
+              if (citedLast === expectedLast || citedLast === otherLast) { matchedExpected = true; continue; }
+              badCandidates.push(m[2]);
             }
+            const bad = matchedExpected ? null : badCandidates[0];
             if (bad) {
               console.log(`[pre-game] BLOCKED: hallucinated starter "${bad}" — ESPN confirms ${chosenStarter.name} for ${matchedSide.team} in ${market.base}`);
               logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'blocked-hallucination', reasoning: `cited starter "${bad}" ≠ ESPN starter "${chosenStarter.name}"`, claudeReasoning: decision.reasoning?.slice(0, 200) });
@@ -5352,6 +5379,7 @@ async function checkPreGamePredictions() {
       if (!decision.trade) {
         console.log(`[pre-game] Sonnet rejected ${market.base}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${decision.reasoning?.slice(0, 80)}`);
         logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'rejected', confidence: decision.confidence, reasoning: decision.reasoning });
+        preGameRejectCache.set(market.base, Date.now());
         continue;
       }
 
@@ -5417,16 +5445,18 @@ async function checkPreGamePredictions() {
     // MLB: +25% (45% + 25% = 70% max) — was 20% but created a dead zone where
     //   65% cap + 67% min-conf = impossible. Raised to let genuine conviction through.
     // NBA: +15% (72% + 15% = 87% max) — dominant mismatch e.g. opponent resting all starters
-    // NHL: +18% (56% + 18% = 74% max) — elite goalie vs backup + PP edge
+    // NHL: +20% (56% + 20% = 76% home, 44% + 20% = 64% away) — was +18 but created
+    //   an impossible pass on NHL away underdogs: cap 62% < floor 63% killed 17pt edges.
     // Soccer: +15% (55% + 15% = 70% max) — opens soccer since we exit on first goal (draws irrelevant)
-    const sportCapBonus = { mlb: 0.25, nba: 0.15, nhl: 0.18, mls: 0.15, epl: 0.15, laliga: 0.15, seriea: 0.15, bundesliga: 0.15, ligue1: 0.15 }[pgSportKey] ?? 0.15;
-    // Detect home/away: "X at Y" → team1=away, team2=home. "X vs Y" → team1=home, team2=away.
-    // Baselines are HOME team probabilities — invert for away bets.
+    const sportCapBonus = { mlb: 0.25, nba: 0.15, nhl: 0.20, mls: 0.15, epl: 0.15, laliga: 0.15, seriea: 0.15, bundesliga: 0.15, ligue1: 0.15 }[pgSportKey] ?? 0.15;
+    // Detect home/away. Titles include "X at Y" (X=away) and "Game N: X at Y" (playoff, X=away).
+    // "X vs Y" → team1=home. Baselines are HOME probabilities — invert for away bets.
     const titleLower = (market.title ?? '').toLowerCase();
     const isAwayBet = (titleLower.includes(' at ') && matchedSide === market.team1) ||
                       (titleLower.includes(' vs ') && matchedSide === market.team2);
     const pgTargetBaseline = isAwayBet ? (1 - pgBaseline) : pgBaseline;
     const pgMaxAllowed = Math.min(0.85, pgTargetBaseline + sportCapBonus);
+    console.log(`[pre-game] side-detect: ${market.base} title="${market.title}" matched=${matchedSide} team1=${market.team1} team2=${market.team2} isAway=${isAwayBet} baseline=${(pgTargetBaseline*100).toFixed(0)}% cap=${(pgMaxAllowed*100).toFixed(0)}%`);
     if (confidence > pgMaxAllowed) {
       console.log(`[pre-game] Confidence capped: Claude said ${(confidence*100).toFixed(0)}% but pre-game baseline is ${(pgTargetBaseline*100).toFixed(0)}% → capped at ${(pgMaxAllowed*100).toFixed(0)}%`);
       confidence = pgMaxAllowed;
@@ -5482,6 +5512,7 @@ async function checkPreGamePredictions() {
           : 0.65; // fallback for other sports
     if (confidence < PRE_GAME_MIN_CONF || (confidence - price) < pgReqMargin) {
       console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${((confidence-price)*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% min=${(PRE_GAME_MIN_CONF*100).toFixed(0)}% (${pgSportKey})`);
+      preGameRejectCache.set(market.base, Date.now());
       continue;
     }
 
