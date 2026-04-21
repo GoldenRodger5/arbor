@@ -814,7 +814,7 @@ const recentCrossContraMovers = new Map(); // ticker → { velocity, when } — 
 // Key: gameBase. Value: { scoreKey, priceCents, ts }.
 // Invalidates when score changes, price moves ≥3¢, or age > 6min.
 const liveEdgeRejectMemo = new Map();
-const LIVE_REJECT_MAX_AGE_MS = 6 * 60 * 1000;
+const LIVE_REJECT_MAX_AGE_MS = 2 * 60 * 1000;
 const LIVE_REJECT_PRICE_TOL_CENTS = 3;
 
 // Check whether a tomorrow-dated ticker starts within maxHours of now (ET).
@@ -4153,14 +4153,9 @@ async function checkLiveScoreEdges() {
           }
         }
 
-        // Fast contra line movement → skip entirely. If the market is moving away from our
-        // target at 2+¢/min during a live game, that's sharp money reacting to something
-        // (bullpen change, injury, news) that we don't have yet. Not worth calling Sonnet.
-        if (_lineMove?.confirming === false && (_lineMove.velocity ?? 0) >= 2.0) {
-          console.log(`[live-edge] Skipping ${targetAbbr}: fast contra movement ${(_lineMove.velocity.toFixed(1))}¢/min — market actively moving away, likely has info we don't`);
-          logScreen({ stage: 'live-edge-skip', result: 'skip-contra-move', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `Fast contra movement ${(_lineMove.velocity.toFixed(1))}¢/min: market moved from ${(_lineMove.from*100).toFixed(0)}¢ to ${(_lineMove.to*100).toFixed(0)}¢ against ${targetAbbr} — sharp money reacting to something we don't have` });
-          continue;
-        }
+        // Contra line movement → no longer auto-skip. A sharp move against us is
+        // exactly the shape sharp bettors fade when their model disagrees. Let Sonnet
+        // see the move (it's already in the prompt as "⚠️ CONTRA LINE MOVEMENT") and decide.
 
         // Reject memo — same score + same price + <6min since last NO = no point re-asking.
         // Score/price changes still let the call through (those are the only things that flip Claude's answer).
