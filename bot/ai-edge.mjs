@@ -776,6 +776,13 @@ const missingFromKalshi = new Map(); // tradeId → firstMissingMs — 2-strike 
 let massDisappearStreak = 0; // consecutive sync cycles where ALL Kalshi positions are absent
 const recentCrossContraMovers = new Map(); // ticker → { velocity, when } — cross-confirmed drops for pg-guard
 
+// Live-edge reject memo — skip Sonnet call when state hasn't changed enough to flip Claude's answer.
+// Key: gameBase. Value: { scoreKey, priceCents, ts }.
+// Invalidates when score changes, price moves ≥3¢, or age > 6min.
+const liveEdgeRejectMemo = new Map();
+const LIVE_REJECT_MAX_AGE_MS = 6 * 60 * 1000;
+const LIVE_REJECT_PRICE_TOL_CENTS = 3;
+
 // Check whether a tomorrow-dated ticker starts within maxHours of now (ET).
 // Ticker format embeds HHMM immediately after the date string, e.g. "26APR172010".
 // This prevents betting on tomorrow evening games when the pre-game scanner opens
@@ -4130,6 +4137,19 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
+        // Reject memo — same score + same price + <6min since last NO = no point re-asking.
+        // Score/price changes still let the call through (those are the only things that flip Claude's answer).
+        const _memoEntry = liveEdgeRejectMemo.get(gameBase);
+        if (_memoEntry && Date.now() - _memoEntry.ts < LIVE_REJECT_MAX_AGE_MS) {
+          const _priceCentsNow = Math.round(price * 100);
+          const _sameScore = _memoEntry.scoreKey === currentScoreKey;
+          const _samePrice = Math.abs(_priceCentsNow - _memoEntry.priceCents) < LIVE_REJECT_PRICE_TOL_CENTS;
+          if (_sameScore && _samePrice) {
+            console.log(`[live-edge] Reject memo hit: ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}) score=${currentScoreKey} price=${_priceCentsNow}¢ — unchanged since last NO, skipping Sonnet`);
+            continue;
+          }
+        }
+
         // Collect for parallel Sonnet execution instead of calling sequentially
         sonnetCallsThisCycle++;
         sonnetQueue.push({
@@ -4187,6 +4207,7 @@ async function checkLiveScoreEdges() {
 
         if (!decision.trade) {
           console.log(`[live-edge] Claude says NO on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): conf=${((decision.confidence ?? 0)*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ | ${decision.reasoning?.slice(0, 80)}`);
+          liveEdgeRejectMemo.set(gameBase, { scoreKey: currentScoreKey, priceCents: Math.round(price * 100), ts: Date.now() });
           logScreen({ stage: 'live-edge', ticker, result: 'pass', confidence: decision.confidence, price, reasoning: decision.reasoning, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, gameDetail, targetAbbr });
           continue;
         }
@@ -4201,6 +4222,7 @@ async function checkLiveScoreEdges() {
         if (confidence < effectiveMinConf) {
           const floorNote = priceBandFloor > sportMinConf ? ` [price-band ${priceBand} floor]` : (CAL.minConfidenceLive?.[league] ? ' [calibrated]' : '');
           console.log(`[live-edge] Confidence too low on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(confidence*100).toFixed(0)}% < ${(effectiveMinConf*100).toFixed(0)}%${floorNote}`);
+          liveEdgeRejectMemo.set(gameBase, { scoreKey: currentScoreKey, priceCents: Math.round(price * 100), ts: Date.now() });
           logScreen({ stage: 'live-edge-skip', result: 'skip-conf-low', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, confidence: decision.confidence, targetAbbr, reasoning: `Claude wanted to trade ${targetAbbr} at ${(confidence*100).toFixed(0)}% confidence but floor is ${(effectiveMinConf*100).toFixed(0)}%${floorNote} — ${decision.reasoning?.slice(0, 120) ?? ''}` });
           continue;
         }
@@ -4691,7 +4713,12 @@ const preGameAnalysisCache = new Map(); // marketBase → timestamp of last Clau
 const pgGameStartTimes = new Map();     // marketBase → game start (ms UTC), persists across scan cycles
 
 const preGameRejectCache = new Map(); // marketBase → timestamp of last REJECTED analysis (longer TTL)
-const PG_REJECT_TTL_MS = 2 * 60 * 60 * 1000; // 2h sticky for rejected markets
+const PG_REJECT_TTL_MS = 4 * 60 * 60 * 1000; // 4h sticky for rejected markets (was 2h — ERA/price-band math doesn't flip in 2h, was re-burning $7/day on repeat rejects)
+// Price at time of reject. If any side moves ≥2¢ since reject, invalidate the sticky cache
+// and let the market re-analyze — sharp money movement is the one signal that can flip
+// a "margin failed" or "confidence low" reject into a real edge.
+const preGameRejectPrice = new Map(); // marketBase → { team1Cents, team2Cents }
+const PG_REJECT_PRICE_TOL_CENTS = 2;
 // Markets that Claude rejected specifically because ESPN ground truth was missing.
 // ESPN fills in starters 4-6h before game time — we force a re-scan in the T-2h window
 // even if the cache/reject timer says skip. Reclaims ~10-12% of MLB games/week that
@@ -4889,9 +4916,21 @@ async function checkPreGamePredictions() {
       const waitedLongEnough = now - lastAt >= 30 * 60 * 1000;
       if (withinRetryWindow && waitedLongEnough) return true;
     }
-    // Sticky reject cache: once margin/cap check rejects, don't burn tokens re-analyzing for 2h.
+    // Sticky reject cache: once margin/cap check rejects, don't burn tokens re-analyzing for 4h.
+    // Exception: if any side's price moved ≥2¢ since the reject, sharp money is repricing —
+    // let it re-analyze to catch the new edge window.
     const rejAt = preGameRejectCache.get(m.base);
-    if (rejAt && now - rejAt < PG_REJECT_TTL_MS) return false;
+    if (rejAt && now - rejAt < PG_REJECT_TTL_MS) {
+      const rejPrices = preGameRejectPrice.get(m.base);
+      const team1Now = Math.round((m.team1?.price ?? 0) * 100);
+      const team2Now = Math.round((m.team2?.price ?? 0) * 100);
+      const moved = rejPrices && (
+        Math.abs(team1Now - (rejPrices.team1Cents ?? team1Now)) >= PG_REJECT_PRICE_TOL_CENTS ||
+        Math.abs(team2Now - (rejPrices.team2Cents ?? team2Now)) >= PG_REJECT_PRICE_TOL_CENTS
+      );
+      if (!moved) return false;
+      console.log(`[pre-game] Reject cache invalidated for ${m.base} — price moved (${rejPrices?.team1Cents}→${team1Now}¢ / ${rejPrices?.team2Cents}→${team2Now}¢)`);
+    }
     return !preGameAnalysisCache.has(m.base) || now - preGameAnalysisCache.get(m.base) > getPgCacheTtl(m.base);
   });
   if (uncachedMarkets.length < eligibleMarkets.length) {
@@ -5488,7 +5527,13 @@ async function checkPreGamePredictions() {
         logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'rejected', confidence: decision.confidence, reasoning: decision.reasoning });
         // Only set sticky reject cache if this wasn't an ESPN-miss retry candidate —
         // otherwise the 2h reject TTL would block the T-2h retry we just queued up.
-        if (!preGameEspnMissSet.has(market.base)) preGameRejectCache.set(market.base, Date.now());
+        if (!preGameEspnMissSet.has(market.base)) {
+          preGameRejectCache.set(market.base, Date.now());
+          preGameRejectPrice.set(market.base, {
+            team1Cents: Math.round((market.team1?.price ?? 0) * 100),
+            team2Cents: Math.round((market.team2?.price ?? 0) * 100),
+          });
+        }
         continue;
       }
       // Trade accepted — clear any stale ESPN-miss flag.
@@ -5625,6 +5670,10 @@ async function checkPreGamePredictions() {
     if (confidence < PRE_GAME_MIN_CONF || (confidence - price) < pgReqMargin) {
       console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${((confidence-price)*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% min=${(PRE_GAME_MIN_CONF*100).toFixed(0)}% (${pgSportKey})`);
       preGameRejectCache.set(market.base, Date.now());
+      preGameRejectPrice.set(market.base, {
+        team1Cents: Math.round((market.team1?.price ?? 0) * 100),
+        team2Cents: Math.round((market.team2?.price ?? 0) * 100),
+      });
       continue;
     }
 
