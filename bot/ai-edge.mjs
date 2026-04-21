@@ -3565,7 +3565,23 @@ async function checkLiveScoreEdges() {
         // but 11:35 left in Q4 ≠ 1:30 left in Q4. Compute the correction and
         // pass BOTH raw and adjusted to Sonnet so it anchors on the right number.
         const _timeAdj = timeAdjustWE(league, period, gameDetail, diff);
-        const _weTimeAdj = _weTarget != null ? Math.max(0.01, Math.min(0.99, _weTarget + _timeAdj.adjustment)) : null;
+        let _weTimeAdj = _weTarget != null ? Math.max(0.01, Math.min(0.99, _weTarget + _timeAdj.adjustment)) : null;
+
+        // PLAYOFF ROAD-LEADER LATE-GAME PENALTY
+        // Pattern seen across 4 recent losses (ANA-EDM, VGK-UTA, MTL-TB, BUF-BOS):
+        // Road team holding a ≤1-goal/run/pt lead entering the final frame of a playoff game
+        // is systematically overrated by the WE table. Home crowd + star talent + urgency is
+        // a real tailwind for the trailing home team that the period-average anchor misses.
+        const _isPlayoff = /Game \d/i.test(targetMarket?.title ?? '');
+        const _targetIsRoadLeader = targetAbbr === leadingAbbr && targetAbbr !== homeAbbr;
+        const _lateFrame = (league === 'nhl' && period >= 3)
+                       || (league === 'nba' && period >= 4)
+                       || (league === 'mlb' && period >= 8);
+        if (_isPlayoff && _targetIsRoadLeader && diff <= 1 && _lateFrame && _weTimeAdj != null) {
+          const before = _weTimeAdj;
+          _weTimeAdj = Math.max(0.01, _weTimeAdj - 0.04);
+          console.log(`[we-penalty] 🏒 PLAYOFF-ROAD-LEADER: ${targetAbbr} away ≤1 lead late ${league.toUpperCase()} playoff — WE ${(before*100).toFixed(0)}%→${(_weTimeAdj*100).toFixed(0)}% (home crowd/urgency tailwind)`);
+        }
         const _weTimeAdjPct = _weTimeAdj != null ? (_weTimeAdj * 100).toFixed(0) : null;
 
         // MLB bullpen context — pulled from the MLB Stats API, not web search.
@@ -6872,6 +6888,33 @@ async function managePositions() {
         const thresholds = getExitThresholds(stage, entryPrice);
 
         // === TIER 1: Rule-based auto-exits ===
+
+        // CONTRA LINE-MOVE SCRATCH — if a cross-confirmed CONTRA drop just fired on this
+        // ticker at >=5¢/min, exit before stop-loss eats the full drawdown. The
+        // recentCrossContraMovers map is already gated on cross-confirmation (both
+        // contracts moved together) and expires after 5min, so a hit here means a
+        // real market reaction within the last few minutes. Saves us from watching
+        // a live trade collapse 75→47→8¢ before the nuclear stop finally fires.
+        // Requires trade to have been open ≥60s to avoid firing on entry-induced moves.
+        const tradeAgeSec = (Date.now() - new Date(trade.timestamp ?? 0).getTime()) / 1000;
+        const contraMove = recentCrossContraMovers.get(trade.ticker);
+        if (contraMove && tradeAgeSec >= 60 && contraMove.velocity >= 5) {
+          const moveAgeSec = (Date.now() - contraMove.when) / 1000;
+          if (moveAgeSec <= 120) {
+            console.log(`[exit] ⚠️ CONTRA EXIT: ${trade.ticker} — cross-confirmed ${contraMove.velocity.toFixed(1)}¢/min drop ${Math.round(moveAgeSec)}s ago, scratching full position @ ${(currentPrice*100).toFixed(0)}¢`);
+            await tg(
+              `⚠️ <b>CONTRA-EXIT</b>\n\n` +
+              `📋 ${trade.title}\n` +
+              `🎯 ${trade.ticker}\n` +
+              `💰 ${(entryPrice*100).toFixed(0)}¢ → ${(currentPrice*100).toFixed(0)}¢ (${pctChange >= 0 ? '+' : ''}${(pctChange*100).toFixed(0)}%)\n` +
+              `📉 Market dropped ${contraMove.velocity.toFixed(1)}¢/min cross-confirmed\n` +
+              `💡 Scratching before stop-loss`,
+            );
+            const result = await executeSell(trade, qty, currentPrice, 'contra-line-move');
+            if (result) anyUpdated = true;
+            continue;
+          }
+        }
 
         // LATE-GAME PROFIT-TAKE at 97¢+ — risking $0.97 to gain $0.03 is 32:1 against us
         if (stage === 'late' && currentPrice >= 0.97 && profitPerContract > 0) {
