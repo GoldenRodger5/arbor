@@ -3761,7 +3761,7 @@ async function checkLiveScoreEdges() {
           `❌ Trailing team is in active playoff survival (must win or season ends) AND the leading team is confirmed to be resting multiple starters OR rotating their lineup tonight → NO. NOTE: "already eliminated" alone is NOT enough — eliminated teams often still play hard for pride/contracts. The roster decision is the signal, not the standings.\n` +
           (league === 'nba' ? `❌ NBA STAR-FOUL HARD NO: Leading team's top scorer (highest PPG on roster) has 5 personal fouls AND period ≥ 3 AND lead ≤ 10 pts → NO. Check a live box score in your search. 5 fouls means he's either pinned to the bench or must play cautious on defense — that's a 10-15pt WE swing not captured by our baseline.\n` : '') +
           (isSoccer ? `❌ SOCCER LATE-DRAW HARD NO: Leading team's season draw rate > 35% AND lead = 1 goal AND minute ≥ 75 → NO. Draw-prone teams protecting a 1-0 late don't win — they draw, which loses a YES on the WIN contract.\n` : '') +
-          (league === 'mlb' ?
+          (league === 'mlb' && !isSwingMode ?
             (leadingBullpenTier === 'poor' && diff <= 2 && period >= 5
               ? `❌ MLB BULLPEN HARD NO: Leading team's bullpen is tier='poor' (ERA ≥ 5.0, L30D) and the lead is only ${diff} run${diff === 1 ? '' : 's'} in inning ${period}. A poor team pen ERA can't reliably protect a thin lead — Respond {"trade":false}. CLOSER EXCEPTION: If in your Step B search you confirmed the specific closer has a 2026 ERA below 2.0 and is not fatigued (no back-to-back), downgrade this to a −5% adjustment instead of Hard NO. The closer's individual stats override the team bullpen average in late-game situations.\n`
               : '')
@@ -3769,6 +3769,9 @@ async function checkLiveScoreEdges() {
               ? `❌ MLB BULLPEN HARD NO: 1-run lead in the ${period}th with a below-average bullpen (ERA 4.5-5.0). Margin of safety too thin — Respond {"trade":false}. CLOSER EXCEPTION: Confirmed elite closer (2026 ERA < 2.0, available) → treat as −3% adjustment, not Hard NO.\n`
               : '')
           : '') +
+          (league === 'mlb' && isSwingMode && leadingBullpenTier === 'poor'
+            ? `ℹ️ SWING MODE + POOR BULLPEN: Normally a Hard NO at settlement risk, but we exit at +12¢, not the 9th inning. Bullpen is a DOWNGRADE here (−5% to confidence), NOT a veto. The market is at ${(price*100).toFixed(0)}¢ — if it's already pricing bullpen risk (which efficient markets do), double-counting it means we never enter the exact EV+ spots swing mode was built for. Evaluate whether you expect a +12¢ move before the bullpen even comes in (insurance run, trailing team makes outs, closer warms looking sharp) — if yes, trade.\n`
+            : '') +
           `⚠️ If edge is 4-7 points, proceed carefully — small but real. Do NOT reject solely because the edge "feels modest." The numerical edge check is what matters, not vibes.\n\n` +
           `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs triggered) ═══\n` +
           `Start from the historical baseline. Adjust based on what you found:\n` +
