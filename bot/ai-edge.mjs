@@ -1613,6 +1613,22 @@ async function refreshPortfolio() {
             continue; // don't close yet, wait for next sync to confirm
           }
           if (Date.now() - firstMissing < 90 * 1000) continue; // wait at least 90s between strikes
+          // Re-read JSONL for this trade — executeSell may have finalized it since we loaded trades[].
+          // Without this, a successful sell that wrote status='sold-...' gets clobbered to 'closed-manual'
+          // with null P&L, ghosting the realized profit.
+          try {
+            const freshLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+            const fresh = freshLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            const freshT = fresh.find(u => u.id === t.id);
+            if (freshT && freshT.status !== 'open') {
+              console.log(`[sync] Skipping closed-manual for ${t.ticker} — JSONL already shows ${freshT.status}`);
+              missingFromKalshi.delete(t.id);
+              t.status = freshT.status;
+              t.realizedPnL = freshT.realizedPnL;
+              t.settledAt = freshT.settledAt;
+              continue;
+            }
+          } catch { /* fall through to closed-manual */ }
           t.realizedPnL = t.realizedPnL ?? null; // unknown — don't zero it out
           t.status = 'closed-manual';
           t.settledAt = new Date().toISOString();
@@ -5455,11 +5471,12 @@ async function checkPreGamePredictions() {
     const PRE_GAME_MIN_CONF = isNhlNba
       ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.70 : 0.72)
       : pgSportKey === 'mlb'
-        // MLB: raise all tiers — actual MLB win rate has been 43% at 65% confidence.
-        //   <50¢ (underdog):   63% → 65% — even low-confidence underdog entries need real conviction
-        //   50-65¢ (mid):      65% → 68% — eliminates marginal "just clears the bar" entries
-        //   >65¢ (favorite):   68% — unchanged, favorites already need conviction
-        ? (price < 0.50 ? 0.65 : price <= 0.65 ? 0.68 : 0.68)
+        // MLB: post-calibration fix (penalty now ~7pts, not 35), relax mid/underdog tiers so
+        // real edges (13-17pt) on under-50¢ underdogs don't get floored out by 1-3pts.
+        //   <50¢ (underdog):   63% — big edge zone, let value through
+        //   50-65¢ (mid):      66% — mid range
+        //   >65¢ (favorite):   68% — favorites still need conviction
+        ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.66 : 0.68)
         : isSoccer
           ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68) // Soccer: unchanged
           : 0.65; // fallback for other sports
@@ -7842,10 +7859,21 @@ async function managePositions() {
   }
 }
 
+// Per-trade mutex: prevents concurrent exit paths (pg-guard + managePositions + swing-exit)
+// from double-selling the same position. Second caller returns false silently.
+const activeSells = new Set();
+
 // Execute a sell order on Kalshi and update the trade record
 async function executeSell(trade, sellQty, currentPrice, reason) {
   const entryPrice = trade.entryPrice ?? 0;
   const priceInCents = Math.round(currentPrice * 100);
+
+  if (activeSells.has(trade.id)) {
+    console.log(`[exit] ⏸ SKIP duplicate sell on ${trade.ticker} (${reason}) — sell already in flight`);
+    return false;
+  }
+  activeSells.add(trade.id);
+  try {
 
   // POSITION GUARD: Check actual Kalshi position before selling to prevent accidental shorts.
   // If our tracked qty disagrees with Kalshi (e.g. a previous sell filled but we didn't detect it),
@@ -7961,6 +7989,16 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
         }
       } catch (e) { console.error(`[exit] Failed to persist sold status for ${trade.ticker}:`, e.message); }
     }
+    // Clear gameEntries on full exit so the scale-in gate doesn't treat this as
+    // a phantom live position blocking legitimate re-entries on the same game.
+    {
+      const lh = trade.ticker.lastIndexOf('-');
+      const gb = lh > 0 ? trade.ticker.slice(0, lh) : trade.ticker;
+      if (gameEntries.has(gb)) {
+        gameEntries.delete(gb);
+        console.log(`[exit] 🧹 Cleared gameEntries for ${gb} after full exit`);
+      }
+    }
     // After any stop-loss, lock out re-entry on this game for 30 min (BOTH sides).
     // Persisted in state.json so restarts don't clear the lock.
     if (isStopLoss) {
@@ -8031,6 +8069,9 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
 
   logScreen({ stage: 'exit', ticker: trade.ticker, reason, sellQty, totalQty, entryPrice, exitPrice: currentPrice, profit });
   return true;
+  } finally {
+    activeSells.delete(trade.id);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
