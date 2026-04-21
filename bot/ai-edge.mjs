@@ -3720,10 +3720,10 @@ async function checkLiveScoreEdges() {
 
         const livePrompt =
           (isSwingMode
-            ? `You are a professional sports bettor evaluating a SWING TRADE — NOT a hold-to-settlement bet. We buy now and sell when the price rises +12¢. We do NOT need this team to win the game, just to extend or protect their lead long enough for the price to spike.\n\n` +
-              `The DEFAULT answer is NO. Swing trades need SHORT-TERM momentum — a reason the price will rise in the next 1-2 periods. If you cannot name a concrete catalyst for a near-term price increase, say no.\n\n`
-            : `You are a professional sports bettor. Your job is NOT to predict whether the leading team wins — the WE baseline already does that. Your job is to find a SPECIFIC, VERIFIABLE reason the market has this priced wrong.\n\n` +
-              `The DEFAULT answer is NO. The market has the same live score we do, plus more. If you cannot name one concrete fact that explains why the market is underpricing this team, say no.\n\n`
+            ? `You are a professional sports bettor evaluating a SWING TRADE — we buy now and sell at +12¢, with a -10¢ stop. We do NOT need this team to win the game, just to extend or protect their lead long enough for one price tick upward.\n\n` +
+              `Our WE baseline is historically calibrated for this exact game state (sport, lead size, period). If the market deviates from WE by 8+ points, that IS the edge — treat it as real. DEFAULT: YES when |WE − price| ≥ 8pt. Reject only for specific concrete factors not already in the data above: active scoring threat in progress, confirmed injury just announced, roster change, red card, 5-on-3. "The market has more info than us" is NOT a reason — we have the same public box score plus a trained WE model. Smart bettors take the edge; market-takers stay broke.\n\n`
+            : `You are a professional sports bettor. Our WE baseline comes from historical outcomes at this exact score/period — it is the best probability estimate available, not the market's.\n\n` +
+              `If WE ≥ price + 6pt, DEFAULT: YES. The burden is on justifying a NO with a specific concrete factor not already in the data above (active threat, just-announced injury, lineup change, power play). Do NOT reject on vague "market knows something" — that reflex is how you miss every real edge. Your job is to evaluate risk factors, not defer to the market.\n\n`
           ) +
           `═══ LIVE ${league.toUpperCase()} GAME ═══\n` +
           `${away.team?.displayName} (${awayRecord}${awayRoadRec ? ', ' + awayRoadRec + ' away' : ''}) ${awayScore}\n` +
