@@ -3690,7 +3690,7 @@ async function checkLiveScoreEdges() {
               `The DEFAULT answer is NO. Swing trades need SHORT-TERM momentum — a reason the price will rise in the next 1-2 periods. If you cannot name a concrete catalyst for a near-term price increase, say no.\n\n`
             : `You are a professional sports bettor. Your job is NOT to predict whether the leading team wins — the WE baseline already does that. Your job is to find a SPECIFIC, VERIFIABLE reason the market has this priced wrong.\n\n` +
               `The DEFAULT answer is NO. The market has the same live score we do, plus more. If you cannot name one concrete fact that explains why the market is underpricing this team, say no.\n\n`
-          ) + +
+          ) +
           `═══ LIVE ${league.toUpperCase()} GAME ═══\n` +
           `${away.team?.displayName} (${awayRecord}${awayRoadRec ? ', ' + awayRoadRec + ' away' : ''}) ${awayScore}\n` +
           `  at\n` +
