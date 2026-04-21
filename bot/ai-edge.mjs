@@ -1749,12 +1749,28 @@ function tickerHasTeam(ticker, teamAbbr) {
 // Build dynamic aliases by matching Kalshi market titles against ESPN team names.
 // Called once per scan cycle after fetching Kalshi markets.
 function buildDynamicAliases(cachedPrices, espnGames) {
+  // Robust title-match helper: checks full displayName, shortDisplayName, and
+  // every word ≥3 chars from the name. Kalshi titles usually use the short
+  // city name ("Brighton") while ESPN displayName is verbose ("Brighton & Hove
+  // Albion"). Last-word fallback returned "Albion" which isn't in the title —
+  // that broke CHE@BHA learning after every restart.
+  const titleHasName = (title, displayName, shortDisplayName) => {
+    const s = (shortDisplayName ?? '').toLowerCase();
+    const n = (displayName ?? '').toLowerCase();
+    if (s && title.includes(s)) return true;
+    if (n && title.includes(n)) return true;
+    const words = n.split(/[\s&]+/).filter(w => w.length >= 3 && !['the','and','club','fc'].includes(w));
+    return words.some(w => title.includes(w));
+  };
+
   for (const game of espnGames) {
     const homeAbbr = (game.home?.team?.abbreviation ?? '').toUpperCase();
     const awayAbbr = (game.away?.team?.abbreviation ?? '').toUpperCase();
-    const homeName = (game.home?.team?.displayName ?? game.home?.team?.shortDisplayName ?? '').toLowerCase();
-    const awayName = (game.away?.team?.displayName ?? game.away?.team?.shortDisplayName ?? '').toLowerCase();
-    if (!homeAbbr || !awayAbbr || !homeName || !awayName) continue;
+    const homeName = game.home?.team?.displayName ?? '';
+    const awayName = game.away?.team?.displayName ?? '';
+    const homeShort = game.home?.team?.shortDisplayName ?? '';
+    const awayShort = game.away?.team?.shortDisplayName ?? '';
+    if (!homeAbbr || !awayAbbr || (!homeName && !homeShort) || (!awayName && !awayShort)) continue;
 
     for (const [ticker] of cachedPrices) {
       const tu = ticker.toUpperCase();
@@ -1762,9 +1778,7 @@ function buildDynamicAliases(cachedPrices, espnGames) {
       if (alreadyMatchesBoth) continue;
 
       const title = (cachedPrices.get(ticker)?.title ?? '').toLowerCase();
-      const titleHasHome = title.includes(homeName) || title.includes(homeName.split(' ').pop());
-      const titleHasAway = title.includes(awayName) || title.includes(awayName.split(' ').pop());
-      if (!titleHasHome || !titleHasAway) continue;
+      if (!titleHasName(title, homeName, homeShort) || !titleHasName(title, awayName, awayShort)) continue;
 
       // Title matches both teams but ticker abbr doesn't — extract Kalshi's abbr from ticker
       const basePart = tu.split('-').slice(0, -1).join('-');
