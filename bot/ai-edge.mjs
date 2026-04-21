@@ -7489,7 +7489,8 @@ async function managePositions() {
         if (pgHardStopReady && !mlbBlowoutLock && (entryPrice - currentPrice) >= pgHardStopCents) {
           const hardStopKey = 'hard-stop-eval:' + trade.ticker;
           const lastHardStopEval = tradeCooldowns.get(hardStopKey) ?? 0;
-          if (Date.now() - lastHardStopEval >= 5 * 60 * 1000) {
+          const _hardStopCd = pctChange < -0.30 ? 90 * 1000 : 5 * 60 * 1000;
+          if (Date.now() - lastHardStopEval >= _hardStopCd) {
             tradeCooldowns.set(hardStopKey, Date.now());
             const ticker = trade.ticker ?? '';
             const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
@@ -7538,10 +7539,11 @@ async function managePositions() {
                   `Coaching adjustments between periods, deeper rotations, and crowd energy create more comebacks. ` +
                   `HOLD unless the deficit is truly insurmountable (${sport === 'NHL' ? '3+ goals in P3' : sport === 'NBA' ? '20+ pts in Q4' : sport === 'MLB' ? '4+ runs after inning 7' : '2+ goals after 80min'}).\n\n`
                 : '') +
+              `⚠️ BLOWUP SIGNATURE: If WE has dropped 25+ points from entry AND the opponent is currently extending their lead, this is a trajectory signal — SELL even if the deficit looks 'recoverable' on paper. Momentum and trajectory matter more than the raw scoreboard here.\n\n` +
               `DECIDE based on: (1) score deficit vs ${sport}${isPlayoff ? ' PLAYOFF' : ''} comeback rates at this stage, ` +
-              `(2) time remaining, (3) is the original thesis still alive, (4) is the deficit recoverable?\n` +
-              `HOLD if comeback is plausible (WE > ${isPlayoff ? '15' : '20'}%, manageable deficit, thesis intact).\n` +
-              `SELL if game is effectively over (large deficit late, WE < ${isPlayoff ? '10' : '15'}%, or blowout with thesis dead).\n\n` +
+              `(2) time remaining, (3) is the original thesis still alive, (4) is the deficit recoverable, (5) trajectory (blowup signature above)?\n` +
+              `HOLD if comeback is plausible (WE > ${isPlayoff ? '15' : '20'}%, manageable deficit, thesis intact, trajectory stable).\n` +
+              `SELL if game is effectively over OR blowup signature present (large deficit late, WE < ${isPlayoff ? '10' : '15'}%, blowout with thesis dead, or opponent scored 2+ unanswered).\n\n` +
               `JSON: {"action":"sell"/"hold","reasoning":"1 sentence on comeback viability given score, time, and thesis status"}`;
             const evalText = await claudeScreen(hardStopPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:hard-stop' });
             if (evalText) {
@@ -7592,7 +7594,8 @@ async function managePositions() {
         if (trade.strategy === 'pre-game-prediction' && pctChange < pgNuclearFloor && pgNuclearTimeGated && !mlbBlowoutLock) {
           const nuclearKey = 'nuclear-eval:' + trade.ticker;
           const lastNuclearEval = tradeCooldowns.get(nuclearKey) ?? 0;
-          if (Date.now() - lastNuclearEval >= 5 * 60 * 1000) {
+          const _nuclearCd = pctChange < -0.30 ? 90 * 1000 : 5 * 60 * 1000;
+          if (Date.now() - lastNuclearEval >= _nuclearCd) {
             tradeCooldowns.set(nuclearKey, Date.now());
             const ticker = trade.ticker ?? '';
             const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
@@ -7621,8 +7624,9 @@ async function managePositions() {
               (ctx?.baselineWE != null ? `Win expectancy: ${(((ctx.leading === (ticker.split('-').pop() ?? '')) ? ctx.baselineWE : (1 - ctx.baselineWE))*100).toFixed(0)}%\n` : '') +
               `TIME LEFT: ${timeLeft}\n\n` +
               `COMEBACK RATES: ${comebackCtx}\n\n` +
-              `SELL only if: WE < 10%, or deficit is insurmountable for the time remaining (e.g. down 5+ runs in 8th inning, down 4 goals in soccer 80th min).\n` +
-              `HOLD if: ANY realistic comeback path exists. 1-2 run/goal deficits with time left = HOLD.\n\n` +
+              `⚠️ BLOWUP SIGNATURE: If the opponent has scored 2+ unanswered since the game started AND WE is deteriorating fast, trajectory > scoreboard — SELL even if deficit looks 'recoverable'. A pre-game pick whose thesis is visibly breaking (starter blown up, key scorer injured, opponent on 2+ unanswered run) should be sold, not held.\n\n` +
+              `SELL if: WE < 10%, deficit is insurmountable (down 5+ runs in 8th, 4 goals in 80th min), OR blowup signature present.\n` +
+              `HOLD if: ANY realistic comeback path exists AND trajectory is stable/improving. 1-2 run/goal deficits with time left AND opponent not on a run = HOLD.\n\n` +
               `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
             const evalText = await claudeScreen(nuclearPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:nuclear' });
             if (evalText) {
@@ -7647,10 +7651,13 @@ async function managePositions() {
           }
         }
 
-        // NUCLEAR STOP — absolute floor, no Claude, just get out
-        // This is deeper than the old stop-loss. Only fires on true blowouts.
-        // 70¢+ entry: -60%. 50-70¢: -75%. Under 50¢: -85%.
-        const nuclearStop = entryPrice >= 0.70 ? -0.60 : entryPrice >= 0.50 ? -0.75 : -0.85;
+        // NUCLEAR STOP — absolute floor, no Claude, just get out.
+        // PRE-GAME: -90% floor only (64% WR to settlement → EV math favors long tail; Claude gates above handle non-trivial cases).
+        // LIVE: -50/-60/-70 by entry price — no thesis backing, tighter floor saves capital on dead positions.
+        const _isPreGameNuke = trade.strategy === 'pre-game-prediction';
+        const nuclearStop = _isPreGameNuke
+          ? -0.90
+          : entryPrice >= 0.70 ? -0.50 : entryPrice >= 0.50 ? -0.60 : -0.70;
         if (pctChange < nuclearStop) {
           console.log(`[exit] 🛑 NUCLEAR STOP (${stage}, entry ${(entryPrice*100).toFixed(0)}¢): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% (floor: ${(nuclearStop*100).toFixed(0)}%)`);
           const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
@@ -7705,7 +7712,8 @@ async function managePositions() {
               // Claude evaluates WE-reversal instead of auto-selling
               const weRevKey = 'we-rev-eval:' + trade.ticker;
               const lastWeRevEval = tradeCooldowns.get(weRevKey) ?? 0;
-              if (Date.now() - lastWeRevEval >= 5 * 60 * 1000) {
+              const _weRevCd = pctChange < -0.30 ? 90 * 1000 : 5 * 60 * 1000;
+              if (Date.now() - lastWeRevEval >= _weRevCd) {
                 tradeCooldowns.set(weRevKey, Date.now());
                 const ticker = trade.ticker ?? '';
                 const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
@@ -7731,10 +7739,11 @@ async function managePositions() {
                   `Win expectancy: ${(ourWE*100).toFixed(0)}% | Score diff: ${ctx.diff}\n\n` +
                   `SPORT-SPECIFIC COMEBACK RATES:\n${playoffComebacks}\n\n` +
                   `At ${(ourWE*100).toFixed(0)}% WE, is a comeback realistic for ${sport} at this stage?\n` +
+                  `⚠️ BLOWUP SIGNATURE: If opponent has scored 2+ unanswered since entry AND WE has dropped 25+ points from entry, trajectory > scoreboard — SELL. Don't fight a visible momentum shift just because the comeback rate "looks fine" on paper.\n\n` +
                   (isPlayoffWER
-                    ? `HOLD unless WE is below 12% OR it is the final 5 minutes/period and the deficit is 3+. Playoff WE underestimates comeback potential.\n`
-                    : `HOLD if deficit is recoverable (1-goal NHL with period+ left, small MLB deficit mid-game).\n`) +
-                  `SELL if game is effectively decided (large deficit late, blowout).\n\n` +
+                    ? `HOLD unless WE < 12% OR final 5 min/period with 3+ deficit OR blowup signature present. Playoff WE underestimates comeback potential, but momentum still matters.\n`
+                    : `HOLD if deficit is recoverable AND trajectory is stable (1-goal NHL with period+ left, small MLB deficit mid-game, no 2+ unanswered).\n`) +
+                  `SELL if game is effectively decided OR blowup signature present (large deficit late, blowout, opponent on a run with WE collapsing).\n\n` +
                   `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
                 const weText = await claudeScreen(weRevPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:we-reversal' });
                 if (weText) {
@@ -7788,7 +7797,8 @@ async function managePositions() {
             // Claude evaluates the WE drop
             const weDropKey = 'we-drop-eval:' + trade.ticker;
             const lastWeDropEval = tradeCooldowns.get(weDropKey) ?? 0;
-            if (Date.now() - lastWeDropEval >= 5 * 60 * 1000) {
+            const _weDropCd = pctChange < -0.30 ? 90 * 1000 : 5 * 60 * 1000;
+            if (Date.now() - lastWeDropEval >= _weDropCd) {
               tradeCooldowns.set(weDropKey, Date.now());
               const ticker = trade.ticker ?? '';
               const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
@@ -7814,10 +7824,11 @@ async function managePositions() {
                 `Current WE: ${(ourCurrentWE*100).toFixed(0)}% | Score diff: ${ctx.diff ?? '?'}\n\n` +
                 `SPORT-SPECIFIC COMEBACK CONTEXT:\n${weDropComebacks}\n\n` +
                 `The position has deteriorated significantly. Is recovery realistic at this stage?\n` +
+                `⚠️ BLOWUP SIGNATURE: A ${(weDrop*100).toFixed(0)}pt WE drop is large. If the opponent has scored 2+ unanswered AND is currently extending the lead, this is a trajectory collapse — SELL even if the deficit "looks" recoverable on raw comeback rates. Rates assume stable game state; a team on a run is the opposite.\n\n` +
                 (isPlayoffWED
-                  ? `HOLD unless the current WE is below 15% OR it's the final period/quarter/inning and deficit is large.\n`
-                  : `HOLD if the deficit is still recoverable for ${sport} at this stage.\n`) +
-                `SELL if the WE drop reflects a real shift the team can't overcome.\n\n` +
+                  ? `HOLD unless current WE < 15% OR final period/quarter/inning with large deficit OR blowup signature present.\n`
+                  : `HOLD if deficit is still recoverable AND trajectory is stable (opponent not on a 2+ unanswered run).\n`) +
+                `SELL if the WE drop reflects a real shift the team can't overcome, OR blowup signature present.\n\n` +
                 `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
               const dropText = await claudeScreen(weDropPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:we-drop' });
               if (dropText) {
@@ -7895,7 +7906,8 @@ async function managePositions() {
                 `- If win expectancy 10-25%: consider selling if it's late in the game\n` +
                 `- If win expectancy < 10%: SELL (game is over)\n` +
                 `- Key player injury/ejection on OUR team: SELL\n`) +
-            `- Score suggests blowout but it's early: HOLD (lots of game left)\n\n` +
+            `- Score suggests blowout but it's early: HOLD (lots of game left)\n` +
+            `- ⚠️ BLOWUP SIGNATURE: opponent has scored 2+ unanswered AND is extending the lead → SELL, trajectory > scoreboard. Don't fight an active run just because comeback rates "look fine" — rates assume stable game state.\n\n` +
             `A) SELL: Lock in loss of $${Math.abs(qty * profitPerContract).toFixed(2)}. Free up $${currentPrice > 0 ? (qty * currentPrice).toFixed(2) : '0'} capital.\n` +
             `B) HOLD: If team wins → +$${(qty * (1 - entryPrice)).toFixed(2)}. If loses → -$${(qty * entryPrice).toFixed(2)}.\n\n` +
             `JSON ONLY: {"action": "sell"/"hold", "reasoning": "why"}`;
