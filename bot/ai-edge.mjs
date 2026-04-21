@@ -1722,6 +1722,15 @@ const ABBR_MAP = {
 
 // Dynamic aliases learned from Kalshi ticker ↔ ESPN name matching at runtime
 const dynamicAbbr = new Map();
+// Pre-seed La Liga mismatches where ABBR_MAP can't represent 1:many mappings.
+// ESPN "VAL" = Valencia (Kalshi VCF), but ABBR_MAP already uses VAL↔VLL for Valladolid.
+// Similarly MLL (Mallorca) → Kalshi MAL has no static entry. The alias-learner only
+// fires when ONE side of a game is unmatched; two-sided mismatches (MAL@VCF with
+// ESPN MLL@VAL) never trigger it. Pre-seed so tickerHasTeam matches either way.
+dynamicAbbr.set('VAL', new Set(['VCF', 'VLL']));
+dynamicAbbr.set('VCF', new Set(['VAL']));
+dynamicAbbr.set('MLL', new Set(['MAL']));
+dynamicAbbr.set('MAL', new Set(['MLL']));
 
 // Check if a ticker contains a team abbreviation (tries static map, then dynamic aliases)
 function tickerHasTeam(ticker, teamAbbr) {
