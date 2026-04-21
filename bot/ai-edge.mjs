@@ -5646,12 +5646,13 @@ async function checkPreGamePredictions() {
     const PRE_GAME_MIN_CONF = isNhlNba
       ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.72)
       : pgSportKey === 'mlb'
-        // MLB: post-calibration fix (penalty now ~7pts, not 35), relax mid/underdog tiers so
-        // real edges (13-17pt) on under-50¢ underdogs don't get floored out by 1-3pts.
+        // MLB tiers — aligned with NHL/NBA mid tier (65%). Prior 66% was a leftover
+        // safety buffer from a calibration bug that has since been fixed; 1pt gap was
+        // locking out legit 7-11pt edge trades where Sonnet naturally lands at 65%.
         //   <50¢ (underdog):   63% — big edge zone, let value through
-        //   50-65¢ (mid):      66% — mid range
+        //   50-65¢ (mid):      65% — aligned with NHL/NBA
         //   >65¢ (favorite):   68% — favorites still need conviction
-        ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.66 : 0.68)
+        ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68)
         : isSoccer
           ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68) // Soccer: unchanged
           : 0.65; // fallback for other sports
