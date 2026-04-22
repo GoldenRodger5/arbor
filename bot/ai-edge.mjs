@@ -3828,7 +3828,8 @@ async function checkLiveScoreEdges() {
               `✓ Confidence ≥ 68% that the price will rise 12¢+ within the next 1-2 periods\n` +
               `✓ Entry price ≤ 65¢ (we need room for the price to spike)\n` +
               `✓ You can name a specific near-term catalyst (pitcher cruising, team on a run, power play coming)\n` +
-              `✓ The lead is likely to hold or grow in the next 15-30 minutes\n`
+              `✓ The lead is likely to hold or grow in the next 15-30 minutes\n` +
+              `🎯 EDGE-FIRST HALF-SIZE EXCEPTION: If price is 50-55¢ AND your honest confidence is 63-67% AND edge (confidence − price) is ≥ 10pt, return {"trade":true} with your real confidence. The bot auto-sizes half and uses the +12¢ exit. Do NOT write "does not clear 68%" as a reason to pass — the edge-first rule IS the gate. Your reasoning gets stored for calibration; keep it consistent with your decision.\n`
             : (_weTimeAdjPct != null
               ? `⚠️ CALIBRATION CHECK: Time-adjusted WE = ${_weTimeAdjPct}% for ${targetAbbr}${_weTimeAdjPct !== _weTargetPct ? ` (period average was ${_weTargetPct}%, adjusted for ${_timeAdj.label})` : ''}. Your final confidence must be within 6 points of the TIME-ADJUSTED number — not the period average. If it's not, name the single specific confirmed fact that justifies the deviation. "They're the better team" does not count.\n\n`
               : _weTargetPct != null ? `⚠️ CALIBRATION CHECK: WE = ${_weTargetPct}% for ${targetAbbr}. Your final confidence must be within 8 points of this number.\n\n` : '') +
@@ -5285,7 +5286,8 @@ async function checkPreGamePredictions() {
         `BUY only if ALL are true:\n` +
         `✓ Confidence meets the price-tiered floor: price<50¢ → ≥63%, price 50-65¢ → ≥66%, price>65¢ → ≥68%. Do NOT return exactly 65% for a mid-price favorite — either you have genuine 66%+ conviction or it's a pass.\n` +
         `✓ Confidence beats current price by the required margin (typically 4+ points)\n` +
-        `✓ Both starters confirmed AND there's a clear pitching/matchup edge\n\n` +
+        `✓ Both starters confirmed AND there's a clear pitching/matchup edge\n` +
+        `🎯 EDGE-FIRST HALF-SIZE EXCEPTION: If the team is priced ≤ 55¢ AND your honest confidence is 58-65% AND the edge (confidence − price) is ≥ 10 points, that IS a valid trade — we take it at half size. Do NOT write "HARD PASS" or return {"trade":false} just because you didn't hit 66%. Return {"trade":true} with your real confidence (58-65%), and the bot will auto-size it at half. The reasoning you write gets stored for calibration — don't contradict yourself.\n\n` +
         (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
         `📊 CONFIDENCE CALIBRATION — MLB scale (MLB is the most random sport):\n` +
         `  0.65 = slight edge (ERA gap 2.5-3.5, lineup is solid but not dominant)\n` +
