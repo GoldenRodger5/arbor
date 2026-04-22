@@ -5729,14 +5729,20 @@ async function checkPreGamePredictions() {
     }
 
     // ── SOCCER CALIBRATION GUARD ───────────────────────────────────────────
-    // The WE tables, injury scraping, and ESPN starter gates are all tuned for
-    // MLB/NBA/NHL. On soccer we have near-zero calibration data and Claude has
-    // demonstrated real hallucination risk (e.g. ELC@ATM cited "Lookman" —
-    // Atalanta player, wrong team; contradicted its own table position).
-    // Three guards until per-league n ≥ 10 completed trades:
-    //   (1) Cap confidence at price + 8pt (block wild overconfidence)
-    //   (2) Block if reasoning cites ≥3 proper-noun player names (hallucination tell)
-    //   (3) Quarter-size (applied at sizing below)
+    // Soccer leagues aren't calibrated yet — WE tables, injury scraping, and
+    // ESPN starter gates are all MLB/NBA/NHL-tuned. Until per-league n ≥ 10
+    // completed trades, apply:
+    //   (1) Confidence cap at price + 15pt (sanity bound on runaway conviction)
+    //   (2) Quarter-size (applied at sizing below)
+    //
+    // Removed 2026-04-22: earlier 3-player hallucination block killed a live
+    // ELC@ATM thesis that played out (40¢ → 60¢). Soccer tactical analysis
+    // naturally cites 3+ players (injuries, key attackers). Guard was too crude
+    // and reactive to a single misread on my part — quarter-sizing already
+    // caps blast radius. Trust the engine; let P&L data arbitrate.
+    // Softened 2026-04-22: conf cap was price + 8pt — too tight. At a 40¢
+    // underdog that caps conf at 48%, below every floor. +15pt lets honest
+    // edge trades through while still catching 80%-vs-40¢ runaways.
     const isSoccerPg = ['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(pgSportKey);
     let soccerCalibrated = false;
     if (isSoccerPg && existsSync(TRADES_LOG)) {
@@ -5754,25 +5760,10 @@ async function checkPreGamePredictions() {
       soccerCalibrated = n >= 10;
     }
     if (isSoccerPg && !soccerCalibrated) {
-      // Cap confidence
-      const cappedConf = Math.min(confidence, price + 0.08);
+      const cappedConf = Math.min(confidence, price + 0.15);
       if (cappedConf < confidence) {
-        console.log(`[pre-game] ⚠️ SOCCER CAP: ${market.base} conf ${(confidence*100).toFixed(0)}% → ${(cappedConf*100).toFixed(0)}% (uncalibrated league, max market+8pt)`);
+        console.log(`[pre-game] ⚠️ SOCCER CAP: ${market.base} conf ${(confidence*100).toFixed(0)}% → ${(cappedConf*100).toFixed(0)}% (uncalibrated league, max market+15pt)`);
         confidence = cappedConf;
-      }
-      // Hallucination flag: count "Firstname Lastname" proper-noun pairs
-      const txt = (decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? '');
-      const nameMatches = txt.match(/\b[A-Z][a-záéíóúñ]+\s+[A-Z][a-záéíóúñ]+/g) ?? [];
-      const teamNames = [market.team1.teamName, market.team2.teamName, market.team1.team, market.team2.team]
-        .map(s => (s ?? '').toLowerCase());
-      const playerHits = nameMatches.filter(n => {
-        const low = n.toLowerCase();
-        return !teamNames.some(t => t && (low.includes(t) || t.includes(low.split(' ')[0])));
-      });
-      if (playerHits.length >= 3) {
-        console.log(`[pre-game] 🚫 SOCCER HALLUCINATION GUARD: ${market.base} cites ${playerHits.length} player names (${playerHits.slice(0,4).join(', ')}) — uncalibrated league, player-level claims unverified. Blocking.`);
-        logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'blocked-soccer-hallucination', reasoning: `cited ${playerHits.length} player names: ${playerHits.slice(0,4).join(', ')}`, claudeReasoning: (decision.reasoning ?? '').slice(0, 200) });
-        continue;
       }
     }
 
