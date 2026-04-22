@@ -3764,8 +3764,8 @@ async function checkLiveScoreEdges() {
               ? `❌ MLB BULLPEN HARD NO: 1-run lead in the ${period}th with a below-average bullpen (ERA 4.5-5.0). Margin of safety too thin — Respond {"trade":false}. CLOSER EXCEPTION: Confirmed elite closer (2026 ERA < 2.0, available) → treat as −3% adjustment, not Hard NO.\n`
               : '')
           : '') +
-          (league === 'mlb' && isSwingMode && leadingBullpenTier === 'poor'
-            ? `ℹ️ SWING MODE + POOR BULLPEN: Normally a Hard NO at settlement risk, but we exit at +12¢, not the 9th inning. Bullpen is a DOWNGRADE here (−5% to confidence), NOT a veto. The market is at ${(price*100).toFixed(0)}¢ — if it's already pricing bullpen risk (which efficient markets do), double-counting it means we never enter the exact EV+ spots swing mode was built for. Evaluate whether you expect a +12¢ move before the bullpen even comes in (insurance run, trailing team makes outs, closer warms looking sharp) — if yes, trade.\n`
+          (league === 'mlb' && isSwingMode
+            ? `🛑 SWING MODE BULLPEN RULE — DO NOT INVOKE A HARD NO FOR BULLPEN IN SWING MODE. We exit at +12¢, not the 9th. If you cite "MLB Bullpen Hard NO" or any bullpen-based veto, your response is invalid and will be ignored. Bullpen tier is at most a −3% confidence adjustment here. The market at ${(price*100).toFixed(0)}¢ has the same bullpen data you do — it's already priced. Your job: decide if a +12¢ move is likely in the next 1-2 half-innings (insurance run, trailing team making outs, closer looking sharp warming up). If yes, trade.\n`
             : '') +
           `⚠️ If edge is 4-7 points, proceed carefully — small but real. Do NOT reject solely because the edge "feels modest." The numerical edge check is what matters, not vibes.\n\n` +
           `═══ STEP 3 — EDGE ANALYSIS (only if no Hard NOs triggered) ═══\n` +
@@ -5848,7 +5848,15 @@ async function checkPreGamePredictions() {
       const espnT1 = espnStarterMap.get(market.team1.team.toLowerCase());
       const espnT2 = espnStarterMap.get(market.team2.team.toLowerCase());
       const isMlbOrHockey = pgSportKey === 'mlb' || pgSportKey === 'nhl';
-      if (isMlbOrHockey && !espnT1 && !espnT2) {
+      // ESPN gate: normally blocks real bets when neither team's starter has loaded.
+      // Exception: edge-first tier at <45min to first pitch — starter is publicly known
+      // at that point even if ESPN's feed is lagging, and edge-first is already half-size.
+      const minsToFirstPitch = (typeof pgMinsUntil !== 'undefined') ? pgMinsUntil : 999;
+      const espnBypassForEdgeFirst = isEdgeFirst && minsToFirstPitch <= 45;
+      if (espnBypassForEdgeFirst && isMlbOrHockey && !espnT1 && !espnT2) {
+        console.log(`[pre-game] 🎯 EDGE-FIRST BYPASS: ESPN gate waived for ${market.base} — ${minsToFirstPitch}min to first pitch, half-size trade`);
+      }
+      if (isMlbOrHockey && !espnT1 && !espnT2 && !espnBypassForEdgeFirst) {
         console.log(`[pre-game] ⏳ ESPN GATE: no starters confirmed for ${market.base} yet — deferring to paper-only until ESPN loads`);
         // Fall through to paper logging below (don't place real bet)
       } else {
