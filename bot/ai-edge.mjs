@@ -4050,11 +4050,20 @@ async function checkLiveScoreEdges() {
         // (e.g., ATL's 2.85 season ERA) without relaxing protection elsewhere.
         if (league === 'mlb' && diff === 1 && period >= 7) {
           const weBase = getWinExpectancy('mlb', 1, period) ?? 0.76;
-          const minEdge = (leadingBullpenTier === 'elite' || leadingBullpenTier === 'good') ? 0.10 : 0.15;
+          // Base minEdge scaled by bullpen: elite/good = 10pt, otherwise 15pt.
+          // AWAY-leader penalty: +5pt — away team leading in top of inning still
+          // faces both B8+B9 (or B9) of opponent at-bats, a structural hazard the
+          // table doesn't capture. Real loss: BAL@KC on 2026-04-21, BAL led 5-4
+          // in top 8, bot bought at 72¢ = 12pt edge vs 84% WE, passed the gate,
+          // KC tied it in bot 8 and price crashed to 42¢. Away leader WE for 1-run
+          // lead in p8 is closer to 76-78%, not 84%.
+          let minEdge = (leadingBullpenTier === 'elite' || leadingBullpenTier === 'good') ? 0.10 : 0.15;
+          const leaderIsAway = leadingAbbr !== homeAbbr;
+          if (leaderIsAway) minEdge += 0.05;
           if (price > weBase - minEdge) {
             const edgePts = (minEdge * 100).toFixed(0);
-            console.log(`[live-edge] Skipping MLB 1-run P${period}: ${leadingAbbr} @${(price*100).toFixed(0)}¢ — need ≤${((weBase-minEdge)*100).toFixed(0)}¢ (WE ${(weBase*100).toFixed(0)}% - ${edgePts}pt min edge, pen tier=${leadingBullpenTier})`);
-            logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-1run-late', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr: leadingAbbr, reasoning: `MLB 1-run P${period}: ${leadingAbbr} @${(price*100).toFixed(0)}¢ needs ≤${((weBase-minEdge)*100).toFixed(0)}¢ (WE ${(weBase*100).toFixed(0)}% minus ${edgePts}pt edge; pen tier=${leadingBullpenTier}) — 1-run late leads too volatile at thin edge` });
+            console.log(`[live-edge] Skipping MLB 1-run P${period}: ${leadingAbbr} @${(price*100).toFixed(0)}¢ — need ≤${((weBase-minEdge)*100).toFixed(0)}¢ (WE ${(weBase*100).toFixed(0)}% - ${edgePts}pt min edge, pen tier=${leadingBullpenTier}${leaderIsAway ? ', AWAY-leader penalty' : ''})`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-1run-late', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr: leadingAbbr, reasoning: `MLB 1-run P${period}: ${leadingAbbr} @${(price*100).toFixed(0)}¢ needs ≤${((weBase-minEdge)*100).toFixed(0)}¢ (WE ${(weBase*100).toFixed(0)}% minus ${edgePts}pt edge; pen tier=${leadingBullpenTier}${leaderIsAway ? '; away-leader +5pt penalty' : ''}) — 1-run late leads too volatile at thin edge` });
             continue;
           }
         }
