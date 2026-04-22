@@ -5713,6 +5713,54 @@ async function checkPreGamePredictions() {
       continue;
     }
 
+    // ── SOCCER CALIBRATION GUARD ───────────────────────────────────────────
+    // The WE tables, injury scraping, and ESPN starter gates are all tuned for
+    // MLB/NBA/NHL. On soccer we have near-zero calibration data and Claude has
+    // demonstrated real hallucination risk (e.g. ELC@ATM cited "Lookman" —
+    // Atalanta player, wrong team; contradicted its own table position).
+    // Three guards until per-league n ≥ 10 completed trades:
+    //   (1) Cap confidence at price + 8pt (block wild overconfidence)
+    //   (2) Block if reasoning cites ≥3 proper-noun player names (hallucination tell)
+    //   (3) Quarter-size (applied at sizing below)
+    const isSoccerPg = ['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(pgSportKey);
+    let soccerCalibrated = false;
+    if (isSoccerPg && existsSync(TRADES_LOG)) {
+      const soccerLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      let n = 0;
+      for (const l of soccerLines) {
+        try {
+          const tr = JSON.parse(l);
+          if (tr.league !== pgSportKey) continue;
+          if (tr.strategy !== 'pre-game-prediction' && tr.strategy !== 'pre-game-edge-first') continue;
+          if (tr.realizedPnL == null) continue;
+          n++;
+        } catch {}
+      }
+      soccerCalibrated = n >= 10;
+    }
+    if (isSoccerPg && !soccerCalibrated) {
+      // Cap confidence
+      const cappedConf = Math.min(confidence, price + 0.08);
+      if (cappedConf < confidence) {
+        console.log(`[pre-game] ⚠️ SOCCER CAP: ${market.base} conf ${(confidence*100).toFixed(0)}% → ${(cappedConf*100).toFixed(0)}% (uncalibrated league, max market+8pt)`);
+        confidence = cappedConf;
+      }
+      // Hallucination flag: count "Firstname Lastname" proper-noun pairs
+      const txt = (decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? '');
+      const nameMatches = txt.match(/\b[A-Z][a-záéíóúñ]+\s+[A-Z][a-záéíóúñ]+/g) ?? [];
+      const teamNames = [market.team1.teamName, market.team2.teamName, market.team1.team, market.team2.team]
+        .map(s => (s ?? '').toLowerCase());
+      const playerHits = nameMatches.filter(n => {
+        const low = n.toLowerCase();
+        return !teamNames.some(t => t && (low.includes(t) || t.includes(low.split(' ')[0])));
+      });
+      if (playerHits.length >= 3) {
+        console.log(`[pre-game] 🚫 SOCCER HALLUCINATION GUARD: ${market.base} cites ${playerHits.length} player names (${playerHits.slice(0,4).join(', ')}) — uncalibrated league, player-level claims unverified. Blocking.`);
+        logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'blocked-soccer-hallucination', reasoning: `cited ${playerHits.length} player names: ${playerHits.slice(0,4).join(', ')}`, claudeReasoning: (decision.reasoning ?? '').slice(0, 200) });
+        continue;
+      }
+    }
+
     const pgReqMargin = getRequiredMargin(price, { sport: pgSportKey, live: false });
     // Price-tiered minimum confidence — the required certainty scales with entry price.
     // Buying a 70¢ favorite requires high confidence (market has priced it well, little margin for error).
@@ -5820,7 +5868,9 @@ async function checkPreGamePredictions() {
     const pgAbsCap = bkr < 500 ? (isUnderdog ? 30 : 20) : bkr < 1000 ? 50 : Infinity;
     const pgMaxTrade = Math.min(bkr * pgFraction, pgAbsCap, getAvailableCash('kalshi'));
     // Edge-first tier: half-size — entry is EV+ but below standard conf floor, so size down.
-    const betAmount = Math.min(getPositionSize('kalshi', edge, 0, pgSportKey), pgMaxTrade) * (isEdgeFirst ? 0.5 : 1.0);
+    // Soccer pre-calibration: quarter-size until league has n≥10 settled pg trades.
+    const soccerSizeMult = (isSoccerPg && !soccerCalibrated) ? 0.25 : 1.0;
+    const betAmount = Math.min(getPositionSize('kalshi', edge, 0, pgSportKey), pgMaxTrade) * (isEdgeFirst ? 0.5 : 1.0) * soccerSizeMult;
     const betQty = betAmount >= 1 ? Math.max(1, Math.floor(betAmount / price)) : 0;
     if (betAmount < 1) continue;
 
