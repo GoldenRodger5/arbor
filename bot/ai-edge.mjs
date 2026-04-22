@@ -5493,13 +5493,22 @@ async function checkPreGamePredictions() {
           .filter(Boolean).map(n => (n.split(' ').slice(-1)[0] ?? '').toLowerCase()).filter(l => l.length >= 4);
 
         // Block if a starter name from a different sport appears in reasoning.
+        // Require FULL-NAME match ("First Last" as a phrase) — last-name alone
+        // produced massive false positives on common English words (e.g. "Early"
+        // in Connelly Early matched "takes early shots" in NBA reasoning).
         let crossSportHit = null;
         for (const [key, entry] of espnStarterMap.entries()) {
           if (!entry?.sport || entry.sport === expectedSport) continue;
-          const last = (entry.name?.split(' ').slice(-1)[0] ?? '').toLowerCase();
-          if (last.length < 5) continue;
+          const full = (entry.name ?? '').trim();
+          if (!full || full.split(/\s+/).length < 2) continue;
+          const parts = full.toLowerCase().split(/\s+/);
+          const last = parts[parts.length - 1];
+          if (last.length < 4) continue;
           if (validLastNames.includes(last)) continue; // real collision on purpose — skip
-          if (new RegExp(`\\b${last}\\b`, 'i').test(fullText)) {
+          // Escape regex metachars; match full name as a phrase with flexible whitespace.
+          const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const phrase = parts.map(esc).join('\\s+');
+          if (new RegExp(`\\b${phrase}\\b`, 'i').test(fullText)) {
             crossSportHit = `${entry.name} (${entry.sport}) cited in ${expectedSport} analysis`;
             break;
           }
