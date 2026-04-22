@@ -2437,6 +2437,11 @@ async function checkLiveScoreEdges() {
       const isSoccer = ['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league);
       // Skip tied games UNLESS it's soccer (draw is a valid bet)
       if (diff === 0 && !isSoccer) continue;
+      // Skip disabled-soccer leagues entirely — same rationale as pre-game: 26-28%
+      // draw rate makes winner contracts -EV, and Kalshi often doesn't list these
+      // markets live anyway (produces 30+ "No TODAY market found" skips/day on
+      // games like NAN@PSG). Cuts log noise + one wasted candidate slot per cycle.
+      if (['mls', 'seriea', 'bundesliga', 'ligue1'].includes(league)) continue;
       const leading = diff > 0 ? (homeScore > awayScore ? home : away) : home; // tied = home as placeholder
       const detail = comp.status?.type?.shortDetail ?? '';
       liveGames.push({ league, comp, ev, home, away, homeScore, awayScore, diff, period, leading, detail, isSoccer });
