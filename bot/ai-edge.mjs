@@ -2479,7 +2479,7 @@ async function checkLiveScoreEdges() {
       const preGameOpen = pgTrades.filter(t =>
         t.status === 'open' &&
         t.exchange === 'kalshi' &&
-        t.strategy === 'pre-game-prediction'
+        (t.strategy === 'pre-game-prediction' || t.strategy === 'pre-game-edge-first')
       );
 
       for (const trade of preGameOpen) {
@@ -3914,7 +3914,7 @@ async function checkLiveScoreEdges() {
                   // For pre-game positions, check how much is still open.
                   // partialTakeAt means we've already taken ≥50% profit —
                   // in that case allow a fresh same-direction live entry up to game cap.
-                  if (jt.strategy === 'pre-game-prediction' && jt.status === 'open') {
+                  if ((jt.strategy === 'pre-game-prediction' || jt.strategy === 'pre-game-edge-first') && jt.status === 'open') {
                     const tookPartial = !!(jt.partialTakeAt);
                     pgPositionFraction = tookPartial ? 0.5 : 1.0;
                     pgPositionTeam = (jt.ticker ?? '').split('-').pop()?.toUpperCase() ?? null;
@@ -4865,7 +4865,7 @@ async function checkPreGamePredictions() {
       for (const l of tradeLines) {
         try {
           const t = JSON.parse(l);
-          if (t.strategy === 'pre-game-prediction' && tsToEtDate(t.timestamp) === todayDateStr && t.ticker) {
+          if ((t.strategy === 'pre-game-prediction' || t.strategy === 'pre-game-edge-first') && tsToEtDate(t.timestamp) === todayDateStr && t.ticker) {
             const base = t.ticker.replace(/-[A-Z]+$/, '');
             if (base) preGameBetGames.add(base);
           }
@@ -7203,7 +7203,7 @@ async function managePositions() {
         // WE tables assume win-or-loss; they don't model the draw outcome. A 1-0 EPL lead at 70'
         // has ~25% draw risk — that's 25% chance of full position loss on top of normal L odds.
         // Sell everything at minute 70 regardless of P&L. If losing: stops handle it earlier anyway.
-        if (trade.strategy === 'pre-game-prediction' && ['epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league)
+        if ((trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first') && ['epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league)
             && ctx?.period != null && ctx.period >= 70) {
           const gainPct = Math.round((profitPerContract / entryPrice) * 100);
           const verb = profitPerContract >= 0 ? 'locking profit' : 'cutting loss';
@@ -7265,11 +7265,11 @@ async function managePositions() {
         const holdToSettle = profitPerContract > 0 && (
           stage !== 'late' || currentPrice < 0.90
         );
-        if (holdToSettle && trade.strategy === 'pre-game-prediction' && profitPerContract >= pgProfitTarget && !trade.pgHoldToSettlement) {
+        if (holdToSettle && (trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first') && profitPerContract >= pgProfitTarget && !trade.pgHoldToSettlement) {
           console.log(`[exit] 🧘 HOLD-TO-SETTLEMENT: ${trade.ticker} [${league.toUpperCase()}] up ${(profitPerContract*100).toFixed(0)}¢ (${(currentPrice*100).toFixed(0)}¢) — holding for settlement, team is winning`);
         }
 
-        if (trade.strategy === 'pre-game-prediction' && profitPerContract >= pgProfitTarget && !trade.partialTakeAt && !trade.pgHoldToSettlement && !holdToSettle) {
+        if ((trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first') && profitPerContract >= pgProfitTarget && !trade.partialTakeAt && !trade.pgHoldToSettlement && !holdToSettle) {
           if (qty >= 1) {
             const gainPct = Math.round((profitPerContract / entryPrice) * 100);
             const anchorNote = confGainTarget > pgStageProfitTarget
@@ -7648,7 +7648,7 @@ async function managePositions() {
         // it almost certainly means news broke: pitcher scratched, goalie pulled, injury, lineup change.
         // The market knows before we do. Don't hold into the game start with a broken thesis.
         // This fires BEFORE the game starts — during the game, the nuclear stop / WE-reversal handle it.
-        if (trade.strategy === 'pre-game-prediction' &&
+        if ((trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first') &&
             (ctx === null || ctx.stage === 'unknown') &&
             (currentPrice - entryPrice) <= -0.20) {
           const dropCents = Math.round((entryPrice - currentPrice) * 100);
@@ -7713,7 +7713,7 @@ async function managePositions() {
         const pgHardStopCents = (entryPrice < 0.50 && league === 'mlb' && stage === 'mid') ? 0.15
           : entryPrice < 0.50 ? 0.12
           : 0.10;
-        const pgHardStopReady = trade.strategy === 'pre-game-prediction' && (
+        const pgHardStopReady = (trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first') && (
           (league === 'mlb' && ctx?.period >= 5) ||
           (league === 'nba' && ctx?.period >= 3) ||
           (league === 'nhl' && ctx?.period >= 2) ||
@@ -7839,7 +7839,7 @@ async function managePositions() {
           league === 'nhl' ? (ctx.period >= 2) :
           true
         );
-        if (trade.strategy === 'pre-game-prediction' && pctChange < pgNuclearFloor && pgNuclearTimeGated && !mlbBlowoutLock) {
+        if ((trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first') && pctChange < pgNuclearFloor && pgNuclearTimeGated && !mlbBlowoutLock) {
           const nuclearKey = 'nuclear-eval:' + trade.ticker;
           const lastNuclearEval = tradeCooldowns.get(nuclearKey) ?? 0;
           const _nuclearCd = pctChange < -0.30 ? 90 * 1000 : 5 * 60 * 1000;
@@ -7902,7 +7902,7 @@ async function managePositions() {
         // NUCLEAR STOP — absolute floor, no Claude, just get out.
         // PRE-GAME: -90% floor only (64% WR to settlement → EV math favors long tail; Claude gates above handle non-trivial cases).
         // LIVE: -50/-60/-70 by entry price — no thesis backing, tighter floor saves capital on dead positions.
-        const _isPreGameNuke = trade.strategy === 'pre-game-prediction';
+        const _isPreGameNuke = (trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first');
         const nuclearStop = _isPreGameNuke
           ? -0.90
           : entryPrice >= 0.70 ? -0.50 : entryPrice >= 0.50 ? -0.60 : -0.70;
@@ -7924,7 +7924,7 @@ async function managePositions() {
         if (ctx?.diff > 0 && ctx.baselineWE != null) {
           const ourTeam = trade.ticker?.split('-').pop() ?? '';
           const ourWE = ctx.leading === ourTeam ? ctx.baselineWE : (1 - ctx.baselineWE);
-          const isPreGame = trade.strategy === 'pre-game-prediction';
+          const isPreGame = (trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first');
           const isComeback = trade.strategy === 'comeback-buy';
           const entryMs = trade.timestamp ? Date.parse(trade.timestamp) : 0;
           const minsSinceEntry = entryMs ? (Date.now() - entryMs) / 60000 : 99;
@@ -8970,7 +8970,7 @@ async function main() {
       const soccerOpen = sLines
         .map(l => { try { return JSON.parse(l); } catch { return null; } })
         .filter(t => t && t.status === 'open' && t.exchange === 'kalshi' &&
-          t.strategy === 'pre-game-prediction' &&
+          (t.strategy === 'pre-game-prediction' || t.strategy === 'pre-game-edge-first') &&
           ['mls', 'epl', 'laliga'].includes((t.sport ?? '').toLowerCase()));
 
       if (soccerOpen.length > 0) {
