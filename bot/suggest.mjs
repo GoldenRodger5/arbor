@@ -77,6 +77,7 @@ const allTrades = raw.split('\n')
 const EXIT_STATUSES = new Set([
   'sold-stop-loss', 'sold-claude-stop', 'sold-pre-game-claude-stop',
   'sold-pre-game-nuclear', 'sold-profit-take', 'sold-we-reversal', 'sold-we-drop',
+  'sold-contra-line-move',
 ]);
 const SETTLED_STATUSES = new Set(['settled']);
 const REAL_STATUSES = new Set([...EXIT_STATUSES, ...SETTLED_STATUSES]);
@@ -136,7 +137,8 @@ async function fetchKalshiBalance() {
 function isWin(t) {
   if (t.status?.startsWith('sold-stop') || t.status === 'sold-claude-stop' ||
       t.status === 'sold-pre-game-claude-stop' || t.status === 'sold-pre-game-nuclear' ||
-      t.status === 'sold-we-reversal' || t.status === 'sold-we-drop') {
+      t.status === 'sold-we-reversal' || t.status === 'sold-we-drop' ||
+      t.status === 'sold-contra-line-move') {
     return false; // exits are thesis-failure signals — always LOSS for strategy stats
   }
   if (t.status === 'sold-profit-take') return (t.realizedPnL ?? 0) > 0;

@@ -8354,12 +8354,47 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
   const actualFill = parseFloat(orderData.fill_count_fp) || orderData.quantity_filled || 0;
   if (actualFill === 0) {
     console.log(`[exit] Sell order accepted but 0 filled for ${trade.ticker} — position likely already sold`);
+    // Re-check position. If truly absent, record exit at currentPrice so PnL
+    // isn't left null — null PnL later gets overwritten to full-deployCost loss
+    // by the settlement loop, which poisons calibration with overstated losses.
+    let positionTrulyGone = false;
+    try {
+      const recheck = await kalshiGet(`/portfolio/positions?ticker=${trade.ticker}`);
+      const mktPos = (recheck.market_positions ?? []).find(p => p.ticker === trade.ticker);
+      const qtyNow = Math.max(0, parseFloat(mktPos?.position_fp ?? '0'));
+      positionTrulyGone = qtyNow === 0;
+    } catch { /* keep positionTrulyGone=false on error */ }
+
+    if (positionTrulyGone) {
+      const approxQty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / (trade.entryPrice || 1));
+      trade.status = `sold-${reason}`;
+      trade.exitPrice = currentPrice;
+      trade.realizedPnL = Math.round((currentPrice - (trade.entryPrice ?? 0)) * approxQty * 100) / 100;
+      trade.settledAt = new Date().toISOString();
+      if (existsSync(TRADES_LOG)) {
+        try {
+          const gLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+          const gTrades = gLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+          const gTrade = gTrades.find(t => t.id === trade.id);
+          if (gTrade) {
+            gTrade.status = trade.status;
+            gTrade.exitPrice = trade.exitPrice;
+            gTrade.realizedPnL = trade.realizedPnL;
+            gTrade.settledAt = trade.settledAt;
+            writeFileSync(TRADES_LOG, gTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
+          }
+        } catch (e) { console.error(`[exit] Failed to persist 0-fill close for ${trade.ticker}:`, e.message); }
+      }
+      console.log(`[exit] 0-fill reconciled: ${trade.ticker} → ${trade.status} @ ${(currentPrice*100).toFixed(0)}¢, PnL=$${trade.realizedPnL.toFixed(2)}`);
+    }
     await tg(
       `⚠️ <b>SELL ATTEMPTED — 0 FILLS</b>\n\n` +
       `${trade.title ?? trade.ticker}\n` +
       `Reason: ${reason}\n` +
       `Price: ${(currentPrice*100).toFixed(0)}¢ | Entry: ${Math.round(entryPrice*100)}¢\n\n` +
-      `Position may have already settled or been sold. Investigating.`
+      (positionTrulyGone
+        ? `Position absent on Kalshi — recorded exit @ ${(currentPrice*100).toFixed(0)}¢, PnL=$${trade.realizedPnL.toFixed(2)}`
+        : `Position may have already settled or been sold. Investigating.`)
     );
     return false;
   }
@@ -8722,6 +8757,37 @@ async function checkSettlements() {
           `Sold before settlement via partial exits\n` +
           `P&L: <b>${pnlStr}</b>`
         );
+        continue;
+      }
+
+      // GUARD: closed-manual with no partial-take data means the position was exited
+      // mid-game but we never recorded the exit price (typically 0-fill race on stop/contra).
+      // The default branch below would assume full-settlement payout and compute
+      // pnl = (qty * 0) - deployCost = full deployCost loss, which is WRONG — we
+      // recovered cash at the mid-game exit. Trust Kalshi's revenue field if present
+      // (revenue = net PnL across all fills); otherwise mark needs-reconcile and skip
+      // rather than poison calibration with an overstated loss.
+      if (trade.status === 'closed-manual' && trade.realizedPnL == null) {
+        if (typeof settlement.revenue === 'number') {
+          trade.status = 'settled';
+          trade.exitPrice = exitPrice;
+          trade.realizedPnL = Math.round(settlement.revenue * 100) / 100;
+          trade.settledAt = settlement.settled_time ?? new Date().toISOString();
+          trade.result = settlement.market_result;
+          trade.gameOutcome = won ? 'correct' : 'incorrect';
+          trade.gameResult = settlement.market_result;
+          updated = true;
+          const icon = trade.realizedPnL >= 0 ? '✅' : '❌';
+          console.log(`[pnl] SETTLED (closed-manual, revenue-based): ${trade.ticker} → ${settlement.market_result} | P&L: ${icon} $${trade.realizedPnL.toFixed(2)}`);
+        } else {
+          trade.status = 'needs-reconcile';
+          trade.settledAt = settlement.settled_time ?? new Date().toISOString();
+          trade.result = settlement.market_result;
+          trade.gameOutcome = won ? 'correct' : 'incorrect';
+          trade.gameResult = settlement.market_result;
+          updated = true;
+          console.log(`[pnl] needs-reconcile: ${trade.ticker} closed-manual with null PnL and no revenue — skipping phantom full-loss overwrite`);
+        }
         continue;
       }
 
