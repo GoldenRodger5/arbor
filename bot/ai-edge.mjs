@@ -8244,7 +8244,7 @@ async function managePositions() {
             `You manage a live ${sport}${isPlayoffT2 ? ' PLAYOFF' : ''} bet that's DOWN. Should you SELL or HOLD?\n\n` +
             `POSITION: Bought ${trade.side?.toUpperCase()} at ${(entryPrice*100).toFixed(0)}¢. Now ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}% loss, -$${Math.abs(qty * profitPerContract).toFixed(2)}).\n` +
             `Game: ${trade.title}\n` +
-            `${ctx ? `LIVE: ${ctx.detail}\nGame stage: ${stage.toUpperCase()} | Win expectancy: ${ctx.baselineWE ? (ctx.baselineWE*100).toFixed(0) + '%' : 'unknown'}` : 'No live data available'}\n\n` +
+            `${ctx ? `LIVE: ${ctx.detail}\nGame stage: ${stage.toUpperCase()} | Win expectancy: ${ctx.baselineWE != null ? (((ctx.leading === (ticker.split('-').pop() ?? '')) ? ctx.baselineWE : (1 - ctx.baselineWE))*100).toFixed(0) + '% (our side)' : 'unknown'}` : 'No live data available'}\n\n` +
             `SPORT-SPECIFIC CONTEXT:\n${comebackContext}\n\n` +
             `DECISION FRAMEWORK:\n` +
             (isPlayoffT2
