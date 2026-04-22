@@ -5143,7 +5143,17 @@ async function checkPreGamePredictions() {
     return out;
   };
 
-  const pgPrompts = pgSlice.map(market => {
+  const pgPrompts = pgSlice.filter(market => {
+    // Pre-filter: drop soccer leagues where winner bets are disabled BEFORE
+    // we burn Claude tokens on them. The downstream block at ~line 5669 was
+    // firing too late — markets were analyzed, returned malformed prose (e.g.
+    // NYRBDCU 2026-04-22), triggered no-json alerts, wasted API budget.
+    const tk = market.base ?? '';
+    if (tk.includes('MLSGAME') || tk.includes('SERIAAGAME') || tk.includes('BUNDESLIGAGAME') || tk.includes('LIGUE1GAME')) {
+      return false;
+    }
+    return true;
+  }).map(market => {
     const tk = market.base ?? '';
     const sport = tk.includes('NBA') ? 'NBA' : tk.includes('NHL') ? 'NHL' :
       tk.includes('MLB') ? 'MLB' : tk.includes('MLS') ? 'MLS' :
