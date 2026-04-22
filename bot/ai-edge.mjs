@@ -7149,7 +7149,26 @@ async function managePositions() {
         const contraMove = recentCrossContraMovers.get(trade.ticker);
         if (contraMove && tradeAgeSec >= 60 && contraMove.velocity >= 5) {
           const moveAgeSec = (Date.now() - contraMove.when) / 1000;
-          if (moveAgeSec <= 120) {
+          // GATE 1: respect recent Claude HOLD — don't override a thesis-aware hold
+          // with a pure price-velocity signal. STL@MIA was scratched at 21¢ 5 min
+          // after Claude explicitly held at WE=60%, costing us ~30% true-WE edge.
+          const claudeHoldMsCt = tradeCooldowns.get('claude-hold:' + trade.ticker) ?? 0;
+          const claudeHoldAgeSec = claudeHoldMsCt > 0 ? (Date.now() - claudeHoldMsCt) / 1000 : Infinity;
+          const claudeHoldActive = claudeHoldAgeSec <= 600;
+          // GATE 2: pre-game / edge-first in early-stage with WE still recoverable.
+          // A 2-run MLB deficit end of 2nd is still ~30% WE — price crash is market
+          // overreaction, not thesis death. Wait for WE to confirm.
+          const isPgLikeCt = trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first';
+          const ourTeamAbbrCt = (trade.ticker?.split('-').pop() ?? '').toUpperCase();
+          const ourWECt = (ctx?.baselineWE != null)
+            ? (ctx.leading === ourTeamAbbrCt ? ctx.baselineWE : (1 - ctx.baselineWE))
+            : null;
+          const pgEarlyWeOk = isPgLikeCt && stage === 'early' && ourWECt != null && ourWECt > 0.30;
+          if (moveAgeSec <= 120 && claudeHoldActive) {
+            console.log(`[exit] 🛡️ CONTRA BLOCKED on ${trade.ticker}: Claude HOLD ${Math.round(claudeHoldAgeSec)}s ago overrides price-velocity signal`);
+          } else if (moveAgeSec <= 120 && pgEarlyWeOk) {
+            console.log(`[exit] 🛡️ CONTRA BLOCKED on ${trade.ticker}: ${trade.strategy} in ${stage} stage, WE=${(ourWECt*100).toFixed(0)}% still recoverable — market overreaction, not thesis death`);
+          } else if (moveAgeSec <= 120) {
             console.log(`[exit] ⚠️ CONTRA EXIT: ${trade.ticker} — cross-confirmed ${contraMove.velocity.toFixed(1)}¢/min drop ${Math.round(moveAgeSec)}s ago, scratching full position @ ${(currentPrice*100).toFixed(0)}¢`);
             await tg(
               `⚠️ <b>CONTRA-EXIT</b>\n\n` +
