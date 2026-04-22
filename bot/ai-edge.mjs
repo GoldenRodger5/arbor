@@ -4002,6 +4002,21 @@ async function checkLiveScoreEdges() {
           }
         }
 
+        // Single-game re-entry cap — protect against cluster risk on one game.
+        // If the thesis collapses late, 5+ cascading losses can wipe a day's profit.
+        // Cap: max 4 entries per game; entries #3 and #4 are half-size.
+        const reentryCount = gameEntries.get(gameBase)?.count ?? 0;
+        let reentryHalfSize = false;
+        if (reentryCount >= 4) {
+          console.log(`[live-edge] BLOCKED ${targetAbbr}: ${reentryCount} entries already on ${homeAbbr}@${awayAbbr} — single-game cap reached (max 4)`);
+          logScreen({ stage: 'live-edge-skip', result: 'skip-reentry-cap', ticker, league, homeAbbr, awayAbbr, reasoning: `${reentryCount} entries already on this game — single-game re-entry cap reached` });
+          continue;
+        }
+        if (reentryCount >= 2) {
+          reentryHalfSize = true;
+          console.log(`[live-edge] ℹ️ Re-entry #${reentryCount + 1} on ${homeAbbr}@${awayAbbr} — half-sizing for cluster risk`);
+        }
+
         // Smart cooldown: base 5min between new entries (use gameBase as canonical key)
         const timeSinceLastTrade = Date.now() - (tradeCooldowns.get(gameBase) ?? 0);
         if (timeSinceLastTrade < COOLDOWN_MS && !hasPosition) {
@@ -4366,6 +4381,7 @@ async function checkLiveScoreEdges() {
           ? getPositionSize(best.platform, bestEdge, hcCheck.tier, league)
           : getPositionSize(best.platform, bestEdge, 0, league);
         if (isSwingMode) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for swing trades
+        if (reentryHalfSize) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for 3rd/4th entry on same game
         const claudeBet = decision.betAmount ?? 0;
         const safeBet = hcCheck.isHighConv ? maxBetLE : Math.min(claudeBet > 0 ? claudeBet : maxBetLE, maxBetLE);
         if (safeBet < 1) {
