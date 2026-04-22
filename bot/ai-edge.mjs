@@ -5266,9 +5266,11 @@ async function checkPreGamePredictions() {
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `⛔ THESE ARE ABSOLUTE. If ANY Hard NO applies, respond {"trade":false} immediately. Do NOT continue reasoning.\n` +
         `❌ Starting pitcher for the team you want to bet cannot be confirmed by ESPN OR by ≥2 independent web sources (MLB.com, Baseball-Reference, team site, ESPN article) → NO. NOTE: if ESPN is silent but 2+ web sources name the starter, that IS confirmed — proceed. Also NOTE: if this is an opener/bullpen game (both sides have no designated starter in ESPN), skip this rule and analyze at the team level.\n` +
-        `❌ Your team's starter is ERA > 5.0 AND opponent starter is ERA < 3.5 → NO. Your bad starter vs their good one = your team falls behind early, price drops, no swing-trade opportunity.\n` +
-        `❌ BOTH starters ERA 4.5–5.5 (mediocre matchup) → NO. The market prices coin-flip games correctly. Stacking adjustments on top of a mediocre matchup does NOT create edge — the market has seen all those stats too. Pass.\n` +
-        `❌ Opponent starter is ERA < 2.5 AND WHIP < 1.0 → NO (will dominate your lineup, price won't rise)\n\n` +
+        `⚠️ PITCHING MATCHUP GUIDANCE (NOT Hard NOs — these are confidence adjustments, not vetoes):\n` +
+        `  • Your starter ERA > 5.0 AND opponent starter ERA < 3.5 → apply -6-10% adjustment, but do NOT auto-veto. Even bad pitchers sometimes hang 4-5 innings and the price can still swing +12¢ if their team scores early.\n` +
+        `  • Both starters ERA 4.5-5.5 → coin-flip game. If WE-price edge is ≥ 8pt, a +12¢ swing is still reachable on early-inning luck. Don't auto-pass — assess the actual edge.\n` +
+        `  • Opponent starter ERA < 2.5 AND WHIP < 1.0 → ace pitcher, apply -8% adjustment. But remember: we exit at +12¢, not at settlement. Even against aces, prices swing on early runs, errors, and bullpen changes. Don't veto unless the WE-price edge is below 5pt.\n` +
+        `  The market has already priced pitching matchups. Your job is to find WE-vs-price gaps, not to re-litigate every pitcher duel.\n\n` +
         `═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══\n` +
         `Start from 54% win rate (home) / 46% (away). Adjust based on confirmed research:\n` +
         `+ Your ace (ERA < 3.0) vs opponent ERA > 4.5 → UP 8-12% (pitching mismatch is the biggest lever)\n` +
@@ -5849,10 +5851,11 @@ async function checkPreGamePredictions() {
       const espnT2 = espnStarterMap.get(market.team2.team.toLowerCase());
       const isMlbOrHockey = pgSportKey === 'mlb' || pgSportKey === 'nhl';
       // ESPN gate: normally blocks real bets when neither team's starter has loaded.
-      // Exception: edge-first tier at <45min to first pitch — starter is publicly known
-      // at that point even if ESPN's feed is lagging, and edge-first is already half-size.
+      // Exception: edge-first tier — starter info is publicly known pre-game even if
+      // ESPN's feed is lagging, and edge-first is already half-size with a large edge.
+      // Skipping these trades was the #1 cause of zero-bet days.
       const minsToFirstPitch = (typeof pgMinsUntil !== 'undefined') ? pgMinsUntil : 999;
-      const espnBypassForEdgeFirst = isEdgeFirst && minsToFirstPitch <= 45;
+      const espnBypassForEdgeFirst = isEdgeFirst;
       if (espnBypassForEdgeFirst && isMlbOrHockey && !espnT1 && !espnT2) {
         console.log(`[pre-game] 🎯 EDGE-FIRST BYPASS: ESPN gate waived for ${market.base} — ${minsToFirstPitch}min to first pitch, half-size trade`);
       }
