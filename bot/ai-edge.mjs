@@ -96,15 +96,17 @@ function isStrategyAutoDisabledByCAL(strategy) {
   return Array.isArray(CAL.disabledStrategies) && CAL.disabledStrategies.includes(strategy);
 }
 
-/** Tier 1: Per-sport/playoff exit thresholds from CAL. Falls back to caller defaults. */
-function getCALExitThresholds(sport, isPlayoff, defaults) {
+/** Tier 1: Per-sport/playoff exit thresholds from CAL. Strategy-specific overrides
+ *  layer on top when present (only the fields CAL actually emits — usually only
+ *  when bad-stop rate ≥30% triggered a loosening). Falls back to caller defaults. */
+function getCALExitThresholds(sport, isPlayoff, defaults, strategy) {
   const bucket = isPlayoff ? 'playoff' : 'regular';
-  const cal = CAL.exitThresholds?.[sport?.toLowerCase?.()]?.[bucket];
-  if (!cal) return defaults;
+  const sportCal = CAL.exitThresholds?.[sport?.toLowerCase?.()]?.[bucket] ?? {};
+  const stratCal = strategy ? (CAL.exitThresholds?._byStrategy?.[strategy] ?? {}) : {};
   return {
-    weFloor: cal.weFloor ?? defaults.weFloor,
-    profitTake: cal.profitTake ?? defaults.profitTake,
-    weDrop: cal.weDrop ?? defaults.weDrop,
+    weFloor: stratCal.weFloor ?? sportCal.weFloor ?? defaults.weFloor,
+    profitTake: stratCal.profitTake ?? sportCal.profitTake ?? defaults.profitTake,
+    weDrop: stratCal.weDrop ?? sportCal.weDrop ?? defaults.weDrop,
   };
 }
 
@@ -133,11 +135,13 @@ function computeCalibrationFeedback() {
   try {
     const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
     const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    // 7-day window: the bot is actively tuned (floors, prompts, gates change
-    // frequently), so trades older than a week were placed under a materially
-    // different regime and muddy the per-band WRs. 7d keeps samples
-    // regime-relevant; min-10 filter per sport drops anything too thin.
-    const cutoff = Date.now() - 7 * 864e5;
+    // Adaptive window: start at 7d (regime-relevant — bot is actively tuned);
+    // expand per-sport up to 21d if a sport has <10 samples so low-volume sports
+    // (e.g. pre-game-edge-first on playoff NHL) still get calibration signal.
+    // Window is applied later per-sport; here we grab the widest (21d) pool and
+    // each sport filters down to its own cutoff.
+    const WINDOWS = [7, 14, 21]; // days
+    const maxCutoff = Date.now() - WINDOWS[WINDOWS.length - 1] * 864e5;
     // Use PICK ACCURACY (gameOutcome) not trade P&L. Stopped-out winners (BUF/VGK)
     // should count as correct picks, since calibration is about prediction skill,
     // not stop-loss timing. Fall back to P&L only when gameOutcome is missing.
@@ -145,7 +149,7 @@ function computeCalibrationFeedback() {
       (t.status === 'settled' || t.status?.startsWith('sold-')) &&
       t.confidence != null &&
       (t.gameOutcome === 'correct' || t.gameOutcome === 'incorrect' || t.realizedPnL != null) &&
-      new Date(t.settledAt ?? t.timestamp).getTime() > cutoff
+      new Date(t.settledAt ?? t.timestamp).getTime() > maxCutoff
     );
     // GAME DEDUPE: multiple bets on the same game side are 1 correlated outcome,
     // not N independent samples. Collapse to one trade per (marketBase, side) —
@@ -161,21 +165,41 @@ function computeCalibrationFeedback() {
         gameSeen.set(gKey, t);
       }
     }
-    const settled = [...gameSeen.values()];
-    if (settled.length < 10) return '';
+    const settledAll = [...gameSeen.values()];
+    if (settledAll.length < 10) return '';
 
-    const sportData = {};
-    for (const t of settled) {
+    // Tag sport on each trade once
+    for (const t of settledAll) {
       const tk = (t.ticker ?? '').toUpperCase();
-      const sport = t.league ?? (tk.includes('NHL') ? 'nhl' : tk.includes('NBA') ? 'nba' : tk.includes('MLB') ? 'mlb' : tk.includes('MLS') ? 'mls' : tk.includes('EPL') ? 'epl' : tk.includes('LALIGA') ? 'laliga' : null);
-      if (!sport) continue;
-      if (!sportData[sport]) sportData[sport] = { wins: 0, losses: 0, confSum: 0, buckets: {} };
-      const won = t.gameOutcome ? t.gameOutcome === 'correct' : (t.realizedPnL ?? 0) > 0;
-      sportData[sport][won ? 'wins' : 'losses']++;
-      sportData[sport].confSum += t.confidence;
-      const band = t.confidence < 0.70 ? '65-69' : t.confidence < 0.75 ? '70-74' : '75+';
-      if (!sportData[sport].buckets[band]) sportData[sport].buckets[band] = { w: 0, l: 0 };
-      sportData[sport].buckets[band][won ? 'w' : 'l']++;
+      t._sport = t.league ?? (tk.includes('NHL') ? 'nhl' : tk.includes('NBA') ? 'nba' : tk.includes('MLB') ? 'mlb' : tk.includes('MLS') ? 'mls' : tk.includes('EPL') ? 'epl' : tk.includes('LALIGA') ? 'laliga' : null);
+      t._ts = new Date(t.settledAt ?? t.timestamp).getTime();
+    }
+
+    // Adaptive per-sport window: for each sport pick narrowest window with ≥10 samples
+    const sportData = {};
+    const sportWindows = {}; // sport → days used
+    const now = Date.now();
+    for (const sport of new Set(settledAll.map(t => t._sport).filter(Boolean))) {
+      let chosen = null;
+      for (const days of WINDOWS) {
+        const cutoff = now - days * 864e5;
+        const subset = settledAll.filter(t => t._sport === sport && t._ts > cutoff);
+        if (subset.length >= 10 || days === WINDOWS[WINDOWS.length - 1]) {
+          chosen = { days, subset };
+          if (subset.length >= 10) break;
+        }
+      }
+      if (!chosen) continue;
+      sportWindows[sport] = chosen.days;
+      sportData[sport] = { wins: 0, losses: 0, confSum: 0, buckets: {} };
+      for (const t of chosen.subset) {
+        const won = t.gameOutcome ? t.gameOutcome === 'correct' : (t.realizedPnL ?? 0) > 0;
+        sportData[sport][won ? 'wins' : 'losses']++;
+        sportData[sport].confSum += t.confidence;
+        const band = t.confidence < 0.70 ? '65-69' : t.confidence < 0.75 ? '70-74' : '75+';
+        if (!sportData[sport].buckets[band]) sportData[sport].buckets[band] = { w: 0, l: 0 };
+        sportData[sport].buckets[band][won ? 'w' : 'l']++;
+      }
     }
 
     // Per-bucket verdicts. Overall cal-error can mislead (a losing 75%+ bucket
@@ -212,15 +236,17 @@ function computeCalibrationFeedback() {
         bucketVerdicts.push(`${band}%: ${b.w}W/${b.l}L (${bWR}%) — ${verdict}`);
       }
 
+      const winTag = sportWindows[sport] ? ` [${sportWindows[sport]}d window]` : '';
       if (bucketVerdicts.length === 0) {
-        lines2.push(`${sport.toUpperCase()}: ${d.wins}W/${d.losses}L overall (${actualWR}%) — sample too thin per band for verdicts`);
+        lines2.push(`${sport.toUpperCase()}${winTag}: ${d.wins}W/${d.losses}L overall (${actualWR}%) — sample too thin per band for verdicts`);
       } else {
-        lines2.push(`${sport.toUpperCase()}: ${d.wins}W/${d.losses}L overall (${actualWR}%)\n  ${bucketVerdicts.join('\n  ')}`);
+        lines2.push(`${sport.toUpperCase()}${winTag}: ${d.wins}W/${d.losses}L overall (${actualWR}%)\n  ${bucketVerdicts.join('\n  ')}`);
       }
     }
 
     if (lines2.length === 0) return '';
-    return `\n📊 YOUR RECENT PICK ACCURACY (last 7 days, ${settled.length} trades; measured by game outcome, not stop-loss P&L):\n${lines2.join('\n')}\nApply these verdicts PER BAND — if your 65-69% band is winning, a 66% read stays 66%. Do NOT blanket-trim. A confident read on a clear mismatch is what the bot needs.\n`;
+    const totalSettled = Object.values(sportData).reduce((s, d) => s + d.wins + d.losses, 0);
+    return `\n📊 YOUR RECENT PICK ACCURACY (adaptive 7-21d window per sport, ${totalSettled} trades; measured by game outcome, not stop-loss P&L):\n${lines2.join('\n')}\nApply these verdicts PER BAND — if your 65-69% band is winning, a 66% read stays 66%. Do NOT blanket-trim. A confident read on a clear mismatch is what the bot needs.\n`;
   } catch { return ''; }
 }
 
@@ -8017,7 +8043,7 @@ async function managePositions() {
             const wer_tkr = (trade.ticker ?? '').toUpperCase();
             const wer_sport = wer_tkr.includes('NBA') ? 'nba' : wer_tkr.includes('MLB') ? 'mlb' : wer_tkr.includes('MLS') ? 'mls' : wer_tkr.includes('EPL') ? 'epl' : wer_tkr.includes('NHL') ? 'nhl' : null;
             const wer_defaults = { weFloor: isPlayoffWER ? 0.20 : 0.30, profitTake: 0.72, weDrop: isPlayoffWER ? 0.40 : 0.35 };
-            const wer_cal = getCALExitThresholds(wer_sport, isPlayoffWER, wer_defaults);
+            const wer_cal = getCALExitThresholds(wer_sport, isPlayoffWER, wer_defaults, trade.strategy);
             const weFloor = isPreGame && stage !== 'late'
               ? (isPlayoffWER ? 0.15 : 0.20)
               : isComeback ? 0.15
@@ -8107,7 +8133,7 @@ async function managePositions() {
           const wed_tkr = (trade.ticker ?? '').toUpperCase();
           const wed_sport = wed_tkr.includes('NBA') ? 'nba' : wed_tkr.includes('MLB') ? 'mlb' : wed_tkr.includes('MLS') ? 'mls' : wed_tkr.includes('EPL') ? 'epl' : wed_tkr.includes('NHL') ? 'nhl' : null;
           const wed_defaults = { weFloor: isPlayoffWED ? 0.20 : 0.30, profitTake: 0.72, weDrop: isPlayoffWED ? 0.40 : 0.35 };
-          const wed_cal = getCALExitThresholds(wed_sport, isPlayoffWED, wed_defaults);
+          const wed_cal = getCALExitThresholds(wed_sport, isPlayoffWED, wed_defaults, trade.strategy);
           const wedTrigger = wed_cal.weDrop;
           const wedMechanical = Math.min(0.70, wedTrigger + (isPlayoffWED ? 0.20 : 0.15));
           if (weDrop >= wedTrigger) {

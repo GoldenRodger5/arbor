@@ -338,6 +338,50 @@ function analyzeExits(trades) {
   return out;
 }
 
+// ─── TIER 1A-strategy: Per-strategy exit calibration ──────────────────────────
+// edge-first underdogs reprice slower than live-predictions — they have different
+// optimal stop/profit-take dynamics. Group by strategy (across sports) and
+// emit overrides at exitThresholds._byStrategy[strategy] = { weFloor, profitTake,
+// weDrop }. ai-edge.mjs resolves sport × playoff first, then layers strategy on
+// top when present.
+function analyzeExitsByStrategy(trades) {
+  const out = {};
+  const strategies = new Set(trades.map(t => t.strategy).filter(Boolean));
+  for (const strategy of strategies) {
+    const stratTrades = trades.filter(t => t.strategy === strategy);
+    const stopExits = stratTrades.filter(t =>
+      t.status === 'sold-stop-loss' ||
+      t.status === 'sold-claude-stop' ||
+      t.status === 'sold-pre-game-claude-stop' ||
+      t.status === 'sold-we-reversal' ||
+      t.status === 'sold-we-drop' ||
+      t.status === 'sold-contra-line-move');
+    if (stopExits.length < EXIT_MIN_SAMPLES) continue;
+    const recoveredStops = stopExits.filter(t =>
+      t.gameOutcome === 'correct' ||
+      t.result === (t.side ?? 'yes'));
+    const badStopRate = recoveredStops.length / stopExits.length;
+    out[strategy] = {
+      _samples: stopExits.length,
+      _badStopRate: parseFloat(badStopRate.toFixed(3)),
+    };
+    // Same threshold as per-sport: ≥30% bad stops → loosen. Strategy-specific
+    // defaults differ — edge-first tolerates deeper drawdown (slow repricing),
+    // live-prediction runs tighter (late-game WE moves fast).
+    const defaults = strategy === 'pre-game-edge-first'
+      ? { weFloor: 0.25, profitTake: 0.68, weDrop: 0.40 }
+      : strategy === 'live-swing'
+        ? { weFloor: 0.32, profitTake: 0.72, weDrop: 0.30 }
+        : { weFloor: 0.30, profitTake: 0.70, weDrop: 0.35 };
+    if (badStopRate >= 0.30) {
+      out[strategy].weFloor = Math.max(0.08, parseFloat((defaults.weFloor - 0.03).toFixed(2)));
+      out[strategy].profitTake = Math.max(0.55, parseFloat((defaults.profitTake - 0.02).toFixed(2)));
+      out[strategy].weDrop = Math.min(0.60, parseFloat((defaults.weDrop + 0.05).toFixed(2)));
+    }
+  }
+  return out;
+}
+
 // ─── TIER 1B: Strategy gating ────────────────────────────────────────────────
 // Disable any strategy whose Wilson-CI-lower WR is below its breakeven avg entry.
 function analyzeStrategies(trades) {
@@ -513,6 +557,10 @@ const tier2Enabled = bankroll != null && bankroll >= TIER2_BANKROLL_MIN;
 
 // ─── Run Tier 1 analyses ──────────────────────────────────────────────────────
 const exitThresholds = analyzeExits(real);
+const exitByStrategy = analyzeExitsByStrategy(real);
+if (Object.keys(exitByStrategy).length > 0) {
+  exitThresholds._byStrategy = exitByStrategy;
+}
 const strategyAnalysis = analyzeStrategies(real);
 const reasoningTagStats = analyzeReasoningTags(real);
 
