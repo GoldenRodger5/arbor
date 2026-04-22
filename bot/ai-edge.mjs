@@ -4228,6 +4228,7 @@ async function checkLiveScoreEdges() {
           leadingAbbr, gameDetail, price, ticker, gameBase, title, targetAbbr, targetTeam,
           targetIsHome: targetAbbr === homeAbbr, leading, hasPosition,
           currentScoreKey, isSwingMode, isThesisVindicated,
+          reentryHalfSize,
           _lineMove, _scoreChanged,
         });
 
@@ -4255,7 +4256,7 @@ async function checkLiveScoreEdges() {
 
       // Destructure back the context we need
       const { league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, leadingAbbr,
-              gameDetail, price, ticker, gameBase, title, targetAbbr, hasPosition, currentScoreKey, isSwingMode, isThesisVindicated } = item;
+              gameDetail, price, ticker, gameBase, title, targetAbbr, hasPosition, currentScoreKey, isSwingMode, isThesisVindicated, reentryHalfSize } = item;
 
       try {
         const jsonMatch = extractJSON(cText);
@@ -4723,7 +4724,7 @@ async function checkLiveScoreEdges() {
 
         // Size conservatively — comeback has higher variance than leading-team bets
         const cbMaxTrade = Math.min(getBankroll() * 0.08, getAvailableCash('kalshi'));
-        const cbQty = Math.max(1, Math.round(Math.min(getPositionSize('kalshi', cbEdge, 0, game?.league ?? null) * 0.60, cbMaxTrade) / trailingPrice));
+        const cbQty = Math.max(1, Math.round(Math.min(getPositionSize('kalshi', cbEdge, 0, g.league) * 0.60, cbMaxTrade) / trailingPrice));
         const cbBetAmount = cbQty * trailingPrice;
         if (cbBetAmount < 5) { console.log(`[comeback] Bet too small ($${cbBetAmount.toFixed(2)}), skipping`); continue; }
 
