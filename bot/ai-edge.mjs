@@ -4585,6 +4585,19 @@ async function checkLiveScoreEdges() {
           }
         }
 
+        // KILLER BUCKET BLOCK (live-edge mirror): 15+pt edge + <70% conf = proportionality mismatch.
+        // Data (live-prediction subset of the 24-trade killer bucket): UTA-CGY -$9, MIA-CHA -$16,
+        // POR-PHX -$14 were all in this bucket. Same "narrative stack" pattern as pre-game.
+        // Carve-out: MLB late-inning + already-leading is handled by P1.1 block; skip here.
+        {
+          const _liveEdge = (decision.confidence ?? 0) - price;
+          if (_liveEdge >= 0.15 && (decision.confidence ?? 0) < 0.70) {
+            console.log(`[live-edge] 🚫 KILLER BUCKET BLOCKED ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(_liveEdge*100).toFixed(0)}pt edge at ${((decision.confidence ?? 0)*100).toFixed(0)}% conf — proportionality mismatch (historical -$81 on 24 trades).`);
+            logScreen({ stage: 'live-edge', ticker, result: 'killer-bucket-block', reasoning: `Edge ${(_liveEdge*100).toFixed(0)}pt + conf ${((decision.confidence ?? 0)*100).toFixed(0)}% = -EV historical bucket` });
+            continue;
+          }
+        }
+
         // Confidence-based gate — sport-specific floor if calibration override exists, else global
         let confidence = decision.confidence ?? 0;
         const sportMinConf = CAL.minConfidenceLive?.[league] ?? MIN_CONFIDENCE;
@@ -6015,6 +6028,34 @@ async function checkPreGamePredictions() {
       preGameEspnMissSet.delete(market.base);
 
     let confidence = decision.confidence ?? 0;
+    const _pgPriceForGate = matchedSide.price;
+
+    // KILLER BUCKET BLOCK (2026-04-23, data-driven):
+    // 89-trade cross-tab showed the 15+pt edge × 65-69% confidence bucket is -$81 on 24 trades
+    // (58% WR). This is the "narrative stack" pattern — Claude claims a big edge without real
+    // conviction. Example losses: SD-LAA -$33, ATL-PHI -$32, SF-WSH -$24, DET-BOS -$21.
+    // Same 15+pt edge at ≥70% conf went 89% WR for +$112 — proportionality is the signal.
+    //
+    // CARVE-OUTS:
+    //   MLB: exempt if opponent starter ERA > 5.5 confirmed (legit spot-starter-disaster edge)
+    //   Otherwise: hard block until confidence ≥ 70%
+    {
+      const _claimedEdge = confidence - _pgPriceForGate;
+      if (_claimedEdge >= 0.15 && confidence < 0.70) {
+        const _fullR = ((decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? '')).toLowerCase();
+        const _isMLB = expectedSport === 'MLB';
+        // Looks for "ERA 6.xx" / "ERA 7.xx" / "ERA 8+" pattern OR explicit spot-starter language
+        const _hasSpotStarterERA = /\bera\s*[67-9]\.\d{1,2}\b/i.test(_fullR) ||
+                                   /\b(emergency|spot|debut|rookie|recalled|called up)\s*(starter|arm|pitcher)\b/i.test(_fullR);
+        if (!(_isMLB && _hasSpotStarterERA)) {
+          console.log(`[pre-game] 🚫 KILLER BUCKET BLOCKED: ${market.base} claims ${(_claimedEdge*100).toFixed(0)}pt edge at ${(confidence*100).toFixed(0)}% conf — proportionality mismatch (15+pt edges need 70%+ conf, historical WR 58% → -$81 on 24 trades).`);
+          logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'killer-bucket-block', reasoning: `Edge ${(_claimedEdge*100).toFixed(0)}pt + conf ${(confidence*100).toFixed(0)}% = -EV historical bucket`, claudeReasoning: (decision.reasoning ?? '').slice(0, 200) });
+          continue;
+        } else {
+          console.log(`[pre-game] ✅ KILLER BUCKET CARVE-OUT: ${market.base} — opponent spot-starter ERA > 6.0 detected, allowing through despite 15+pt edge + ${(confidence*100).toFixed(0)}% conf`);
+        }
+      }
+    }
 
     // CONFIDENCE OUTLIER GATE: if Claude claims >0.75, require at least 2 numeric stats
     // cited in the reasoning. High confidence on vague reasoning = overfit on narrative.
@@ -9727,6 +9768,82 @@ async function main() {
     saveState();
     setTimeout(statsLoop, 5 * 60 * 1000);
   }
+
+  // LOSING-STREAK DETECTOR: scans recent settled trades for any (sport, strategy) bucket
+  // that has gone cold — 5+ consecutive losses or <30% WR over 10+ recent trades. Alerts
+  // via Telegram so we can investigate systematic bias. Not auto-freeze — that's a
+  // separate design decision (P3.2 Wilson-CI auto-freeze).
+  // De-duplicates alerts per bucket per 6h.
+  const losingStreakAlertMemo = new Map(); // bucket key -> last alert ts
+  async function checkLosingStreak() {
+    if (!existsSync(TRADES_LOG)) return;
+    try {
+      const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      const settled = [];
+      for (const l of lines) {
+        try {
+          const t = JSON.parse(l);
+          if (t.realizedPnL == null || !t.gameOutcome) continue;
+          if (!t.strategy || !t.ticker) continue;
+          settled.push(t);
+        } catch {}
+      }
+      // Group by sport+strategy
+      const buckets = new Map();
+      for (const t of settled) {
+        const sport = (t.ticker ?? '').includes('NBA') ? 'NBA' :
+          (t.ticker ?? '').includes('MLB') ? 'MLB' :
+          (t.ticker ?? '').includes('NHL') ? 'NHL' :
+          (t.ticker ?? '').match(/MLS|EPL|LALIGA|SERIEA|BUNDESLIGA|LIGUE1/) ? 'Soccer' : 'Other';
+        const key = `${sport}:${t.strategy}`;
+        if (!buckets.has(key)) buckets.set(key, []);
+        buckets.get(key).push(t);
+      }
+      for (const [key, trades] of buckets) {
+        if (trades.length < 5) continue;
+        const recent = trades.slice(-10);
+        const wins = recent.filter(t => t.gameOutcome === 'correct').length;
+        const losses = recent.filter(t => t.gameOutcome === 'incorrect').length;
+        const wr = wins / recent.length;
+        const recentPnL = recent.reduce((s, t) => s + (t.realizedPnL ?? 0), 0);
+        // Check consecutive-loss streak at the tail
+        let streak = 0;
+        for (let i = trades.length - 1; i >= 0; i--) {
+          if (trades[i].gameOutcome === 'incorrect') streak++;
+          else break;
+        }
+        const alertKey = `streak-alert:${key}`;
+        const lastAlertMs = losingStreakAlertMemo.get(alertKey) ?? 0;
+        if (Date.now() - lastAlertMs < 6 * 3600 * 1000) continue; // 6h dedup
+        // Trigger conditions
+        const isStreakAlarm = streak >= 5;
+        const isWRAlarm = recent.length >= 10 && wr < 0.30;
+        if (isStreakAlarm || isWRAlarm) {
+          losingStreakAlertMemo.set(alertKey, Date.now());
+          const icon = isStreakAlarm ? '🧊' : '📉';
+          const headline = isStreakAlarm
+            ? `${streak} LOSSES IN A ROW`
+            : `WR ${Math.round(wr*100)}% last ${recent.length}`;
+          const lastPicks = trades.slice(-Math.min(8, trades.length)).map(t => {
+            const team = (t.ticker ?? '').split('-').pop();
+            const o = t.gameOutcome === 'correct' ? '✓' : '✗';
+            return `${team}${o}`;
+          }).join(' ');
+          console.log(`[streak] ${icon} ${key}: ${headline} | recent P&L $${recentPnL.toFixed(2)} | ${lastPicks}`);
+          await tg(
+            `${icon} <b>LOSING-STREAK ALERT</b>\n\n` +
+            `<b>${key}</b>: ${headline}\n` +
+            `Last 10 WR: ${wins}-${losses} (${Math.round(wr*100)}%)\n` +
+            `Last 10 P&L: $${recentPnL.toFixed(2)}\n` +
+            `Last picks: ${lastPicks}\n\n` +
+            `💡 Systematic bias likely — investigate prompt / freeze bucket?`
+          );
+        }
+      }
+    } catch (e) {
+      console.error('[streak] scan error:', e.message);
+    }
+  }
   setTimeout(statsLoop, 5 * 60 * 1000);
 
   // Settlement reconciliation + stop-loss review — every 5 min
@@ -9735,6 +9852,7 @@ async function main() {
     try { await checkSettlements(); } catch (e) { console.error('[settlement] error:', e.message); }
     try { await settlePaperTrades(); } catch (e) { console.error('[paper-settle] error:', e.message); }
     try { await reviewStopLossOutcomes(); } catch (e) { console.error('[stop-review] error:', e.message); }
+    try { await checkLosingStreak(); } catch (e) { console.error('[streak] error:', e.message); }
     setTimeout(settlementLoop, 5 * 60 * 1000);
   }
   setTimeout(settlementLoop, 2 * 60 * 1000); // first run after 2 min

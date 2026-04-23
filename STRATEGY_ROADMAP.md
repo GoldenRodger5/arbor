@@ -285,6 +285,22 @@ Things we need tracked but aren't yet:
 
 ---
 
+## 7a. KILLER BUCKET discovery (2026-04-23)
+
+Cross-tab analysis of 89 settled trades revealed a specific anti-edge bucket:
+
+| Edge × Conf | n | WR | P&L | Action |
+|---|---|---|---|---|
+| **15+pt edge + 65-69% conf** | 24 | 58% | **−$81** | 🚫 **BLOCK** (shipped) |
+| 15+pt edge + 70-74% conf | 9 | 89% | +$112 | ✅ Keep (jackpot) |
+| 10-14pt edge × any conf | 20 | 85% | +$93 | ✅ Keep (sweet spot) |
+| <10pt edge + 75%+ conf | 20 | 70% | +$53 | ✅ Keep (volume) |
+| <10pt edge + 65-69% conf | 5 | 20% | −$34 | 🚫 Implicitly blocked by min conf floors |
+
+**Root insight**: edge should be *proportional* to confidence. Claude's "15pt edge at 65-69% conf" trades are narrative-stacked — big gap claimed without real conviction. Block unless MLB opponent ERA > 5.5 (legit spot-starter carve-out).
+
+Also shipped: `checkLosingStreak()` in settlementLoop — alerts via Telegram on 5+ consecutive losses or <30% WR in last 10 trades per (sport, strategy) bucket. 6h dedup per bucket.
+
 ## 8. Open questions
 
 1. Is live-swing worth fixing or should it die? Data says die; need 1-2 more weeks.
