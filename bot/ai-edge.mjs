@@ -5249,6 +5249,8 @@ async function checkPreGamePredictions() {
     if (realTeams.length < 2) continue;
     const team1 = realTeams[0];
     const team2 = realTeams[1];
+    // Preserve the TIE leg for soccer — Claude needs to see market-implied draw probability.
+    const tieTicker = game.tickers.find(t => t.team.toUpperCase() === 'TIE');
 
     // Skip if both prices are outside range
     if (team1.yesAsk > MAX_PRICE && team2.yesAsk > MAX_PRICE) continue;
@@ -5258,6 +5260,7 @@ async function checkPreGamePredictions() {
       title: game.title, base, series: game.series,
       team1: { ticker: team1.ticker, team: team1.team, teamName: team1.teamName, price: team1.yesAsk },
       team2: { ticker: team2.ticker, team: team2.team, teamName: team2.teamName, price: team2.yesAsk },
+      tie: tieTicker ? { ticker: tieTicker.ticker, price: tieTicker.yesAsk } : null,
     });
   }
 
@@ -5657,7 +5660,10 @@ async function checkPreGamePredictions() {
         `⚠️ DATA RULES: You have ONE web search. Use it to check TODAY's team news, key injuries, form, and motivation context. If you cannot confirm a key injury after searching, treat the player as available but apply a 2% uncertainty buffer. Do NOT use uncertainty as a reason to pass unless it affects a Hard NO.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
-        `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
+        `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n` +
+        (market.tie ? `DRAW (tie): ${(market.tie.price*100).toFixed(0)}¢  ← market-implied draw probability\n` : '') +
+        (market.tie ? `⚠️ 3-WAY CHECK: ${(market.team1.price*100).toFixed(0)} + ${(market.team2.price*100).toFixed(0)} + ${(market.tie.price*100).toFixed(0)} = ${Math.round((market.team1.price + market.team2.price + market.tie.price) * 100)}¢. Draw takes ${Math.round(market.tie.price*100)}% probability off the top of the win market — your win confidence must beat both the price AND the draw leg.\n` : '') +
+        `\n`+
         `WIN PROBABILITY BASELINE: Soccer home teams win (regulation) ~45% of games, draw ~27%, away ~28%. Strong home sides vs. weak away teams can reach 55-60% win probability. Draw probability is NOT irrelevant — it counts against us since we need the team to WIN for the price to rise and stay elevated.\n\n` +
         `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
         `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} team news injuries form recent meetings head to head" and use results to assess:\n` +
@@ -8080,25 +8086,43 @@ async function managePositions() {
         // PRE-GAME PRICE DROP MONITOR — exit before game starts if market reprices sharply.
         // When a pre-game position's price drops 20¢+ and the game hasn't started (stage unknown),
         // it almost certainly means news broke: pitcher scratched, goalie pulled, injury, lineup change.
-        // The market knows before we do. Don't hold into the game start with a broken thesis.
-        // This fires BEFORE the game starts — during the game, the nuclear stop / WE-reversal handle it.
+        //
+        // HARDENED AFTER RVCESP BUG: ticker had no HHMM start time + no ESPN match, so ctx.stage
+        // stayed 'unknown' even after the La Liga game kicked off. When RVC dropped 34¢ live (ESP
+        // scored, price crashed), this exit fired as "pre-game news" — but it was live action.
+        // Rayo later recovered to 90¢. Two hardenings:
+        //   (1) require drop ≥45¢ for soccer (live swings routinely 20-30¢ in minutes; true news is 45¢+)
+        //   (2) suppress when any cross-confirmed line-move fired on this ticker in the last 3 min —
+        //       that velocity signature only happens during live play, not for pre-game news.
         if ((trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first') &&
             (ctx === null || ctx.stage === 'unknown') &&
             (currentPrice - entryPrice) <= -0.20) {
           const dropCents = Math.round((entryPrice - currentPrice) * 100);
-          console.log(`[exit] ⚠️ PRE-GAME PRICE DROP (pre-start): ${trade.ticker} dropped ${dropCents}¢ before game start — lineup/news change likely, exiting`);
-          await tg(
-            `⚠️ <b>PRE-GAME EXIT (pre-start)</b>\n\n` +
-            `📋 <b>POSITION</b>\n` +
-            `${trade.title}\n\n` +
-            `📊 <b>METRICS</b>\n` +
-            `Entry: ${Math.round((trade.entryPrice ?? 0)*100)}¢ → Now: ${Math.round(currentPrice*100)}¢ (−${dropCents}¢)\n\n` +
-            `💬 <b>REASON</b>\n` +
-            `Price dropped ${dropCents}¢ before game start — likely lineup change or injury news`
-          );
-          const result = await executeSell(trade, qty, currentPrice, 'pre-game-news-exit');
-          if (result) anyUpdated = true;
-          continue;
+          // Check for recent cross-confirmed line-move on this ticker = live play indicator
+          const _pgExitContra = recentCrossContraMovers.get(trade.ticker);
+          const _liveSignatureActive = _pgExitContra && (Date.now() - _pgExitContra.when) <= 3 * 60 * 1000;
+          // Soccer-specific: require much bigger drop before assuming news
+          const _pgIsSoccer = ['mls','epl','laliga','seriea','bundesliga','ligue1'].some(l => (trade.ticker ?? '').toUpperCase().includes(l.toUpperCase()));
+          const _pgMinDrop = _pgIsSoccer ? 0.45 : 0.20;
+          if ((currentPrice - entryPrice) > -_pgMinDrop) {
+            console.log(`[exit] 🛡️ PRE-GAME DROP BLOCKED (${trade.ticker}): ${dropCents}¢ drop below ${Math.round(_pgMinDrop*100)}¢ soccer threshold — holding`);
+          } else if (_liveSignatureActive) {
+            console.log(`[exit] 🛡️ PRE-GAME DROP BLOCKED (${trade.ticker}): cross-confirmed ${_pgExitContra.velocity.toFixed(1)}¢/min move ${Math.round((Date.now() - _pgExitContra.when)/1000)}s ago = game is LIVE, not pre-game news — suppressing pre-game exit`);
+          } else {
+            console.log(`[exit] ⚠️ PRE-GAME PRICE DROP (pre-start): ${trade.ticker} dropped ${dropCents}¢ before game start — lineup/news change likely, exiting`);
+            await tg(
+              `⚠️ <b>PRE-GAME EXIT (pre-start)</b>\n\n` +
+              `📋 <b>POSITION</b>\n` +
+              `${trade.title}\n\n` +
+              `📊 <b>METRICS</b>\n` +
+              `Entry: ${Math.round((trade.entryPrice ?? 0)*100)}¢ → Now: ${Math.round(currentPrice*100)}¢ (−${dropCents}¢)\n\n` +
+              `💬 <b>REASON</b>\n` +
+              `Price dropped ${dropCents}¢ before game start — likely lineup change or injury news`
+            );
+            const result = await executeSell(trade, qty, currentPrice, 'pre-game-news-exit');
+            if (result) anyUpdated = true;
+            continue;
+          }
         }
 
         // PARTIAL PROFIT-TAKE (live bets) — sell 25% when up ≥15¢, late game only.
@@ -8942,12 +8966,17 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
       const isDrawBet = trade.strategy === 'draw-bet';
       const lockKey = isDrawBet ? `${stoppedBase}-TIE` : stoppedBase;
       stoppedBets.set(stoppedBase, { team: stoppedTeam, stoppedAt: Date.now(), entryPrice });
-      const STOP_REENTRY_COOLDOWN = 30 * 60 * 1000;
+      // Soccer re-entry lock shortened to 10min: soccer swings violently on goals/disallowed goals,
+      // RVCESP-type scenarios (ESP scored, RVC crashed, 60s later ESP disallowed and RVC bounced to 90¢)
+      // deserve faster re-entry. Other sports stay at 30min — MLB/NHL/NBA reversals are rarer and
+      // 30min gives time for thesis to genuinely reset.
+      const _soccerSport = ['MLS','EPL','LALIGA','SERIEA','BUNDESLIGA','LIGUE1'].some(l => stoppedBase.toUpperCase().includes(l));
+      const STOP_REENTRY_COOLDOWN = _soccerSport ? 10 * 60 * 1000 : 30 * 60 * 1000;
       const unlockAt = Date.now() + STOP_REENTRY_COOLDOWN;
       stopLocks.set(lockKey, unlockAt);
       tradeCooldowns.set(lockKey, unlockAt - COOLDOWN_MS);
       saveState();
-      console.log(`[exit] 🔒 Re-entry locked on ${lockKey} (${stoppedTeam}) for 30 min after stop (persisted)${isDrawBet ? ' — winner contracts NOT locked' : ''}`);
+      console.log(`[exit] 🔒 Re-entry locked on ${lockKey} (${stoppedTeam}) for ${Math.round(STOP_REENTRY_COOLDOWN/60000)} min after stop (persisted)${isDrawBet ? ' — winner contracts NOT locked' : ''}`);
     }
   } else {
     // Partial exit — update quantity and cost, keep open
