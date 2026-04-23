@@ -873,6 +873,52 @@ const missingFromKalshi = new Map(); // tradeId → firstMissingMs — 2-strike 
 let massDisappearStreak = 0; // consecutive sync cycles where ALL Kalshi positions are absent
 const recentCrossContraMovers = new Map(); // ticker → { velocity, when } — cross-confirmed drops for pg-guard
 
+// Claude HOLD memo — structured record of the last HOLD decision per ticker.
+// When a sell-decision prompt fires and Claude says HOLD, we stamp the context here.
+// Subsequent sell-decision prompts within 10min skip the Claude call entirely if nothing
+// material has changed. Prevents the "5 prompts ask the same question 5 ways, one eventually
+// caves" failure mode (DAL@MIN: HOLD at hard-stop, HOLD at hard-stop, then mechanical nuclear
+// fired anyway on the same tied game).
+const claudeHoldMemos = new Map(); // ticker -> { ts, ourWE, diff, period, stage, reasoning, path }
+
+function recordClaudeHold(ticker, ctx, ourWE, path, reasoning) {
+  if (!ticker) return;
+  claudeHoldMemos.set(ticker, {
+    ts: Date.now(),
+    ourWE: (typeof ourWE === 'number' && isFinite(ourWE)) ? ourWE : null,
+    diff: ctx?.diff ?? null,
+    period: ctx?.period ?? null,
+    stage: ctx?.stage ?? null,
+    reasoning: String(reasoning ?? '').slice(0, 120),
+    path: String(path ?? ''),
+  });
+}
+
+// Returns an auto-HOLD object { ageMin, ourWE, path, reasoning } if the memo is fresh
+// and no material state change has occurred, else null (caller should proceed to Claude).
+function shouldAutoHold(ticker, ctx, ourWE) {
+  if (!ticker) return null;
+  const memo = claudeHoldMemos.get(ticker);
+  if (!memo) return null;
+  const ageMs = Date.now() - memo.ts;
+  if (ageMs > 10 * 60 * 1000) { claudeHoldMemos.delete(ticker); return null; }
+  // Our WE dropped meaningfully since the HOLD — re-ask Claude.
+  if (memo.ourWE != null && typeof ourWE === 'number' && isFinite(ourWE) && ourWE < memo.ourWE - 0.10) return null;
+  // Deficit grew against us.
+  if (memo.diff != null && ctx?.diff != null && ctx.diff < memo.diff) return null;
+  // Cross-confirmed contra-velocity AFTER the memo — market moved against us, re-ask.
+  const contra = recentCrossContraMovers.get(ticker);
+  if (contra && contra.when > memo.ts && (contra.velocity ?? 0) >= 5) return null;
+  // Stage advanced into late — new regime, re-ask.
+  if (ctx?.stage === 'late' && memo.stage && memo.stage !== 'late') return null;
+  return {
+    ageMin: Math.round(ageMs / 60000),
+    ourWE: memo.ourWE,
+    path: memo.path,
+    reasoning: memo.reasoning,
+  };
+}
+
 // Live-edge reject memo — skip Sonnet call when state hasn't changed enough to flip Claude's answer.
 // Key: gameBase. Value: { scoreKey, priceCents, ts }.
 // Invalidates when score changes, price moves ≥3¢, or age > 6min.
@@ -7867,6 +7913,17 @@ async function managePositions() {
             const swingStopKey = 'swing-stop-eval:' + trade.ticker;
             const lastSwingEval = tradeCooldowns.get(swingStopKey) ?? 0;
             if (Date.now() - lastSwingEval >= 5 * 60 * 1000) {
+              // Memo check: if Claude already said HOLD recently and nothing material shifted, skip.
+              {
+                const _swOurTeam = (trade.ticker?.split('-').pop() ?? '').toUpperCase();
+                const _swOurWE = (ctx?.baselineWE != null) ? (ctx.leading === _swOurTeam ? ctx.baselineWE : (1 - ctx.baselineWE)) : null;
+                const _ah = shouldAutoHold(trade.ticker, ctx, _swOurWE);
+                if (_ah) {
+                  console.log(`[exit] 🧠🧘 AUTO-HOLD swing-stop (memo ${_ah.ageMin}min ago from ${_ah.path}): ${trade.ticker} — skipping Claude re-eval | prev: ${_ah.reasoning}`);
+                  tradeCooldowns.set(swingStopKey, Date.now());
+                  continue;
+                }
+              }
               tradeCooldowns.set(swingStopKey, Date.now());
               const ticker = trade.ticker ?? '';
               const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
@@ -7908,6 +7965,11 @@ async function managePositions() {
                     } else {
                       console.log(`[exit] 🧠🛡️ CLAUDE HOLD swing-stop: ${trade.ticker} down ${Math.round(-swingProfit*100)}¢ — holding | ${d.reasoning?.slice(0,80)}`);
                       tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                      {
+                        const _swOurTeam2 = (trade.ticker?.split('-').pop() ?? '').toUpperCase();
+                        const _swOurWE2 = (ctx?.baselineWE != null) ? (ctx.leading === _swOurTeam2 ? ctx.baselineWE : (1 - ctx.baselineWE)) : null;
+                        recordClaudeHold(trade.ticker, { ...ctx, stage }, _swOurWE2, 'swing-stop', d.reasoning);
+                      }
                     }
                   }
                 } catch { /* skip */ }
@@ -8111,6 +8173,16 @@ async function managePositions() {
           const lastHardStopEval = tradeCooldowns.get(hardStopKey) ?? 0;
           const _hardStopCd = pctChange < -0.30 ? 90 * 1000 : 5 * 60 * 1000;
           if (Date.now() - lastHardStopEval >= _hardStopCd) {
+            {
+              const _hsTeam = (trade.ticker?.split('-').pop() ?? '').toUpperCase();
+              const _hsWE = (ctx?.baselineWE != null) ? (ctx.leading === _hsTeam ? ctx.baselineWE : (1 - ctx.baselineWE)) : null;
+              const _ah = shouldAutoHold(trade.ticker, { ...ctx, stage }, _hsWE);
+              if (_ah) {
+                console.log(`[exit] 🧠🧘 AUTO-HOLD pg-hard-stop (memo ${_ah.ageMin}min ago from ${_ah.path}): ${trade.ticker} — skipping Claude re-eval | prev: ${_ah.reasoning}`);
+                tradeCooldowns.set(hardStopKey, Date.now());
+                continue;
+              }
+            }
             tradeCooldowns.set(hardStopKey, Date.now());
             const ticker = trade.ticker ?? '';
             const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
@@ -8179,6 +8251,11 @@ async function managePositions() {
                   } else {
                     console.log(`[exit] 🧠🛡️ CLAUDE HOLD at stop (${stage}${isPlayoff ? '/playoff' : ''}): ${trade.ticker} down ${Math.round((entryPrice-currentPrice)*100)}¢ — holding | ${d.reasoning?.slice(0,80)}`);
                     tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                    {
+                      const _hsTeam2 = (trade.ticker?.split('-').pop() ?? '').toUpperCase();
+                      const _hsWE2 = (ctx?.baselineWE != null) ? (ctx.leading === _hsTeam2 ? ctx.baselineWE : (1 - ctx.baselineWE)) : null;
+                      recordClaudeHold(trade.ticker, { ...ctx, stage }, _hsWE2, 'pg-hard-stop', d.reasoning);
+                    }
                   }
                 }
               } catch { /* skip */ }
@@ -8227,6 +8304,14 @@ async function managePositions() {
           const lastNuclearEval = tradeCooldowns.get(nuclearKey) ?? 0;
           const _nuclearCd = pctChange < -0.30 ? 90 * 1000 : 5 * 60 * 1000;
           if (Date.now() - lastNuclearEval >= _nuclearCd) {
+            {
+              const _ah = shouldAutoHold(trade.ticker, { ...ctx, stage }, _ourWENuke);
+              if (_ah) {
+                console.log(`[exit] 🧠🧘 AUTO-HOLD nuclear (memo ${_ah.ageMin}min ago from ${_ah.path}): ${trade.ticker} — skipping Claude re-eval | prev: ${_ah.reasoning}`);
+                tradeCooldowns.set(nuclearKey, Date.now());
+                continue;
+              }
+            }
             tradeCooldowns.set(nuclearKey, Date.now());
             const ticker = trade.ticker ?? '';
             const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
@@ -8273,6 +8358,7 @@ async function managePositions() {
                   } else {
                     console.log(`[exit] 🧠🛡️ CLAUDE HOLD at nuclear (${stage}): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — holding | ${d.reasoning?.slice(0,80)}`);
                     tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                    recordClaudeHold(trade.ticker, { ...ctx, stage }, _ourWENuke, 'nuclear', d.reasoning);
                   }
                 }
               } catch { /* skip */ }
@@ -8375,6 +8461,14 @@ async function managePositions() {
               const lastWeRevEval = tradeCooldowns.get(weRevKey) ?? 0;
               const _weRevCd = pctChange < -0.30 ? 90 * 1000 : 5 * 60 * 1000;
               if (Date.now() - lastWeRevEval >= _weRevCd) {
+                {
+                  const _ah = shouldAutoHold(trade.ticker, { ...ctx, stage }, ourWE);
+                  if (_ah) {
+                    console.log(`[exit] 🧠🧘 AUTO-HOLD we-rev (memo ${_ah.ageMin}min ago from ${_ah.path}): ${trade.ticker} — skipping Claude re-eval | prev: ${_ah.reasoning}`);
+                    tradeCooldowns.set(weRevKey, Date.now());
+                    continue;
+                  }
+                }
                 tradeCooldowns.set(weRevKey, Date.now());
                 const ticker = trade.ticker ?? '';
                 const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
@@ -8420,6 +8514,7 @@ async function managePositions() {
                       } else {
                         console.log(`[exit] 🧠🛡️ CLAUDE HOLD at WE-reversal (${(ourWE*100).toFixed(0)}% WE): ${trade.ticker} — holding | ${d.reasoning?.slice(0,80)}`);
                         tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                        recordClaudeHold(trade.ticker, { ...ctx, stage }, ourWE, 'we-reversal', d.reasoning);
                       }
                     }
                   } catch { /* skip */ }
@@ -8460,6 +8555,14 @@ async function managePositions() {
             const lastWeDropEval = tradeCooldowns.get(weDropKey) ?? 0;
             const _weDropCd = pctChange < -0.30 ? 90 * 1000 : 5 * 60 * 1000;
             if (Date.now() - lastWeDropEval >= _weDropCd) {
+              {
+                const _ah = shouldAutoHold(trade.ticker, { ...ctx, stage }, ourCurrentWE);
+                if (_ah) {
+                  console.log(`[exit] 🧠🧘 AUTO-HOLD we-drop (memo ${_ah.ageMin}min ago from ${_ah.path}): ${trade.ticker} — skipping Claude re-eval | prev: ${_ah.reasoning}`);
+                  tradeCooldowns.set(weDropKey, Date.now());
+                  continue;
+                }
+              }
               tradeCooldowns.set(weDropKey, Date.now());
               const ticker = trade.ticker ?? '';
               const sport = ticker.includes('NBA') ? 'NBA' : ticker.includes('MLB') ? 'MLB'
@@ -8505,6 +8608,7 @@ async function managePositions() {
                     } else {
                       console.log(`[exit] 🧠🛡️ CLAUDE HOLD at WE-drop (${(weDrop*100).toFixed(0)}pt): ${trade.ticker} — holding | ${d.reasoning?.slice(0,80)}`);
                       tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                      recordClaudeHold(trade.ticker, { ...ctx, stage }, ourCurrentWE, 'we-drop', d.reasoning);
                     }
                   }
                 } catch { /* skip */ }
@@ -8526,6 +8630,16 @@ async function managePositions() {
           const isNBA = trade.ticker?.includes('NBA');
           const evalCooldownMs = isNBA ? 8 * 60 * 1000 : 12 * 60 * 1000;
           if (Date.now() - (tradeCooldowns.get(exitCooldownKey) ?? 0) < evalCooldownMs) continue;
+          {
+            const _t2Team = (trade.ticker?.split('-').pop() ?? '').toUpperCase();
+            const _t2WE = (ctx?.baselineWE != null) ? (ctx.leading === _t2Team ? ctx.baselineWE : (1 - ctx.baselineWE)) : null;
+            const _ah = shouldAutoHold(trade.ticker, { ...ctx, stage }, _t2WE);
+            if (_ah) {
+              console.log(`[exit] 🧠🧘 AUTO-HOLD tier-2 (memo ${_ah.ageMin}min ago from ${_ah.path}): ${trade.ticker} — skipping Claude re-eval | prev: ${_ah.reasoning}`);
+              tradeCooldowns.set(exitCooldownKey, Date.now());
+              continue;
+            }
+          }
           tradeCooldowns.set(exitCooldownKey, Date.now());
 
           // Detect sport for context-specific prompt
@@ -8586,6 +8700,11 @@ async function managePositions() {
                 } else {
                   console.log(`[exit] 🧠 CLAUDE HOLD (losing): ${trade.ticker} ${(pctChange*100).toFixed(0)}% (${stage}) | ${d.reasoning?.slice(0, 60)}`);
                   tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                  {
+                    const _t2Team2 = (trade.ticker?.split('-').pop() ?? '').toUpperCase();
+                    const _t2WE2 = (ctx?.baselineWE != null) ? (ctx.leading === _t2Team2 ? ctx.baselineWE : (1 - ctx.baselineWE)) : null;
+                    recordClaudeHold(trade.ticker, { ...ctx, stage }, _t2WE2, 'tier-2', d.reasoning);
+                  }
                 }
               }
             } catch { /* skip */ }
