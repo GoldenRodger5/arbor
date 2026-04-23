@@ -202,6 +202,22 @@
   - Auto-tighten if GOOD rate > 80%
   - Surfaces calibration suggestions to Telegram, not auto-applies
   
+- [ ] **P3.6 — CLV tracking for Kalshi binary markets** (DEFERRED — needs design)
+  - Proposal: track peak/trough price while position open
+  - Exit efficiency = (exitPrice - entryPrice) / (peakPrice - entryPrice); score 1.0 = sold at peak
+  - Needs cycle-by-cycle snapshot infrastructure
+  - Defer to focused session when we have bandwidth
+
+- [x] **P3.7 — Drawdown circuit breaker** ✅ 2026-04-23
+  - Shipped: if 24h realized P&L < -$30, pause new entries for 12h
+  - UI override: set `forceTradeAfterDrawdown:true` in control.json
+  - Rationale: 4/15-16 lost -$105, 4/23 lost -$46 on edge-first; a pro walks after a bad day
+
+- [x] **P3.8 — Date-bounded line-move detector** ✅ 2026-04-23
+  - Shipped: `tickerIsWithinNext24h` gates line-move detection
+  - Kills log noise and false contra-exit triggers from thin far-future markets
+  - LFC-CFC May 9 17¢/min move was the motivating case
+
 - [x] **P3.3 — Time-of-day / day-of-week logging** ✅ 2026-04-23 (data plumbing only)
   - Shipped: `etHour`, `dayPart` (morning/afternoon/evening/night), `dayOfWeek` on every trade
   - Still TODO: run WR analysis once we have 100+ new trades with these fields
@@ -263,6 +279,8 @@ Things we need tracked but aren't yet:
 | 2026-04-23 | Ship P2.3 + P3.3 | Bullpen state in late-MLB exits + time-of-day logging | TBD |
 | 2026-04-23 | Fix isSoccer ReferenceError | Crash in live-edge Sonnet batch (also caused sonnet-empty side-effect) | Fixed |
 | 2026-04-23 | Sport audit (NHL/NBA/Soccer) | NHL bleeds in stops (already fixed); NBA tightened prompt; Soccer underdog cap 35¢→40¢ | TBD |
+| 2026-04-23 | Reality check on P&L | Realized +$152 but net-of-deposits is -$440 from $550 bankroll; profit driven by TOT-BRI outlier | Flagged in ROADMAP |
+| 2026-04-23 | Future-market filter + drawdown breaker | 24h window on line-move detector; −$30/24h halts new entries for 12h | TBD |
 
 ---
 

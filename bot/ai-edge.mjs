@@ -948,6 +948,27 @@ function tomorrowTickerWithinHours(ticker, tonightStr, etNow, maxHours = 8) {
   return minsUntil <= maxHours * 60;
 }
 
+// Checks if a ticker's embedded game date is within the next 24h window.
+// Used to filter line-move detector to near-term games only — avoids log noise
+// and false contra-exit triggers from thin-liquidity far-future markets
+// (e.g. LFC-CFC May 9 EPL showing 17¢/min moves from odd-lot fills).
+function tickerIsWithinNext24h(ticker) {
+  // Format: KXSPORTGAME-YYMMMDD[HHMM]-TEAM (e.g. KXMLBGAME-26APR231510SDCOL-SD)
+  const m = ticker.match(/-(\d{2})([A-Z]{3})(\d{2})/);
+  if (!m) return true; // unparseable, let it through
+  const [_, yr, monStr, day] = m;
+  const monMap = { JAN:0, FEB:1, MAR:2, APR:3, MAY:4, JUN:5, JUL:6, AUG:7, SEP:8, OCT:9, NOV:10, DEC:11 };
+  const mon = monMap[monStr];
+  if (mon == null) return true;
+  const year = 2000 + parseInt(yr);
+  // Compare in ET
+  const now = etNow();
+  const gameDate = new Date(year, mon, parseInt(day));
+  const daysOut = (gameDate.getTime() - new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()) / (24 * 3600 * 1000);
+  // Allow today + tomorrow (some games start past ET midnight)
+  return daysOut <= 1.5 && daysOut >= -0.5;
+}
+
 // Restore gameEntries + tradeCooldowns from trades.jsonl on startup so restarts don't
 // wipe knowledge of existing positions (prevents double-buys and scale-in at worse prices)
 try {
@@ -1207,9 +1228,42 @@ function canTrade() {
     return false;
   }
 
-  // Daily loss limit DISABLED — was triggering on deployed capital (open positions)
-  // not actual realized losses. Needs to be rewritten to track realized P&L only.
-  // TODO: rebuild daily loss tracking from settled trades in JSONL, not bankroll delta
+  // DRAWDOWN CIRCUIT BREAKER (2026-04-23): if realized P&L in last 24h is worse than
+  // -$30 (adjustable), pause ALL new entries for 12h. Reads settled trades from JSONL.
+  // Rationale: on 4/15-16 we lost -$105, on 4/23 we lost -$46 on edge-first cluster.
+  // A pro bettor walks away after a bad day. The bot shouldn't press into a losing streak.
+  // UI can override by setting { paused: false, forceTradeAfterDrawdown: true } in control.json.
+  try {
+    if (existsSync(TRADES_LOG) && !ctrl.forceTradeAfterDrawdown) {
+      const cutoffMs = Date.now() - 24 * 3600 * 1000;
+      const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      let last24hPnL = 0;
+      for (const l of lines) {
+        try {
+          const t = JSON.parse(l);
+          const settledMs = t.settledAt ? Date.parse(t.settledAt) : 0;
+          if (settledMs >= cutoffMs && t.realizedPnL != null) {
+            last24hPnL += t.realizedPnL;
+          }
+        } catch {}
+      }
+      const DRAWDOWN_LIMIT = -30;
+      if (last24hPnL < DRAWDOWN_LIMIT) {
+        // Check if cooldown window (12h) has elapsed since first trigger
+        const dcbKey = 'drawdown-circuit:trigger';
+        const firstTrigger = tradeCooldowns.get(dcbKey) ?? 0;
+        const cooldownMs = 12 * 3600 * 1000;
+        if (firstTrigger === 0 || Date.now() - firstTrigger > cooldownMs) {
+          tradeCooldowns.set(dcbKey, Date.now());
+        }
+        if (Date.now() - tradeCooldowns.get(dcbKey) <= cooldownMs) {
+          const remainHrs = ((cooldownMs - (Date.now() - tradeCooldowns.get(dcbKey))) / 3600 / 1000).toFixed(1);
+          console.log(`[risk] 🛑 DRAWDOWN CIRCUIT BREAKER: 24h realized P&L = $${last24hPnL.toFixed(2)} (< $${DRAWDOWN_LIMIT}) — pausing new entries for ${remainHrs}h more. Override with forceTradeAfterDrawdown:true in control.json.`);
+          return false;
+        }
+      }
+    }
+  } catch (e) { /* circuit breaker is best-effort; don't halt trading on read failure */ }
 
   // Check max positions (dynamic) — only count positions with meaningful cost
   const maxPos = getMaxPositions();
@@ -3117,8 +3171,15 @@ async function checkLiveScoreEdges() {
   buildDynamicAliases(cachedPrices, liveGames.map(g => ({ home: g.home, away: g.away })));
 
   // === LINE MOVEMENT DETECTION — flag big price swings for priority analysis ===
+  // Date-bounded (2026-04-23): only detect on games within 24h. Thin far-future markets
+  // (e.g. LFC-CFC May 9, BRI-WOL May 9) showed 17-22¢/min spurious moves from odd-lot
+  // fills. These polluted logs and risked false contra-exit triggers on same-base tickers.
   const lineMovers = [];
   for (const [ticker, data] of cachedPrices) {
+    if (!tickerIsWithinNext24h(ticker)) {
+      lastSeenPrices.set(ticker, { price: data.yes, ts: Date.now() });
+      continue;
+    }
     const prev = lastSeenPrices.get(ticker);
     const currentPrice = data.yes;
     if (prev) {
