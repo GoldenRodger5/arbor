@@ -37,6 +37,35 @@ function etTodayStr() {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
 function etHour() { return etNow().getHours(); }
+
+// Centralized cross-sport contamination guard. Catches cases like:
+//   - MLS DAL@MIN ticker analyzed with NHL terms (Wallstedt, Hintz, "period")
+//   - NBA ticker where reasoning cites pitchers / innings
+// `expectedSport` is one of 'MLB' | 'NBA' | 'NHL' | 'SOCCER' | 'NFL'
+// Returns the offending term (string) if mismatch detected, else null.
+function detectWrongSport(expectedSport, reasoningRaw) {
+  const r = (reasoningRaw ?? '').toLowerCase();
+  if (!r) return null;
+  const has = (...terms) => terms.find(t => r.includes(t)) ?? null;
+  const sport = String(expectedSport ?? '').toUpperCase();
+  if (sport === 'MLB') {
+    return has(' nba', ' nhl', 'basketball', 'hockey', 'goalie', 'power play', 'faceoff', 'puck', 'world series winner', 'quarter', 'touchdown');
+  }
+  if (sport === 'NBA') {
+    return has(' mlb', ' nhl', 'pitcher', 'era ', 'inning', 'goalie', 'puck', 'power play', 'faceoff', 'touchdown', 'halftime match', 'stoppage time');
+  }
+  if (sport === 'NHL') {
+    return has(' nba', ' mlb', 'pitcher', 'basketball', 'inning', 'era ', 'touchdown', 'stoppage time', 'corner kick', 'yellow card', 'red card');
+  }
+  if (sport === 'SOCCER' || sport === 'MLS' || sport === 'EPL' || sport === 'LALIGA' || sport === 'SERIEA' || sport === 'BUNDESLIGA' || sport === 'LIGUE1') {
+    // Soccer matchups must NOT cite hockey/basketball/baseball terminology.
+    return has('goalie', 'power play', 'faceoff', 'puck', 'hat trick', 'period', 'pitcher', 'inning', 'era ', 'bullpen', 'quarter', 'three-pointer', 'free throw', 'rebound', 'touchdown', 'wallstedt', 'hintz', 'oettinger');
+  }
+  if (sport === 'NFL') {
+    return has(' nba', ' mlb', ' nhl', 'pitcher', 'inning', 'goalie', 'puck', 'three-pointer');
+  }
+  return null;
+}
 function etTimestamp() {
   const d = etNow();
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
@@ -4445,6 +4474,18 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
+        // Cross-sport contamination guard — same logic the pre-game path uses, now on live-edge too.
+        // Catches cases like KXMLSGAME DAL@MIN analyzed with NHL terms (Wallstedt, period, power play).
+        {
+          const _expSport = league === 'mlb' ? 'MLB' : league === 'nba' ? 'NBA' : league === 'nhl' ? 'NHL' : isSoccer ? 'SOCCER' : league.toUpperCase();
+          const _wrong = detectWrongSport(_expSport, (decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? ''));
+          if (_wrong) {
+            console.log(`[live-edge] BLOCKED ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): Claude confused sport — reasoning mentions "${_wrong}"`);
+            logScreen({ stage: 'live-edge', ticker, result: 'blocked-wrong-sport', reasoning: `Expected ${_expSport}, reasoning mentions ${_wrong}`, claudeReasoning: (decision.reasoning ?? '').slice(0, 200) });
+            continue;
+          }
+        }
+
         // Confidence-based gate — sport-specific floor if calibration override exists, else global
         let confidence = decision.confidence ?? 0;
         const sportMinConf = CAL.minConfidenceLive?.[league] ?? MIN_CONFIDENCE;
@@ -5721,12 +5762,9 @@ async function checkPreGamePredictions() {
       const price = matchedSide.price;
       const bettingOnTeam = matchedSide.teamName;
       const expectedSport = batchItems[i].sport;
-      const wrongSport =
-        (expectedSport === 'MLB' && (reasoning.includes('nba') || reasoning.includes('nhl') || reasoning.includes('basketball') || reasoning.includes('hockey') || reasoning.includes('goalie') || reasoning.includes('power play') || reasoning.includes('world series winner'))) ||
-        (expectedSport === 'NBA' && (reasoning.includes('mlb') || reasoning.includes('nhl') || reasoning.includes('pitcher') || reasoning.includes('era ') || reasoning.includes('inning') || reasoning.includes('goalie'))) ||
-        (expectedSport === 'NHL' && (reasoning.includes('nba') || reasoning.includes('mlb') || reasoning.includes('pitcher') || reasoning.includes('basketball') || reasoning.includes('inning')));
+      const wrongSport = detectWrongSport(expectedSport, reasoning);
       if (wrongSport) {
-        console.log(`[pre-game] BLOCKED: Claude confused sport for ${market.base}. Expected ${expectedSport}, reasoning mentions wrong sport.`);
+        console.log(`[pre-game] BLOCKED: Claude confused sport for ${market.base}. Expected ${expectedSport}, reasoning mentions ${wrongSport}.`);
         continue;
       }
 
@@ -8173,7 +8211,18 @@ async function managePositions() {
           league === 'nhl' ? (ctx.period >= 2) :
           true
         );
-        if ((trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first') && pctChange < pgNuclearFloor && pgNuclearTimeGated && !mlbBlowoutLock) {
+        // Extended: also run Claude-gated nuclear for LIVE trades when team is still viable.
+        // Why: DAL@MIN NHL Game 3 — Claude HELD twice at -27%, then mechanical nuclear fired at -60%
+        // on a tie game. Dallas won. Missed ~$38. Live-prediction/swing had no Claude-gated path;
+        // they went straight to mechanical.
+        const _isPGLikeNuke = (trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first');
+        const _isLiveNuke = (trade.strategy === 'live-prediction' || trade.strategy === 'live-swing' || trade.strategy === 'live-edge' || trade.strategy === 'comeback-buy' || trade.strategy === 'draw-bet');
+        const _ourTeamAbbrNuke = (trade.ticker?.split('-').pop() ?? '').toUpperCase();
+        const _ourWENuke = (ctx?.baselineWE != null)
+          ? (ctx.leading === _ourTeamAbbrNuke ? ctx.baselineWE : (1 - ctx.baselineWE))
+          : null;
+        const _liveNukeViable = _isLiveNuke && (_ourWENuke == null || _ourWENuke >= 0.15 || ctx?.diff === 0 || ctx?.leading === _ourTeamAbbrNuke);
+        if ((_isPGLikeNuke || _liveNukeViable) && pctChange < pgNuclearFloor && pgNuclearTimeGated && !mlbBlowoutLock) {
           const nuclearKey = 'nuclear-eval:' + trade.ticker;
           const lastNuclearEval = tradeCooldowns.get(nuclearKey) ?? 0;
           const _nuclearCd = pctChange < -0.30 ? 90 * 1000 : 5 * 60 * 1000;
@@ -8237,9 +8286,21 @@ async function managePositions() {
         // PRE-GAME: -90% floor only (64% WR to settlement → EV math favors long tail; Claude gates above handle non-trivial cases).
         // LIVE: -50/-60/-70 by entry price — no thesis backing, tighter floor saves capital on dead positions.
         const _isPreGameNuke = (trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first');
+        // Claude-HOLD respect: if Claude explicitly held within last 15min AND team is still viable
+        // (leading, tied, or WE ≥20%), widen the mechanical floor by 15pt. Prevents overriding a
+        // thesis-aware HOLD with a price-only panic sell on a recoverable game.
+        const _claudeHoldTs = tradeCooldowns.get('claude-hold:' + trade.ticker) ?? 0;
+        const _claudeHoldRecent = _claudeHoldTs > 0 && (Date.now() - _claudeHoldTs) <= 15 * 60 * 1000;
+        const _teamStillViable = _claudeHoldRecent && (
+          _ourWENuke == null || _ourWENuke >= 0.20 || ctx?.diff === 0 || ctx?.leading === _ourTeamAbbrNuke
+        );
+        const _floorWiden = _teamStillViable ? -0.15 : 0;
         const nuclearStop = _isPreGameNuke
           ? -0.90
-          : entryPrice >= 0.70 ? -0.50 : entryPrice >= 0.50 ? -0.60 : -0.70;
+          : (entryPrice >= 0.70 ? -0.50 : entryPrice >= 0.50 ? -0.60 : -0.70) + _floorWiden;
+        if (_teamStillViable && pctChange < (entryPrice >= 0.70 ? -0.50 : entryPrice >= 0.50 ? -0.60 : -0.70) && pctChange >= nuclearStop) {
+          console.log(`[exit] 🛡️ NUCLEAR WIDENED on ${trade.ticker}: Claude HOLD ${Math.round((Date.now() - _claudeHoldTs)/60000)}min ago + team viable (WE=${_ourWENuke != null ? (_ourWENuke*100).toFixed(0)+'%' : 'n/a'}, diff=${ctx?.diff ?? '?'}) → floor ${(nuclearStop*100).toFixed(0)}% vs normal ${((nuclearStop - _floorWiden)*100).toFixed(0)}%`);
+        }
         if (pctChange < nuclearStop) {
           console.log(`[exit] 🛑 NUCLEAR STOP (${stage}, entry ${(entryPrice*100).toFixed(0)}¢): ${trade.ticker} down ${(pctChange*100).toFixed(0)}% (floor: ${(nuclearStop*100).toFixed(0)}%)`);
           const result = await executeSell(trade, qty, currentPrice, 'stop-loss');
