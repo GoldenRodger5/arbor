@@ -4005,6 +4005,9 @@ async function checkLiveScoreEdges() {
                 const jtMs = jt.timestamp ? Date.parse(jt.timestamp) : 0;
                 if (jtMs < dupStartMs || jtMs >= dupEndMs) continue;
                 const jticker = (jt.ticker ?? '').toLowerCase();
+                // Sport-prefix guard: same-day MLS DAL vs NHL DAL are different games — don't
+                // let an MLS stop-loss journal entry mark the NHL version as "exited/clear".
+                if (!jticker.toUpperCase().startsWith(series)) continue;
                 if (tickerHasTeam(jticker, homeAbbr) && tickerHasTeam(jticker, awayAbbr)) {
                   // Fully exited positions (sold/stopped) are off the exchange — don't block new entries.
                   // Only open and closed-manual (may still be physically on exchange) should block.
@@ -4104,17 +4107,18 @@ async function checkLiveScoreEdges() {
           }
         }
 
-        // Single-game re-entry cap — protect against cluster risk on one game.
-        // If the thesis collapses late, 5+ cascading losses can wipe a day's profit.
-        // Cap: max 4 entries per game; entries #3 and #4 are half-size.
+        // Single-game re-entry cap — protect against falling-knife cluster losses.
+        // Real case 2026-04-22 NHL DAL@MIN: 3 stacked entries (67¢, 65¢, 64¢) all stopped
+        // simultaneously at 24¢ for −$20.72 total. Each entry passed "more edge!" logic
+        // while the actual thesis was dying. Cap at 2 per game. Entry #2 half-size.
         const reentryCount = gameEntries.get(gameBase)?.count ?? 0;
         let reentryHalfSize = false;
-        if (reentryCount >= 4) {
-          console.log(`[live-edge] BLOCKED ${targetAbbr}: ${reentryCount} entries already on ${homeAbbr}@${awayAbbr} — single-game cap reached (max 4)`);
-          logScreen({ stage: 'live-edge-skip', result: 'skip-reentry-cap', ticker, league, homeAbbr, awayAbbr, reasoning: `${reentryCount} entries already on this game — single-game re-entry cap reached` });
+        if (reentryCount >= 2) {
+          console.log(`[live-edge] BLOCKED ${targetAbbr}: ${reentryCount} entries already on ${homeAbbr}@${awayAbbr} — single-game cap reached (max 2)`);
+          logScreen({ stage: 'live-edge-skip', result: 'skip-reentry-cap', ticker, league, homeAbbr, awayAbbr, reasoning: `${reentryCount} entries already on this game — single-game re-entry cap reached (max 2)` });
           continue;
         }
-        if (reentryCount >= 2) {
+        if (reentryCount >= 1) {
           reentryHalfSize = true;
           console.log(`[live-edge] ℹ️ Re-entry #${reentryCount + 1} on ${homeAbbr}@${awayAbbr} — half-sizing for cluster risk`);
         }
