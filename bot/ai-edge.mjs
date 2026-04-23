@@ -1471,9 +1471,17 @@ function getActualFill(result, requestedQty) {
 }
 
 function logTrade(entry) {
+  // P3.3 — capture ET time-of-day + day-of-week for future pattern analysis.
+  // Enables weekend vs weekday WR splits, day-game vs night-game splits, etc.
+  const etHourNow = etHour();
+  const dayPart = etHourNow < 12 ? 'morning' : etHourNow < 17 ? 'afternoon' : etHourNow < 22 ? 'evening' : 'night';
+  const dayOfWeek = ['sun','mon','tue','wed','thu','fri','sat'][etNow().getDay()];
   const record = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     timestamp: new Date().toISOString(),
+    etHour: etHourNow,
+    dayPart,
+    dayOfWeek,
     ...entry,
     status: 'open',           // open → settled (updated by checkSettlements)
     exitPrice: null,
@@ -8269,6 +8277,35 @@ async function managePositions() {
             // selling when the original edge factors (goalie matchup, pitching mismatch, etc.) are still intact.
             const entryReasoning = trade.reasoning ? trade.reasoning.slice(0, 300) : '';
 
+            // P2.3 — Late-game MLB: pull bullpen stats for both teams so Claude can reason about
+            // lead-protection viability. Our biggest live-prediction losers were late-inning 1-2-run
+            // leads (inn 7-9) where the bullpen blew up. The market priced bullpen risk; our WE table
+            // didn't. Now the exit eval will see both bullpens' tier + ERA.
+            let bullpenLine = '';
+            if (sport === 'MLB' && (ctx?.period ?? 0) >= 6) {
+              try {
+                const _hsOurTeam = (trade.ticker?.split('-').pop() ?? '').toUpperCase();
+                const _hsOurLeading = ctx?.leading === _hsOurTeam;
+                const _hsOpp = _hsOurTeam === (ctx?.homeAbbr ?? '') ? (ctx?.awayAbbr ?? '') : (ctx?.homeAbbr ?? '');
+                const [_ourBull, _oppBull] = await Promise.all([
+                  getBullpenStats(_hsOurTeam).catch(() => null),
+                  getBullpenStats(_hsOpp).catch(() => null),
+                ]);
+                const _ourLine = formatBullpenLine(_hsOurTeam, _ourBull);
+                const _oppLine = formatBullpenLine(_hsOpp, _oppBull);
+                const _ourTier = _ourBull ? bullpenTier(_ourBull) : 'unknown';
+                if (_ourLine || _oppLine) {
+                  bullpenLine =
+                    `\n🔥 BULLPEN STATE (MLB Stats API — late-inning critical):\n` +
+                    (_ourLine ? `  OUR team: ${_ourLine} — tier ${_ourTier}\n` : '') +
+                    (_oppLine ? `  OPP team: ${_oppLine}\n` : '') +
+                    (_hsOurLeading
+                      ? `  ↑ We are LEADING. A POOR bullpen (5+ ERA) means the market correctly discounts our ${(currentPrice*100).toFixed(0)}¢ price — the 1-run lead is NOT safe. A GOOD bullpen (<3.5 ERA) means the lead should hold; price drop is noise.\n`
+                      : `  ↑ We are TRAILING. Our own bullpen matters less; opponent's bullpen tier determines whether we can break through in the 8th-9th.\n`);
+                }
+              } catch (e) { /* bullpen optional, skip on failure */ }
+            }
+
             const hardStopPrompt =
               `Live ${sport}${isPlayoff ? ' PLAYOFF' : ''} bet hit stop-loss threshold. Should we SELL or HOLD?\n\n` +
               `POSITION: Bought at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢ (down ${Math.round((entryPrice-currentPrice)*100)}¢, ${(pctChange*100).toFixed(0)}%).\n` +
@@ -8278,6 +8315,7 @@ async function managePositions() {
               `TIME LEFT: ${timeLeft}\n\n` +
               (entryReasoning ? `ORIGINAL THESIS (why we bet): ${entryReasoning}\n` +
                 `↑ Consider: is this thesis still intact? Key player still playing? Matchup edge still real?\n\n` : '') +
+              bullpenLine +
               `COMEBACK RATES${isPlayoff ? ' (PLAYOFF — higher than regular season)' : ''}: ${comebackCtx}\n\n` +
               (isPlayoff
                 ? `⚠️ PLAYOFF HOLD BIAS: This is a playoff game. Playoff teams are elite — they don't fold like regular-season teams. ` +

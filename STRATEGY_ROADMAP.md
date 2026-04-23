@@ -178,9 +178,10 @@
   - Add explicit "the market has priced it unless you have a testable mispricing reason"
   - New section: "before you pick, list ONE specific reason the market has mispriced THIS game"
   
-- [ ] **P2.3 — Bullpen state surfaced in late-game exit prompts**
-  - Pull ESPN bullpen usage data (closer availability, last appearance)
-  - Include in live-prediction exit prompts for MLB 7th+
+- [x] **P2.3 — Bullpen state surfaced in late-game exit prompts** ✅ 2026-04-23
+  - Shipped: MLB 6th+ inning hard-stop eval now fetches both bullpens via MLB Stats API
+  - Prompt annotated with tier/ERA + LEADING/TRAILING framing
+  - Attacks the C1 pattern root cause (bullpen-collapse risk unmodeled)
   
 - [ ] **P2.4 — Pitcher mid-game re-eval**
   - If starter pulled / line of 4+ ER / surrendered 3+ runs in <2 IP → trigger eval
@@ -201,9 +202,9 @@
   - Auto-tighten if GOOD rate > 80%
   - Surfaces calibration suggestions to Telegram, not auto-applies
   
-- [ ] **P3.3 — Time-of-day / day-of-week analysis**
-  - Add `dayPart`, `dow` to trade records
-  - Run WR analysis; flag buckets with <45% WR for restriction
+- [x] **P3.3 — Time-of-day / day-of-week logging** ✅ 2026-04-23 (data plumbing only)
+  - Shipped: `etHour`, `dayPart` (morning/afternoon/evening/night), `dayOfWeek` on every trade
+  - Still TODO: run WR analysis once we have 100+ new trades with these fields
   
 - [ ] **P3.4 — Recent W/L feedback in entry prompts**
   - Top-line: "You're 3-0 / 2-8 / 5-5 on recent MLB pre-game"
@@ -259,6 +260,7 @@ Things we need tracked but aren't yet:
 | 2026-04-23 | Cut TIE leg into soccer pre-game prompt | Claude not pricing draw risk | TBD |
 | 2026-04-23 | Raise pg-hard-stop threshold 12¢→25¢ | Data: 4 BAD stops at 12-15¢ threshold, −$79 | TBD |
 | 2026-04-23 | Ship Phase 1 (P1.1-P1.4) | Kill known bleeding patterns; data-backed | TBD |
+| 2026-04-23 | Ship P2.3 + P3.3 | Bullpen state in late-MLB exits + time-of-day logging | TBD |
 
 ---
 
