@@ -2471,11 +2471,9 @@ async function checkLiveScoreEdges() {
       const isSoccer = ['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league);
       // Skip tied games UNLESS it's soccer (draw is a valid bet)
       if (diff === 0 && !isSoccer) continue;
-      // Skip disabled-soccer leagues entirely — same rationale as pre-game: 26-28%
-      // draw rate makes winner contracts -EV, and Kalshi often doesn't list these
-      // markets live anyway (produces 30+ "No TODAY market found" skips/day on
-      // games like NAN@PSG). Cuts log noise + one wasted candidate slot per cycle.
-      if (['mls', 'seriea', 'bundesliga', 'ligue1'].includes(league)) continue;
+      // Soccer winner live-edge is gated below by a draw-adjusted candidate filter
+      // (require 2+ goal lead, or late 1-goal lead in 2nd half). Tied soccer games
+      // still fall through to the draw-bet strategy.
       const leading = diff > 0 ? (homeScore > awayScore ? home : away) : home; // tied = home as placeholder
       const detail = comp.status?.type?.shortDetail ?? '';
       liveGames.push({ league, comp, ev, home, away, homeScore, awayScore, diff, period, leading, detail, isSoccer });
@@ -2981,7 +2979,15 @@ async function checkLiveScoreEdges() {
     g._scoreChanged = scoreChanged;
 
     // Include if: score changed, OR baseline suggests opportunity (>60% WE with a lead),
-    // OR it's a tied soccer game (draw-bet logic evaluates these separately)
+    // OR it's a tied soccer game (draw-bet logic evaluates these separately).
+    //
+    // Soccer winner contracts: draw-adjusted gate — 26-28% draw rate makes 1-goal
+    // leads marginal unless the game is late. Require 2+ goal lead, OR 1-goal lead
+    // in the 2nd half (period>=2, typically >=45 min played).
+    if (g.isSoccer && g.diff > 0) {
+      const soccerWinnerOK = g.diff >= 2 || (g.diff === 1 && g.period >= 2);
+      if (!soccerWinnerOK) continue;
+    }
     if (scoreChanged || (g.diff > 0 && we >= 0.60) || (g.isSoccer && g.diff === 0)) {
       candidates.push(g);
     }
@@ -2997,7 +3003,7 @@ async function checkLiveScoreEdges() {
   // including tonight's live games (they appear later in the list after future games).
   // Fetch up to 1000 per series to ensure we don't miss any live game.
   const cachedPrices = new Map();
-  const seriesList = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME', 'KXEPLGAME', 'KXLALIGAGAME'];
+  const seriesList = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME', 'KXEPLGAME', 'KXLALIGAGAME', 'KXSERIAA', 'KXBUNDESLIGA', 'KXLIGUE1'];
   try {
     const batchResults = await Promise.allSettled(
       seriesList.map(s => kalshiGet(`/markets?series_ticker=${s}&status=open&limit=1000`).catch(() => ({ markets: [] })))
