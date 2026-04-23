@@ -8163,14 +8163,16 @@ async function managePositions() {
         //     and WE-reversal (WE ≤ 30%) cover innings 3-4 instead.
         //   NBA: Q3+ (period 3+)  |  NHL: P2+  |  Soccer: min 60+
         //
-        // CENT THRESHOLD (widened for cheap entries in mid stage):
-        //   < 50¢ entry in MLB mid (inning 5-6): 15¢ — at 45¢ entry, 12¢ = -26.7% which still
-        //     fires before pg-guard Claude (-35%). Widening to 15¢ = -33.3% ensures Claude
-        //     evaluates before the mechanical stop fires in mid-game underdog plays.
-        //   All other: < 50¢ entry → 12¢, ≥ 50¢ entry → 10¢
-        const pgHardStopCents = (entryPrice < 0.50 && league === 'mlb' && stage === 'mid') ? 0.15
-          : entryPrice < 0.50 ? 0.12
-          : 0.10;
+        // CENT THRESHOLD (widened per data analysis 2026-04-23):
+        //   Data: 4 pre-game hard-stop BAD stops cost us $79 in opp cost. ATL@PHI 48→35 (−13¢,
+        //   team won), STL@HOU 45→33 (−12¢, team won). Both fired at 12-15¢ — the exact
+        //   threshold that was costing us winners. Pre-game picks have 64% base WR; at −12¢
+        //   the EV of holding is strongly positive. Widening to 25¢ gives Claude's prompts
+        //   (pg-guard at −35%, nuclear, WE-reversal) room to evaluate a recoverable thesis.
+        //   MLB mid-stage underdog bets keep a 30¢ threshold for extra room.
+        const pgHardStopCents = (entryPrice < 0.50 && league === 'mlb' && stage === 'mid') ? 0.30
+          : entryPrice < 0.50 ? 0.25
+          : 0.25;
         const pgHardStopReady = (trade.strategy === 'pre-game-prediction' || trade.strategy === 'pre-game-edge-first') && (
           (league === 'mlb' && ctx?.period >= 5) ||
           (league === 'nba' && ctx?.period >= 3) ||
@@ -8469,6 +8471,12 @@ async function managePositions() {
           } else if (isComeback && minsSinceEntry < 15) {
             // COMEBACK GRACE PERIOD: comeback entries are at 10-44¢ with WE already low.
             // Give 15 min for the trade to breathe.
+          } else if (isPreGame && league === 'mlb' && (ctx?.period ?? 0) < 5) {
+            // Pre-game MLB innings 1-4: suppress WE-reversal. Data: SF@WSH BAD stop (−$47 missed)
+            // fired on WE collapse mid-game with time remaining. Pre-game picks have 64% WR to
+            // settlement; early-inning WE crashes on pre-game bets need room for the thesis
+            // (starter fatigue, bullpen entry, lineup turn) to play out. pg-guard Claude at
+            // −35% and the nuclear path still fire if drawdown is truly catastrophic.
           } else {
             const isPlayoffWER = /Game \d/i.test(trade.title ?? '');
             // Playoff games have more comebacks — lower the WE floor before we even ask Claude.
