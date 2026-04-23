@@ -4254,10 +4254,16 @@ async function checkLiveScoreEdges() {
         const _memoEntry = liveEdgeRejectMemo.get(gameBase);
         if (_memoEntry && Date.now() - _memoEntry.ts < LIVE_REJECT_MAX_AGE_MS) {
           const _priceCentsNow = Math.round(price * 100);
+          const _priceDelta = _priceCentsNow - _memoEntry.priceCents;
           const _sameScore = _memoEntry.scoreKey === currentScoreKey;
-          const _samePrice = Math.abs(_priceCentsNow - _memoEntry.priceCents) < LIVE_REJECT_PRICE_TOL_CENTS;
+          // Tightened tolerance: same-score memo holds only when price is within
+          // ±2¢ AND price didn't drop >1¢ (favorable move → re-ask Claude).
+          // Favorable drop = price moving toward our side; often that's the exact
+          // reprice that flips the original NO. Loose 5¢ tolerance was letting
+          // real re-rates get skipped (SD@COL 79¢→76¢ today).
+          const _samePrice = Math.abs(_priceDelta) <= 2 && _priceDelta >= -1;
           if (_sameScore && _samePrice) {
-            console.log(`[live-edge] Reject memo hit: ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}) score=${currentScoreKey} price=${_priceCentsNow}¢ — unchanged since last NO, skipping Sonnet`);
+            console.log(`[live-edge] Reject memo hit: ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}) score=${currentScoreKey} price=${_priceCentsNow}¢ (Δ${_priceDelta >= 0 ? '+' : ''}${_priceDelta}) — unchanged since last NO, skipping Sonnet`);
             continue;
           }
         }
@@ -4613,7 +4619,8 @@ async function checkLiveScoreEdges() {
           console.error(`[live-edge] Order failed:`, result.status, JSON.stringify(result.data));
         }
       } catch (e) {
-        console.error(`[live-edge] error processing ${item.homeAbbr}@${item.awayAbbr}:`, e.message);
+        console.error(`[live-edge] error processing ${item.homeAbbr}@${item.awayAbbr}:`, e.message, '\n', e.stack);
+        await reportError('live-edge:process-crash', `${item.homeAbbr}@${item.awayAbbr} ${item.league?.toUpperCase()}: ${e.message}`);
       }
     }
   }
@@ -8580,13 +8587,20 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
       const stoppedTeam = trade.ticker.lastIndexOf('-') > 0
         ? trade.ticker.slice(trade.ticker.lastIndexOf('-') + 1)
         : '';
+      // Draw-bet stops lock ONLY the TIE contract — the opposite-side winner
+      // contract is an independent thesis (often moved the exact opposite way as
+      // the draw died). Winner-side stops keep game-wide locks because flipping
+      // from the stopped side to the opposite winner on the same game is almost
+      // always reactive emotion, not signal.
+      const isDrawBet = trade.strategy === 'draw-bet';
+      const lockKey = isDrawBet ? `${stoppedBase}-TIE` : stoppedBase;
       stoppedBets.set(stoppedBase, { team: stoppedTeam, stoppedAt: Date.now(), entryPrice });
       const STOP_REENTRY_COOLDOWN = 30 * 60 * 1000;
       const unlockAt = Date.now() + STOP_REENTRY_COOLDOWN;
-      stopLocks.set(stoppedBase, unlockAt);
-      tradeCooldowns.set(stoppedBase, unlockAt - COOLDOWN_MS);
+      stopLocks.set(lockKey, unlockAt);
+      tradeCooldowns.set(lockKey, unlockAt - COOLDOWN_MS);
       saveState();
-      console.log(`[exit] 🔒 Re-entry locked on ${stoppedBase} (${stoppedTeam}) for 30 min after stop (persisted)`);
+      console.log(`[exit] 🔒 Re-entry locked on ${lockKey} (${stoppedTeam}) for 30 min after stop (persisted)${isDrawBet ? ' — winner contracts NOT locked' : ''}`);
     }
   } else {
     // Partial exit — update quantity and cost, keep open
