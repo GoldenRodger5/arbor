@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, useEffect } from 'react';
 import { useArbor } from '@/context/ArborContext';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
@@ -76,6 +76,41 @@ export default function AnalyticsPage() {
   const [drill, setDrill] = useState<{ title: string; subtitle?: string; trades: any[] } | null>(null);
   const [calSport, setCalSport] = useState<string>('all');
   const [calDay, setCalDay] = useState<string>('all');
+
+  // ─── Calibration stats panel (per sport × strategy × edge × conf bucket) ───
+  type CalBucket = { sport: string; strategy: string; edge: string; conf: string; n: number; wins: number; losses: number; wr: number; pnl: number; pnlPerTrade: number };
+  type CalStats = { updatedAt: string | null; totalSettled: number; buckets: CalBucket[] };
+  const [calStats, setCalStats] = useState<CalStats | null>(null);
+  const [calSportFilter, setCalSportFilter] = useState<string>('all');
+  const [calSortKey, setCalSortKey] = useState<'n' | 'wr' | 'pnl'>('n');
+  useEffect(() => {
+    let stop = false;
+    const fetchStats = async () => {
+      try {
+        const res = await fetch('/api/calibration-stats');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!stop) setCalStats(data);
+      } catch {}
+    };
+    fetchStats();
+    const iv = setInterval(fetchStats, 60 * 1000); // refresh every 60s
+    return () => { stop = true; clearInterval(iv); };
+  }, []);
+  const calBuckets = useMemo(() => {
+    const buckets = calStats?.buckets ?? [];
+    const filtered = calSportFilter === 'all' ? buckets : buckets.filter(b => b.sport === calSportFilter);
+    const sorted = [...filtered].sort((a, b) => {
+      if (calSortKey === 'n') return b.n - a.n;
+      if (calSortKey === 'wr') return b.wr - a.wr;
+      return b.pnl - a.pnl;
+    });
+    return sorted;
+  }, [calStats, calSportFilter, calSortKey]);
+  const calBucketSports = useMemo(() => {
+    const s = new Set((calStats?.buckets ?? []).map(b => b.sport));
+    return Array.from(s).sort();
+  }, [calStats]);
 
   const start = tfStart(tf);
   const filtered = useMemo(() => trades.filter(t => new Date(t.timestamp).getTime() >= start), [trades, start]);
@@ -241,6 +276,75 @@ export default function AnalyticsPage() {
   return (
     <div>
       <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 12 }}>Analytics</h1>
+
+      {/* ─── Calibration Buckets ─── */}
+      <Section title="🎯 Calibration Buckets" action={
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12 }}>
+          <select value={calSportFilter} onChange={e => setCalSportFilter(e.target.value)}
+            style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg)' }}>
+            <option value="all">All sports</option>
+            {calBucketSports.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <select value={calSortKey} onChange={e => setCalSortKey(e.target.value as any)}
+            style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg)' }}>
+            <option value="n">Sort: Volume</option>
+            <option value="wr">Sort: WR%</option>
+            <option value="pnl">Sort: P&amp;L</option>
+          </select>
+        </div>
+      }>
+        {!calStats ? (
+          <div style={{ color: 'var(--text-muted)', fontSize: 13 }}>Loading…</div>
+        ) : calBuckets.length === 0 ? (
+          <div style={{ color: 'var(--text-muted)', fontSize: 13 }}>No buckets yet. Data accumulates as trades settle.</div>
+        ) : (
+          <div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
+              {calStats.totalSettled} total settled · updated {calStats.updatedAt ? new Date(calStats.updatedAt).toLocaleTimeString() : 'never'}
+            </div>
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', color: 'var(--text-muted)', borderBottom: '1px solid var(--border)' }}>
+                    <th style={{ padding: '6px 8px' }}>Sport</th>
+                    <th style={{ padding: '6px 8px' }}>Strategy</th>
+                    <th style={{ padding: '6px 8px' }}>Edge</th>
+                    <th style={{ padding: '6px 8px' }}>Conf</th>
+                    <th style={{ padding: '6px 8px', textAlign: 'right' }}>n</th>
+                    <th style={{ padding: '6px 8px', textAlign: 'right' }}>WR</th>
+                    <th style={{ padding: '6px 8px', textAlign: 'right' }}>P&amp;L</th>
+                    <th style={{ padding: '6px 8px', textAlign: 'right' }}>$/trade</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {calBuckets.slice(0, 40).map((b, i) => {
+                    const isGood = b.pnl > 5 && b.n >= 5;
+                    const isBad = b.pnl < -5 && b.n >= 5;
+                    const isThin = b.n < 5;
+                    const rowBg = isGood ? 'rgba(34,197,94,0.12)' : isBad ? 'rgba(239,68,68,0.12)' : isThin ? 'rgba(255,255,255,0.03)' : 'transparent';
+                    return (
+                      <tr key={i} style={{ background: rowBg, borderBottom: '1px solid var(--border)' }}>
+                        <td style={{ padding: '6px 8px', fontWeight: 600 }}>{b.sport}</td>
+                        <td style={{ padding: '6px 8px', fontSize: 11, color: 'var(--text-muted)' }}>{b.strategy.replace('pre-game-', 'pg-').replace('live-', 'lv-')}</td>
+                        <td style={{ padding: '6px 8px' }}>{b.edge}</td>
+                        <td style={{ padding: '6px 8px' }}>{b.conf}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', fontWeight: 600 }}>{b.n}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', color: b.wr >= 60 ? '#22C55E' : b.wr <= 40 ? '#EF4444' : 'var(--text)' }}>{b.wr}%</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', fontWeight: 700, color: b.pnl > 0 ? '#22C55E' : b.pnl < 0 ? '#EF4444' : 'var(--text-muted)' }}>{b.pnl >= 0 ? '+' : ''}${b.pnl.toFixed(2)}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', color: 'var(--text-muted)' }}>{b.pnlPerTrade >= 0 ? '+' : ''}${b.pnlPerTrade.toFixed(2)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 10 }}>
+              Green rows = profitable buckets (n≥5). Red = losing. Faded = thin samples (n&lt;5).
+              Showing top 40 of {calBuckets.length}. Sort by volume, WR, or P&L.
+            </div>
+          </div>
+        )}
+      </Section>
 
       {/* Timeframe pills */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>

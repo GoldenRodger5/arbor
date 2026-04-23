@@ -1055,6 +1055,21 @@ Rules:
         hourly: hourly.map(h => ({ ...h, cents: Math.round(h.cents * 100) / 100 })),
       });
 
+    } else if (path === '/api/calibration-stats') {
+      // Per (sport × strategy × edge-band × conf-band) aggregation of settled trades.
+      // Written by bot/ai-edge.mjs updateCalibrationStats() every 5min.
+      const calPath = './logs/calibration-stats.json';
+      try {
+        if (!existsSync(calPath)) {
+          json(res, { updatedAt: null, totalSettled: 0, buckets: [] });
+          return;
+        }
+        const data = JSON.parse(readFileSync(calPath, 'utf-8'));
+        json(res, data);
+      } catch (e) {
+        json(res, { error: e.message, updatedAt: null, totalSettled: 0, buckets: [] });
+      }
+
     } else {
       res.writeHead(404);
       res.end('Not found');

@@ -1171,19 +1171,86 @@ function getAvailableCash(exchange = 'kalshi') {
   return Math.max(0, bal - reserve);
 }
 
+// GRADUATED AUTO-SIZE-DOWN (2026-04-23): reads calibration-stats.json and returns
+// a sizing multiplier based on recent (sport × strategy) WR. Softer than binary
+// auto-freeze — reduces blast radius while preserving data flow.
+//
+// Thresholds (rolling last 10 trades in the bucket):
+//   WR ≥ 50% or n < 10     → 1.00x (full sizing)
+//   WR 35-49%              → 0.50x (half size — cautionary)
+//   WR < 35% and n ≥ 10    → 0.25x (quarter size — strong warning)
+//   WR < 30% and n ≥ 15    → 0.00x (soft freeze — enough evidence)
+//
+// Cache 5min so we don't re-parse file on every trade.
+const _bucketMultCache = { ts: 0, data: null };
+function getBucketSizingMult(sport, strategy) {
+  if (!sport || !strategy) return 1;
+  const now = Date.now();
+  if (!_bucketMultCache.data || now - _bucketMultCache.ts > 5 * 60 * 1000) {
+    try {
+      const calPath = './logs/calibration-stats.json';
+      if (existsSync(calPath)) {
+        const raw = JSON.parse(readFileSync(calPath, 'utf-8'));
+        // We need per (sport × strategy) aggregated across all buckets, using recent trades only.
+        // Reconstruct from trades.jsonl instead of the bucket file since we want "last 10".
+        const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+        const bySportStrat = new Map();
+        for (const l of lines) {
+          try {
+            const t = JSON.parse(l);
+            if (t.realizedPnL == null || !t.gameOutcome) continue;
+            const tk = (t.ticker ?? '').toUpperCase();
+            const sportKey = tk.includes('NBA') ? 'NBA' : tk.includes('MLB') ? 'MLB'
+              : tk.includes('NHL') ? 'NHL' : (tk.match(/MLS|EPL|LALIGA|SERIEA|BUNDESLIGA|LIGUE1/) ? 'Soccer' : 'Other');
+            const key = `${sportKey}|${t.strategy}`;
+            if (!bySportStrat.has(key)) bySportStrat.set(key, []);
+            bySportStrat.get(key).push(t);
+          } catch {}
+        }
+        const data = {};
+        for (const [key, trades] of bySportStrat) {
+          // Use last 10 trades to gauge recent performance
+          const recent = trades.slice(-10);
+          const wins = recent.filter(t => t.gameOutcome === 'correct').length;
+          const wr = recent.length > 0 ? wins / recent.length : 0.5;
+          data[key] = { n: recent.length, wr };
+        }
+        _bucketMultCache.ts = now;
+        _bucketMultCache.data = data;
+      } else {
+        _bucketMultCache.ts = now;
+        _bucketMultCache.data = {};
+      }
+    } catch (e) {
+      return 1; // on error, don't penalize
+    }
+  }
+  const stats = _bucketMultCache.data?.[`${sport}|${strategy}`];
+  if (!stats || stats.n < 10) return 1; // not enough samples — full sizing
+  if (stats.wr >= 0.50) return 1.00;
+  if (stats.wr >= 0.35) return 0.50;
+  if (stats.n >= 15 && stats.wr < 0.30) return 0.00; // soft freeze
+  return 0.25; // WR < 35% with 10-14 samples
+}
+
 function getDynamicMaxTrade(exchange = 'kalshi', sport = null, strategy = null) {
   const bankroll = getBankroll();
   // Tier 2: Per-sport Kelly fraction (downward-only; default 0.50 = half-Kelly)
-  // MAX_TRADE_FRACTION is the base cap; kellyFraction scales it further if
-  // realized edge for this sport is below expectations.
-  const kellyMult = sport ? (getKellyFraction(sport) / 0.50) : 1; // 1.0 = no change, 0.5 = half
-  // P1.3 — pre-game strategies capped at 5% (half the live-edge max).
-  // Data: biggest losses are 60-85 contracts on ~$30-33 deploy (10%+ of bankroll).
-  // SD-LAA -$33, ATL-PHI -$32, SF-WSH -$24, DET-BOS -$21, MIL-MIA -$20 — all oversized.
-  // Pre-game has higher variance tail risk; 5% cap preserves the edge while trimming blowups.
+  const kellyMult = sport ? (getKellyFraction(sport) / 0.50) : 1;
+  // Tier 3: Per-bucket auto-size-down based on recent (sport × strategy) WR.
+  // Softer than auto-freeze — data keeps flowing. See getBucketSizingMult.
+  const sportMapped = sport ? (sport === 'mlb' ? 'MLB' : sport === 'nba' ? 'NBA' : sport === 'nhl' ? 'NHL'
+    : ['mls','epl','laliga','seriea','bundesliga','ligue1'].includes(sport) ? 'Soccer' : 'Other') : null;
+  const bucketMult = getBucketSizingMult(sportMapped, strategy);
+  if (bucketMult < 1 && bucketMult > 0) {
+    console.log(`[risk] 📉 BUCKET SIZE-DOWN: ${sportMapped || 'sport?'} × ${strategy} running cold — sizing at ${(bucketMult*100).toFixed(0)}% of normal`);
+  } else if (bucketMult === 0) {
+    console.log(`[risk] 🧊 BUCKET SOFT-FREEZE: ${sportMapped || 'sport?'} × ${strategy} at <30% WR on 15+ samples — blocking trade`);
+  }
+  // P1.3 — pre-game strategies capped at 5%.
   const isPreGame = strategy && (strategy === 'pre-game-prediction' || strategy === 'pre-game-edge-first');
   const strategyFrac = isPreGame ? 0.05 : MAX_TRADE_FRACTION;
-  const pctCap = bankroll * strategyFrac * kellyMult;
+  const pctCap = bankroll * strategyFrac * kellyMult * bucketMult;
   const ceiling = getTradeCapCeiling();
   const available = getAvailableCash(exchange);
   return Math.min(pctCap, ceiling, available);
