@@ -62,7 +62,11 @@ const logPath = logArg
 const overridesPath = new URL('../bot/calibration-overrides.json', import.meta.url).pathname;
 
 // ─── Tier 2 gating ────────────────────────────────────────────────────────────
-const TIER2_BANKROLL_MIN = 2000;
+// Lowered from 2000 → 100: small-bankroll calibration is MORE valuable, not less.
+// Wilson-CI gating (total<10, bucket<3) already prevents noisy overrides on thin samples.
+// Flying blind at low bankroll was an own-goal — the gate existed as conservative default,
+// not evidence-based. With today's data (MLB pre-game 0/6) we need the floor-tightening.
+const TIER2_BANKROLL_MIN = 100;
 
 // ─── Load trades ──────────────────────────────────────────────────────────────
 let raw;

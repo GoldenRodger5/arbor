@@ -168,16 +168,22 @@ function computeCalibrationFeedback() {
     const settledAll = [...gameSeen.values()];
     if (settledAll.length < 10) return '';
 
-    // Tag sport on each trade once
+    // Tag sport + phase + side on each trade.
+    // phase: pre-game vs live (from strategy). side: dog (<50¢) vs fav (≥50¢).
+    // Blended feedback hid today's failure — MLB live 8-2 + MLB pre-game 0-6 → 50% overall.
+    // Claude saw "MLB calibrated" when pre-game/dog was broken. Split fixes that.
     for (const t of settledAll) {
       const tk = (t.ticker ?? '').toUpperCase();
       t._sport = t.league ?? (tk.includes('NHL') ? 'nhl' : tk.includes('NBA') ? 'nba' : tk.includes('MLB') ? 'mlb' : tk.includes('MLS') ? 'mls' : tk.includes('EPL') ? 'epl' : tk.includes('LALIGA') ? 'laliga' : null);
       t._ts = new Date(t.settledAt ?? t.timestamp).getTime();
+      t._phase = (t.strategy ?? '').startsWith('pre-game') ? 'pre' : 'live';
+      t._side = (t.entryPrice ?? 0.5) < 0.50 ? 'dog' : 'fav';
     }
 
-    // Adaptive per-sport window: for each sport pick narrowest window with ≥10 samples
+    // Adaptive per-sport window, then split by (phase, side) combo → buckets.
+    // Buckets now include 58-64% to cover edge-first tier bets (previously below all buckets).
     const sportData = {};
-    const sportWindows = {}; // sport → days used
+    const sportWindows = {};
     const now = Date.now();
     for (const sport of new Set(settledAll.map(t => t._sport).filter(Boolean))) {
       let chosen = null;
@@ -191,62 +197,64 @@ function computeCalibrationFeedback() {
       }
       if (!chosen) continue;
       sportWindows[sport] = chosen.days;
-      sportData[sport] = { wins: 0, losses: 0, confSum: 0, buckets: {} };
+      const combos = {};
       for (const t of chosen.subset) {
         const won = t.gameOutcome ? t.gameOutcome === 'correct' : (t.realizedPnL ?? 0) > 0;
-        sportData[sport][won ? 'wins' : 'losses']++;
-        sportData[sport].confSum += t.confidence;
-        const band = t.confidence < 0.70 ? '65-69' : t.confidence < 0.75 ? '70-74' : '75+';
-        if (!sportData[sport].buckets[band]) sportData[sport].buckets[band] = { w: 0, l: 0 };
-        sportData[sport].buckets[band][won ? 'w' : 'l']++;
+        const band = t.confidence < 0.65 ? '58-64' : t.confidence < 0.70 ? '65-69' : t.confidence < 0.75 ? '70-74' : '75+';
+        const comboKey = `${t._phase}/${t._side}`;
+        if (!combos[comboKey]) combos[comboKey] = { buckets: {}, totalW: 0, totalL: 0 };
+        const c = combos[comboKey];
+        c[won ? 'totalW' : 'totalL']++;
+        if (!c.buckets[band]) c.buckets[band] = { w: 0, l: 0, entrySum: 0, n: 0 };
+        c.buckets[band][won ? 'w' : 'l']++;
+        c.buckets[band].entrySum += t.entryPrice ?? 0.5;
+        c.buckets[band].n++;
       }
+      sportData[sport] = combos;
     }
 
-    // Per-bucket verdicts. Overall cal-error can mislead (a losing 75%+ bucket
-    // drags the headline down even when the 65-69% bucket is winning). Give
-    // Sonnet bucket-specific guidance so it knows which confidence levels to
-    // trust and which to trim.
-    // Compare actual WR to the BAND LOWER BOUND, not midpoint. If you say 65-69%
-    // and win 62%, that's still profitable EV at entry prices ≤62¢ — don't trim.
-    // Only flag overconfidence when the band is losing relative to its floor.
+    // Verdicts per (sport, phase/side, bucket). For 58-64% bucket, compare WR to
+    // average entry price (that's the breakeven — edge-first buys cheap). For
+    // higher buckets, compare to band floor as before.
     const bandLower = { '65-69': 65, '70-74': 70, '75+': 75 };
     const lines2 = [];
-    for (const [sport, d] of Object.entries(sportData)) {
-      const total = d.wins + d.losses;
-      if (total < 10) continue;
-      const actualWR = Math.round((d.wins / total) * 100);
-
-      const bucketVerdicts = [];
-      for (const band of ['65-69', '70-74', '75+']) {
-        const b = d.buckets[band];
-        if (!b) continue;
-        const bt = b.w + b.l;
-        if (bt < 3) {
-          if (bt >= 1) bucketVerdicts.push(`${band}%: ${b.w}W/${b.l}L (too small — no verdict)`);
-          continue;
+    for (const [sport, combos] of Object.entries(sportData)) {
+      const winTag = sportWindows[sport] ? ` [${sportWindows[sport]}d]` : '';
+      const comboLines = [];
+      for (const combo of ['pre/dog', 'pre/fav', 'live/dog', 'live/fav']) {
+        const c = combos[combo];
+        if (!c) continue;
+        const totalN = c.totalW + c.totalL;
+        if (totalN < 3) continue;
+        const wr = Math.round((c.totalW / totalN) * 100);
+        const bucketLines = [];
+        for (const band of ['58-64', '65-69', '70-74', '75+']) {
+          const b = c.buckets[band];
+          if (!b || b.n < 3) continue;
+          const bt = b.w + b.l;
+          const bWR = Math.round((b.w / bt) * 100);
+          const floor = band === '58-64' ? Math.round((b.entrySum / b.n) * 100) : bandLower[band];
+          let verdict;
+          if (bWR >= floor + 5) verdict = `CRUSHING at ${bWR}% vs ${floor}% — underconfident here`;
+          else if (bWR >= floor) verdict = `calibrated at ${bWR}% vs ${floor}% — trust reads`;
+          else if (bWR >= floor - 5) verdict = `within tolerance at ${bWR}% vs ${floor}%`;
+          else if (bWR >= floor - 15) verdict = `underperforming at ${bWR}% vs ${floor}% — trim ~${Math.min(8, floor - bWR)}pts`;
+          else verdict = `LOSING at ${bWR}% vs ${floor}% — require much stronger evidence or skip this combo`;
+          bucketLines.push(`    ${band}%: ${b.w}W/${b.l}L — ${verdict}`);
         }
-        const bWR = Math.round((b.w / bt) * 100);
-        const floor = bandLower[band];
-        let verdict;
-        if (bWR >= floor + 5) verdict = `CRUSHING at ${bWR}% — trust these reads aggressively, you are underconfident here`;
-        else if (bWR >= floor) verdict = `calibrated at ${bWR}% — trust your reads, do NOT trim`;
-        else if (bWR >= floor - 5) verdict = `within tolerance at ${bWR}% (profitable EV at market prices) — trust your reads, do NOT trim`;
-        else if (bWR >= floor - 15) verdict = `underperforming at ${bWR}% — trim ~${Math.min(8, floor - bWR)}pts from this band`;
-        else verdict = `losing at ${bWR}% — trim ~10pts or require much stronger evidence`;
-        bucketVerdicts.push(`${band}%: ${b.w}W/${b.l}L (${bWR}%) — ${verdict}`);
+        if (bucketLines.length === 0) {
+          comboLines.push(`  ${combo}: ${c.totalW}W/${c.totalL}L (${wr}%) — buckets too thin for verdict`);
+        } else {
+          comboLines.push(`  ${combo}: ${c.totalW}W/${c.totalL}L (${wr}%)\n${bucketLines.join('\n')}`);
+        }
       }
-
-      const winTag = sportWindows[sport] ? ` [${sportWindows[sport]}d window]` : '';
-      if (bucketVerdicts.length === 0) {
-        lines2.push(`${sport.toUpperCase()}${winTag}: ${d.wins}W/${d.losses}L overall (${actualWR}%) — sample too thin per band for verdicts`);
-      } else {
-        lines2.push(`${sport.toUpperCase()}${winTag}: ${d.wins}W/${d.losses}L overall (${actualWR}%)\n  ${bucketVerdicts.join('\n  ')}`);
-      }
+      if (comboLines.length === 0) continue;
+      lines2.push(`${sport.toUpperCase()}${winTag}:\n${comboLines.join('\n')}`);
     }
 
     if (lines2.length === 0) return '';
-    const totalSettled = Object.values(sportData).reduce((s, d) => s + d.wins + d.losses, 0);
-    return `\n📊 YOUR RECENT PICK ACCURACY (adaptive 7-21d window per sport, ${totalSettled} trades; measured by game outcome, not stop-loss P&L):\n${lines2.join('\n')}\nApply these verdicts PER BAND — if your 65-69% band is winning, a 66% read stays 66%. Do NOT blanket-trim. A confident read on a clear mismatch is what the bot needs.\n`;
+    const totalSettled = Object.values(sportData).reduce((s, combos) => s + Object.values(combos).reduce((ss, c) => ss + c.totalW + c.totalL, 0), 0);
+    return `\n📊 YOUR RECENT PICK ACCURACY (adaptive 7-21d window per sport, ${totalSettled} trades; split by phase=pre-game/live and side=dog[<50¢]/fav[≥50¢]; measured by game outcome, not stop-loss P&L):\n${lines2.join('\n')}\nApply verdicts PER (phase/side/bucket). If MLB/pre/dog is losing, treat a 62% MLB pre-game underdog read with heavy skepticism even if MLB/live/fav is calibrated. A confident read on a clear mismatch is what the bot needs — but don't ride a losing combo just because another one works.\n`;
   } catch { return ''; }
 }
 
