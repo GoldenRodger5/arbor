@@ -3165,6 +3165,9 @@ async function checkLiveScoreEdges() {
 
         // Only bet draws when probability is strong (65%+) — eliminates the
         // 55-64% zone where a single goal wipes out the entire position
+        if (!hasRedCard && drawProb > 0 && drawProb < 0.65) {
+          console.log(`[draw-bet-trace] ${homeAbbr} vs ${awayAbbr} ${homeScore}-${awayScore} min=${effectiveMin}: drawProb=${(drawProb*100).toFixed(0)}% below 65% threshold — silent skip (observe only)`);
+        }
         if (!hasRedCard && drawProb >= 0.65) {
           // Find the TIE market from cached prices (instant, no API call)
           const tieEntry = [...cachedPrices.entries()].find(([t]) =>
@@ -4207,6 +4210,18 @@ async function checkLiveScoreEdges() {
             console.log(`[live-edge] Skipping ${leadingAbbr}: market dissent guard — WE=${(weBase*100).toFixed(0)}% vs market=${(price*100).toFixed(0)}¢ (${(marketGap*100).toFixed(0)}pt gap). Sharp money is pricing a specific collapse, not lagging the score.`);
             logScreen({ stage: 'live-edge-skip', result: 'skip-market-dissent', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr: leadingAbbr, reasoning: `Market dissent: WE=${(weBase*100).toFixed(0)}% but market=${(price*100).toFixed(0)}¢ (${(marketGap*100).toFixed(0)}pt gap) with ${diff}-run lead in P${period}. This gap is not market lag — sharp money has specific information about a collapse. Do not fade professionals with a 40pt+ discount on a large late lead.` });
             continue;
+          }
+        }
+
+        // Observability-only: log thin-lead market-dissent cases (diff<4 OR period<7)
+        // where market is ≥12pt below WE. No skip — just surface the pattern for later
+        // analysis. Example: MIN@NYM Top 9th NYM @94¢ vs WE 78% = 16pt gap, silently eaten.
+        if (league === 'mlb' && diff >= 1 && !(diff >= 4 && period >= 7)) {
+          const weBase = getWinExpectancy('mlb', diff, period) ?? 0;
+          const marketGap = weBase - price;
+          if (Math.abs(marketGap) >= 0.12) {
+            const dir = marketGap > 0 ? 'market-below-WE' : 'market-above-WE';
+            console.log(`[market-dissent-thin] ${dir} ${league.toUpperCase()} ${leadingAbbr} (${homeAbbr}@${awayAbbr}) P${period} diff=${diff}: WE=${(weBase*100).toFixed(0)}% vs market=${(price*100).toFixed(0)}¢ (${(marketGap*100).toFixed(0)}pt gap) — observe only`);
           }
         }
 
