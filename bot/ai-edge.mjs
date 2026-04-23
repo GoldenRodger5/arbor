@@ -3177,7 +3177,17 @@ async function checkLiveScoreEdges() {
 
             // Only buy if our probability exceeds the price by 3%+
             const drawMargin = isHighGoalLeague ? 0.05 : CONFIDENCE_MARGIN;
-            if (tiePrice < drawProb - drawMargin && tiePrice <= MAX_PRICE && tiePrice >= 0.10) {
+            // Scoreline-aware price ceiling:
+            //   0-0 late: safe draw profile — full ceiling (MAX_PRICE, ~75¢)
+            //   1-1+ late: any goal craters TIE by 30¢+ (ATL@NE 58→29 on one goal).
+            //     Cap at 50¢ so risk:reward stays roughly 1:1 instead of 1:1.5 against us.
+            const hasGoalsScored = homeScore > 0 || awayScore > 0;
+            const drawPriceCeiling = hasGoalsScored ? 0.50 : MAX_PRICE;
+            if (tiePrice > drawPriceCeiling) {
+              console.log(`[draw-bet] Skipping ${homeAbbr} vs ${awayAbbr}: TIE @${Math.round(tiePrice*100)}¢ > ${Math.round(drawPriceCeiling*100)}¢ ceiling (score ${homeScore}-${awayScore}, one goal = ~30¢ drop)`);
+              continue;
+            }
+            if (tiePrice < drawProb - drawMargin && tiePrice <= drawPriceCeiling && tiePrice >= 0.10) {
               const margin = drawProb - tiePrice;
 
               // Check risk gates
