@@ -3447,11 +3447,14 @@ async function checkLiveScoreEdges() {
 
       // SWING MODE: games between SWING_WE_FLOOR and MIN_WE_FOR_SONNET are candidates
       // for live swing trades — buy at ≤65¢, exit at +12¢ profit (not hold to settlement).
+      // Period-aware: early-game small leads are fragile (one swing of the bat erases the
+      // thesis), so require a higher WE floor before we'll consider a swing. 2026-04-23
+      // ATL@WSH swing stopped out at -10¢: 1-run lead inning 4, thesis died when tied.
       const SWING_WE_FLOOR = (() => {
-        if (league === 'mlb') return 0.62;
-        if (league === 'nba') return 0.60;
-        if (league === 'nhl') return 0.60;
-        return 0.55; // soccer
+        if (league === 'mlb') return period <= 4 ? 0.66 : 0.62; // innings 1-4 fragile, 5+ normal
+        if (league === 'nba') return period <= 2 ? 0.64 : 0.60; // Q1-Q2 small leads volatile
+        if (league === 'nhl') return period === 1 ? 0.64 : 0.60; // P1 1-goal leads volatile
+        return (period === 1) ? 0.58 : 0.55; // soccer: 1st half tighter than 2nd
       })();
       if (baseWE < MIN_WE_FOR_SONNET) {
         if (_lineMovePromoted) {
@@ -4492,6 +4495,30 @@ async function checkLiveScoreEdges() {
           if (confidence > maxAllowed) {
             console.log(`[live-edge] Confidence capped on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): Claude said ${(confidence*100).toFixed(0)}% but WE baseline is ${(targetBaseline*100).toFixed(0)}% → capped at ${(maxAllowed*100).toFixed(0)}% (leading=${isLeadingTeamTarget})`);
             confidence = maxAllowed;
+          }
+        }
+
+        // Team-quality haircut: when swinging a small lead, penalize if the trailing team is materially stronger by season record.
+        // Why: a .400 team leading a .550 team 1-0 in inning 3 is a mean-reversion trap — market knows this, WE table doesn't.
+        if (isSwingMode && isLeadingTeamTarget) {
+          const leadRec = leading?.records?.[0]?.summary ?? '';
+          const trailRec = trailing?.records?.[0]?.summary ?? '';
+          const parseWinPct = (rec) => {
+            const m = rec.match(/^(\d+)-(\d+)/);
+            if (!m) return null;
+            const w = parseInt(m[1], 10), l = parseInt(m[2], 10);
+            const total = w + l;
+            return total >= 10 ? w / total : null;
+          };
+          const leadPct = parseWinPct(leadRec);
+          const trailPct = parseWinPct(trailRec);
+          if (leadPct != null && trailPct != null) {
+            const gap = trailPct - leadPct;
+            if (gap >= 0.100) {
+              const haircut = Math.min(0.05, gap * 0.25);
+              console.log(`[live-swing] 📉 Team-quality haircut: leading ${leadingAbbr} (${leadRec}, ${(leadPct*100).toFixed(0)}%) vs trailing ${trailingAbbr} (${trailRec}, ${(trailPct*100).toFixed(0)}%) — trailing stronger by ${(gap*100).toFixed(0)}pt, applying -${(haircut*100).toFixed(1)}pt confidence haircut`);
+              confidence -= haircut;
+            }
           }
         }
 
