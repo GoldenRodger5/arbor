@@ -8311,6 +8311,18 @@ async function managePositions() {
                 tradeCooldowns.set(nuclearKey, Date.now());
                 continue;
               }
+              // DEEP-DRAWDOWN HOLD: at price ≤20¢, EV math overwhelmingly favors holding.
+              // Real-data: 2 of our 4 pre-game nuclear sells were BAD STOPs — COL@MIA MLB
+              // sold $41→18¢ ($70 opp cost) and NE soccer sold $36→10¢ ($63 opp cost).
+              // Both at ≤20¢ with recoverable WE. Claude's pessimism bias at deep drawdowns
+              // treats "looks dead" as "is dead" but the math at 15¢ is:
+              //   Hold EV = WE × 85¢  vs  Sell locks 15¢.  Break-even at WE=18%.
+              //   Pre-game base WR = 64%, so holding at ≤20¢ is strongly +EV until WE collapses.
+              if (currentPrice <= 0.20 && (_isPGLikeNuke || (_ourWENuke != null && _ourWENuke >= 0.18))) {
+                console.log(`[exit] 🧘 DEEP-DRAWDOWN HOLD on ${trade.ticker}: price=${(currentPrice*100).toFixed(0)}¢ ≤20¢, WE=${_ourWENuke != null ? (_ourWENuke*100).toFixed(0)+'%' : 'pre-game 64% base'} — EV favors hold, skipping nuclear eval (WE-reversal safety net at 10% still active)`);
+                tradeCooldowns.set(nuclearKey, Date.now());
+                continue;
+              }
             }
             tradeCooldowns.set(nuclearKey, Date.now());
             const ticker = trade.ticker ?? '';
@@ -8636,6 +8648,17 @@ async function managePositions() {
             const _ah = shouldAutoHold(trade.ticker, { ...ctx, stage }, _t2WE);
             if (_ah) {
               console.log(`[exit] 🧠🧘 AUTO-HOLD tier-2 (memo ${_ah.ageMin}min ago from ${_ah.path}): ${trade.ticker} — skipping Claude re-eval | prev: ${_ah.reasoning}`);
+              tradeCooldowns.set(exitCooldownKey, Date.now());
+              continue;
+            }
+            // WE-based short-circuit: tier-2 is the widest net (pctChange threshold only).
+            // Real data: tier-2 was 2-for-3 BAD stops (POR@PHX NBA at WE=65% entry, KC@DET MLB at WE=90%).
+            // If our WE is still ≥30% AND opponent isn't on a visible run (no contra-velocity firing),
+            // the WE-aware layers above would have flagged it if truly over. Skip Claude.
+            const _contra = recentCrossContraMovers.get(trade.ticker);
+            const _contraRecent = _contra && (Date.now() - _contra.when) <= 3 * 60 * 1000 && (_contra.velocity ?? 0) >= 5;
+            if (_t2WE != null && _t2WE >= 0.30 && !_contraRecent) {
+              console.log(`[exit] 🧘 AUTO-HOLD tier-2 (WE=${(_t2WE*100).toFixed(0)}% ≥30%, no contra): ${trade.ticker} — WE-aware layers would have flagged if truly over, skipping`);
               tradeCooldowns.set(exitCooldownKey, Date.now());
               continue;
             }
@@ -9386,10 +9409,16 @@ async function reviewStopLossOutcomes() {
 
         console.log(`[stop-review] ${icon} ${trade.ticker}: ${verdict}`);
 
+        const _srSport = (trade.ticker ?? '').includes('NBA') ? '🏀 NBA' :
+          (trade.ticker ?? '').includes('MLB') ? '⚾ MLB' :
+          (trade.ticker ?? '').includes('NHL') ? '🏒 NHL' :
+          (trade.ticker ?? '').match(/MLS|EPL|LALIGA|SERIEA|BUNDESLIGA|LIGUE1/) ? '⚽ Soccer' : 'Sport';
+        const _srStopType = (trade.status ?? '').replace(/^sold-/, '');
         await tg(
           `${icon} <b>STOP-LOSS REVIEW</b>\n\n` +
+          `${_srSport} · <code>${_srStopType}</code>\n` +
           `<b>${trade.title ?? trade.ticker}</b>\n` +
-          `Entry: ${(entryPrice*100).toFixed(0)}¢ → Stopped at: ${(exitPrice*100).toFixed(0)}¢\n` +
+          `Entry: ${(entryPrice*100).toFixed(0)}¢ → Stopped at: ${(exitPrice*100).toFixed(0)}¢ · qty ${qty}\n` +
           `Game result: <b>${market.result?.toUpperCase()}</b> (we bet ${trade.side})\n\n` +
           `${wouldHaveWon ? `😤 <b>Premature stop</b> — would have won $${(ifHeld * qty).toFixed(2)}` :
             `✅ <b>Good stop</b> — avoided losing $${(Math.abs(entryPrice) * qty).toFixed(2)}`}\n` +
