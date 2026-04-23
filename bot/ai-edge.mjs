@@ -3171,7 +3171,7 @@ async function checkLiveScoreEdges() {
         if (!hasRedCard && drawProb >= 0.65) {
           // Find the TIE market from cached prices (instant, no API call)
           const tieEntry = [...cachedPrices.entries()].find(([t]) =>
-            t.includes('-TIE') && tickerHasTeam(t, homeAbbr) && tickerHasTeam(t, awayAbbr)
+            t.startsWith(series) && t.includes('-TIE') && tickerHasTeam(t, homeAbbr) && tickerHasTeam(t, awayAbbr)
           );
           const tieMarket = tieEntry ? { ticker: tieEntry[0], yes_ask_dollars: String(tieEntry[1].yes), title: tieEntry[1].title } : null;
 
@@ -3507,6 +3507,10 @@ async function checkLiveScoreEdges() {
             // If ESPN shows a live game but Kalshi only has tomorrow's market for those teams,
             // skip rather than bet on the wrong game. (KC@DET live vs tomorrow's pre-game = wrong.)
             if (!isToday(ticker)) return false;
+            // Sport-prefix guard: NHL Dallas Stars (DAL) @ Minnesota Wild (MIN) must NOT match
+            // the MLS ticker KXMLSGAME-...-DALMIN-DAL (FC Dallas vs Minnesota United same night).
+            // Both have DAL+MIN abbrs — without the prefix check we'd cross-sport-match.
+            if (!ticker.startsWith(series)) return false;
             return tickerHasTeam(ticker, homeAbbr) && tickerHasTeam(ticker, awayAbbr);
           })
           .sort(([, a], [, b]) => Math.abs(b.yes - 0.50) - Math.abs(a.yes - 0.50)) // most decisive first
@@ -4681,7 +4685,8 @@ async function checkLiveScoreEdges() {
         // Find trailing team's Kalshi ticker in cached prices
         const trailingTicker = [...cachedPrices.keys()].find(t => {
           const suffix = t.split('-').pop()?.toUpperCase() ?? '';
-          return suffix === trailingAbbr.toUpperCase() &&
+          return t.startsWith('KXMLBGAME') &&
+                 suffix === trailingAbbr.toUpperCase() &&
                  tickerHasTeam(t.toLowerCase(), trailingAbbr) &&
                  tickerHasTeam(t.toLowerCase(), leadingAbbr);
         });
@@ -4747,6 +4752,7 @@ async function checkLiveScoreEdges() {
         // Example: ESPN says 0-1 (comebackWinPct=31% → leading team should be ~69¢) but
         // Kalshi is pricing WSH at 84¢ (15-point gap) → WSH already scored more runs.
         const leadingTicker = [...cachedPrices.keys()].find(t =>
+          t.startsWith('KXMLBGAME') &&
           tickerHasTeam(t.toLowerCase(), leadingAbbr) &&
           tickerHasTeam(t.toLowerCase(), trailingAbbr)
         );
