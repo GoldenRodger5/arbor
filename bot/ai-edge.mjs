@@ -3257,9 +3257,25 @@ async function checkLiveScoreEdges() {
               const priceInCents = Math.round(tiePrice * 100);
               console.log(`[draw-bet] ⚽ ${homeAbbr} ${homeScore}-${awayScore} ${awayAbbr} at ${effectiveMin}' | TIE @${priceInCents}¢ (prob: ${(drawProb*100).toFixed(0)}%) margin: ${(margin*100).toFixed(0)}%`);
 
+              // Team context from already-fetched ESPN scoreboard data (zero new API calls).
+              // Gives Claude the identity of each side so "open vs closed" judgement has something
+              // concrete to latch onto — records, home/road splits, recent form string if present.
+              const homeName = home.team?.displayName ?? homeAbbr;
+              const awayName = away.team?.displayName ?? awayAbbr;
+              const homeOverall = home.records?.[0]?.summary ?? '?';
+              const awayOverall = away.records?.[0]?.summary ?? '?';
+              const homeHomeRecDB = home.records?.find(r => r.type === 'home')?.summary ?? '';
+              const awayRoadRecDB = away.records?.find(r => r.type === 'road' || r.type === 'away')?.summary ?? '';
+              const homeForm = home.form ?? home.team?.form ?? '';
+              const awayForm = away.form ?? away.team?.form ?? '';
+              const teamCtx =
+                `HOME ${homeAbbr} — ${homeName} | Record: ${homeOverall}${homeHomeRecDB ? ` | Home: ${homeHomeRecDB}` : ''}${homeForm ? ` | Form (recent): ${homeForm}` : ''}\n` +
+                `AWAY ${awayAbbr} — ${awayName} | Record: ${awayOverall}${awayRoadRecDB ? ` | Away: ${awayRoadRecDB}` : ''}${awayForm ? ` | Form (recent): ${awayForm}` : ''}\n`;
+
               // Claude reasoning gate — swing-trade evaluation before placing
               const drawPrompt = `You are a soccer swing-trade analyst. We are NOT betting on settlement — we buy TIE and sell when the price RISES in the next 10-15 minutes. Evaluate this entry.\n\n` +
                 `MATCH: ${homeAbbr} vs ${awayAbbr} (${league.toUpperCase()})\n` +
+                `${teamCtx}` +
                 `SCORE: ${homeScore}-${awayScore} at ${effectiveMin}'\n` +
                 `DRAW PROBABILITY (historical baseline): ${(drawProb*100).toFixed(0)}%\n` +
                 `TIE PRICE: ${priceInCents}¢ (margin: ${(margin*100).toFixed(0)}%)\n` +
@@ -3267,6 +3283,7 @@ async function checkLiveScoreEdges() {
                 `SWING-TRADE LOGIC: TIE price rises as clock ticks without a goal. Every goalless minute = higher TIE price. We sell at +12¢. We stop-loss at -50%.\n\n` +
                 `STATISTICAL BASE RATE: Tied EPL/MLS games after minute 70 end as draws approximately 65% of the time, regardless of team quality, rivalry intensity, or motivation. This is the statistical floor — weigh narrative risk against it. Do NOT override this base rate without strong, specific evidence (e.g. a red card just issued, a confirmed injury to the leading scorer).\n\n` +
                 `Consider:\n` +
+                `- TEAM IDENTITIES (from the records above): strong home sides losing at home are usually chasing (open, goal-risk); strong away sides protecting a draw against a top home side are typically parking the bus (closed, good for us). A team badly out of form (L-L-L in recent) often closes down late to stop bleeding — also good for TIE. A team on a winning streak late in a tied game presses hard — bad for TIE.\n` +
                 `- Is the game OPEN (end-to-end, both teams attacking) or CLOSED (defensive, low-energy, time-wasting)? Closed = TIE price rises faster.\n` +
                 `- At ${effectiveMin}', will the next 10-15 minutes likely be goalless? That's all we need for profit.\n` +
                 `- Is either team pressing hard for a winner? A team throwing bodies forward = higher goal risk = bad for us.\n` +
@@ -4263,13 +4280,41 @@ async function checkLiveScoreEdges() {
 
   // === PHASE 4: Fire Sonnet calls in parallel (3 at a time) ===
   if (sonnetQueue.length === 0) return;
-  console.log(`[live-edge] Sending ${sonnetQueue.length} games to Sonnet in parallel...`);
+
+  // Elevate up to 2 items with CONTRA line-movement to Claude-with-search.
+  // Rationale: contra moves are often breaking injury/lineup/ejection news the
+  // ESPN snapshot hasn't caught yet. A targeted search can surface it before we
+  // fade a sharp move. Cap at 2/cycle so we don't blow the 60s live-edge window
+  // (each search adds ~5-8s vs. ~2-3s for no-search Sonnet).
+  const SEARCH_CAP = 2;
+  let searchBudget = SEARCH_CAP;
+  const shouldSearch = (item) => {
+    if (searchBudget <= 0) return false;
+    if (!item._lineMove || item._lineMove.confirming !== false) return false;
+    searchBudget--;
+    item._useSearch = true;
+    return true;
+  };
+  for (const item of sonnetQueue) shouldSearch(item);
+  const searchItemCount = sonnetQueue.filter(i => i._useSearch).length;
+  console.log(`[live-edge] Sending ${sonnetQueue.length} games to Sonnet in parallel${searchItemCount > 0 ? ` (${searchItemCount} with web search on contra-move)` : ''}...`);
 
   // Batch in groups of 3 for parallel execution
   for (let batch = 0; batch < sonnetQueue.length; batch += 3) {
     const batchItems = sonnetQueue.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeSonnet(item.prompt, { maxTokens: 1500, category: 'live-edge', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
+      batchItems.map(item => {
+        if (item._useSearch) {
+          const searchPrompt = item.prompt +
+            `\n\n═══ BREAKING-NEWS SEARCH (contra line-move fired) ═══\n` +
+            `Market moved AGAINST ${item.targetAbbr} fast. This is often breaking news not yet in ESPN. ` +
+            `Do ONE targeted search: "${item.targetTeam?.team?.displayName ?? item.targetAbbr} ${item.league.toUpperCase()} injury ejection lineup news today". ` +
+            `If the search surfaces a confirmed injury, ejection, or lineup change affecting ${item.targetAbbr}, cite it and reject the trade. ` +
+            `If nothing concrete is found, treat the contra move as market noise and evaluate normally on the WE-vs-price edge.`;
+          return claudeWithSearch(searchPrompt, { maxTokens: 2000, maxSearches: 1, timeout: 25000, category: 'live-edge-search', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' });
+        }
+        return claudeSonnet(item.prompt, { maxTokens: 1500, category: 'live-edge', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' });
+      })
     );
 
     for (let i = 0; i < batchItems.length; i++) {
@@ -5241,11 +5286,12 @@ async function checkPreGamePredictions() {
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `WIN PROBABILITY BASELINE: NBA home teams win ~63% of games. A motivated team vs. a resting/eliminated opponent can push to 70%+. Teams on back-to-backs win ~45% of those games.\n\n` +
         `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
-        `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} injury report lineup news" and use results to assess:\n` +
+        `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} injury report lineup news head to head recent meetings" and use results to assess:\n` +
         `A) ROSTER QUALITY: Who are the key players for each team? Any stars OUT, DOUBTFUL, or on rest? Confirmed injuries from your search trump training knowledge.\n` +
         `B) BACK-TO-BACK: Is either team on a back-to-back or 3rd game in 4 nights? Check schedule from search results. Fatigue significantly reduces win probability.\n` +
         `C) MOTIVATION: Where are these teams in the standings? Playoff race, seeding fights, or coasting? NBA teams tanking or fully clinched play worse.\n` +
-        `D) MATCHUP EDGE: Does this team have a structural advantage — size, pace, offensive system — that makes them more likely to win specifically against this opponent?\n\n` +
+        `D) MATCHUP EDGE: Does this team have a structural advantage — size, pace, offensive system — that makes them more likely to win specifically against this opponent?\n` +
+        `E) HEAD-TO-HEAD (PLAYOFFS ONLY): If this is a playoff series or the teams have met in the same series recently, note who has won recent meetings and by what margin. Regular-season H2H is mostly noise — ignore unless playoff context. Playoff H2H is signal — +3% for a team that won 3 of the last 4 meetings in the series.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Team you want to bet is confirmed resting 2+ starters (load management) → NO\n` +
         `❌ Team has clinched and cannot confirm stars playing meaningful minutes → NO\n` +
@@ -5296,11 +5342,12 @@ async function checkPreGamePredictions() {
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `WIN PROBABILITY BASELINE: NHL home teams win (in regulation + OT) ~55% of games. An elite goalie vs. a backup can push that to 62%+. A team on back-to-back drops to ~47%.\n\n` +
         `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
-        `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} goalie confirmed injury news" and use results to assess:\n` +
+        `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} goalie confirmed injury news playoff series head to head" and use results to assess:\n` +
         `A) GOALIES: Goalies confirmed above from ESPN — use the ESPN SV%/GAA as ground truth. Verify with search for any last-minute changes. Assess each goalie's win probability impact. An elite goalie (SV% > .920) vs. a backup (.890) is a 10-15% win probability swing. In playoff context: search for 2026 PLAYOFF SV% specifically — elite goalies outperform regular-season numbers in elimination games.\n` +
         `B) SPECIAL TEAMS: From search + training knowledge, assess power play and penalty kill quality. Top-5 PP teams convert at a higher rate and generate scoring momentum.\n` +
         `C) FATIGUE: Is either team on a back-to-back? NHL back-to-back teams win at ~8% lower rates.\n` +
-        `D) MOTIVATION: Playoff race intensity for each team. Teams fighting for seeding play harder in regulation.\n\n` +
+        `D) MOTIVATION: Playoff race intensity for each team. Teams fighting for seeding play harder in regulation.\n` +
+        `E) HEAD-TO-HEAD (PLAYOFFS ONLY): If this is a playoff series game, note series score (e.g. 2-1) and who won recent meetings. Momentum in a playoff series is real: +3% for the team coming off a win in the series, -3% for a team that just lost Game N at home. Regular-season H2H is noise — ignore outside playoffs.\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Starting goalie for the team you want to bet cannot be confirmed by ESPN OR by ≥2 independent web sources (NHL.com, team official, major outlets) → NO. NOTE: if ESPN is silent but 2+ web sources name the goalie, that IS confirmed — proceed.\n` +
         `❌ Team has clinched everything AND cannot confirm starting goalie → NO\n` +
@@ -5406,12 +5453,13 @@ async function checkPreGamePredictions() {
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
         `WIN PROBABILITY BASELINE: Soccer home teams win (regulation) ~45% of games, draw ~27%, away ~28%. Strong home sides vs. weak away teams can reach 55-60% win probability. Draw probability is NOT irrelevant — it counts against us since we need the team to WIN for the price to rise and stay elevated.\n\n` +
         `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
-        `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} team news injuries form" and use results to assess:\n` +
+        `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} team news injuries form recent meetings head to head" and use results to assess:\n` +
         `A) ATTACK QUALITY: How prolific is each team's attack? Top-5 goals-per-game teams generate scoring chances that translate to wins.\n` +
         `B) KEY PLAYERS: Are either team's star strikers/forwards available? Check injury news from search. Key absences significantly reduce win probability.\n` +
         `C) FORM & STYLE: Recent form from search results. High-energy pressing teams create chances earlier. Teams in strong form win at higher rates.\n` +
         `D) MOTIVATION: Is either team in a must-win (relegation, title run, European qualification)? Higher motivation = more aggressive pressing = more goals = higher win probability.\n` +
-        `E) DEFENSE: Elite defenses (conceding <0.8/game) can keep motivated opponents scoreless. Porous defenses lose more games.\n\n` +
+        `E) DEFENSE: Elite defenses (conceding <0.8/game) can keep motivated opponents scoreless. Porous defenses lose more games.\n` +
+        `F) HEAD-TO-HEAD: Soccer H2H is more meaningful than US sports — tactical matchups, psychological edges, and stylistic mismatches persist across seasons. If one side has won ≥3 of the last 5 meetings OR dominated the last 2 with clean sheets, that is a real +3-5% signal. Cite the specific scorelines from search, not a vague "they own this matchup."\n\n` +
         `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
         `❌ Your team's key striker is confirmed OUT AND opponent defense is strong → NO\n` +
         `❌ Both teams are defensive/low-scoring (under 1 goal per game each) → NO (likely to draw, price won't move)\n` +
