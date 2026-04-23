@@ -8295,10 +8295,28 @@ async function managePositions() {
           _ourWENuke == null || _ourWENuke >= 0.20 || ctx?.diff === 0 || ctx?.leading === _ourTeamAbbrNuke
         );
         const _floorWiden = _teamStillViable ? -0.15 : 0;
+        // Early-period variance widening (applied BEFORE claude-hold widening):
+        //   NHL P1-P2: 2-goal deficits routinely price at 20-30¢ and recover (15-22% comeback).
+        //     Widen every bucket to -70% floor so we don't force-sell during normal P1-P2 swings.
+        //   NBA Q1-Q2: runs are fast (7-0 in 90s). 15pt mid-game deficits recover 13% of the time
+        //     but reprice violently. Widen by 15pt (e.g. -60% → -75%).
+        let _baseFloor = entryPrice >= 0.70 ? -0.50 : entryPrice >= 0.50 ? -0.60 : -0.70;
+        let _earlyPeriodWiden = 0;
+        if (league === 'nhl' && (ctx?.period ?? 0) > 0 && ctx.period <= 2) {
+          _baseFloor = -0.70; // NHL P1-P2: uniform -70%
+          _earlyPeriodWiden = -0.01; // sentinel so we log it
+        } else if (league === 'nba' && (ctx?.period ?? 0) > 0 && ctx.period <= 2) {
+          _earlyPeriodWiden = -0.15;
+          _baseFloor += _earlyPeriodWiden;
+        }
         const nuclearStop = _isPreGameNuke
           ? -0.90
-          : (entryPrice >= 0.70 ? -0.50 : entryPrice >= 0.50 ? -0.60 : -0.70) + _floorWiden;
-        if (_teamStillViable && pctChange < (entryPrice >= 0.70 ? -0.50 : entryPrice >= 0.50 ? -0.60 : -0.70) && pctChange >= nuclearStop) {
+          : _baseFloor + _floorWiden;
+        const _normalFloor = entryPrice >= 0.70 ? -0.50 : entryPrice >= 0.50 ? -0.60 : -0.70;
+        if (_earlyPeriodWiden !== 0 && pctChange < _normalFloor && pctChange >= nuclearStop) {
+          console.log(`[exit] 🛡️ NUCLEAR WIDENED (${league.toUpperCase()} P${ctx.period} early-variance) on ${trade.ticker}: floor ${(nuclearStop*100).toFixed(0)}% vs normal ${(_normalFloor*100).toFixed(0)}%`);
+        }
+        if (_teamStillViable && pctChange < _normalFloor && pctChange >= nuclearStop) {
           console.log(`[exit] 🛡️ NUCLEAR WIDENED on ${trade.ticker}: Claude HOLD ${Math.round((Date.now() - _claudeHoldTs)/60000)}min ago + team viable (WE=${_ourWENuke != null ? (_ourWENuke*100).toFixed(0)+'%' : 'n/a'}, diff=${ctx?.diff ?? '?'}) → floor ${(nuclearStop*100).toFixed(0)}% vs normal ${((nuclearStop - _floorWiden)*100).toFixed(0)}%`);
         }
         if (pctChange < nuclearStop) {
