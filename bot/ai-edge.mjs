@@ -4585,15 +4585,15 @@ async function checkLiveScoreEdges() {
           }
         }
 
-        // KILLER BUCKET BLOCK (live-edge mirror): 15+pt edge + <70% conf = proportionality mismatch.
-        // Data (live-prediction subset of the 24-trade killer bucket): UTA-CGY -$9, MIA-CHA -$16,
-        // POR-PHX -$14 were all in this bucket. Same "narrative stack" pattern as pre-game.
-        // Carve-out: MLB late-inning + already-leading is handled by P1.1 block; skip here.
+        // KILLER BUCKET BLOCK (live-edge, MLB-only after per-sport audit):
+        // NBA 15+pt × 70-74% conf bucket went 5/5 WR for +$55 — blocking broadly would
+        // kill NBA's strongest live-pred cluster. Restricted to MLB only until non-MLB
+        // sports accumulate ≥15 samples per bucket for principled blocks.
         {
           const _liveEdge = (decision.confidence ?? 0) - price;
-          if (_liveEdge >= 0.15 && (decision.confidence ?? 0) < 0.70) {
-            console.log(`[live-edge] 🚫 KILLER BUCKET BLOCKED ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(_liveEdge*100).toFixed(0)}pt edge at ${((decision.confidence ?? 0)*100).toFixed(0)}% conf — proportionality mismatch (historical -$81 on 24 trades).`);
-            logScreen({ stage: 'live-edge', ticker, result: 'killer-bucket-block', reasoning: `Edge ${(_liveEdge*100).toFixed(0)}pt + conf ${((decision.confidence ?? 0)*100).toFixed(0)}% = -EV historical bucket` });
+          if (league === 'mlb' && _liveEdge >= 0.15 && (decision.confidence ?? 0) < 0.70) {
+            console.log(`[live-edge] 🚫 MLB KILLER BUCKET BLOCKED ${targetAbbr} (MLB ${awayAbbr}@${homeAbbr}): ${(_liveEdge*100).toFixed(0)}pt edge at ${((decision.confidence ?? 0)*100).toFixed(0)}% conf — MLB-specific proportionality mismatch.`);
+            logScreen({ stage: 'live-edge', ticker, result: 'mlb-killer-bucket-block', reasoning: `MLB: Edge ${(_liveEdge*100).toFixed(0)}pt + conf ${((decision.confidence ?? 0)*100).toFixed(0)}% = -EV bucket` });
             continue;
           }
         }
@@ -6030,29 +6030,29 @@ async function checkPreGamePredictions() {
     let confidence = decision.confidence ?? 0;
     const _pgPriceForGate = matchedSide.price;
 
-    // KILLER BUCKET BLOCK (2026-04-23, data-driven):
-    // 89-trade cross-tab showed the 15+pt edge × 65-69% confidence bucket is -$81 on 24 trades
-    // (58% WR). This is the "narrative stack" pattern — Claude claims a big edge without real
-    // conviction. Example losses: SD-LAA -$33, ATL-PHI -$32, SF-WSH -$24, DET-BOS -$21.
-    // Same 15+pt edge at ≥70% conf went 89% WR for +$112 — proportionality is the signal.
+    // KILLER BUCKET BLOCK (2026-04-23, data-driven — MLB-ONLY after per-sport audit):
+    // MLB cross-tab: 15+pt edge × 65-69% conf = 17 trades, -$43 (real statistical power).
+    // Non-MLB sports have 1-3 samples per cell — not enough to block. ELC-ATM LALIGA hit
+    // +$40 on exactly this bucket (67% conf, 27pt edge) with 3 confirmed injuries.
+    // Blocking non-MLB would kill legitimate soccer/NBA/NHL edges based on weak evidence.
     //
-    // CARVE-OUTS:
-    //   MLB: exempt if opponent starter ERA > 5.5 confirmed (legit spot-starter-disaster edge)
-    //   Otherwise: hard block until confidence ≥ 70%
+    // Per-sport auto-learning (P3.2 Wilson-CI auto-freeze) will handle non-MLB once we
+    // have 15+ samples per bucket. Until then, trust Claude for non-MLB 15+pt edges.
+    //
+    // MLB CARVE-OUT: exempt when opponent starter ERA > 5.5 (STL-HOU Weiss +$42 case).
     {
       const _claimedEdge = confidence - _pgPriceForGate;
-      if (_claimedEdge >= 0.15 && confidence < 0.70) {
+      const _isMLB = expectedSport === 'MLB';
+      if (_isMLB && _claimedEdge >= 0.15 && confidence < 0.70) {
         const _fullR = ((decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? '')).toLowerCase();
-        const _isMLB = expectedSport === 'MLB';
-        // Looks for "ERA 6.xx" / "ERA 7.xx" / "ERA 8+" pattern OR explicit spot-starter language
         const _hasSpotStarterERA = /\bera\s*[67-9]\.\d{1,2}\b/i.test(_fullR) ||
                                    /\b(emergency|spot|debut|rookie|recalled|called up)\s*(starter|arm|pitcher)\b/i.test(_fullR);
-        if (!(_isMLB && _hasSpotStarterERA)) {
-          console.log(`[pre-game] 🚫 KILLER BUCKET BLOCKED: ${market.base} claims ${(_claimedEdge*100).toFixed(0)}pt edge at ${(confidence*100).toFixed(0)}% conf — proportionality mismatch (15+pt edges need 70%+ conf, historical WR 58% → -$81 on 24 trades).`);
-          logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'killer-bucket-block', reasoning: `Edge ${(_claimedEdge*100).toFixed(0)}pt + conf ${(confidence*100).toFixed(0)}% = -EV historical bucket`, claudeReasoning: (decision.reasoning ?? '').slice(0, 200) });
+        if (!_hasSpotStarterERA) {
+          console.log(`[pre-game] 🚫 MLB KILLER BUCKET BLOCKED: ${market.base} claims ${(_claimedEdge*100).toFixed(0)}pt edge at ${(confidence*100).toFixed(0)}% conf — MLB-specific block (17 trades -$43 historical). Non-MLB 15+pt edges still pass.`);
+          logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'mlb-killer-bucket-block', reasoning: `MLB: Edge ${(_claimedEdge*100).toFixed(0)}pt + conf ${(confidence*100).toFixed(0)}% = -EV bucket`, claudeReasoning: (decision.reasoning ?? '').slice(0, 200) });
           continue;
         } else {
-          console.log(`[pre-game] ✅ KILLER BUCKET CARVE-OUT: ${market.base} — opponent spot-starter ERA > 6.0 detected, allowing through despite 15+pt edge + ${(confidence*100).toFixed(0)}% conf`);
+          console.log(`[pre-game] ✅ MLB KILLER BUCKET CARVE-OUT: ${market.base} — spot-starter ERA > 6.0 detected, allowing through`);
         }
       }
     }
@@ -9846,6 +9846,84 @@ async function main() {
   }
   setTimeout(statsLoop, 5 * 60 * 1000);
 
+  // CALIBRATION STATS — aggregates all settled trades by (sport × strategy × edge-band ×
+  // conf-band). Writes to logs/calibration-stats.json every 10min and emits a Telegram
+  // digest once per day (first cycle after 09:00 ET). Enables per-sport bucket analysis
+  // without hardcoding rules — we can eyeball the data + act when samples > 15 per cell.
+  const _lastDigestDateKey = { value: '' };
+  async function updateCalibrationStats() {
+    if (!existsSync(TRADES_LOG)) return;
+    try {
+      const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      const settled = [];
+      for (const l of lines) {
+        try {
+          const t = JSON.parse(l);
+          if (t.realizedPnL == null || !t.gameOutcome) continue;
+          if (!t.strategy || !t.ticker) continue;
+          settled.push(t);
+        } catch {}
+      }
+      const sportOf = (tk) => tk.includes('NBA') ? 'NBA' : tk.includes('MLB') ? 'MLB'
+        : tk.includes('NHL') ? 'NHL' : tk.match(/MLS|EPL|LALIGA|SERIEA|BUNDESLIGA|LIGUE1/) ? 'Soccer' : 'Other';
+      const edgeBand = (edge) => edge < 0.05 ? '<5pt' : edge < 0.10 ? '5-9pt' : edge < 0.15 ? '10-14pt' : edge < 0.20 ? '15-19pt' : '20+pt';
+      const confBand = (c) => c < 0.60 ? '<60%' : c < 0.65 ? '60-64%' : c < 0.70 ? '65-69%' : c < 0.75 ? '70-74%' : c < 0.80 ? '75-79%' : '80%+';
+
+      const buckets = new Map();
+      for (const t of settled) {
+        const sport = sportOf(t.ticker ?? '');
+        const strat = t.strategy ?? 'unknown';
+        const edge = (t.confidence ?? 0) - (t.entryPrice ?? 0);
+        const ebd = edgeBand(edge);
+        const cbd = confBand(t.confidence ?? 0);
+        const key = `${sport}|${strat}|${ebd}|${cbd}`;
+        if (!buckets.has(key)) buckets.set(key, { sport, strategy: strat, edge: ebd, conf: cbd, n: 0, wins: 0, losses: 0, pnl: 0 });
+        const b = buckets.get(key);
+        b.n++;
+        if (t.gameOutcome === 'correct') b.wins++;
+        else if (t.gameOutcome === 'incorrect') b.losses++;
+        b.pnl += (t.realizedPnL ?? 0);
+      }
+      const rows = Array.from(buckets.values()).map(b => ({
+        ...b,
+        wr: b.n > 0 ? Math.round(b.wins / b.n * 100) : 0,
+        pnl: Math.round(b.pnl * 100) / 100,
+        pnlPerTrade: b.n > 0 ? Math.round(b.pnl / b.n * 100) / 100 : 0,
+      })).sort((a, b) => b.n - a.n);
+
+      const calPath = './logs/calibration-stats.json';
+      try {
+        writeFileSync(calPath, JSON.stringify({ updatedAt: new Date().toISOString(), totalSettled: settled.length, buckets: rows }, null, 2));
+      } catch (e) { console.log(`[cal-stats] write error: ${e.message}`); }
+
+      // Daily digest: once per ET day after 09:00. Finds worst + best buckets with ≥5 trades.
+      const etH = etHour();
+      const todayKey = etTodayStr();
+      if (etH >= 9 && _lastDigestDateKey.value !== todayKey) {
+        _lastDigestDateKey.value = todayKey;
+        const significant = rows.filter(r => r.n >= 5);
+        if (significant.length > 0) {
+          const worst = [...significant].sort((a, b) => a.pnl - b.pnl).slice(0, 3);
+          const best = [...significant].sort((a, b) => b.pnl - a.pnl).slice(0, 3);
+          const fmt = (r) => `${r.sport} ${r.strategy.replace('pre-game-','pg-').replace('live-','lv-')}\n   ${r.edge} × ${r.conf}: ${r.n}n, ${r.wr}% WR, $${r.pnl.toFixed(0)}`;
+          const totalPnL = rows.reduce((s, r) => s + r.pnl, 0);
+          console.log(`[cal-stats] Daily digest: ${settled.length} settled, net $${totalPnL.toFixed(2)}`);
+          await tg(
+            `📊 <b>DAILY CALIBRATION DIGEST</b>\n` +
+            `${settled.length} settled · total P&L $${totalPnL.toFixed(2)}\n\n` +
+            `🟢 <b>BEST BUCKETS (n≥5)</b>\n` +
+            best.map(fmt).join('\n') + '\n\n' +
+            `🔴 <b>WORST BUCKETS (n≥5)</b>\n` +
+            worst.map(fmt).join('\n') + '\n\n' +
+            `📁 Full stats: logs/calibration-stats.json`
+          );
+        }
+      }
+    } catch (e) {
+      console.error('[cal-stats] scan error:', e.message);
+    }
+  }
+
   // Settlement reconciliation + stop-loss review — every 5 min
   async function settlementLoop() {
     try { await managePositions(); } catch (e) { console.error('[exit] error:', e.message); }
@@ -9853,6 +9931,7 @@ async function main() {
     try { await settlePaperTrades(); } catch (e) { console.error('[paper-settle] error:', e.message); }
     try { await reviewStopLossOutcomes(); } catch (e) { console.error('[stop-review] error:', e.message); }
     try { await checkLosingStreak(); } catch (e) { console.error('[streak] error:', e.message); }
+    try { await updateCalibrationStats(); } catch (e) { console.error('[cal-stats] error:', e.message); }
     setTimeout(settlementLoop, 5 * 60 * 1000);
   }
   setTimeout(settlementLoop, 2 * 60 * 1000); // first run after 2 min

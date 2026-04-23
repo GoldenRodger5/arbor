@@ -301,6 +301,16 @@ Cross-tab analysis of 89 settled trades revealed a specific anti-edge bucket:
 
 Also shipped: `checkLosingStreak()` in settlementLoop — alerts via Telegram on 5+ consecutive losses or <30% WR in last 10 trades per (sport, strategy) bucket. 6h dedup per bucket.
 
+**Killer-bucket block LOOSENED to MLB-only (2026-04-23):** after per-sport cross-tab showed:
+- MLB 15+pt × 65-69% = 17 trades, -$43 (real statistical power — keep block)
+- NBA 15+pt × 70-74% = 5 trades at 100% WR for +$55 (would be falsely blocked)
+- LALIGA ELC-ATM +$40 was 67% conf, 27pt edge (exactly the bucket pattern, but legit with 3 confirmed injuries)
+- Non-MLB sports have 1-3 samples per cell — not enough for principled block
+
+Decision: MLB-only block, let Wilson-CI auto-learn catch non-MLB patterns as samples accumulate.
+
+**Calibration stats tracker shipped:** `updateCalibrationStats()` runs each settlement loop (5min), writes `logs/calibration-stats.json` with per-(sport × strategy × edge × conf) WR/P&L breakdown. Daily Telegram digest after 09:00 ET shows top-3 best and worst buckets with n≥5. Enables per-sport bucket analysis without hardcoding rules.
+
 ## 8. Open questions
 
 1. Is live-swing worth fixing or should it die? Data says die; need 1-2 more weeks.
