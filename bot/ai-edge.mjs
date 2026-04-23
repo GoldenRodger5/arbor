@@ -4323,9 +4323,11 @@ async function checkLiveScoreEdges() {
       const cText = batchResult.status === 'fulfilled' ? batchResult.value : null;
       if (!cText) { await reportError('live-edge:sonnet-empty', `${item.targetAbbr} ${item.league.toUpperCase()} ${item.awayAbbr}@${item.homeAbbr}${batchResult.status === 'rejected' ? ': ' + batchResult.reason?.message : ''}`); continue; }
 
-      // Destructure back the context we need
+      // Destructure back the context we need. `isSwingMode` is mutable below
+      // (isEdgeFirstLive promotion at ~line 4377 reassigns it) so it must be `let`.
       const { league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, leadingAbbr,
-              gameDetail, price, ticker, gameBase, title, targetAbbr, hasPosition, currentScoreKey, isSwingMode, isThesisVindicated, reentryHalfSize } = item;
+              gameDetail, price, ticker, gameBase, title, targetAbbr, hasPosition, currentScoreKey, isThesisVindicated, reentryHalfSize } = item;
+      let { isSwingMode } = item;
 
       try {
         const jsonMatch = extractJSON(cText);
