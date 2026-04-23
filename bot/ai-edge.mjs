@@ -3098,6 +3098,38 @@ async function checkLiveScoreEdges() {
         }
       }
     }
+    // PROMOTION: a cross-confirmed, high-velocity line move on a liveGame that wasn't
+    // already a candidate means the market is reacting to something (mid-inning HR, injury,
+    // bullpen change) that our WE-floor filter missed. Promote it so Sonnet can evaluate.
+    // Market-lag detection is strongest precisely when small early leads create big price
+    // swings — exactly the 52-58% WE zone our normal 60% candidate filter excludes.
+    const promoted = new Set();
+    for (const mover of lineMovers) {
+      const gameBase = mover.ticker.lastIndexOf('-') > 0 ? mover.ticker.slice(0, mover.ticker.lastIndexOf('-')) : mover.ticker;
+      if (promoted.has(gameBase)) continue;
+      const liveGame = liveGames.find(g => {
+        const homeAbbr = g.home.team?.abbreviation ?? '';
+        const awayAbbr = g.away.team?.abbreviation ?? '';
+        return tickerHasTeam(mover.ticker, homeAbbr) && tickerHasTeam(mover.ticker, awayAbbr);
+      });
+      if (!liveGame || candidates.includes(liveGame)) continue;
+      // Cross-confirmation: the OTHER contract in this same game also moved this cycle
+      const crossConfirmed = lineMovers.some(m => {
+        if (m.ticker === mover.ticker) return false;
+        const mBase = m.ticker.lastIndexOf('-') > 0 ? m.ticker.slice(0, m.ticker.lastIndexOf('-')) : m.ticker;
+        return mBase === gameBase;
+      });
+      if (!crossConfirmed) continue;
+      if ((mover.velocity ?? 0) < 5) continue;
+      const isHome = liveGame.leading === liveGame.home;
+      liveGame._baselineWE = liveGame.diff > 0 ? (getWinExpectancy(liveGame.league, liveGame.diff, liveGame.period, isHome) ?? 0.50) : 0.50;
+      liveGame._lineMovePromoted = true;
+      liveGame._lineMove = { ...mover, confirming: false, crossConfirmed: true };
+      candidates.push(liveGame);
+      promoted.add(gameBase);
+      console.log(`[live-edge] 📣 PROMOTED by line-move: ${liveGame.away.team?.abbreviation}@${liveGame.home.team?.abbreviation} — cross-confirmed ${(mover.velocity ?? 0).toFixed(1)}¢/min, WE=${(liveGame._baselineWE*100).toFixed(0)}% (below normal floor but market is active)`);
+    }
+
     // Re-sort — confirming moves at top, contra moves stay at natural WE rank
     candidates.sort((a, b) => b._baselineWE - a._baselineWE);
   }
@@ -3114,7 +3146,7 @@ async function checkLiveScoreEdges() {
   // Collect Sonnet work items for parallel execution
   const sonnetQueue = [];
 
-  for (const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail, isSoccer, _scoreChanged, _lineMove } of candidates) {
+  for (const { league, comp, home, away, homeScore, awayScore, diff, period, leading, detail: gameDetail, isSoccer, _scoreChanged, _lineMove, _lineMovePromoted } of candidates) {
     const seriesMap = { mlb: 'KXMLBGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME', mls: 'KXMLSGAME', epl: 'KXEPLGAME', laliga: 'KXLALIGAGAME', seriea: 'KXSERIAA', bundesliga: 'KXBUNDESLIGA', ligue1: 'KXLIGUE1' };
     const series = seriesMap[league] ?? 'KXMLBGAME';
 
@@ -3422,7 +3454,10 @@ async function checkLiveScoreEdges() {
         return 0.55; // soccer
       })();
       if (baseWE < MIN_WE_FOR_SONNET) {
-        if (baseWE >= SWING_WE_FLOOR) {
+        if (_lineMovePromoted) {
+          isSwingMode = true;
+          console.log(`[live-swing] 🔄 Swing candidate (line-move-promoted): ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} WE=${(baseWE*100).toFixed(0)}% below floor but market moved — letting Sonnet evaluate`);
+        } else if (baseWE >= SWING_WE_FLOOR) {
           isSwingMode = true;
           const trigger = _scoreChanged ? 'score-changed' : 'sub-floor-WE';
           console.log(`[live-swing] 🔄 Swing candidate (${trigger}): ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} WE=${(baseWE*100).toFixed(0)}% (swing floor ${(SWING_WE_FLOOR*100).toFixed(0)}%, live floor ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%)`);
