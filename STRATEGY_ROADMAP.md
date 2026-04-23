@@ -208,10 +208,10 @@
   - Needs cycle-by-cycle snapshot infrastructure
   - Defer to focused session when we have bandwidth
 
-- [x] **P3.7 — Drawdown circuit breaker** ✅ 2026-04-23
-  - Shipped: if 24h realized P&L < -$30, pause new entries for 12h
-  - UI override: set `forceTradeAfterDrawdown:true` in control.json
-  - Rationale: 4/15-16 lost -$105, 4/23 lost -$46 on edge-first; a pro walks after a bad day
+- [~] **P3.7 — Drawdown circuit breaker** REVERTED 2026-04-23
+  - User preference: keep trading smaller bets to collect data, not pause after a bad day
+  - Replaced with: tighter per-game (8%→5%) and per-trade (10%→6%) caps
+  - Keeps blast radius small while maintaining data flow for calibration
 
 - [x] **P3.8 — Date-bounded line-move detector** ✅ 2026-04-23
   - Shipped: `tickerIsWithinNext24h` gates line-move detection
@@ -281,6 +281,7 @@ Things we need tracked but aren't yet:
 | 2026-04-23 | Sport audit (NHL/NBA/Soccer) | NHL bleeds in stops (already fixed); NBA tightened prompt; Soccer underdog cap 35¢→40¢ | TBD |
 | 2026-04-23 | Reality check on P&L | Realized +$152 but net-of-deposits is -$440 from $550 bankroll; profit driven by TOT-BRI outlier | Flagged in ROADMAP |
 | 2026-04-23 | Future-market filter + drawdown breaker | 24h window on line-move detector; −$30/24h halts new entries for 12h | TBD |
+| 2026-04-23 | Revert drawdown breaker, tighten caps instead | User: prefer smaller bets + data collection over pausing. 8%→5% game, 10%→6% trade | TBD |
 
 ---
 

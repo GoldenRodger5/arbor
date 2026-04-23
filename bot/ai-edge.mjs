@@ -396,7 +396,10 @@ function getMaxPrice(league, period, diff = 1) {
   if (['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league)) return 0.75;
   return MAX_PRICE;
 }
-const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — live-edge base fraction
+// 2026-04-23: tightened 10% → 6%. Preference is smaller bets for data collection
+// over concentrated bets. At $110 bankroll: 6% = $6.60 per live-edge trade.
+// When WR and calibration stabilize, can relax back toward 8-10%.
+const MAX_TRADE_FRACTION = 0.06; // 6% of bankroll per trade — live-edge base fraction
 // P1.3 — Pre-game sizing cut 15% → 5% per data analysis 2026-04-23.
 // Biggest losses all came from oversized pre-game positions: SD-LAA -$33 (76 ct @ 44¢),
 // ATL-PHI -$32 (66 ct @ 49¢), SF-WSH -$24 (57 ct @ 52¢), DET-BOS -$21 (71 ct @ 46¢).
@@ -404,7 +407,10 @@ const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — live-edge base
 const PRE_GAME_TRADE_FRACTION = 0.05; // 5% for pre-game — tighter until pre-game WR improves
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 5 * 60 * 1000;  // 5 min base cooldown (can be bypassed for better prices)
-const MAX_GAME_EXPOSURE_PCT = 0.08; // Max 8% of bankroll on one game (was 15% — too concentrated at small bankroll)
+// 2026-04-23: tightened 8% → 5%. At $110 bankroll this is $5.50 per game, which is
+// small enough to spread bets and collect diversified data. Was producing 30-80 contract
+// positions that moved too much of the book on single games.
+const MAX_GAME_EXPOSURE_PCT = 0.05; // Max 5% of bankroll on one game
 
 // Scale-in entries scale with bankroll — at small bankroll, concentrate less on single games
 function getMaxEntriesPerGame() {
@@ -1228,42 +1234,9 @@ function canTrade() {
     return false;
   }
 
-  // DRAWDOWN CIRCUIT BREAKER (2026-04-23): if realized P&L in last 24h is worse than
-  // -$30 (adjustable), pause ALL new entries for 12h. Reads settled trades from JSONL.
-  // Rationale: on 4/15-16 we lost -$105, on 4/23 we lost -$46 on edge-first cluster.
-  // A pro bettor walks away after a bad day. The bot shouldn't press into a losing streak.
-  // UI can override by setting { paused: false, forceTradeAfterDrawdown: true } in control.json.
-  try {
-    if (existsSync(TRADES_LOG) && !ctrl.forceTradeAfterDrawdown) {
-      const cutoffMs = Date.now() - 24 * 3600 * 1000;
-      const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
-      let last24hPnL = 0;
-      for (const l of lines) {
-        try {
-          const t = JSON.parse(l);
-          const settledMs = t.settledAt ? Date.parse(t.settledAt) : 0;
-          if (settledMs >= cutoffMs && t.realizedPnL != null) {
-            last24hPnL += t.realizedPnL;
-          }
-        } catch {}
-      }
-      const DRAWDOWN_LIMIT = -30;
-      if (last24hPnL < DRAWDOWN_LIMIT) {
-        // Check if cooldown window (12h) has elapsed since first trigger
-        const dcbKey = 'drawdown-circuit:trigger';
-        const firstTrigger = tradeCooldowns.get(dcbKey) ?? 0;
-        const cooldownMs = 12 * 3600 * 1000;
-        if (firstTrigger === 0 || Date.now() - firstTrigger > cooldownMs) {
-          tradeCooldowns.set(dcbKey, Date.now());
-        }
-        if (Date.now() - tradeCooldowns.get(dcbKey) <= cooldownMs) {
-          const remainHrs = ((cooldownMs - (Date.now() - tradeCooldowns.get(dcbKey))) / 3600 / 1000).toFixed(1);
-          console.log(`[risk] 🛑 DRAWDOWN CIRCUIT BREAKER: 24h realized P&L = $${last24hPnL.toFixed(2)} (< $${DRAWDOWN_LIMIT}) — pausing new entries for ${remainHrs}h more. Override with forceTradeAfterDrawdown:true in control.json.`);
-          return false;
-        }
-      }
-    }
-  } catch (e) { /* circuit breaker is best-effort; don't halt trading on read failure */ }
+  // Daily loss limit DISABLED — preference is to keep trading smaller bets to collect
+  // data rather than pause after a bad day. Per-game and per-trade caps below keep
+  // blast radius contained.
 
   // Check max positions (dynamic) — only count positions with meaningful cost
   const maxPos = getMaxPositions();
