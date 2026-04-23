@@ -5482,7 +5482,8 @@ async function checkPreGamePredictions() {
         `✓ Confidence meets the price-tiered floor: price<50¢ → ≥63%, price 50-65¢ → ≥66%, price>65¢ → ≥68%. Do NOT return exactly 65% for a mid-price favorite — either you have genuine 66%+ conviction or it's a pass.\n` +
         `✓ Confidence beats current price by the required margin (typically 4+ points)\n` +
         `✓ Both starters confirmed AND there's a clear pitching/matchup edge\n` +
-        `🎯 EDGE-FIRST HALF-SIZE EXCEPTION: If the team is priced ≤ 55¢ AND your honest confidence is 58-65% AND the edge (confidence − price) is ≥ 10 points, that IS a valid trade — we take it at half size. Do NOT write "HARD PASS" or return {"trade":false} just because you didn't hit 66%. Return {"trade":true} with your real confidence (58-65%), and the bot will auto-size it at half. The reasoning you write gets stored for calibration — don't contradict yourself.\n\n` +
+        `🎯 EDGE-FIRST HALF-SIZE EXCEPTION (NON-MLB ONLY): If this is NBA/NHL/soccer AND the team is priced ≤ 55¢ AND your honest confidence is 58-65% AND the edge (confidence − price) is ≥ 10 points, that IS a valid trade — we take it at half size. Do NOT write "HARD PASS" or return {"trade":false} just because you didn't hit 66%. Return {"trade":true} with your real confidence (58-65%), and the bot will auto-size. The reasoning you write gets stored for calibration — don't contradict yourself.\n` +
+        `🧊 MLB PRE-GAME EDGE-FIRST IS FROZEN (went 1-5 on 2026-04-22). For MLB, the standard 66%+ floor applies — there is NO half-size exception today. If you're under 66% on MLB pre-game, just return {"trade":false}.\n\n` +
         (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
         `📊 CONFIDENCE CALIBRATION — MLB scale (MLB is the most random sport):\n` +
         `  0.65 = slight edge (ERA gap 2.5-3.5, lineup is solid but not dominant)\n` +
@@ -5984,12 +5985,18 @@ async function checkPreGamePredictions() {
     const _reasonForSource = ((decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? '')).toLowerCase();
     const _hasEdgeSource = /\b(scratch|injury list|day[- ]to[- ]day|doubtful|questionable|ruled out|out (with|for|today|the game)|bullpen game|opener|weather|wind|rain|snow|rookie (debut|start)|recalled|suspended|late scratch|\bil\b|15[- ]?day|10[- ]?day|concussion|illness|flu|covid|personal leave|bereavement|paternity|load management)\b/i.test(_reasonForSource);
     const _edgeSourceRequired = pgSportKey === 'mlb';
+    // MLB pre-game edge-first FROZEN 2026-04-23: went 1-5 (−$27.54) on 2026-04-22.
+    // Re-enable after rewriting qualification rules. Other sports keep the tier.
+    const MLB_PREGAME_EDGE_FIRST_FROZEN = true;
     const isEdgeFirst = confidence >= 0.58 &&
                         _edgeAbs >= _edgeFirstFloor &&
                         price <= 0.55 &&
                         confidence < PRE_GAME_MIN_CONF && // only triggers when standard gate would reject on conf
-                        (!_edgeSourceRequired || _hasEdgeSource);
-    if (pgSportKey === 'mlb' && confidence >= 0.58 && _edgeAbs >= _edgeFirstFloor && price <= 0.55 && confidence < PRE_GAME_MIN_CONF && !_hasEdgeSource) {
+                        (!_edgeSourceRequired || _hasEdgeSource) &&
+                        !(MLB_PREGAME_EDGE_FIRST_FROZEN && pgSportKey === 'mlb');
+    if (pgSportKey === 'mlb' && MLB_PREGAME_EDGE_FIRST_FROZEN && confidence >= 0.58 && _edgeAbs >= _edgeFirstFloor && price <= 0.55 && confidence < PRE_GAME_MIN_CONF) {
+      console.log(`[pre-game] 🧊 MLB edge-first FROZEN: ${market.base} would qualify (conf=${(confidence*100).toFixed(0)}%, edge=${(_edgeAbs*100).toFixed(0)}pt, price=${(price*100).toFixed(0)}¢) — tier paused after 1-5 yesterday`);
+    } else if (pgSportKey === 'mlb' && confidence >= 0.58 && _edgeAbs >= _edgeFirstFloor && price <= 0.55 && confidence < PRE_GAME_MIN_CONF && !_hasEdgeSource) {
       console.log(`[pre-game] ❌ MLB edge-first rejected for ${market.base}: no cited edge source (injury/weather/starter-change/bullpen-game) in reasoning`);
     }
 
