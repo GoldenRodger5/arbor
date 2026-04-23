@@ -397,7 +397,11 @@ function getMaxPrice(league, period, diff = 1) {
   return MAX_PRICE;
 }
 const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — live-edge base fraction
-const PRE_GAME_TRADE_FRACTION = 0.15; // 15% for pre-game — structural edge is larger, compound-friendly
+// P1.3 — Pre-game sizing cut 15% → 5% per data analysis 2026-04-23.
+// Biggest losses all came from oversized pre-game positions: SD-LAA -$33 (76 ct @ 44¢),
+// ATL-PHI -$32 (66 ct @ 49¢), SF-WSH -$24 (57 ct @ 52¢), DET-BOS -$21 (71 ct @ 46¢).
+// Pre-game WR is 41% — can't afford 10-15% position sizing when losers are 2.6× winners.
+const PRE_GAME_TRADE_FRACTION = 0.05; // 5% for pre-game — tighter until pre-game WR improves
 const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
 const COOLDOWN_MS = 5 * 60 * 1000;  // 5 min base cooldown (can be bypassed for better prices)
 const MAX_GAME_EXPOSURE_PCT = 0.08; // Max 8% of bankroll on one game (was 15% — too concentrated at small bankroll)
@@ -1140,13 +1144,19 @@ function getAvailableCash(exchange = 'kalshi') {
   return Math.max(0, bal - reserve);
 }
 
-function getDynamicMaxTrade(exchange = 'kalshi', sport = null) {
+function getDynamicMaxTrade(exchange = 'kalshi', sport = null, strategy = null) {
   const bankroll = getBankroll();
   // Tier 2: Per-sport Kelly fraction (downward-only; default 0.50 = half-Kelly)
   // MAX_TRADE_FRACTION is the base cap; kellyFraction scales it further if
   // realized edge for this sport is below expectations.
   const kellyMult = sport ? (getKellyFraction(sport) / 0.50) : 1; // 1.0 = no change, 0.5 = half
-  const pctCap = bankroll * MAX_TRADE_FRACTION * kellyMult;
+  // P1.3 — pre-game strategies capped at 5% (half the live-edge max).
+  // Data: biggest losses are 60-85 contracts on ~$30-33 deploy (10%+ of bankroll).
+  // SD-LAA -$33, ATL-PHI -$32, SF-WSH -$24, DET-BOS -$21, MIL-MIA -$20 — all oversized.
+  // Pre-game has higher variance tail risk; 5% cap preserves the edge while trimming blowups.
+  const isPreGame = strategy && (strategy === 'pre-game-prediction' || strategy === 'pre-game-edge-first');
+  const strategyFrac = isPreGame ? 0.05 : MAX_TRADE_FRACTION;
+  const pctCap = bankroll * strategyFrac * kellyMult;
   const ceiling = getTradeCapCeiling();
   const available = getAvailableCash(exchange);
   return Math.min(pctCap, ceiling, available);
@@ -4617,6 +4627,18 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
+        // P1.1 — Block late-inning 1-run MLB live-prediction leads.
+        // Data (11 historical trades, 36% WR, -$19 net): buying the leader of a 1-run MLB game
+        // in innings 7-9 at 62-78¢ (when WE table says 76-87%) has been a net loser. The market
+        // is correctly pricing bullpen-collapse risk at 60-70¢ — our WE table doesn't model it.
+        // Losers (LAA-NYY -$18, KC-DET -$18, MIA-ATL -$17) averaged $15; winners averaged $8.
+        // The edge we think we have is the edge the market already priced. Just skip the setup.
+        if (!isSwingMode && league === 'mlb' && stage === 'late' && Math.abs(diff) <= 1 && targetAbbr === leadingAbbr) {
+          console.log(`[live-edge] BLOCKED ${targetAbbr} (MLB late-inning 1-run lead pattern): inning ${period}, diff ${diff}, WE-table overvalues bullpen protection — historical 36% WR, -$19 net. Skipping.`);
+          logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-late-1run', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `MLB late-inning 1-run leads: 11 historical trades, 36% WR, -$19 net. Market correctly prices bullpen risk; WE table doesn't.` });
+          continue;
+        }
+
         // Swing mode: entry price must be ≤65¢ and confidence ≥68%
         if (isSwingMode) {
           if (price > 0.65) {
@@ -5307,7 +5329,8 @@ async function checkPreGamePredictions() {
     console.log(`[pre-game] Analysis cache: skipping ${eligibleMarkets.length - uncachedMarkets.length} recently-analyzed markets (${uncachedMarkets.length} uncached)`);
   }
   const pgSlice = uncachedMarkets.slice(0, 12); // up to 12 per cycle for broad coverage
-  const maxBetDisplay = getDynamicMaxTrade().toFixed(2);
+  // Pre-game sizing capped at 5% per P1.3 — pass strategy so getDynamicMaxTrade applies the cap.
+  const maxBetDisplay = getDynamicMaxTrade('kalshi', null, 'pre-game-prediction').toFixed(2);
 
   const todayDate = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'long', day: 'numeric' });
   const nowET = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', weekday: 'long', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
@@ -5598,7 +5621,9 @@ async function checkPreGamePredictions() {
       : /* MLB */
       sport === 'MLB'
       ? `You are a professional MLB swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
-        `STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building an early lead, or the opponent's starter struggling. Your confidence = "what is the real probability this team WINS today?" Starting pitching is the dominant driver of MLB win probability. An ace vs. a weak lineup can win 65%+ of games; a weak starter on your side drops it below 45%.\n\n` +
+        `STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building an early lead, or the opponent's starter struggling. Your confidence = "what is the real probability this team WINS today?"\n\n` +
+        `⚠️ CORE FRAME: The market has already priced starting pitching, team records, home field, and recent form. These are NOT your edge — the market sees them too. Your job is to find situations where the market has MISPRICED a specific factor — OR where a spot-starter/opener disaster (ERA > 6.0) has been under-weighted. A 1-2pt ERA gap is not an edge; a 3+pt gap OR an opponent at ERA 6+ IS one.\n\n` +
+        `📊 HISTORICAL DATA: MLB pre-game picks with 1-2pt ERA gaps went 8-16 (33% WR) for -$94 over our last sample. Picks with opponent ERA > 6.0 went 4-1 (80% WR) for +$95. The difference is real. Stop picking thin ERA gaps.\n\n` +
         `⚠️ DATA RULES: ESPN-confirmed starters and their ERA/WHIP are provided above — those are authoritative ground truth. Do NOT override ESPN stats with different values from your training data or web search. You have ONE web search — use it for: last 5 starts form, bullpen rest, lineup injuries, any late scratches. Do NOT search for pitcher ERA — it is already provided above.\n` +
         `⚠️ ROSTER INTEGRITY: Only cite players who play for the SPECIFIC teams in this game. Verify any player name you mention belongs to ${market.team1.teamName} or ${market.team2.teamName}, not another franchise.\n\n` +
         `GAME: ${market.title}\n` +
@@ -5621,13 +5646,13 @@ async function checkPreGamePredictions() {
         `  The market has already priced pitching matchups. Your job is to find WE-vs-price gaps, not to re-litigate every pitcher duel.\n\n` +
         `═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══\n` +
         `Start from 54% win rate (home) / 46% (away). Adjust based on confirmed research:\n` +
-        `+ Your ace (ERA < 3.0) vs opponent ERA > 4.5 → UP 8-12% (pitching mismatch is the biggest lever)\n` +
-        `+ Opponent starter ERA > 6.0 (genuinely terrible, not just below average) → UP 8-12%\n` +
-        `+ Opponent starter ERA 5.0–6.0 AND your lineup is strong → UP 4-6%\n` +
-        `+ Your team top-tier bullpen (ERA < 3.5) → UP 2-3%\n` +
+        `+ Opponent starter ERA > 6.0 (genuinely terrible — spot starter, emergency call-up, debut disaster) → UP 10-14% ← THIS IS THE REAL EDGE\n` +
+        `+ Your ace (ERA < 2.5, WHIP < 1.05) vs opponent ERA > 5.5 → UP 8-10% (need BOTH ends of the gap to be extreme)\n` +
+        `+ Your team top-tier bullpen (ERA < 3.5) → UP 2-3% (but market knows this too — small bump)\n` +
         `- Opponent has elite ace (ERA < 2.5, WHIP < 1.0) → DOWN 8-12%\n` +
         `- Your key lineup bat confirmed OUT → DOWN 4-6%\n\n` +
-        `⚠️ CONFIDENCE CAP: For MLB, confidence above 65% requires a clear ERA gap of 2.5+ between the two starters OR confirmed opponent ERA > 6.0. If you're reaching 66%+ by stacking 3-4 small factors (bullpen + lineup + recent form + park), cap at 65%. The market prices all of those in.\n\n` +
+        `🚫 THIN-EDGE REJECTION: Do NOT stack 1-2pt ERA gaps + "strong lineup" + "home field" + "recent form" into a 66% confidence. Historical data says these are market-priced and net-losing. If your only case is a 1-3pt ERA gap, return {"trade":false}.\n\n` +
+        `⚠️ CONFIDENCE CAP: For MLB, confidence above 65% requires EITHER: (a) opponent starter ERA > 6.0 confirmed, OR (b) your ace ERA < 2.5 AND opponent ERA > 5.5 (BOTH extremes). Any 2pt ERA gap on two mid-quality pitchers is NOT enough — cap at 62% and likely pass.\n\n` +
         `═══ STEP 4 — DECISION ═══\n` +
         `REMEMBER: confidence = P(this team wins the game). We exit at +12¢ — typically happens after they score early and the market reprices. A clear pitching edge translates to win probability and contract price movement.\n` +
         `BUY only if ALL are true:\n` +
@@ -5637,11 +5662,12 @@ async function checkPreGamePredictions() {
         `🎯 EDGE-FIRST HALF-SIZE EXCEPTION (NON-MLB ONLY): If this is NBA/NHL/soccer AND the team is priced ≤ 55¢ AND your honest confidence is 58-65% AND the edge (confidence − price) is ≥ 10 points, that IS a valid trade — we take it at half size. Do NOT write "HARD PASS" or return {"trade":false} just because you didn't hit 66%. Return {"trade":true} with your real confidence (58-65%), and the bot will auto-size. The reasoning you write gets stored for calibration — don't contradict yourself.\n` +
         `🧊 MLB PRE-GAME EDGE-FIRST IS FROZEN (went 1-5 on 2026-04-22). For MLB, the standard 66%+ floor applies — there is NO half-size exception today. If you're under 66% on MLB pre-game, just return {"trade":false}.\n\n` +
         (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
-        `📊 CONFIDENCE CALIBRATION — MLB scale (MLB is the most random sport):\n` +
-        `  0.65 = slight edge (ERA gap 2.5-3.5, lineup is solid but not dominant)\n` +
-        `  0.68 = clear edge (ERA gap 3.5+ confirmed from ESPN stats, or opponent ERA > 6.0)\n` +
-        `  0.72 = strong edge (ace ERA < 3.0 vs ERA > 5.5 confirmed + lineup has clear run-scoring advantage)\n` +
-        `  0.75+ = exceptional (ace ERA < 2.5 + opponent ERA > 6.5 + confirmed injuries to opponent lineup — all three independently verified from ESPN + search)\n` +
+        `📊 CONFIDENCE CALIBRATION — MLB scale (MLB is the most random sport — tightened 2026-04-23 per 45-trade post-mortem):\n` +
+        `  0.62 = marginal — ERA gap 3-4pt, must be your only edge; expect high variance\n` +
+        `  0.66 = clear edge — opponent ERA > 5.5 confirmed OR your ace ERA < 2.8 vs their ERA > 4.5\n` +
+        `  0.70 = strong edge — opponent ERA > 6.0 (emergency starter) confirmed\n` +
+        `  0.73+ = exceptional — opponent ERA > 6.5 + confirmed lineup injuries; needs 3 independent factors\n` +
+        `  ⛔ DO NOT hit 0.68+ on "solid ace vs mediocre starter." Our data: 8-16 on that bucket (-$94). Reject those.\n` +
         `⛔ ESPN ERA/WHIP above are ground truth. If you write a different ERA in your reasoning than what ESPN shows, your analysis is invalid. Use the ESPN number.\n\n` +
         `⚠️ UNDERDOG REALITY CHECK — If the team you want to bet is priced below 35¢:\n` +
         `  YOUR MAX CONFIDENCE = market price + 20 points. Example: team at 25¢ → max 45%. Team at 30¢ → max 50%.\n` +
@@ -6210,7 +6236,8 @@ async function checkPreGamePredictions() {
     // Boost underdog sizing by 50% to capitalize on the edge.
     const bkr = getBankroll();
     const isUnderdog = price < 0.45;
-    const pgFraction = bkr < 500 ? (isUnderdog ? 0.15 : 0.10) : PRE_GAME_TRADE_FRACTION;
+    // Small bankroll tiers: slightly looser to allow meaningful bet sizes but capped below old levels.
+    const pgFraction = bkr < 500 ? (isUnderdog ? 0.08 : 0.06) : PRE_GAME_TRADE_FRACTION;
     const pgAbsCap = bkr < 500 ? (isUnderdog ? 30 : 20) : bkr < 1000 ? 50 : Infinity;
     const pgMaxTrade = Math.min(bkr * pgFraction, pgAbsCap, getAvailableCash('kalshi'));
     // Edge-first tier: half-size — entry is EV+ but below standard conf floor, so size down.
