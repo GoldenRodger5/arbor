@@ -5833,15 +5833,36 @@ async function checkPreGamePredictions() {
     //
     // Qualifies if: conf ≥ 58% AND edge ≥ 10pt AND price ≤ 55¢ (underdog zone only —
     // favorites at this conf level are actually risky, cheap edges are where the math works).
+    // CALIBRATION HAIRCUT — Claude's pre-game confidence has been systematically overconfident.
+    // 2026-04-22 data: MLB pre-game edge-first went 0/5 on claimed 10-17pt edges the market
+    // had already absorbed. Apply sport-specific haircut before gate/edge-first so floors and
+    // Kelly sizing both reflect realistic probability. Live markets are not adjusted here
+    // (their edges come from Kalshi book lag on WE, which is a different dynamic).
+    const _calibrationHaircut = pgSportKey === 'mlb' ? 0.05
+                              : pgSportKey === 'nba' ? 0.03
+                              : pgSportKey === 'nhl' ? 0.02
+                              : 0.02; // soccer/other
+    if (_calibrationHaircut > 0 && confidence > _calibrationHaircut) {
+      const _preHaircut = confidence;
+      confidence = Math.max(0, confidence - _calibrationHaircut);
+      console.log(`[pre-game] calibration haircut: ${(_preHaircut*100).toFixed(0)}% → ${(confidence*100).toFixed(0)}% (${pgSportKey} -${(_calibrationHaircut*100).toFixed(0)}pt)`);
+    }
     const _edgeAbs = confidence - price;
-    // MLB edge-first went 5/5 losses on 2026-04-22 (-$28) on claimed 10-17pt edges that
-    // overnight markets had already absorbed. Tighten MLB-only to 13pt to filter soft edges
-    // while keeping other sports at 10pt (live NBA/NHL edges are sharper).
-    const _edgeFirstFloor = pgSportKey === 'mlb' ? 0.13 : 0.10;
+    // EDGE-FIRST FLOORS — MLB tightened to 15pt after 2026-04-22 0/5 on 10-13pt edges.
+    // MLB pre-game also requires a CITED EDGE SOURCE (injury scratch, weather, starter change,
+    // bullpen game) because generic "ERA gap / home field" reasoning is already priced in.
+    const _edgeFirstFloor = pgSportKey === 'mlb' ? 0.15 : 0.10;
+    const _reasonForSource = ((decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? '')).toLowerCase();
+    const _hasEdgeSource = /\b(scratch|injury list|day[- ]to[- ]day|doubtful|questionable|ruled out|out (with|for|today|the game)|bullpen game|opener|weather|wind|rain|snow|rookie (debut|start)|recalled|suspended|late scratch|\bil\b|15[- ]?day|10[- ]?day|concussion|illness|flu|covid|personal leave|bereavement|paternity|load management)\b/i.test(_reasonForSource);
+    const _edgeSourceRequired = pgSportKey === 'mlb';
     const isEdgeFirst = confidence >= 0.58 &&
                         _edgeAbs >= _edgeFirstFloor &&
                         price <= 0.55 &&
-                        confidence < PRE_GAME_MIN_CONF; // only triggers when standard gate would reject on conf
+                        confidence < PRE_GAME_MIN_CONF && // only triggers when standard gate would reject on conf
+                        (!_edgeSourceRequired || _hasEdgeSource);
+    if (pgSportKey === 'mlb' && confidence >= 0.58 && _edgeAbs >= _edgeFirstFloor && price <= 0.55 && confidence < PRE_GAME_MIN_CONF && !_hasEdgeSource) {
+      console.log(`[pre-game] ❌ MLB edge-first rejected for ${market.base}: no cited edge source (injury/weather/starter-change/bullpen-game) in reasoning`);
+    }
 
     if ((confidence < PRE_GAME_MIN_CONF || _edgeAbs < pgReqMargin) && !isEdgeFirst) {
       console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(_edgeAbs*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% min=${(PRE_GAME_MIN_CONF*100).toFixed(0)}% (${pgSportKey})`);

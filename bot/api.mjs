@@ -263,6 +263,28 @@ async function generateRecap(period) {
     .map(s => `${s.sport.toUpperCase()} ${s.trades}t ${s.wins}W ${s.pnl >= 0 ? '+' : ''}$${s.pnl.toFixed(2)}`)
     .join(' · ') || '(no settlements)';
 
+  // Per-bucket calibration: (sport, phase, confidence bucket) → WR/PnL
+  // Phase: strategy starting with 'pre-game' = pre, else = live. Surfaces systematic
+  // over/underconfidence so future tuning has evidence, not intuition.
+  const bucketMap = {};
+  for (const t of settled) {
+    const sport = getSportFromTicker(t.ticker);
+    const phase = (t.strategy ?? '').startsWith('pre-game') ? 'pre' : 'live';
+    const conf = t.confidence ?? 0;
+    const bucket = conf < 0.60 ? '55-60' : conf < 0.65 ? '60-65' : conf < 0.70 ? '65-70' : conf < 0.75 ? '70-75' : '75+';
+    const key = `${sport}/${phase}/${bucket}`;
+    if (!bucketMap[key]) bucketMap[key] = { key, sport, phase, bucket, trades: 0, wins: 0, pnl: 0 };
+    bucketMap[key].trades++;
+    if ((t.realizedPnL ?? 0) > 0) bucketMap[key].wins++;
+    bucketMap[key].pnl += t.realizedPnL ?? 0;
+  }
+  const calibrationRows = Object.values(bucketMap)
+    .filter(b => b.trades >= 2)
+    .sort((a, b) => b.trades - a.trades);
+  const calibrationLine = calibrationRows
+    .map(b => `${b.sport.toUpperCase()}/${b.phase}/${b.bucket}%: ${b.trades}t ${b.wins}W (${Math.round(100*b.wins/b.trades)}%) ${b.pnl >= 0 ? '+' : ''}$${b.pnl.toFixed(2)}`)
+    .join(' · ') || '(insufficient sample)';
+
   let commentary = null;
   try {
     const compact = settled.slice(-30).map(t => {
@@ -294,6 +316,7 @@ Rules:
 Placed: ${placed.length} · Settled: ${settled.length} · ${wins.length}W/${losses.length}L · Win% ${settled.length ? Math.round((wins.length / settled.length) * 100) : '—'}
 Total PnL: $${totalPnL.toFixed(2)}
 Per sport: ${sportLine}
+Calibration by (sport/phase/conf-bucket), min 2 trades: ${calibrationLine}
 
 Settled trades (most recent last):
 ${compact || '(no settled trades this period)'}
@@ -315,6 +338,7 @@ Write the recap.`
     best: best ? { title: best.title, pnl: best.realizedPnL, ticker: best.ticker } : null,
     worst: worst ? { title: worst.title, pnl: worst.realizedPnL, ticker: worst.ticker } : null,
     sportBreakdown: Object.values(sportMap).map(s => ({ ...s, pnl: Math.round(s.pnl * 100) / 100, winRate: s.trades ? Math.round((s.wins / s.trades) * 100) : 0 })),
+    calibration: calibrationRows.map(b => ({ ...b, pnl: Math.round(b.pnl * 100) / 100, winRate: Math.round(100 * b.wins / b.trades) })),
     commentary,
     generatedAt: new Date().toISOString(),
   };
