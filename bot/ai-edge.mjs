@@ -3592,6 +3592,22 @@ async function checkLiveScoreEdges() {
 
         console.log(`[live-edge] Found market: ${targetMarket.ticker} "${title}" ${targetAbbr} YES=$${price.toFixed(2)}`);
 
+        // === ESPN-STALE GUARD ===
+        // ESPN scoreboard often lags real scoring by 30-90s. Normal live-edge bets are 8-15pt
+        // WE-vs-price gaps; those are the sweet spot. The tell for "ESPN stale" is a recent
+        // CONTRA line-move on the leading team: market is actively moving against the lead
+        // RIGHT NOW, which means price is absorbing a score the ESPN snapshot doesn't show yet.
+        // Real case 2026-04-22: NHL DAL "2-0 P2" per ESPN @64¢ — MIN had just scored to 2-1,
+        //   price was dropping, ESPN API snapshot was stale. We bet on a lead that no longer existed.
+        if (targetMarket === leadMarket && diff >= 1 && _lineMove?.confirming === false) {
+          const leadingIsHome = leading === home;
+          const weLeadEspn = getWinExpectancy(league, diff, period, leadingIsHome) ?? 0;
+          if (weLeadEspn > 0 && price > 0 && (weLeadEspn - price) >= 0.10) {
+            console.log(`[live-edge] ⏸️ ESPN-stale guard: ${targetAbbr} priced ${(price*100).toFixed(0)}¢ vs ESPN-WE=${(weLeadEspn*100).toFixed(0)}% (${((weLeadEspn-price)*100).toFixed(0)}pt gap) + contra line-move — ESPN likely lagging a score. Skipping until sync.`);
+            continue;
+          }
+        }
+
         // === BUILD RICH CONTEXT FROM ESPN DATA ===
         const homeRecord = home.records?.[0]?.summary ?? '';
         const awayRecord = away.records?.[0]?.summary ?? '';
@@ -3937,7 +3953,14 @@ async function checkLiveScoreEdges() {
           `   "conviction": "the single factor that pushed you over threshold",\n` +
           `   "reasoning_tags": ["1-3 short lowercase tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, other"]\n` +
           ` }}\n\n` +
-          `Every TRADE response MUST follow this exact schema. Do not substitute a string for the reasoning object.`;
+          `Every TRADE response MUST follow this exact schema. Do not substitute a string for the reasoning object.\n\n` +
+          `🛡️ STEEL-MAN RESOLUTION (non-negotiable):\n` +
+          `Before you return trade:true, your edge_argument MUST specifically defeat the steel_man — not just out-weigh it.\n` +
+          `• If your steel_man names a concrete risk (injury, matchup, tired bullpen, strong home record) and your edge_argument does NOT address that specific risk with a verifiable fact — return trade:false.\n` +
+          `• If your resolution is "yes steel-man is real but our edge is bigger" without naming WHY the steel-man is less load-bearing here — return trade:false.\n` +
+          `• If steel_man and edge_argument are both strong and point opposite directions → the market is probably right → return trade:false.\n` +
+          `• Valid resolution looks like: steel_man says "bullpen shaky" + edge_argument says "their setup man has 0.00 ERA last 10 appearances and is available tonight per ESPN". That's a specific defeat.\n` +
+          `Your conviction field should name the specific fact that neutralizes the steel_man, not restate the edge.`;
         // Block if we already have a position on this game (check BOTH platforms)
         const ticker = targetMarket.ticker;
         const lastH = ticker.lastIndexOf('-');
