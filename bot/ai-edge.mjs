@@ -4541,7 +4541,8 @@ async function checkLiveScoreEdges() {
         // Cross-sport contamination guard — same logic the pre-game path uses, now on live-edge too.
         // Catches cases like KXMLSGAME DAL@MIN analyzed with NHL terms (Wallstedt, period, power play).
         {
-          const _expSport = league === 'mlb' ? 'MLB' : league === 'nba' ? 'NBA' : league === 'nhl' ? 'NHL' : isSoccer ? 'SOCCER' : league.toUpperCase();
+          const _isSoccerLeague = ['mls','epl','laliga','seriea','bundesliga','ligue1'].includes(league);
+          const _expSport = league === 'mlb' ? 'MLB' : league === 'nba' ? 'NBA' : league === 'nhl' ? 'NHL' : _isSoccerLeague ? 'SOCCER' : league.toUpperCase();
           const _wrong = detectWrongSport(_expSport, (decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? ''));
           if (_wrong) {
             console.log(`[live-edge] BLOCKED ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): Claude confused sport — reasoning mentions "${_wrong}"`);
