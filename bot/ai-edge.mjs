@@ -5834,8 +5834,12 @@ async function checkPreGamePredictions() {
     // Qualifies if: conf ≥ 58% AND edge ≥ 10pt AND price ≤ 55¢ (underdog zone only —
     // favorites at this conf level are actually risky, cheap edges are where the math works).
     const _edgeAbs = confidence - price;
+    // MLB edge-first went 5/5 losses on 2026-04-22 (-$28) on claimed 10-17pt edges that
+    // overnight markets had already absorbed. Tighten MLB-only to 13pt to filter soft edges
+    // while keeping other sports at 10pt (live NBA/NHL edges are sharper).
+    const _edgeFirstFloor = pgSportKey === 'mlb' ? 0.13 : 0.10;
     const isEdgeFirst = confidence >= 0.58 &&
-                        _edgeAbs >= 0.10 &&
+                        _edgeAbs >= _edgeFirstFloor &&
                         price <= 0.55 &&
                         confidence < PRE_GAME_MIN_CONF; // only triggers when standard gate would reject on conf
 
