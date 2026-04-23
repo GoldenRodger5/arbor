@@ -7816,7 +7816,16 @@ async function managePositions() {
           }
 
           // 2. STOP THRESHOLD: -10¢ after 1+ period → Claude evaluates
-          if (periodsElapsed >= 1 && swingProfit <= -0.10) {
+          // Contra-velocity escalation: if a cross-confirmed contra move fired on this
+          // ticker within the last 10min, tighten stop to -6¢. The market is actively
+          // moving away from us — don't wait for a full -10¢ drawdown.
+          const swingContra = recentCrossContraMovers.get(trade.ticker);
+          const swingContraActive = swingContra && (Date.now() - swingContra.when) <= 10 * 60 * 1000 && swingContra.velocity >= 5;
+          const swingStopThreshold = swingContraActive ? -0.06 : -0.10;
+          if (swingContraActive && swingProfit <= -0.06 && swingProfit > -0.10) {
+            console.log(`[live-swing] 🔻 CONTRA-ESCALATED stop on ${trade.ticker}: contra ${swingContra.velocity.toFixed(1)}¢/min — tightened stop to -6¢`);
+          }
+          if (periodsElapsed >= 1 && swingProfit <= swingStopThreshold) {
             const swingStopKey = 'swing-stop-eval:' + trade.ticker;
             const lastSwingEval = tradeCooldowns.get(swingStopKey) ?? 0;
             if (Date.now() - lastSwingEval >= 5 * 60 * 1000) {
