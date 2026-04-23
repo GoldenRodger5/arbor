@@ -261,6 +261,8 @@ Things we need tracked but aren't yet:
 | 2026-04-23 | Raise pg-hard-stop threshold 12¢→25¢ | Data: 4 BAD stops at 12-15¢ threshold, −$79 | TBD |
 | 2026-04-23 | Ship Phase 1 (P1.1-P1.4) | Kill known bleeding patterns; data-backed | TBD |
 | 2026-04-23 | Ship P2.3 + P3.3 | Bullpen state in late-MLB exits + time-of-day logging | TBD |
+| 2026-04-23 | Fix isSoccer ReferenceError | Crash in live-edge Sonnet batch (also caused sonnet-empty side-effect) | Fixed |
+| 2026-04-23 | Sport audit (NHL/NBA/Soccer) | NHL bleeds in stops (already fixed); NBA tightened prompt; Soccer underdog cap 35¢→40¢ | TBD |
 
 ---
 

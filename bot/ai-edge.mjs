@@ -5519,7 +5519,9 @@ async function checkPreGamePredictions() {
 
     const pgPromptText = sport === 'NBA'
       ? `You are a professional NBA swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
-        `STRATEGY: We buy pre-game and SELL when the price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building a lead, or the opponent struggling. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing. Find a genuine win-probability edge over the posted price.\n\n` +
+        `STRATEGY: We buy pre-game and SELL when the price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building a lead, or the opponent struggling. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing.\n\n` +
+        `📊 HISTORICAL DATA: NBA pre-game picks have gone 1-4 on trades where the only edge was "better team record + home court." The market prices those already. Play-In Tournament bets stacking "opponent missing star X (doubtful)" + "must-win motivation" have gone 0-2 on heavy underdogs (POR 18¢ → 75% conf → loss). DOUBTFUL players play ~40% of the time; do NOT stack a +30% swing on a single doubtful star.\n\n` +
+        `⚠️ CORE FRAME: The market has already priced team records, home court, and obvious injury news. Your edge must be a SPECIFIC mispricing the market hasn't caught — NOT a re-confirmation of what the price already reflects.\n\n` +
         `⚠️ DATA RULES: ESPN roster data is injected above — use it. You have ONE web search. Use it to check TODAY's injury report, back-to-back schedule, and rest news for both teams. If ESPN provided active/inactive players above, those are confirmed — do NOT contradict them. For any star player whose 2026 status you cannot confirm after searching, apply a 3% uncertainty penalty and continue — do NOT use uncertainty as a reason to pass unless it would affect a Hard NO.\n` +
         `⚠️ ROSTER INTEGRITY: Only cite players who play for the SPECIFIC teams in this game. Do NOT reference players from other franchises.\n\n` +
         `GAME: ${market.title}\n` +
@@ -5553,6 +5555,8 @@ async function checkPreGamePredictions() {
         `✓ Confidence ≥ 70% (win probability)\n` +
         `✓ Confidence beats current price by 4+ points\n` +
         `✓ You have a SPECIFIC edge catalyst — not just "better team"\n` +
+        `🚫 THIN-EDGE REJECTION: if your only case is "better record + home court" OR "opponent missing Xth-best player" OR "playoff motivation," return {"trade":false}. These are market-priced. Need a non-obvious fact.\n` +
+        `🚫 PLAY-IN / PLAYOFF UNDERDOG CAP: if the team is priced below 35¢ AND it's a Play-In or elimination game, MAX confidence = price + 12. A 7-seed does not have 60%+ probability to beat a 2-seed at home, even with their star doubtful.\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
         (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
         `📊 CONFIDENCE CALIBRATION — use this scale precisely:\n` +
@@ -5699,7 +5703,9 @@ async function checkPreGamePredictions() {
         (market.tie ? `DRAW (tie): ${(market.tie.price*100).toFixed(0)}¢  ← market-implied draw probability\n` : '') +
         (market.tie ? `⚠️ 3-WAY CHECK: ${(market.team1.price*100).toFixed(0)} + ${(market.team2.price*100).toFixed(0)} + ${(market.tie.price*100).toFixed(0)} = ${Math.round((market.team1.price + market.team2.price + market.tie.price) * 100)}¢. Draw takes ${Math.round(market.tie.price*100)}% probability off the top of the win market — your win confidence must beat both the price AND the draw leg.\n` : '') +
         `\n`+
-        `WIN PROBABILITY BASELINE: Soccer home teams win (regulation) ~45% of games, draw ~27%, away ~28%. Strong home sides vs. weak away teams can reach 55-60% win probability. Draw probability is NOT irrelevant — it counts against us since we need the team to WIN for the price to rise and stay elevated.\n\n` +
+        `WIN PROBABILITY BASELINE: Soccer home teams win (regulation) ~45% of games, draw ~27%, away ~28%. Strong home sides vs. weak away teams can reach 55-60% win probability.\n\n` +
+        `⚠️ DRAW TAX (KEY): Your confidence = P(team wins). A TIE is NOT a loss on your ledger but IS a loss on our contract — we need the team to WIN outright. If the TIE leg is priced ≥30¢, ~30%+ of outcomes are draws and your win confidence must be computed AGAINST that, not on top of it. Example: if you think home team is "clearly better," they still face ~30% draw probability before they even face loss probability. Ceiling that thinking.\n\n` +
+        `📊 HISTORICAL DATA: Soccer pre-game picks at <40¢ entry with 30pt+ claimed edges have gone 1-2 (-$18 on NE-CLB MLS at 36¢ / 68% conf). Don't stack "unbeaten home run" + "opponent missing scorer" + "motivation" into a 70% prob on a 36¢ team — the market is telling you they're heavy underdogs for a reason that survives all three.\n\n` +
         `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
         `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} team news injuries form recent meetings head to head" and use results to assess:\n` +
         `A) ATTACK QUALITY: How prolific is each team's attack? Top-5 goals-per-game teams generate scoring chances that translate to wins.\n` +
@@ -5995,18 +6001,22 @@ async function checkPreGamePredictions() {
     // for the 7-seed. That's delusional — doubtful ≠ out, and SAS has depth beyond one player.
     // The market isn't perfect but it's not off by 57 points.
     //
-    // Sport-specific max edge above market for heavy underdogs (price < 35¢):
-    //   NBA: +15 (most efficient market, seeding gaps are strongest predictor)
-    //   NHL: +18 (goalie variance creates real upsets, slightly more room)
-    //   MLB: +20 (most random sport, any team can win, pitching mismatches are real)
-    //   Soccer: +15 (draw rate ~25% makes underdog wins even harder to predict)
+    // Sport-specific max edge above market for underdogs.
+    // Extended 2026-04-23 after NE-CLB MLS loss at 36¢ entry (conf 68% = 32pt edge, -$18).
+    // Soccer draw suppressor means a 36-40¢ team needs more skepticism than other sports.
+    //   NBA: price < 35¢ → +15 pt (efficient market)
+    //   NHL: price < 35¢ → +18 pt (goalie variance)
+    //   MLB: price < 35¢ → +20 pt (most random sport)
+    //   Soccer: price < 40¢ → +15 pt (draw tax widens the underdog zone)
     const pgSportKey = expectedSport.toLowerCase();
-    if (price < 0.35) {
+    const isSoccerSport = ['mls','epl','laliga','seriea','bundesliga','ligue1'].includes(pgSportKey);
+    const underdogCapThreshold = isSoccerSport ? 0.40 : 0.35;
+    if (price < underdogCapThreshold) {
       const maxEdgeMap = { nba: 0.15, nhl: 0.18, mlb: 0.20, epl: 0.15, laliga: 0.15, mls: 0.15, seriea: 0.15, bundesliga: 0.15, ligue1: 0.15 };
       const maxEdge = maxEdgeMap[pgSportKey] ?? 0.15;
       const maxUnderdogConf = price + maxEdge;
       if (confidence > maxUnderdogConf) {
-        console.log(`[pre-game] ⚠️ UNDERDOG CAP: ${market.base} at ${(price*100).toFixed(0)}¢ — Claude said ${(confidence*100).toFixed(0)}% but max = ${(maxUnderdogConf*100).toFixed(0)}% (${pgSportKey.toUpperCase()} heavy-underdog cap: price + ${(maxEdge*100).toFixed(0)}pt)`);
+        console.log(`[pre-game] ⚠️ UNDERDOG CAP: ${market.base} at ${(price*100).toFixed(0)}¢ — Claude said ${(confidence*100).toFixed(0)}% but max = ${(maxUnderdogConf*100).toFixed(0)}% (${pgSportKey.toUpperCase()} underdog cap: price + ${(maxEdge*100).toFixed(0)}pt)`);
         confidence = maxUnderdogConf;
       }
     }
