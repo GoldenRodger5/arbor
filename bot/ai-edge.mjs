@@ -840,8 +840,8 @@ const recentCrossContraMovers = new Map(); // ticker → { velocity, when } — 
 // Key: gameBase. Value: { scoreKey, priceCents, ts }.
 // Invalidates when score changes, price moves ≥3¢, or age > 6min.
 const liveEdgeRejectMemo = new Map();
-const LIVE_REJECT_MAX_AGE_MS = 2 * 60 * 1000;
-const LIVE_REJECT_PRICE_TOL_CENTS = 3;
+const LIVE_REJECT_MAX_AGE_MS = 5 * 60 * 1000;
+const LIVE_REJECT_PRICE_TOL_CENTS = 5;
 
 // Check whether a tomorrow-dated ticker starts within maxHours of now (ET).
 // Ticker format embeds HHMM immediately after the date string, e.g. "26APR172010".
@@ -4297,7 +4297,7 @@ async function checkLiveScoreEdges() {
         const _edgeAbsLive = confidence - price;
         const isEdgeFirstLive = confidence >= 0.63 &&
                                 _edgeAbsLive >= 0.10 &&
-                                price >= 0.50 && price <= 0.55 &&
+                                price >= 0.48 && price <= 0.68 &&
                                 (confidence < effectiveMinConf || (isSwingMode && confidence < 0.68));
         if (isEdgeFirstLive && !isSwingMode) {
           const openSwingCountEF = openPositions.filter(p => p.strategy === 'live-swing').length;
