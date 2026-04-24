@@ -282,6 +282,7 @@ Things we need tracked but aren't yet:
 | 2026-04-23 | Reality check on P&L | Realized +$152 but net-of-deposits is -$440 from $550 bankroll; profit driven by TOT-BRI outlier | Flagged in ROADMAP |
 | 2026-04-23 | Future-market filter + drawdown breaker | 24h window on line-move detector; −$30/24h halts new entries for 12h | TBD |
 | 2026-04-23 | Revert drawdown breaker, tighten caps instead | User: prefer smaller bets + data collection over pausing. 8%→5% game, 10%→6% trade | TBD |
+| 2026-04-23 | Pre-game cost optimization (Option B + C) | Price-movement gate + cycle cap 12→5 with priority sort. Target $20/day → $7/day API. Quality loss minimal (same Claude calls, just fewer redundant). | TBD |
 
 ---
 

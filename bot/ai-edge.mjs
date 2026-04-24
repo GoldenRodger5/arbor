@@ -5222,6 +5222,11 @@ let preGameTradesToday = 0;
 let preGameTradesDate = '';         // reset counter on new day
 const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
 const preGameAnalysisCache = new Map(); // marketBase → timestamp of last Claude analysis
+// Price snapshot at time of last analysis. When cache TTL expires, we gate re-analysis
+// on whether prices actually moved. If neither side moved ≥3¢ since last look, Claude
+// would produce the same answer from the same data — skip the $0.08 call. (2026-04-23)
+const preGameAnalyzedPrice = new Map(); // marketBase → { team1Cents, team2Cents, at }
+const PG_ANALYZED_PRICE_TOL_CENTS = 3;
 const pgGameStartTimes = new Map();     // marketBase → game start (ms UTC), persists across scan cycles
 
 const preGameRejectCache = new Map(); // marketBase → timestamp of last REJECTED analysis (longer TTL)
@@ -5446,12 +5451,59 @@ async function checkPreGamePredictions() {
       if (!moved) return false;
       console.log(`[pre-game] Reject cache invalidated for ${m.base} — price moved (${rejPrices?.team1Cents}→${team1Now}¢ / ${rejPrices?.team2Cents}→${team2Now}¢)`);
     }
-    return !preGameAnalysisCache.has(m.base) || now - preGameAnalysisCache.get(m.base) > getPgCacheTtl(m.base);
+    // Primary TTL check
+    const lastAnalyzedAt = preGameAnalysisCache.get(m.base) ?? 0;
+    const ttlExpired = now - lastAnalyzedAt > getPgCacheTtl(m.base);
+    if (!preGameAnalysisCache.has(m.base)) return true; // never analyzed
+    if (!ttlExpired) return false; // still within TTL
+    // TTL expired — but only re-analyze if price actually moved ≥3¢ on either side.
+    // Same prompt + same data = same Claude answer. Skip the $0.08 call if nothing
+    // changed. (Option B cost optimization, 2026-04-23.)
+    const priceSnapshot = preGameAnalyzedPrice.get(m.base);
+    if (priceSnapshot) {
+      const team1Now = Math.round((m.team1?.price ?? 0) * 100);
+      const team2Now = Math.round((m.team2?.price ?? 0) * 100);
+      const moved =
+        Math.abs(team1Now - (priceSnapshot.team1Cents ?? team1Now)) >= PG_ANALYZED_PRICE_TOL_CENTS ||
+        Math.abs(team2Now - (priceSnapshot.team2Cents ?? team2Now)) >= PG_ANALYZED_PRICE_TOL_CENTS;
+      if (!moved) return false;
+      console.log(`[pre-game] TTL expired but price static — skipping re-analysis for ${m.base} (${priceSnapshot.team1Cents}→${team1Now}¢ / ${priceSnapshot.team2Cents}→${team2Now}¢)`);
+      // Extend the cache timestamp so we don't re-hit this filter every cycle
+      preGameAnalysisCache.set(m.base, now);
+      return false;
+    }
+    return true; // no snapshot yet, go analyze
   });
   if (uncachedMarkets.length < eligibleMarkets.length) {
     console.log(`[pre-game] Analysis cache: skipping ${eligibleMarkets.length - uncachedMarkets.length} recently-analyzed markets (${uncachedMarkets.length} uncached)`);
   }
-  const pgSlice = uncachedMarkets.slice(0, 12); // up to 12 per cycle for broad coverage
+  // Option C — priority sort + cap 12 → 5 per cycle.
+  // Rank by (1) near-kickoff games first, (2) larger recent price moves (news signal),
+  // (3) ESPN-miss retry candidates. This ensures the 5 analyses per cycle hit the
+  // markets most likely to produce real edges.
+  uncachedMarkets.sort((a, b) => {
+    // ESPN-miss retry candidates get absolute priority (they were deferred earlier)
+    const aEspnMiss = preGameEspnMissSet.has(a.base) ? 0 : 1;
+    const bEspnMiss = preGameEspnMissSet.has(b.base) ? 0 : 1;
+    if (aEspnMiss !== bEspnMiss) return aEspnMiss - bEspnMiss;
+    // Closer to start time = higher priority
+    const aMins = (pgGameStartTimes.get(a.base) ?? Number.MAX_SAFE_INTEGER) - now;
+    const bMins = (pgGameStartTimes.get(b.base) ?? Number.MAX_SAFE_INTEGER) - now;
+    if (Math.abs(aMins - bMins) > 30 * 60 * 1000) return aMins - bMins; // differ by >30min
+    // Within similar time windows, prefer markets with larger recent price movement
+    const priceMove = (mkt) => {
+      const snap = preGameAnalyzedPrice.get(mkt.base);
+      if (!snap) return 10; // never analyzed — treat as high priority
+      const t1n = Math.round((mkt.team1?.price ?? 0) * 100);
+      const t2n = Math.round((mkt.team2?.price ?? 0) * 100);
+      return Math.max(Math.abs(t1n - snap.team1Cents), Math.abs(t2n - snap.team2Cents));
+    };
+    return priceMove(b) - priceMove(a);
+  });
+  const pgSlice = uncachedMarkets.slice(0, 5); // cap 12 → 5 per cycle (Option C)
+  if (uncachedMarkets.length > 5) {
+    console.log(`[pre-game] Cycle cap: analyzing top 5 of ${uncachedMarkets.length} (priority: near-kickoff + price-move)`);
+  }
   // Pre-game sizing capped at 5% per P1.3 — pass strategy so getDynamicMaxTrade applies the cap.
   const maxBetDisplay = getDynamicMaxTrade('kalshi', null, 'pre-game-prediction').toFixed(2);
 
@@ -6064,8 +6116,14 @@ async function checkPreGamePredictions() {
       }
       // ───────────────────────────────────────────────────────────────────────
 
-      // Mark as analyzed regardless of trade/no-trade — don't re-analyze for 2 hours
+      // Mark as analyzed regardless of trade/no-trade — don't re-analyze for 2 hours.
+      // Also snapshot the price so the TTL-expired re-analysis gate can check for movement.
       preGameAnalysisCache.set(market.base, Date.now());
+      preGameAnalyzedPrice.set(market.base, {
+        team1Cents: Math.round((market.team1?.price ?? 0) * 100),
+        team2Cents: Math.round((market.team2?.price ?? 0) * 100),
+        at: Date.now(),
+      });
 
       if (!decision.trade) {
         const reasonText = decision.reasoning ?? '';
