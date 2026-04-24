@@ -9117,16 +9117,24 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
       }
       console.log(`[exit] 0-fill reconciled: ${trade.ticker} → ${trade.status} @ ${(currentPrice*100).toFixed(0)}¢, PnL=$${trade.realizedPnL.toFixed(2)}`);
     }
-    await tg(
-      `⚠️ <b>SELL ATTEMPTED — 0 FILLS</b>\n\n` +
-      `${trade.title ?? trade.ticker}\n` +
-      `Reason: ${reason}\n` +
-      `Price: ${(currentPrice*100).toFixed(0)}¢ | Entry: ${Math.round(entryPrice*100)}¢\n\n` +
-      (positionTrulyGone
-        ? `Position absent on Kalshi — recorded exit @ ${(currentPrice*100).toFixed(0)}¢, PnL=$${trade.realizedPnL.toFixed(2)}`
-        : `Position may have already settled or been sold. Investigating.`)
-    );
-    return false;
+    // Only alert when position is NOT gone — that's a real problem.
+    // If position IS gone, the sale happened (either our order filled but fill_count_fp parse
+    // returned 0, or a parallel path closed it first). Both are silent success — don't spam
+    // the user with "0 FILLS" warnings on trades that actually closed cleanly.
+    // The successful sale Telegram was already sent by the caller (e.g. PRE-GAME PROFIT TAKE).
+    if (!positionTrulyGone) {
+      await tg(
+        `⚠️ <b>SELL ATTEMPTED — 0 FILLS</b>\n\n` +
+        `${trade.title ?? trade.ticker}\n` +
+        `Reason: ${reason}\n` +
+        `Price: ${(currentPrice*100).toFixed(0)}¢ | Entry: ${Math.round(entryPrice*100)}¢\n\n` +
+        `Position still present on Kalshi but order didn't fill — investigating.`
+      );
+      return false;
+    }
+    // Position gone = effective success. Return true so callers (like managePositions)
+    // mark their partialTakeAt / anyUpdated flags correctly.
+    return true;
   }
 
   const effectiveQty = Math.min(actualFill, sellQty);
