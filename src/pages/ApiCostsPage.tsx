@@ -93,12 +93,32 @@ export default function ApiCostsPage() {
         </div>
       ) : (
         <>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 16 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 8 }}>
             <Stat label="SPEND" value={fmtUsd(data.totals.cents)} color="var(--accent)" />
             <Stat label="CALLS" value={data.totals.calls.toLocaleString()} />
             <Stat label="SEARCHES" value={data.totals.searches.toLocaleString()} />
             <Stat label="AVG/CALL" value={`${(data.totals.cents / data.totals.calls).toFixed(2)}¢`} />
           </div>
+          {/* Efficiency row — cost per trade placed */}
+          {data.totals.tradesPlaced !== undefined && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, marginBottom: 16 }}>
+              <Stat
+                label="TRADES PLACED"
+                value={data.totals.tradesPlaced.toLocaleString()}
+              />
+              <Stat
+                label="COST/TRADE"
+                value={data.totals.costPerTradeUsd != null ? fmtUsd((data.totals.costPerTradeCents ?? 0))  : '—'}
+                color={data.totals.costPerTradeUsd != null && data.totals.costPerTradeUsd > 5 ? 'var(--red)'
+                  : data.totals.costPerTradeUsd != null && data.totals.costPerTradeUsd > 1 ? 'var(--orange)'
+                  : 'var(--green)'}
+              />
+              <Stat
+                label={hours >= 168 ? 'AVG/DAY' : hours >= 24 ? 'DAILY RATE' : 'HOURLY RATE'}
+                value={fmtUsd(data.totals.cents / (hours / (hours >= 168 ? 24 : hours >= 24 ? 24 : 1)))}
+              />
+            </div>
+          )}
 
           <section style={{
             background: 'var(--bg-surface)', border: '1px solid var(--border)',
@@ -113,8 +133,79 @@ export default function ApiCostsPage() {
             </div>
           </section>
 
-          {/* Hourly chart */}
-          {data.hourly.length > 1 && (
+          {/* Daily chart + table — for 7d/30d windows, per-day view is more useful than hourly */}
+          {hours >= 168 && data.daily && data.daily.length > 0 && (
+            <>
+              <section style={{
+                background: 'var(--bg-surface)', border: '1px solid var(--border)',
+                borderRadius: 12, padding: 16, marginBottom: 16,
+              }}>
+                <div className="label" style={{ marginBottom: 10 }}>DAILY SPEND</div>
+                <div style={{ display: 'flex', alignItems: 'flex-end', gap: 4, height: 120 }}>
+                  {data.daily.map(d => {
+                    const maxDaily = Math.max(...(data.daily ?? []).map(x => x.cents), 1);
+                    const pct = Math.max(3, (d.cents / maxDaily) * 100);
+                    const label = new Date(d.day + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                    return (
+                      <div key={d.day} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                        <div
+                          title={`${label} · ${fmtUsd(d.cents)} · ${d.calls} calls · top: ${d.topCategory}`}
+                          style={{
+                            width: '100%',
+                            height: `${pct}%`,
+                            background: 'linear-gradient(to top, var(--accent), rgba(99,102,241,0.5))',
+                            borderRadius: 3,
+                            minHeight: 3,
+                          }}
+                        />
+                        <div style={{ fontSize: 9, color: 'var(--text-tertiary)', writingMode: data.daily!.length > 14 ? 'vertical-rl' as any : 'horizontal-tb' as any }}>
+                          {label}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+
+              <section style={{
+                background: 'var(--bg-surface)', border: '1px solid var(--border)',
+                borderRadius: 12, padding: 16, marginBottom: 16, overflowX: 'auto',
+              }}>
+                <div className="label" style={{ marginBottom: 10 }}>DAILY BREAKDOWN</div>
+                <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ textAlign: 'left', color: 'var(--text-tertiary)', borderBottom: '1px solid var(--border)' }}>
+                      <th style={{ padding: '6px 8px' }}>Date</th>
+                      <th style={{ padding: '6px 8px', textAlign: 'right' }}>Calls</th>
+                      <th style={{ padding: '6px 8px', textAlign: 'right' }}>Searches</th>
+                      <th style={{ padding: '6px 8px', textAlign: 'right' }}>In Tok</th>
+                      <th style={{ padding: '6px 8px', textAlign: 'right' }}>Out Tok</th>
+                      <th style={{ padding: '6px 8px' }}>Top Category</th>
+                      <th style={{ padding: '6px 8px', textAlign: 'right' }}>USD</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...data.daily].reverse().map(d => (
+                      <tr key={d.day} style={{ borderBottom: '1px solid var(--border)' }}>
+                        <td style={{ padding: '6px 8px', fontWeight: 600 }}>{new Date(d.day + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right' }}>{d.calls}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right' }}>{d.searches}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', color: 'var(--text-tertiary)' }}>{fmtTok(d.inputTok)}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', color: 'var(--text-tertiary)' }}>{fmtTok(d.outputTok)}</td>
+                        <td style={{ padding: '6px 8px', fontSize: 10, color: 'var(--text-secondary)' }}>{d.topCategory.replace('pre-game-', 'pg-').replace('live-', 'lv-')}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', fontWeight: 700, color: d.cents > 2000 ? 'var(--red)' : d.cents > 800 ? 'var(--orange)' : 'var(--accent)' }}>
+                          {fmtUsd(d.cents)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+            </>
+          )}
+
+          {/* Hourly chart — shown for short windows (6h/24h) or as fallback */}
+          {hours < 168 && data.hourly.length > 1 && (
             <section style={{
               background: 'var(--bg-surface)', border: '1px solid var(--border)',
               borderRadius: 12, padding: 16, marginBottom: 16,

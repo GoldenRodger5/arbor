@@ -96,9 +96,22 @@ export type ApiCostReport = {
     cacheWriteTok: number;
     cents: number;
     usd: number;
+    tradesPlaced?: number;
+    costPerTradeCents?: number | null;
+    costPerTradeUsd?: number | null;
   };
   byCategory: ApiCostCategory[];
   hourly: { hour: string; calls: number; cents: number }[];
+  daily?: {
+    day: string;
+    calls: number;
+    cents: number;
+    usd: number;
+    searches: number;
+    inputTok: number;
+    outputTok: number;
+    topCategory: string;
+  }[];
 };
 
 export type PaperTrade = {

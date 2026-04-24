@@ -1037,6 +1037,58 @@ Rules:
       }
       const hourly = Object.values(hourlySeries).sort((a, b) => a.hour.localeCompare(b.hour));
 
+      // Daily series keyed on ET calendar date — for 7d/30d windows this is more useful
+      // than 60+ hourly buckets. Also tracks per-day top category and searches.
+      const dailySeries = {};
+      const etDateKey = (isoTs) => {
+        const d = new Date(isoTs);
+        // Convert to ET calendar date as YYYY-MM-DD
+        return d.toLocaleString('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' });
+      };
+      for (const e of events) {
+        const day = etDateKey(e.ts);
+        if (!dailySeries[day]) dailySeries[day] = { day, calls: 0, cents: 0, searches: 0, inputTok: 0, outputTok: 0, byCategory: {} };
+        const d = dailySeries[day];
+        d.calls += 1;
+        d.cents += e.cents ?? 0;
+        d.searches += e.searches ?? 0;
+        d.inputTok += e.inputTok ?? 0;
+        d.outputTok += e.outputTok ?? 0;
+        const cat = e.category ?? 'uncategorized';
+        d.byCategory[cat] = (d.byCategory[cat] ?? 0) + (e.cents ?? 0);
+      }
+      const daily = Object.values(dailySeries)
+        .map(d => {
+          const topCategory = Object.entries(d.byCategory).sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'none';
+          return {
+            day: d.day,
+            calls: d.calls,
+            cents: Math.round(d.cents * 100) / 100,
+            usd: Math.round(d.cents) / 100,
+            searches: d.searches,
+            inputTok: d.inputTok,
+            outputTok: d.outputTok,
+            topCategory,
+          };
+        })
+        .sort((a, b) => a.day.localeCompare(b.day));
+
+      // Efficiency metric: cost per trade placed in the same window. Reads trades.jsonl.
+      let tradesInWindow = 0;
+      try {
+        if (existsSync(TRADES_LOG)) {
+          const tradeLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+          for (const l of tradeLines) {
+            try {
+              const t = JSON.parse(l);
+              const ts = t.timestamp ? Date.parse(t.timestamp) : 0;
+              if (ts >= cutoff) tradesInWindow += 1;
+            } catch {}
+          }
+        }
+      } catch {}
+      const costPerTradeCents = tradesInWindow > 0 ? totalCents / tradesInWindow : null;
+
       json(res, {
         windowHours: days > 0 ? days * 24 : hours,
         totals: {
@@ -1048,11 +1100,15 @@ Rules:
           cacheWriteTok: totalCacheWriteTok,
           cents: Math.round(totalCents * 100) / 100,
           usd: Math.round(totalCents) / 100,
+          tradesPlaced: tradesInWindow,
+          costPerTradeCents: costPerTradeCents != null ? Math.round(costPerTradeCents * 100) / 100 : null,
+          costPerTradeUsd: costPerTradeCents != null ? Math.round(costPerTradeCents) / 100 : null,
         },
         byCategory: Object.values(byCategory)
           .map(b => ({ ...b, cents: Math.round(b.cents * 100) / 100, usd: Math.round(b.cents) / 100 }))
           .sort((a, b) => b.cents - a.cents),
         hourly: hourly.map(h => ({ ...h, cents: Math.round(h.cents * 100) / 100 })),
+        daily,
       });
 
     } else if (path === '/api/calibration-stats') {
