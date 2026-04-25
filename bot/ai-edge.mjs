@@ -4548,11 +4548,16 @@ async function checkLiveScoreEdges() {
 
         // Collect for parallel Sonnet execution instead of calling sequentially
         sonnetCallsThisCycle++;
+        // Compute stage for queue items — needed by Phase 4 P1.1 MLB late-1run block.
+        const _qStage = league === 'mlb' ? (period <= 4 ? 'early' : period <= 6 ? 'mid' : 'late')
+          : league === 'nba' ? (period <= 2 ? 'early' : period === 3 ? 'mid' : 'late')
+          : league === 'nhl' ? (period === 1 ? 'early' : period === 2 ? 'mid' : 'late')
+          : (period === 1 ? 'early' : 'late');
         sonnetQueue.push({
           prompt: livePrompt, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period,
           leadingAbbr, gameDetail, price, ticker, gameBase, title, targetAbbr, targetTeam,
-          targetIsHome: targetAbbr === homeAbbr, leading, hasPosition,
-          currentScoreKey, isSwingMode, isThesisVindicated,
+          targetIsHome: targetAbbr === homeAbbr, leading, trailing, trailingAbbr, stage: _qStage,
+          hasPosition, currentScoreKey, isSwingMode, isThesisVindicated,
           reentryHalfSize,
           _lineMove, _scoreChanged,
         });
@@ -4609,8 +4614,12 @@ async function checkLiveScoreEdges() {
 
       // Destructure back the context we need. `isSwingMode` is mutable below
       // (isEdgeFirstLive promotion at ~line 4377 reassigns it) so it must be `let`.
+      // 2026-04-24: added leading/trailing/trailingAbbr/stage which are referenced by
+      // P1.1 (MLB late-1run block) and team-quality haircut. Were causing
+      // ReferenceErrors on every live-edge call.
       const { league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, leadingAbbr,
-              gameDetail, price, ticker, gameBase, title, targetAbbr, hasPosition, currentScoreKey, isThesisVindicated, reentryHalfSize } = item;
+              gameDetail, price, ticker, gameBase, title, targetAbbr, hasPosition, currentScoreKey, isThesisVindicated, reentryHalfSize,
+              leading, trailing, trailingAbbr, stage } = item;
       let { isSwingMode } = item;
 
       try {
