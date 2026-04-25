@@ -28,6 +28,31 @@ When closing an item, move it to **Closed** at the bottom (don't delete) so we h
 
 ---
 
+## 2026-05-15 — Recent-crash entry cool-off rule
+
+**Trigger:** ≥5 trades have fired with `recentCrashContext != null` AND we have settled outcomes for them.
+
+**Why we're waiting:** WHU/EVE 2026-04-25 — bot bought during a 80→50→65→84 recovery whipsaw (1.3 minutes after a 27¢/min cross-confirmed contra crash). EVE actually scored 2 minutes later. Trade ultimately netted +$2.16 because WHU scored 2-1 right before our profit-lock fired — likely lucky, not skillful. The ESPN-stale guard correctly fired during the crash but RELEASED 1 minute later when line-move reverted to confirming. The guard has no "cool-off" memory.
+
+Hypothesis: trades placed within 90s of a ≥15¢/min cross-confirmed contra crash systematically underperform vs. trades without this tag, because the volatility predicts imminent scoring.
+
+**What's been shipped (data-only):** trades now log `recentCrashContext: {velocity, ageSec, when}` when entered within 90s of a ≥15¢/min crash. Tag-only, no behavioral change. See `bot/ai-edge.mjs` near the live-edge `logTrade` call.
+
+**What to do at review:**
+
+1. Filter trades where `recentCrashContext != null`. Compute their P&L distribution and MFE distribution.
+2. Compare to a same-period control: live-prediction trades without the tag.
+3. Decision:
+   - **Tagged trades clearly underperform** (e.g., median P&L < 0 vs control ~0): add the cool-off rule — 90s lockout on entry after a ≥15¢/min crash regardless of line-move state.
+   - **Tagged trades match or beat control:** WHU was variance, not signal. Close this item; remove the tagging logic to clean up.
+   - **Mixed signal:** narrow the threshold (e.g., velocity ≥20¢/min, ageSec ≤60) and re-test.
+
+**Files to revisit:**
+- [bot/ai-edge.mjs](bot/ai-edge.mjs) — live-edge `logTrade` call where `recentCrashContext` is computed; ESPN-stale guard at line ~4031.
+- This file — move to Closed.
+
+---
+
 ## Closed
 
 (empty)

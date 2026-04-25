@@ -5162,6 +5162,28 @@ async function checkLiveScoreEdges() {
           logScreen({ stage: 'live-edge', ticker, result: 'TRADE', confidence, price: bestPrice, platform: best.platform, reasoning: decision.reasoning, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, gameDetail, targetAbbr });
           recordGameEntry(gameBase, bestPrice, actualDeployed, currentScoreKey); // use ticker base as canonical key, store score for scale-in gate
 
+          // Recent-crash tag — flags entries placed shortly after a high-velocity
+          // contra crash on the same ticker. Pure observation; no behavioral change.
+          // Hypothesis under test: WHU/EVE 4/25 — bot bought during a 80→50→65→84
+          // recovery whipsaw, EVE actually scored 2 min later. Did we get bailed out
+          // by luck (WHU scored 2-1 right before our profit-lock) or is "buying the
+          // recovery from a head-fake crash" systematically OK? n=1 isn't enough.
+          // Threshold: velocity ≥15¢/min within last 90s. Captures real volatility,
+          // skips routine 5¢/min noise.
+          let recentCrashContext = null;
+          {
+            const cm = recentCrossContraMovers.get(ticker);
+            if (cm) {
+              const ageSec = (Date.now() - cm.when) / 1000;
+              if (ageSec <= 90 && cm.velocity >= 15) {
+                recentCrashContext = {
+                  velocity: Math.round(cm.velocity * 10) / 10,
+                  ageSec: Math.round(ageSec),
+                  when: new Date(cm.when).toISOString(),
+                };
+              }
+            }
+          }
           logTrade({
             exchange: best.platform,
             strategy: isThesisVindicated ? 'thesis-reentry' : isSwingMode ? 'live-swing' : hcCheck.isHighConv ? 'high-conviction' : 'live-prediction',
@@ -5183,7 +5205,11 @@ async function checkLiveScoreEdges() {
             liveStageAtEntry: liveStage,
             weAtEntry,                          // WE table's prediction for this team (null if no table entry)
             isLeadingTeam: isLeadingTeamTarget, // true = betting leader, false = betting underdog
+            recentCrashContext,                  // null or {velocity, ageSec, when} — see WAITLIST.md
           });
+          if (recentCrashContext) {
+            console.log(`[live-edge] 🏷️ TAGGED recent-crash entry: ${ticker} bought ${recentCrashContext.ageSec}s after ${recentCrashContext.velocity}¢/min crash`);
+          }
 
           // Clear thesis-vindicated flag after successful re-entry (one shot only)
           if (isThesisVindicated) {
