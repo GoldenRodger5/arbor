@@ -107,6 +107,30 @@ export default function AnalyticsPage() {
     });
     return sorted;
   }, [calStats, calSportFilter, calSortKey]);
+  // ─── Shadow calibration (Phase 3 + bonus UI) ─────────────────────────────
+  type ShadowReport = {
+    totalSettled: number;
+    totalPending: number;
+    brier: number | null;
+    bySport: { sport: string; n: number; wins: number; wr: number; avgConf: number }[];
+    confidenceBuckets: { confBand: number; n: number; wins: number; actualWR: number }[];
+  };
+  const [shadowData, setShadowData] = useState<ShadowReport | null>(null);
+  useEffect(() => {
+    let stop = false;
+    const fetchShadow = async () => {
+      try {
+        const res = await fetch('/api/shadow-calibration');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!stop) setShadowData(data);
+      } catch {}
+    };
+    fetchShadow();
+    const iv = setInterval(fetchShadow, 5 * 60 * 1000); // 5min refresh
+    return () => { stop = true; clearInterval(iv); };
+  }, []);
+
   const calBucketSports = useMemo(() => {
     const s = new Set((calStats?.buckets ?? []).map(b => b.sport));
     return Array.from(s).sort();
@@ -276,6 +300,77 @@ export default function AnalyticsPage() {
   return (
     <div>
       <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 12 }}>Analytics</h1>
+
+      {/* ─── Shadow Calibration Panel ─── */}
+      {shadowData && (shadowData.totalSettled > 0 || shadowData.totalPending > 0) && (
+        <Section title="🌑 Shadow Calibration (Claude decisions, settled by game outcome)">
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
+            {shadowData.totalSettled} settled · {shadowData.totalPending} pending
+            {shadowData.brier != null ? ` · Brier ${shadowData.brier.toFixed(3)} (lower = better; <0.20 good)` : ''}
+          </div>
+
+          {/* Per-sport actual vs stated */}
+          {shadowData.bySport.length > 0 && (
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>Per-sport: stated confidence vs actual WR</div>
+              <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', color: 'var(--text-muted)', borderBottom: '1px solid var(--border)' }}>
+                    <th style={{ padding: '4px 6px' }}>Sport</th>
+                    <th style={{ padding: '4px 6px', textAlign: 'right' }}>n</th>
+                    <th style={{ padding: '4px 6px', textAlign: 'right' }}>Actual WR</th>
+                    <th style={{ padding: '4px 6px', textAlign: 'right' }}>Avg Conf</th>
+                    <th style={{ padding: '4px 6px', textAlign: 'right' }}>Gap</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {shadowData.bySport.map(s => {
+                    const gap = s.wr - s.avgConf;
+                    const bg = Math.abs(gap) > 10 ? 'rgba(239,68,68,0.10)' : Math.abs(gap) > 5 ? 'rgba(245,158,11,0.10)' : 'transparent';
+                    return (
+                      <tr key={s.sport} style={{ background: bg, borderBottom: '1px solid var(--border)' }}>
+                        <td style={{ padding: '4px 6px', fontWeight: 600 }}>{s.sport}</td>
+                        <td style={{ padding: '4px 6px', textAlign: 'right' }}>{s.n}</td>
+                        <td style={{ padding: '4px 6px', textAlign: 'right', fontWeight: 600 }}>{s.wr}%</td>
+                        <td style={{ padding: '4px 6px', textAlign: 'right', color: 'var(--text-muted)' }}>{s.avgConf}%</td>
+                        <td style={{ padding: '4px 6px', textAlign: 'right', color: gap > 5 ? '#22C55E' : gap < -5 ? '#EF4444' : 'var(--text-muted)' }}>{gap >= 0 ? '+' : ''}{gap}pt</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Confidence calibration scatter — stated vs actual */}
+          {shadowData.confidenceBuckets.length > 0 && (
+            <div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>Confidence calibration (each bar = 5pt band)</div>
+              <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6, height: 120, padding: '0 4px' }}>
+                {shadowData.confidenceBuckets.map(b => {
+                  const expectedHeight = (b.confBand + 2.5) / 100 * 100; // expected line at midband
+                  const actualHeight = b.actualWR;
+                  const diff = b.actualWR - (b.confBand + 2.5);
+                  const color = Math.abs(diff) > 10 ? '#EF4444' : Math.abs(diff) > 5 ? '#F59E0B' : '#22C55E';
+                  return (
+                    <div key={b.confBand} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                      <div style={{ position: 'relative', width: '100%', height: 100, display: 'flex', alignItems: 'flex-end', gap: 2 }}>
+                        <div title={`Expected ${b.confBand}-${b.confBand+5}%`} style={{ flex: 1, height: `${expectedHeight}%`, background: 'rgba(99,102,241,0.3)', borderRadius: 2 }} />
+                        <div title={`Actual ${b.actualWR}% (n=${b.n})`} style={{ flex: 1, height: `${actualHeight}%`, background: color, borderRadius: 2 }} />
+                      </div>
+                      <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 4 }}>{b.confBand}+%</div>
+                      <div style={{ fontSize: 9, color: 'var(--text-muted)' }}>n={b.n}</div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8 }}>
+                Each band: expected (purple, midband %) vs actual (green/orange/red — green = within 5pt, red = over 10pt drift). Goal: bars match.
+              </div>
+            </div>
+          )}
+        </Section>
+      )}
 
       {/* ─── Calibration Buckets ─── */}
       <Section title="🎯 Calibration Buckets" action={

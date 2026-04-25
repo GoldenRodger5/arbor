@@ -207,6 +207,41 @@ function computeCalibrationFeedback() {
       t._ts = new Date(t.settledAt ?? t.timestamp).getTime();
       t._phase = (t.strategy ?? '').startsWith('pre-game') ? 'pre' : 'live';
       t._side = (t.entryPrice ?? 0.5) < 0.50 ? 'dog' : 'fav';
+      t._isShadow = false;
+    }
+
+    // SHADOW DATA INTEGRATION (Phase 3): merge settled shadow decisions into the same buckets.
+    // Each shadow record adds to the same (sport × phase × side × confidence band) bucket but
+    // is tagged so we can show "REAL X + SHADOW Y" separately to Claude. Wilson bounds tighten
+    // naturally as combined n grows. Shadow-only Brier helps detect drift between live trading
+    // calibration and unbet decision calibration.
+    if (existsSync(SHADOW_DECISIONS_LOG)) {
+      try {
+        const shadowLines = readFileSync(SHADOW_DECISIONS_LOG, 'utf-8').split('\n').filter(l => l.trim());
+        const shadowRecords = shadowLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        // Only settled shadow records, within window, with valid confidence
+        for (const sr of shadowRecords) {
+          if (sr.status !== 'settled') continue;
+          if (sr.claudeConfidence == null || sr.ourPickWon == null) continue;
+          const settledMs = sr.settledAt ? Date.parse(sr.settledAt) : 0;
+          if (settledMs < maxCutoff) continue;
+          // Convert shadow → trade-like record for the same bucket pipeline
+          settledAll.push({
+            ticker: sr.ticker,
+            confidence: sr.claudeConfidence,
+            entryPrice: sr.decisionPrice,
+            gameOutcome: sr.ourPickWon ? 'correct' : 'incorrect',
+            strategy: sr.stage === 'live-edge' ? 'live-prediction-shadow' : 'pre-game-prediction-shadow',
+            settledAt: sr.settledAt,
+            timestamp: sr.ts,
+            _sport: sr.league ?? (sr.sport === 'NBA' ? 'nba' : sr.sport === 'MLB' ? 'mlb' : sr.sport === 'NHL' ? 'nhl' : 'soccer'),
+            _ts: settledMs,
+            _phase: 'live', // shadow is always from live-edge currently
+            _side: (sr.decisionPrice ?? 0.5) < 0.50 ? 'dog' : 'fav',
+            _isShadow: true,
+          });
+        }
+      } catch { /* shadow file optional */ }
     }
 
     // Adaptive per-sport window, then split by (phase, side) combo → buckets.
@@ -231,11 +266,20 @@ function computeCalibrationFeedback() {
         const won = t.gameOutcome ? t.gameOutcome === 'correct' : (t.realizedPnL ?? 0) > 0;
         const band = t.confidence < 0.65 ? '58-64' : t.confidence < 0.70 ? '65-69' : t.confidence < 0.75 ? '70-74' : '75+';
         const comboKey = `${t._phase}/${t._side}`;
-        if (!combos[comboKey]) combos[comboKey] = { buckets: {}, totalW: 0, totalL: 0 };
+        if (!combos[comboKey]) combos[comboKey] = { buckets: {}, totalW: 0, totalL: 0, totalShadowW: 0, totalShadowL: 0 };
         const c = combos[comboKey];
-        c[won ? 'totalW' : 'totalL']++;
-        if (!c.buckets[band]) c.buckets[band] = { w: 0, l: 0, entrySum: 0, n: 0 };
-        c.buckets[band][won ? 'w' : 'l']++;
+        // Track real vs shadow separately at total + bucket level for transparent output
+        if (t._isShadow) {
+          c[won ? 'totalShadowW' : 'totalShadowL']++;
+        } else {
+          c[won ? 'totalW' : 'totalL']++;
+        }
+        if (!c.buckets[band]) c.buckets[band] = { w: 0, l: 0, sw: 0, sl: 0, entrySum: 0, n: 0 };
+        if (t._isShadow) {
+          c.buckets[band][won ? 'sw' : 'sl']++;
+        } else {
+          c.buckets[band][won ? 'w' : 'l']++;
+        }
         c.buckets[band].entrySum += t.entryPrice ?? 0.5;
         c.buckets[band].n++;
       }
@@ -260,29 +304,36 @@ function computeCalibrationFeedback() {
         for (const band of ['58-64', '65-69', '70-74', '75+']) {
           const b = c.buckets[band];
           if (!b || b.n < 3) continue;
-          const bt = b.w + b.l;
-          const bWR = Math.round((b.w / bt) * 100);
+          const realN = b.w + b.l;
+          const shadowN = (b.sw ?? 0) + (b.sl ?? 0);
+          const totalN = realN + shadowN;
+          const totalW = b.w + (b.sw ?? 0);
+          const bWR = totalN > 0 ? Math.round((totalW / totalN) * 100) : 0;
           const floor = band === '58-64' ? Math.round((b.entrySum / b.n) * 100) : bandLower[band];
-          // Sample-size aware verdict: 4W/0L = "100% WR" was misleading Claude into treating
-          // tiny samples as confirmed signal (LAL@HOU 4/24 -$3.84). Wilson 95% lower bound on
-          // n=4 with k=4 wins is ~40% — we should not call that "calibrated" to Claude.
-          // Apply tiny-sample warning when n < 10, hard caveat when n < 5.
-          let verdict;
-          if (bt < 5) {
-            verdict = `n=${bt} TOO FEW — ignore (Wilson lower bound spans 20-90%)`;
-          } else if (bt < 10) {
-            // Compute Wilson 95% lower bound for the WR
-            const p = b.w / bt;
+          // Wilson 95% lower bound — combined n shrinks the bound, giving stronger signal
+          // Combined uses real+shadow; reported separately so Claude sees the source split.
+          const wilsonLowerBound = (w, n) => {
+            if (n === 0) return 0;
+            const p = w / n;
             const z = 1.96;
-            const denom = 1 + z*z/bt;
-            const wilsonLow = Math.max(0, Math.round(((p + z*z/(2*bt) - z * Math.sqrt(p*(1-p)/bt + z*z/(4*bt*bt))) / denom) * 100));
-            verdict = `${b.w}W/${b.l}L on small n=${bt} (Wilson lower ${wilsonLow}%) — treat with caution, don't over-anchor`;
-          } else if (bWR >= floor + 5) verdict = `CRUSHING at ${bWR}% vs ${floor}% — underconfident here`;
-          else if (bWR >= floor) verdict = `calibrated at ${bWR}% vs ${floor}% — trust reads`;
-          else if (bWR >= floor - 5) verdict = `within tolerance at ${bWR}% vs ${floor}%`;
-          else if (bWR >= floor - 15) verdict = `underperforming at ${bWR}% vs ${floor}% — trim ~${Math.min(8, floor - bWR)}pts`;
-          else verdict = `LOSING at ${bWR}% vs ${floor}% — require much stronger evidence or skip this combo`;
-          bucketLines.push(`    ${band}%: ${b.w}W/${b.l}L — ${verdict}`);
+            const denom = 1 + z*z/n;
+            return Math.max(0, Math.round(((p + z*z/(2*n) - z * Math.sqrt(p*(1-p)/n + z*z/(4*n*n))) / denom) * 100));
+          };
+          // Combine real + shadow for the verdict (more samples = tighter bounds).
+          let verdict;
+          const sourceLabel = shadowN > 0
+            ? `REAL ${b.w}W/${b.l}L + SHADOW ${b.sw ?? 0}W/${b.sl ?? 0}L`
+            : `${b.w}W/${b.l}L`;
+          if (totalN < 5) {
+            verdict = `n=${totalN} TOO FEW — ignore (Wilson lower bound spans 20-90%)`;
+          } else if (totalN < 10) {
+            verdict = `${sourceLabel} on small n=${totalN} (Wilson lower ${wilsonLowerBound(totalW, totalN)}%) — treat with caution, don't over-anchor`;
+          } else if (bWR >= floor + 5) verdict = `CRUSHING at ${bWR}% vs ${floor}% (n=${totalN}) — underconfident here`;
+          else if (bWR >= floor) verdict = `calibrated at ${bWR}% vs ${floor}% (n=${totalN}) — trust reads`;
+          else if (bWR >= floor - 5) verdict = `within tolerance at ${bWR}% vs ${floor}% (n=${totalN})`;
+          else if (bWR >= floor - 15) verdict = `underperforming at ${bWR}% vs ${floor}% (n=${totalN}) — trim ~${Math.min(8, floor - bWR)}pts`;
+          else verdict = `LOSING at ${bWR}% vs ${floor}% (n=${totalN}) — require much stronger evidence or skip this combo`;
+          bucketLines.push(`    ${band}%: ${sourceLabel} — ${verdict}`);
         }
         if (bucketLines.length === 0) {
           comboLines.push(`  ${combo}: ${c.totalW}W/${c.totalL}L (${wr}%) — buckets too thin for verdict`);
@@ -1496,6 +1547,10 @@ const TRADES_LOG = './logs/trades.jsonl';
 const DAILY_LOG = './logs/daily-snapshots.jsonl';
 const SCREENS_LOG = './logs/screens.jsonl';
 const PAPER_TRADES_LOG = './logs/paper-trades.jsonl';
+// Shadow decision tracker (2026-04-25): captures every Sonnet decision (live-edge YES + NO)
+// for offline calibration analysis. Settled via Kalshi market resolution. 100x more samples
+// than real trades alone; enables proper confidence calibration with Wilson-bounded buckets.
+const SHADOW_DECISIONS_LOG = './logs/shadow-decisions.jsonl';
 
 // Games currently in progress — populated by checkLiveScoreEdges each cycle.
 // Key: "ABBR1|ABBR2" (sorted, upper-case). Lets pre-game scanner skip live games.
@@ -1623,6 +1678,47 @@ function logPaperTrade(entry) {
   }
 }
 
+// Shadow decision dedup map: avoid logging same (ticker, score, price-bucket) within 5min.
+// Shadow decisions fire many times per game cycle as Sonnet re-evaluates; we only need
+// one shadow record per state-change to track outcome.
+const recentShadowKeys = new Map(); // key → ts
+
+// Log a shadow Claude decision (every YES/NO from live-edge Sonnet) for calibration analysis.
+// These are NOT trades — purely data points to track Claude's confidence vs actual game outcome.
+// Settled via Kalshi market.result by settleShadowDecisions() — see Phase 2.
+function logShadowDecision(entry) {
+  // Quality filter: skip ultra-low-info decisions
+  if (entry.claudeConfidence != null && entry.claudeConfidence < 0.50) return; // <50% conf = no signal
+  if (entry.decisionPrice != null && entry.decisionPrice > 0.95) return;       // settlement-imminent
+  // Dedup: same (ticker, score, ~5¢ price-bucket) in last 5min = skip
+  const priceCents = Math.round((entry.decisionPrice ?? 0) * 100);
+  const priceBucket = Math.round(priceCents / 5) * 5; // 5-cent buckets
+  const dedupKey = `${entry.ticker}|${entry.scoreDiff}|${entry.period}|${priceBucket}`;
+  const lastTs = recentShadowKeys.get(dedupKey) ?? 0;
+  if (Date.now() - lastTs < 5 * 60 * 1000) return; // skip within 5min
+  recentShadowKeys.set(dedupKey, Date.now());
+  // Periodic GC: remove entries older than 30min to bound memory
+  if (recentShadowKeys.size > 1000) {
+    const cutoff = Date.now() - 30 * 60 * 1000;
+    for (const [k, t] of recentShadowKeys) if (t < cutoff) recentShadowKeys.delete(k);
+  }
+  const record = {
+    id: `shadow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    ts: new Date().toISOString(),
+    status: 'pending',          // pending → settled (updated by settleShadowDecisions)
+    settledAt: null,
+    winningSide: null,          // 'yes' or 'no' from market.result
+    ourPickWon: null,           // boolean: did our targetAbbr's YES contract win?
+    calibrationDelta: null,     // Brier component: (claudeConfidence - outcome)²
+    ...entry,
+  };
+  try {
+    appendFileSync(SHADOW_DECISIONS_LOG, JSON.stringify(record) + '\n');
+  } catch (e) {
+    // Silent fail — shadow data is best-effort, don't disrupt trading
+  }
+}
+
 // Settle pending paper trades against Kalshi market outcomes
 async function settlePaperTrades() {
   if (!existsSync(PAPER_TRADES_LOG)) return;
@@ -1655,6 +1751,58 @@ async function settlePaperTrades() {
   const allById = new Map(trades.map(t => [t.id, t]));
   for (const t of pending) allById.set(t.id, t);
   writeFileSync(PAPER_TRADES_LOG, [...allById.values()].map(t => JSON.stringify(t)).join('\n') + '\n');
+}
+
+// PHASE 2 — Settle pending shadow decisions against Kalshi market outcomes.
+// For each shadow record, fetch the ticker's resolution, compute whether our
+// targetAbbr's YES contract won, and store calibrationDelta (Brier component).
+// Caps work per cycle to avoid hammering the Kalshi API on backlog.
+async function settleShadowDecisions() {
+  if (!existsSync(SHADOW_DECISIONS_LOG)) return;
+  const lines = readFileSync(SHADOW_DECISIONS_LOG, 'utf-8').split('\n').filter(l => l.trim());
+  const records = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  // Settle records older than 6h (game should be over by then)
+  const cutoffMs = Date.now() - 6 * 3600 * 1000;
+  const pending = records.filter(r => r.status === 'pending' && r.ticker && Date.parse(r.ts ?? '') < cutoffMs);
+  if (pending.length === 0) return;
+  // Cap per-cycle work — don't slam Kalshi if we have a big backlog
+  const MAX_PER_CYCLE = 30;
+  const batch = pending.slice(0, MAX_PER_CYCLE);
+
+  let updated = false;
+  for (const r of batch) {
+    try {
+      const market = await kalshiGet(`/markets/${r.ticker}`);
+      const result = market?.market?.result;
+      if (!result || (result !== 'yes' && result !== 'no')) {
+        // Mark as expired (game over but no resolution we can read) so we don't loop on it forever
+        if (Date.parse(r.ts ?? '') < Date.now() - 48 * 3600 * 1000) {
+          r.status = 'expired';
+          updated = true;
+        }
+        continue;
+      }
+      r.status = 'settled';
+      r.settledAt = market.market.close_time ?? new Date().toISOString();
+      r.winningSide = result;
+      // We log every shadow as the YES side of targetAbbr — won iff result === 'yes'
+      r.ourPickWon = result === 'yes';
+      // Brier component: (predicted - outcome)². Lower is better. 0 = perfect.
+      if (r.claudeConfidence != null) {
+        const outcome = r.ourPickWon ? 1 : 0;
+        r.calibrationDelta = Math.round(Math.pow(r.claudeConfidence - outcome, 2) * 10000) / 10000;
+      }
+      updated = true;
+    } catch { /* network error or market not found — try next cycle */ }
+  }
+
+  if (!updated) return;
+  // Rewrite file with updated records (atomic by Map dedup on id)
+  const allById = new Map(records.map(r => [r.id, r]));
+  for (const r of batch) allById.set(r.id, r);
+  writeFileSync(SHADOW_DECISIONS_LOG, [...allById.values()].map(r => JSON.stringify(r)).join('\n') + '\n');
+  const settled = batch.filter(r => r.status === 'settled').length;
+  if (settled > 0) console.log(`[shadow] Settled ${settled} decisions (${pending.length - MAX_PER_CYCLE > 0 ? `${pending.length - MAX_PER_CYCLE} remaining` : 'queue clear'})`);
 }
 
 // Log screening decisions for analysis: what Haiku flagged, what Sonnet decided
@@ -4665,6 +4813,31 @@ async function checkLiveScoreEdges() {
           : (typeof decision.reasoning === 'string' ? decision.reasoning : '');
         decision.reasoning = reasoningStr;
         decision.reasoningStructured = reasoningStructured;
+
+        // Shadow decision logging — captures every Sonnet YES/NO for offline calibration.
+        // YES decisions also become trades.jsonl entries via downstream code; logging here
+        // ensures we have the AT-DECISION price and reasoning regardless of what filters
+        // do downstream. Settlement reconciler (Phase 2) backfills outcome.
+        const _shadowSport = league === 'mlb' ? 'MLB' : league === 'nba' ? 'NBA' : league === 'nhl' ? 'NHL'
+          : ['mls','epl','laliga','seriea','bundesliga','ligue1'].includes(league) ? 'Soccer' : 'Other';
+        logShadowDecision({
+          stage: 'live-edge',
+          ticker,
+          sport: _shadowSport,
+          league,
+          decision: decision.trade ? 'trade' : 'no-trade',
+          rejectReason: decision.trade ? null : 'claude-no',
+          claudeConfidence: decision.confidence ?? null,
+          decisionPrice: price,
+          edge: decision.confidence != null ? Math.round((decision.confidence - price) * 100) : null,
+          scoreDiff: diff,
+          period,
+          gameDetail,
+          leadingAbbr,
+          targetAbbr,
+          reasoningPreview: (decision.reasoning ?? '').slice(0, 200),
+          reasoningTags: decision.reasoningStructured?.reasoning_tags ?? null,
+        });
 
         if (!decision.trade) {
           console.log(`[live-edge] Claude says NO on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): conf=${((decision.confidence ?? 0)*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ | ${decision.reasoning?.slice(0, 80)}`);
@@ -10152,6 +10325,7 @@ async function main() {
     try { await managePositions(); } catch (e) { console.error('[exit] error:', e.message); }
     try { await checkSettlements(); } catch (e) { console.error('[settlement] error:', e.message); }
     try { await settlePaperTrades(); } catch (e) { console.error('[paper-settle] error:', e.message); }
+    try { await settleShadowDecisions(); } catch (e) { console.error('[shadow-settle] error:', e.message); }
     try { await reviewStopLossOutcomes(); } catch (e) { console.error('[stop-review] error:', e.message); }
     try { await checkLosingStreak(); } catch (e) { console.error('[streak] error:', e.message); }
     try { await updateCalibrationStats(); } catch (e) { console.error('[cal-stats] error:', e.message); }

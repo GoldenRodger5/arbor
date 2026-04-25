@@ -286,6 +286,9 @@ Things we need tracked but aren't yet:
 | 2026-04-24 | Daily P&L view + cost-per-trade UI metric | New /api/costs daily aggregation, sortable table, $/trade efficiency display | Live |
 | 2026-04-24 | Fix ReferenceError (stage/leading/trailing) in live-edge Phase 4 | Regression from earlier feature stack — was emitting Telegram error every cycle | Fixed |
 | 2026-04-24 | Cross-sport killer-bucket extension + re-enable MLS pre-game | Block 15+pt × <70% conf on all sports with sport-specific carve-outs (MLB ERA>5.5, NHL backup goalie, NBA 2+ stars OUT, soccer 3+ injury terms). MLS pre-game now active again. SerieA/Bundesliga/Ligue1 stay disabled (Kalshi has no markets). | TBD |
+| 2026-04-24 | Sample-size aware calibration + NBA Q4 time-floor | Wilson CI lower bounds on n<10 calibration buckets. NBA Q4 with >8min left now requires 6pt edge. LAL@HOU loss revealed both gaps. | TBD |
+| 2026-04-25 | Suppress transient Anthropic timeout alerts | Web-search 25s timeouts shouldn't ping Telegram. Now log-only. | TBD |
+| 2026-04-25 | Shadow Decision Tracker (all 4 phases + UI) | Captures every Sonnet YES/NO in live-edge → settles via Kalshi market.result → merges into calibration feedback (real + shadow Wilson-bounded). New /api/shadow-calibration endpoint + Analytics dashboard panel with per-sport drift + confidence calibration scatter. Cost impact ~$0/day (parasitic on existing Sonnet calls). | Live |
 
 ---
 

@@ -1126,6 +1126,57 @@ Rules:
         json(res, { error: e.message, updatedAt: null, totalSettled: 0, buckets: [] });
       }
 
+    } else if (path === '/api/shadow-calibration') {
+      // Shadow decision calibration: aggregates settled shadow decisions into confidence
+      // bands per sport. Used by the dashboard to show "stated conf vs actual WR" scatter.
+      const shadowPath = './logs/shadow-decisions.jsonl';
+      try {
+        if (!existsSync(shadowPath)) {
+          json(res, { totalSettled: 0, totalPending: 0, bySport: [], confidenceBuckets: [], brier: null });
+          return;
+        }
+        const lines = readFileSync(shadowPath, 'utf-8').split('\n').filter(l => l.trim());
+        const records = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        const settled = records.filter(r => r.status === 'settled' && r.claudeConfidence != null && r.ourPickWon != null);
+        const pending = records.filter(r => r.status === 'pending').length;
+        // Brier
+        const brier = settled.length > 0
+          ? settled.reduce((s, r) => s + Math.pow(r.claudeConfidence - (r.ourPickWon ? 1 : 0), 2), 0) / settled.length
+          : null;
+        // Per-sport
+        const bySportMap = {};
+        for (const r of settled) {
+          const sport = r.sport ?? 'OTHER';
+          if (!bySportMap[sport]) bySportMap[sport] = { sport, n: 0, wins: 0, confSum: 0 };
+          bySportMap[sport].n++;
+          if (r.ourPickWon) bySportMap[sport].wins++;
+          bySportMap[sport].confSum += r.claudeConfidence;
+        }
+        const bySport = Object.values(bySportMap)
+          .map(s => ({ ...s, wr: s.n > 0 ? Math.round((s.wins / s.n) * 100) : 0, avgConf: s.n > 0 ? Math.round((s.confSum / s.n) * 100) : 0 }))
+          .sort((a, b) => b.n - a.n);
+        // Confidence bands (5pt buckets) for scatter plot
+        const buckets = {};
+        for (const r of settled) {
+          const band = Math.floor(r.claudeConfidence * 20) * 5; // 5pt buckets: 50, 55, 60, ...
+          if (!buckets[band]) buckets[band] = { confBand: band, n: 0, wins: 0 };
+          buckets[band].n++;
+          if (r.ourPickWon) buckets[band].wins++;
+        }
+        const confidenceBuckets = Object.values(buckets)
+          .map(b => ({ ...b, actualWR: b.n > 0 ? Math.round((b.wins / b.n) * 100) : 0 }))
+          .sort((a, b) => a.confBand - b.confBand);
+        json(res, {
+          totalSettled: settled.length,
+          totalPending: pending,
+          brier: brier != null ? Math.round(brier * 10000) / 10000 : null,
+          bySport,
+          confidenceBuckets,
+        });
+      } catch (e) {
+        json(res, { error: e.message, totalSettled: 0, totalPending: 0, bySport: [], confidenceBuckets: [], brier: null });
+      }
+
     } else {
       res.writeHead(404);
       res.end('Not found');

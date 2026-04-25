@@ -70,6 +70,9 @@ export const api = {
     get<PaperStats>('/api/paper-stats'),
   getApiCosts: (hours = 24) =>
     get<ApiCostReport>(`/api/costs?hours=${hours}`),
+
+  getShadowCalibration: () =>
+    get<ShadowCalibrationReport>('/api/shadow-calibration'),
 };
 
 export type ApiCostCategory = {
@@ -83,6 +86,14 @@ export type ApiCostCategory = {
   cents: number;
   usd: number;
   models: Record<string, number>;
+};
+
+export type ShadowCalibrationReport = {
+  totalSettled: number;
+  totalPending: number;
+  brier: number | null;
+  bySport: { sport: string; n: number; wins: number; wr: number; avgConf: number }[];
+  confidenceBuckets: { confBand: number; n: number; wins: number; actualWR: number }[];
 };
 
 export type ApiCostReport = {

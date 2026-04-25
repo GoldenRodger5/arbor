@@ -363,3 +363,70 @@ if (flagCount === 0) {
 }
 
 console.log('\n' + divider + '\n');
+
+// ─── SHADOW DECISIONS ANALYSIS (Phase 3) ──────────────────────────────────────
+// Read shadow-decisions.jsonl and compute parallel calibration metrics.
+// Shadow data has 100x more samples than real trades — useful for detecting
+// bucket-level miscalibration that real-trade volume can't reveal yet.
+
+const SHADOW_LOG = new URL('../bot/logs/shadow-decisions.jsonl', import.meta.url).pathname;
+let shadowRaw;
+try { shadowRaw = readFileSync(SHADOW_LOG, 'utf-8'); } catch { shadowRaw = null; }
+
+if (shadowRaw) {
+  const shadowAll = shadowRaw.split('\n').filter(l => l.trim())
+    .map(l => { try { return JSON.parse(l); } catch { return null; } })
+    .filter(Boolean)
+    .filter(r => r.status === 'settled' && r.claudeConfidence != null && r.ourPickWon != null);
+
+  console.log(`📊 SHADOW DECISIONS — ${shadowAll.length} settled records (Claude evaluated, not bet)`);
+  console.log(thin);
+
+  if (shadowAll.length >= 10) {
+    const shadowBrier = shadowAll.reduce((s, r) => {
+      const outcome = r.ourPickWon ? 1 : 0;
+      return s + Math.pow(r.claudeConfidence - outcome, 2);
+    }, 0) / shadowAll.length;
+    console.log(`  Shadow Brier:  ${brierLabel(shadowBrier)}  (n=${shadowAll.length})`);
+    const realBrier = brierScore(real);
+    if (realBrier != null) {
+      const drift = shadowBrier - realBrier;
+      const driftLabel = Math.abs(drift) > 0.05 ? `⚠ DRIFT ${(drift > 0 ? '+' : '')}${drift.toFixed(3)}` : `✓ aligned`;
+      console.log(`  Drift vs real: ${driftLabel}  (real ${realBrier.toFixed(3)}, shadow ${shadowBrier.toFixed(3)})`);
+    }
+
+    // Per-sport shadow breakdown
+    console.log('\n  Per-sport shadow WR:');
+    const bySport = {};
+    for (const r of shadowAll) {
+      const sport = r.sport ?? 'OTHER';
+      if (!bySport[sport]) bySport[sport] = { w: 0, l: 0, confSum: 0 };
+      bySport[sport][r.ourPickWon ? 'w' : 'l']++;
+      bySport[sport].confSum += r.claudeConfidence;
+    }
+    for (const [sport, s] of Object.entries(bySport)) {
+      const n = s.w + s.l;
+      if (n < 5) continue;
+      const wr = s.w / n;
+      const avgConf = s.confSum / n;
+      const flag = Math.abs(wr - avgConf) > 0.10 ? '⚠' : '✓';
+      console.log(`    ${flag} ${sport.padEnd(8)} ${s.w}W/${s.l}L (${(wr*100).toFixed(0)}% WR, avg conf ${(avgConf*100).toFixed(0)}%, gap ${gap(wr, avgConf)})`);
+    }
+
+    // Confidence calibration histogram
+    console.log('\n  Confidence calibration (stated → actual):');
+    const bands = [['50-59', 0.50, 0.60], ['60-64', 0.60, 0.65], ['65-69', 0.65, 0.70], ['70-74', 0.70, 0.75], ['75-79', 0.75, 0.80], ['80+', 0.80, 1.01]];
+    for (const [label, lo, hi] of bands) {
+      const subset = shadowAll.filter(r => r.claudeConfidence >= lo && r.claudeConfidence < hi);
+      const n = subset.length;
+      if (n < 5) continue;
+      const wr = subset.filter(r => r.ourPickWon).length / n;
+      const expected = (lo + (hi === 1.01 ? 0.85 : hi)) / 2;
+      const flag = Math.abs(wr - expected) > 0.08 ? '⚠' : '✓';
+      console.log(`    ${flag} ${label}%: n=${n}, actual WR=${(wr*100).toFixed(0)}% (expected ~${(expected*100).toFixed(0)}%)`);
+    }
+  } else {
+    console.log(`  Need ≥10 settled shadow decisions for analysis (have ${shadowAll.length}). Capture is real-time as Sonnet decisions log.`);
+  }
+  console.log('\n' + divider + '\n');
+}
