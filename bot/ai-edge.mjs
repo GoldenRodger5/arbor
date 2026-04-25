@@ -9713,19 +9713,35 @@ async function checkSettlements() {
             if (fills.length > 0) {
               let totalSellProceeds = 0;
               let totalBuyCost = 0;
+              let buyContracts = 0;
+              let sellContracts = 0;
               for (const fill of fills) {
                 const count = parseFloat(fill.count_fp ?? 0);
                 const fee = parseFloat(fill.fee_cost ?? 0);
                 if (fill.action === "sell") {
                   const price = parseFloat(fill.yes_price_dollars ?? 0);
                   totalSellProceeds += count * price - fee;
+                  sellContracts += count;
                 } else if (fill.action === "buy") {
                   const price = parseFloat(fill.yes_price_dollars ?? 0);
                   totalBuyCost += count * price + fee;
+                  buyContracts += count;
                 }
               }
+              // Auto-payout: contracts that auto-resolved at settlement without
+              // generating a "sell" fill. Kalshi credits the cash on settlement
+              // but /portfolio/fills only records explicit orders. Without this
+              // adjustment, revenue = -deployCost on every auto-settled win
+              // (e.g., ANA EDMANA 4/24 booked as -$6.11 instead of +$1.92).
+              const residual = Math.max(0, buyContracts - sellContracts);
+              let autoPayout = 0;
+              if (residual > 0 && market.result) {
+                const wonRes = (trade.side === 'yes' && market.result === 'yes') ||
+                               (trade.side === 'no' && market.result === 'no');
+                autoPayout = wonRes ? residual * 1.0 : 0;
+              }
               if (totalSellProceeds > 0 || totalBuyCost > 0) {
-                revenue = Math.round((totalSellProceeds - totalBuyCost) * 100) / 100;
+                revenue = Math.round((totalSellProceeds + autoPayout - totalBuyCost) * 100) / 100;
               }
             }
           } catch { /* fills not available — fall back to quantity calc */ }
