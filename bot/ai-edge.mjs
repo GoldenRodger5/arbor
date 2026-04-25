@@ -263,8 +263,21 @@ function computeCalibrationFeedback() {
           const bt = b.w + b.l;
           const bWR = Math.round((b.w / bt) * 100);
           const floor = band === '58-64' ? Math.round((b.entrySum / b.n) * 100) : bandLower[band];
+          // Sample-size aware verdict: 4W/0L = "100% WR" was misleading Claude into treating
+          // tiny samples as confirmed signal (LAL@HOU 4/24 -$3.84). Wilson 95% lower bound on
+          // n=4 with k=4 wins is ~40% — we should not call that "calibrated" to Claude.
+          // Apply tiny-sample warning when n < 10, hard caveat when n < 5.
           let verdict;
-          if (bWR >= floor + 5) verdict = `CRUSHING at ${bWR}% vs ${floor}% — underconfident here`;
+          if (bt < 5) {
+            verdict = `n=${bt} TOO FEW — ignore (Wilson lower bound spans 20-90%)`;
+          } else if (bt < 10) {
+            // Compute Wilson 95% lower bound for the WR
+            const p = b.w / bt;
+            const z = 1.96;
+            const denom = 1 + z*z/bt;
+            const wilsonLow = Math.max(0, Math.round(((p + z*z/(2*bt) - z * Math.sqrt(p*(1-p)/bt + z*z/(4*bt*bt))) / denom) * 100));
+            verdict = `${b.w}W/${b.l}L on small n=${bt} (Wilson lower ${wilsonLow}%) — treat with caution, don't over-anchor`;
+          } else if (bWR >= floor + 5) verdict = `CRUSHING at ${bWR}% vs ${floor}% — underconfident here`;
           else if (bWR >= floor) verdict = `calibrated at ${bWR}% vs ${floor}% — trust reads`;
           else if (bWR >= floor - 5) verdict = `within tolerance at ${bWR}% vs ${floor}%`;
           else if (bWR >= floor - 15) verdict = `underperforming at ${bWR}% vs ${floor}% — trim ~${Math.min(8, floor - bWR)}pts`;
@@ -4799,7 +4812,7 @@ async function checkLiveScoreEdges() {
         // Dynamic margin — sport-aware, price-aware, situation-aware
         // Swing mode uses 3% floor (we exit at +12¢, not settlement — tighter edge OK).
         // Standard mode uses 4% floor.
-        const reqMargin = Math.max(isSwingMode ? 0.03 : 0.04, getRequiredMargin(price, {
+        let reqMargin = Math.max(isSwingMode ? 0.03 : 0.04, getRequiredMargin(price, {
           sport: league, live: true,
           scoreChanged: !!item._scoreChanged,
           lineMove: !!item._lineMove,
@@ -4808,6 +4821,20 @@ async function checkLiveScoreEdges() {
           lineMoveVelocity:   item._lineMove?.velocity ?? 0,
           crossConfirmed:     item._lineMove?.crossConfirmed === true,
         }));
+        // NBA Q4 time-aware floor (LAL@HOU 4/24 -$3.84 lesson):
+        // 7-pt lead with 11:30 left in Q4 had thin 4pt edge but ~25 possessions of variance
+        // remaining. Late-game NBA leads compress in WR variance only as time decays. Require
+        // 6pt edge minimum when >8min left in Q4, easing back to 4pt under 4min.
+        if (league === 'nba' && period === 4 && !isSwingMode) {
+          const minMatch = (gameDetail ?? '').match(/^(\d{1,2}):(\d{2})/);
+          const minsLeft = minMatch ? parseInt(minMatch[1], 10) + parseInt(minMatch[2], 10) / 60 : null;
+          if (minsLeft != null && minsLeft > 8) {
+            reqMargin = Math.max(reqMargin, 0.06);
+            console.log(`[live-edge] NBA Q4 time-floor (${minsLeft.toFixed(1)}min left): edge floor raised to 6pt`);
+          } else if (minsLeft != null && minsLeft > 4) {
+            reqMargin = Math.max(reqMargin, 0.05);
+          }
+        }
         const rawEdge = confidence - price;
         if (rawEdge < reqMargin) {
           console.log(`[live-edge] Not enough margin on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(rawEdge*100).toFixed(1)}% need=${(reqMargin*100).toFixed(0)}%`);
