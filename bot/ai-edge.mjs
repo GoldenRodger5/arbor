@@ -10368,8 +10368,47 @@ async function main() {
       const edgeBand = (edge) => edge < 0.05 ? '<5pt' : edge < 0.10 ? '5-9pt' : edge < 0.15 ? '10-14pt' : edge < 0.20 ? '15-19pt' : '20+pt';
       const confBand = (c) => c < 0.60 ? '<60%' : c < 0.65 ? '60-64%' : c < 0.70 ? '65-69%' : c < 0.75 ? '70-74%' : c < 0.80 ? '75-79%' : '80%+';
 
-      const buckets = new Map();
+      // Position-level aggregation: collapse multiple bets on the same ticker
+      // (e.g. SAS@POR pre-game $4.03 win + live $3.12 nuclear loss = one POR
+      // position +$0.91). Matches the dedupe-to-first behavior in
+      // computeCalibrationFeedback, but ALSO sums P&L across the position so
+      // dashboard rows reflect total $ in/out per team-game. Bucket assignment
+      // uses the earliest trade's confidence/strategy (canonical thesis read);
+      // MFE = max across trades in position; gameOutcome = earliest's (all
+      // trades in a position share the same underlying game outcome).
+      const positionMap = new Map();
       for (const t of settled) {
+        const key = t.ticker ?? '';
+        const existing = positionMap.get(key);
+        if (!existing) {
+          positionMap.set(key, {
+            earliest: t,
+            totalPnL: t.realizedPnL ?? 0,
+            maxMFE: t.maxFavorableMove ?? null,
+            tradeCount: 1,
+          });
+        } else {
+          existing.totalPnL += (t.realizedPnL ?? 0);
+          existing.tradeCount++;
+          if (t.maxFavorableMove != null) {
+            existing.maxMFE = existing.maxMFE != null
+              ? Math.max(existing.maxMFE, t.maxFavorableMove)
+              : t.maxFavorableMove;
+          }
+          const tTs = new Date(t.timestamp ?? t.settledAt).getTime();
+          const eTs = new Date(existing.earliest.timestamp ?? existing.earliest.settledAt).getTime();
+          if (tTs < eTs) existing.earliest = t;
+        }
+      }
+      const positions = [...positionMap.values()].map(p => ({
+        ...p.earliest,
+        realizedPnL: Math.round(p.totalPnL * 100) / 100,
+        maxFavorableMove: p.maxMFE,
+        positionTradeCount: p.tradeCount,
+      }));
+
+      const buckets = new Map();
+      for (const t of positions) {
         const sport = sportOf(t.ticker ?? '');
         const strat = t.strategy ?? 'unknown';
         const edge = (t.confidence ?? 0) - (t.entryPrice ?? 0);
@@ -10399,7 +10438,12 @@ async function main() {
 
       const calPath = './logs/calibration-stats.json';
       try {
-        writeFileSync(calPath, JSON.stringify({ updatedAt: new Date().toISOString(), totalSettled: settled.length, buckets: rows }, null, 2));
+        writeFileSync(calPath, JSON.stringify({
+          updatedAt: new Date().toISOString(),
+          totalSettled: settled.length,        // raw trade count
+          totalPositions: positions.length,    // position-aggregated count (multi-trade theses collapsed)
+          buckets: rows,
+        }, null, 2));
       } catch (e) { console.log(`[cal-stats] write error: ${e.message}`); }
 
       // Daily digest: once per ET day after 09:00. Finds worst + best buckets with ≥5 trades.
