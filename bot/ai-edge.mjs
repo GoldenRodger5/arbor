@@ -10350,18 +10350,25 @@ async function main() {
         const ebd = edgeBand(edge);
         const cbd = confBand(t.confidence ?? 0);
         const key = `${sport}|${strat}|${ebd}|${cbd}`;
-        if (!buckets.has(key)) buckets.set(key, { sport, strategy: strat, edge: ebd, conf: cbd, n: 0, wins: 0, losses: 0, pnl: 0 });
+        if (!buckets.has(key)) buckets.set(key, { sport, strategy: strat, edge: ebd, conf: cbd, n: 0, wins: 0, losses: 0, pnl: 0, pmHits: 0, pmTracked: 0 });
         const b = buckets.get(key);
         b.n++;
         if (t.gameOutcome === 'correct') b.wins++;
         else if (t.gameOutcome === 'incorrect') b.losses++;
         b.pnl += (t.realizedPnL ?? 0);
+        // Price-move tracking — only when MFE was recorded (trades placed before
+        // 2026-04-25 have null maxFavorableMove and are excluded from pmTracked).
+        if (t.maxFavorableMove != null) {
+          b.pmTracked++;
+          if (t.maxFavorableMove >= 0.05) b.pmHits++;
+        }
       }
       const rows = Array.from(buckets.values()).map(b => ({
         ...b,
         wr: b.n > 0 ? Math.round(b.wins / b.n * 100) : 0,
         pnl: Math.round(b.pnl * 100) / 100,
         pnlPerTrade: b.n > 0 ? Math.round(b.pnl / b.n * 100) / 100 : 0,
+        priceMoveWR: b.pmTracked > 0 ? Math.round(b.pmHits / b.pmTracked * 100) : null,
       })).sort((a, b) => b.n - a.n);
 
       const calPath = './logs/calibration-stats.json';
