@@ -4378,6 +4378,7 @@ async function checkLiveScoreEdges() {
           `- Leading team win rate below 35% → DOWN 6-10% (weak teams protect leads less reliably)\n` +
           `- Trailing team is at HOME with loud playoff/crucial crowd → DOWN 3-5% (home crowd lifts desperate teams)\n` +
           `- Time remaining: 3 min left with a lead ≠ 10 min left with same lead. Adjust accordingly.\n\n` +
+          `⚠️ STEP 3 IS NOT OPTIONAL. The Step 3 adjustments above are ON TOP OF the WE baseline, not "already baked in." If a DOWN adjustment applies, you MUST subtract it. The arguments "the baseline already accounts for this," "the WE table already includes superior trailing teams," or any equivalent meta-argument that dismisses Step 3 adjustments are FORBIDDEN. Your reasoning MUST list the adjustments you applied with their numeric values (e.g., "trailing better -6, trailing at home -4 → final 61%"). If you cannot show this math in your reasoning, your decision is invalid. ATH/ATM 2026-04-25 was a real failure of this rule: bot bought ATH at 67% conf when 71% baseline minus -6 (ATM significantly better) minus -4 (ATM at home) = 61% cap, edge collapsed within 5 minutes. Don't do this.\n\n` +
           `═══ STEP 3.5 — MARKET CHECK ═══\n` +
           `The market is ${(price*100).toFixed(0)}¢. Briefly consider: is there a SPECIFIC concrete reason the market is lower than your estimate?\n` +
           `Look for: confirmed injury news, lineup change, weather, rest day, goalie switch — something factual.\n` +
