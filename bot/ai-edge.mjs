@@ -8069,10 +8069,26 @@ async function managePositions() {
             ? (ctx.leading === ourTeamAbbrCt ? ctx.baselineWE : (1 - ctx.baselineWE))
             : null;
           const pgEarlyWeOk = isPgLikeCt && stage === 'early' && ourWECt != null && ourWECt > 0.30;
+          // GATE 3: MLB live-prediction same-inning variance. Half-inning swings
+          // (one team batting) routinely produce 20-30¢ moves that fully recover
+          // on the next half. DET@CIN 2026-04-23: bot 7th, CIN scored 3, contra
+          // fired at 14¢, DET regained lead next inning and settled near 80¢.
+          // Wait for inning boundary before letting price-velocity stops fire.
+          // Excludes live-swing (which has its own contra-escalation tightener).
+          const isLivePredCt = trade.strategy === 'live-prediction'
+            || trade.strategy === 'high-conviction'
+            || trade.strategy === 'thesis-reentry';
+          const sameInningMlb = league === 'mlb'
+            && isLivePredCt
+            && trade.periodAtEntry != null
+            && ctx?.period != null
+            && ctx.period <= trade.periodAtEntry;
           if (moveAgeSec <= 120 && claudeHoldActive) {
             console.log(`[exit] 🛡️ CONTRA BLOCKED on ${trade.ticker}: Claude HOLD ${Math.round(claudeHoldAgeSec)}s ago overrides price-velocity signal`);
           } else if (moveAgeSec <= 120 && pgEarlyWeOk) {
             console.log(`[exit] 🛡️ CONTRA BLOCKED on ${trade.ticker}: ${trade.strategy} in ${stage} stage, WE=${(ourWECt*100).toFixed(0)}% still recoverable — market overreaction, not thesis death`);
+          } else if (moveAgeSec <= 120 && sameInningMlb) {
+            console.log(`[exit] 🛡️ CONTRA BLOCKED on ${trade.ticker}: MLB ${trade.strategy} still in entry inning ${ctx.period} (entered P${trade.periodAtEntry}) — half-inning variance, waiting for inning boundary`);
           } else if (moveAgeSec <= 120) {
             console.log(`[exit] ⚠️ CONTRA EXIT: ${trade.ticker} — cross-confirmed ${contraMove.velocity.toFixed(1)}¢/min drop ${Math.round(moveAgeSec)}s ago, scratching full position @ ${(currentPrice*100).toFixed(0)}¢`);
             await tg(
