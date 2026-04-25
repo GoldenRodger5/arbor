@@ -4610,7 +4610,19 @@ async function checkLiveScoreEdges() {
       const item = batchItems[i];
       const batchResult = batchResults[i];
       const cText = batchResult.status === 'fulfilled' ? batchResult.value : null;
-      if (!cText) { await reportError('live-edge:sonnet-empty', `${item.targetAbbr} ${item.league.toUpperCase()} ${item.awayAbbr}@${item.homeAbbr}${batchResult.status === 'rejected' ? ': ' + batchResult.reason?.message : ''}`); continue; }
+      if (!cText) {
+        // Distinguish transient infra failures (Anthropic web-search timeouts, network
+        // aborts) from real Sonnet failures (empty response, bad model output).
+        // Transient infra failures are noise — log but don't spam Telegram.
+        const reasonMsg = batchResult.status === 'rejected' ? (batchResult.reason?.message ?? '') : '';
+        const isTransientTimeout = /aborted|timeout|ECONNRESET|ETIMEDOUT|fetch failed|network/i.test(reasonMsg);
+        if (isTransientTimeout) {
+          console.log(`[live-edge] ⏳ Transient timeout on ${item.targetAbbr} (${item.league.toUpperCase()} ${item.awayAbbr}@${item.homeAbbr}): ${reasonMsg.slice(0, 100)} — silent skip, will retry next cycle`);
+        } else {
+          await reportError('live-edge:sonnet-empty', `${item.targetAbbr} ${item.league.toUpperCase()} ${item.awayAbbr}@${item.homeAbbr}${reasonMsg ? ': ' + reasonMsg : ''}`);
+        }
+        continue;
+      }
 
       // Destructure back the context we need. `isSwingMode` is mutable below
       // (isEdgeFirstLive promotion at ~line 4377 reassigns it) so it must be `let`.
@@ -5951,7 +5963,14 @@ async function checkPreGamePredictions() {
       const batchRes = batchResults[i];
       const decideText = batchRes.status === 'fulfilled' ? batchRes.value : null;
       if (!decideText) {
-        await reportError('pre-game:sonnet-empty', `${market.base}${batchRes.status === 'rejected' ? ': ' + batchRes.reason?.message : ''}`);
+        // Same transient-timeout suppression as live-edge.
+        const reasonMsg = batchRes.status === 'rejected' ? (batchRes.reason?.message ?? '') : '';
+        const isTransientTimeout = /aborted|timeout|ECONNRESET|ETIMEDOUT|fetch failed|network/i.test(reasonMsg);
+        if (isTransientTimeout) {
+          console.log(`[pre-game] ⏳ Transient timeout on ${market.base}: ${reasonMsg.slice(0, 100)} — silent skip, will retry next cycle`);
+        } else {
+          await reportError('pre-game:sonnet-empty', `${market.base}${reasonMsg ? ': ' + reasonMsg : ''}`);
+        }
         continue;
       }
 
