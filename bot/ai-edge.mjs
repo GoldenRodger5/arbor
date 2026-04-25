@@ -800,11 +800,32 @@ async function claudeScreen(prompt, { maxTokens = 300, timeout = 10000, category
 // per-promise rejection-message check from detecting transient timeouts.
 // Wrappers stamp this when they catch a transient; batch callers check it as
 // a backstop. Race window is short and false-positives just suppress alerts.
+//
+// Escalation: per-event Telegram pings on transients are noise (we suppress
+// them above), but a sustained Anthropic degradation IS something the user
+// wants to know about. Track timestamps in a 1h ring; if count >= threshold,
+// fire ONE summary alert and reset. Keeps the canary for real outages.
 let _lastClaudeTransientErrorAt = 0;
+let _claudeTransientTimestamps = []; // sliding 1h window
+let _lastTransientEscalationAt = 0;
 const CLAUDE_TRANSIENT_REGEX = /aborted|timeout|ECONNRESET|ETIMEDOUT|fetch failed|network/i;
+const TRANSIENT_ESCALATION_THRESHOLD = 10;
+const TRANSIENT_ESCALATION_WINDOW_MS = 60 * 60 * 1000;
 function _markClaudeTransientIfApplicable(err) {
   if (err && CLAUDE_TRANSIENT_REGEX.test(err.message ?? String(err))) {
-    _lastClaudeTransientErrorAt = Date.now();
+    const now = Date.now();
+    _lastClaudeTransientErrorAt = now;
+    // Trim ring to last hour, then add
+    _claudeTransientTimestamps = _claudeTransientTimestamps.filter(t => now - t < TRANSIENT_ESCALATION_WINDOW_MS);
+    _claudeTransientTimestamps.push(now);
+    // Escalate if threshold hit AND we haven't escalated in the last hour
+    if (_claudeTransientTimestamps.length >= TRANSIENT_ESCALATION_THRESHOLD &&
+        (now - _lastTransientEscalationAt) >= TRANSIENT_ESCALATION_WINDOW_MS) {
+      _lastTransientEscalationAt = now;
+      const count = _claudeTransientTimestamps.length;
+      _claudeTransientTimestamps = []; // reset ring after escalation
+      tg(`🌐 <b>Anthropic web-search degraded</b>\n${count} transient Claude timeouts in last hour — bot is auto-skipping affected cycles. No action needed unless this continues.`).catch(() => {});
+    }
   }
 }
 function _claudeTransientRecent(windowMs = 10000) {
@@ -4816,7 +4837,10 @@ async function checkLiveScoreEdges() {
             `Do ONE targeted search: "${item.targetTeam?.team?.displayName ?? item.targetAbbr} ${item.league.toUpperCase()} injury ejection lineup news today". ` +
             `If the search surfaces a confirmed injury, ejection, or lineup change affecting ${item.targetAbbr}, cite it and reject the trade. ` +
             `If nothing concrete is found, treat the contra move as market noise and evaluate normally on the WE-vs-price edge.`;
-          return claudeWithSearch(searchPrompt, { maxTokens: 2000, maxSearches: 1, timeout: 25000, category: 'live-edge-search', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' });
+          // 45s timeout (was 25s): Anthropic web-search routinely needs 30-50s
+          // for one search + reasoning. Today's 3 sonnet-empty alerts were all
+          // 25s timeouts on calls that almost certainly would've completed at 45s.
+          return claudeWithSearch(searchPrompt, { maxTokens: 2000, maxSearches: 1, timeout: 45000, category: 'live-edge-search', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' });
         }
         return claudeSonnet(item.prompt, { maxTokens: 1500, category: 'live-edge', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' });
       })
