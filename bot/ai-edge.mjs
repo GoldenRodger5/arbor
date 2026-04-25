@@ -832,6 +832,51 @@ function _claudeTransientRecent(windowMs = 10000) {
   return (Date.now() - _lastClaudeTransientErrorAt) < windowMs;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Static prompt block for live-edge — extracted to enable Anthropic prompt caching.
+// Contains the fully-static portions of the live-edge prompt: response format,
+// steel-man resolution rules, Step 3 enforcement language. ~1500 tokens, above
+// Anthropic's 1024-token cache minimum. Sent as the FIRST content block on every
+// live-edge call (with cache_control: ephemeral); the dynamic per-game block
+// follows. Cache hits reduce input cost ~10x on this prefix.
+//
+// Identical text to what was previously inlined at the end of the prompt — only
+// the position changes (now front, was back). A trigger line at the end of the
+// dynamic block points Claude back to this format ("respond per JSON format above").
+// ─────────────────────────────────────────────────────────────────────────────
+const LIVE_EDGE_STATIC_PREFIX = `═══ MANDATORY RESPONSE FORMAT — READ FIRST ═══
+You will receive game-specific data and analysis instructions below this section. After reading them, you MUST respond with valid JSON in one of these two shapes ONLY — no prose, no markdown, no explanation outside JSON.
+
+PASS response (no trade):
+{"trade": false, "confidence": 0.XX, "reasoning": "why market is right / what disqualified this"}
+
+TRADE response (placing a bet) — reasoning MUST be a structured object (not a string):
+{"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N,
+ "reasoning": {
+   "steel_man": "sharp money's argument for the current price, in one sentence",
+   "edge_source": "one tag from this list: bullpen_mismatch | starter_dominance | lineup_cold | market_lag | star_injury | goalie_mismatch | pace_mismatch | schedule_spot | motivation | other",
+   "edge_argument": "our concrete reason the market is wrong, in one sentence",
+   "key_facts": ["verifiable fact 1", "verifiable fact 2", "verifiable fact 3"],
+   "top_risk": "what could still beat us, in one sentence",
+   "conviction": "the single factor that pushed you over threshold",
+   "reasoning_tags": ["1-3 short lowercase tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, other"]
+ }}
+Every TRADE response MUST follow this exact schema. Do not substitute a string for the reasoning object.
+
+🛡️ STEEL-MAN RESOLUTION (non-negotiable):
+Before you return trade:true, your edge_argument MUST specifically defeat the steel_man — not just out-weigh it.
+• If your steel_man names a concrete risk (injury, matchup, tired bullpen, strong home record) and your edge_argument does NOT address that specific risk with a verifiable fact — return trade:false.
+• If your resolution is "yes steel-man is real but our edge is bigger" without naming WHY the steel-man is less load-bearing here — return trade:false.
+• If steel_man and edge_argument are both strong and point opposite directions → the market is probably right → return trade:false.
+• Valid resolution looks like: steel_man says "bullpen shaky" + edge_argument says "their setup man has 0.00 ERA last 10 appearances and is available tonight per ESPN". That's a specific defeat.
+Your conviction field should name the specific fact that neutralizes the steel_man, not restate the edge.
+
+⚠️ STEP 3 ENFORCEMENT (referenced below): The Step 3 adjustments in the league-specific section are ON TOP OF the WE baseline, not "already baked in." If a DOWN adjustment applies, you MUST subtract it. The arguments "the baseline already accounts for this," "the WE table already includes superior trailing teams," or any equivalent meta-argument that dismisses Step 3 adjustments are FORBIDDEN. Your reasoning MUST list the adjustments you applied with their numeric values (e.g., "trailing better -6, trailing at home -4 → final 61%"). If you cannot show this math in your reasoning, your decision is invalid. ATH/ATM 2026-04-25 was a real failure of this rule: bot bought ATH at 67% conf when 71% baseline minus -6 (ATM significantly better) minus -4 (ATM at home) = 61% cap, edge collapsed within 5 minutes.
+
+═══ END OF UNIVERSAL RULES — game-specific instructions and data follow ═══
+
+`;
+
 // Prompt-caching support — opt-in via array-form prompt or cacheSystem flag.
 // `prompt` can be a string (existing contract, no caching) OR an array of content
 // blocks `[{type:'text', text:'...', cache_control?:{type:'ephemeral'}}, ...]`.
@@ -4395,7 +4440,7 @@ async function checkLiveScoreEdges() {
           `- Leading team win rate below 35% → DOWN 6-10% (weak teams protect leads less reliably)\n` +
           `- Trailing team is at HOME with loud playoff/crucial crowd → DOWN 3-5% (home crowd lifts desperate teams)\n` +
           `- Time remaining: 3 min left with a lead ≠ 10 min left with same lead. Adjust accordingly.\n\n` +
-          `⚠️ STEP 3 IS NOT OPTIONAL. The Step 3 adjustments above are ON TOP OF the WE baseline, not "already baked in." If a DOWN adjustment applies, you MUST subtract it. The arguments "the baseline already accounts for this," "the WE table already includes superior trailing teams," or any equivalent meta-argument that dismisses Step 3 adjustments are FORBIDDEN. Your reasoning MUST list the adjustments you applied with their numeric values (e.g., "trailing better -6, trailing at home -4 → final 61%"). If you cannot show this math in your reasoning, your decision is invalid. ATH/ATM 2026-04-25 was a real failure of this rule: bot bought ATH at 67% conf when 71% baseline minus -6 (ATM significantly better) minus -4 (ATM at home) = 61% cap, edge collapsed within 5 minutes. Don't do this.\n\n` +
+          `⚠️ STEP 3 IS NOT OPTIONAL — see the STEP 3 ENFORCEMENT block in the universal rules at the top. Apply each DOWN adjustment with explicit numeric value in your reasoning.\n\n` +
           `═══ STEP 3.5 — MARKET CHECK ═══\n` +
           `The market is ${(price*100).toFixed(0)}¢. Briefly consider: is there a SPECIFIC concrete reason the market is lower than your estimate?\n` +
           `Look for: confirmed injury news, lineup change, weather, rest day, goalie switch — something factual.\n` +
@@ -4426,28 +4471,8 @@ async function checkLiveScoreEdges() {
             `  • If the price is already reflecting smart money, you have NO edge — say NO.\n` +
             `  • If you cannot name ONE specific, verifiable fact (not "they're the better team") that overrides the deficit — say NO.\n` : ''}` +
           `Max bet: $${getDynamicMaxTrade().toFixed(2)}\n\n` +
-          `RESPOND WITH JSON ONLY:\n\n` +
-          `PASS response:\n` +
-          `{"trade": false, "confidence": 0.XX, "reasoning": "why market is right / what disqualified this"}\n\n` +
-          `TRADE response — reasoning MUST be a structured object (not a string):\n` +
-          `{"trade": true, "side": "yes", "confidence": 0.XX, "betAmount": N,\n` +
-          ` "reasoning": {\n` +
-          `   "steel_man": "sharp money's argument for the current price, in one sentence",\n` +
-          `   "edge_source": "one tag from this list: bullpen_mismatch | starter_dominance | lineup_cold | market_lag | star_injury | goalie_mismatch | pace_mismatch | schedule_spot | motivation | other",\n` +
-          `   "edge_argument": "our concrete reason the market is wrong, in one sentence",\n` +
-          `   "key_facts": ["verifiable fact 1", "verifiable fact 2", "verifiable fact 3"],\n` +
-          `   "top_risk": "what could still beat us, in one sentence",\n` +
-          `   "conviction": "the single factor that pushed you over threshold",\n` +
-          `   "reasoning_tags": ["1-3 short lowercase tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, other"]\n` +
-          ` }}\n\n` +
-          `Every TRADE response MUST follow this exact schema. Do not substitute a string for the reasoning object.\n\n` +
-          `🛡️ STEEL-MAN RESOLUTION (non-negotiable):\n` +
-          `Before you return trade:true, your edge_argument MUST specifically defeat the steel_man — not just out-weigh it.\n` +
-          `• If your steel_man names a concrete risk (injury, matchup, tired bullpen, strong home record) and your edge_argument does NOT address that specific risk with a verifiable fact — return trade:false.\n` +
-          `• If your resolution is "yes steel-man is real but our edge is bigger" without naming WHY the steel-man is less load-bearing here — return trade:false.\n` +
-          `• If steel_man and edge_argument are both strong and point opposite directions → the market is probably right → return trade:false.\n` +
-          `• Valid resolution looks like: steel_man says "bullpen shaky" + edge_argument says "their setup man has 0.00 ERA last 10 appearances and is available tonight per ESPN". That's a specific defeat.\n` +
-          `Your conviction field should name the specific fact that neutralizes the steel_man, not restate the edge.`;
+          `═══ DECIDE NOW ═══\n` +
+          `Apply Steps 0-4 above and the universal rules from the top of this prompt (response format + steel-man resolution + Step 3 enforcement). Respond with valid JSON in the schema specified at the top.`;
         // Block if we already have a position on this game (check BOTH platforms)
         const ticker = targetMarket.ticker;
         const lastH = ticker.lastIndexOf('-');
@@ -4808,8 +4833,18 @@ async function checkLiveScoreEdges() {
           : league === 'nba' ? (period <= 2 ? 'early' : period === 3 ? 'mid' : 'late')
           : league === 'nhl' ? (period === 1 ? 'early' : period === 2 ? 'mid' : 'late')
           : (period === 1 ? 'early' : 'late');
+        // Two-block prompt with cached static prefix. The prefix (~1500 tokens of
+        // response format + steel-man rules + Step 3 enforcement) is identical
+        // across all live-edge calls and gets cached for 5 min on Anthropic side
+        // — saves ~$5-7/day on input cost. The dynamic block (livePrompt) is
+        // built per-call and not cached. claudeSonnet/claudeWithSearch already
+        // accept array-form prompts (Step 1 wrapper change).
+        const livePromptBlocks = [
+          { type: 'text', text: LIVE_EDGE_STATIC_PREFIX, cache_control: { type: 'ephemeral' } },
+          { type: 'text', text: livePrompt },
+        ];
         sonnetQueue.push({
-          prompt: livePrompt, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period,
+          prompt: livePromptBlocks, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period,
           leadingAbbr, gameDetail, price, ticker, gameBase, title, targetAbbr, targetTeam,
           targetIsHome: targetAbbr === homeAbbr, leading, trailing, trailingAbbr, stage: _qStage,
           hasPosition, currentScoreKey, isSwingMode, isThesisVindicated,
@@ -4849,18 +4884,26 @@ async function checkLiveScoreEdges() {
     const batchResults = await Promise.allSettled(
       batchItems.map(item => {
         if (item._useSearch) {
-          const searchPrompt = item.prompt +
+          // item.prompt is an array of content blocks (cached prefix + dynamic).
+          // For the search path, append a third block with the breaking-news
+          // search instructions — preserves the cached prefix.
+          const searchSuffixText =
             `\n\n═══ BREAKING-NEWS SEARCH (contra line-move fired) ═══\n` +
             `Market moved AGAINST ${item.targetAbbr} fast. This is often breaking news not yet in ESPN. ` +
             `Do ONE targeted search: "${item.targetTeam?.team?.displayName ?? item.targetAbbr} ${item.league.toUpperCase()} injury ejection lineup news today". ` +
             `If the search surfaces a confirmed injury, ejection, or lineup change affecting ${item.targetAbbr}, cite it and reject the trade. ` +
             `If nothing concrete is found, treat the contra move as market noise and evaluate normally on the WE-vs-price edge.`;
+          const searchPrompt = Array.isArray(item.prompt)
+            ? [...item.prompt, { type: 'text', text: searchSuffixText }]
+            : item.prompt + searchSuffixText;
           // 45s timeout (was 25s): Anthropic web-search routinely needs 30-50s
           // for one search + reasoning. Today's 3 sonnet-empty alerts were all
           // 25s timeouts on calls that almost certainly would've completed at 45s.
-          return claudeWithSearch(searchPrompt, { maxTokens: 2000, maxSearches: 1, timeout: 45000, category: 'live-edge-search', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' });
+          // cacheSystem: true — short system stem combines with the cached user
+          // prefix block (LIVE_EDGE_STATIC_PREFIX) for cumulative prefix caching.
+          return claudeWithSearch(searchPrompt, { maxTokens: 2000, maxSearches: 1, timeout: 45000, category: 'live-edge-search', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.', cacheSystem: true });
         }
-        return claudeSonnet(item.prompt, { maxTokens: 1500, category: 'live-edge', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' });
+        return claudeSonnet(item.prompt, { maxTokens: 1500, category: 'live-edge', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.', cacheSystem: true });
       })
     );
 
