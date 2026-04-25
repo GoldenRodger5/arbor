@@ -832,15 +832,26 @@ function _claudeTransientRecent(windowMs = 10000) {
   return (Date.now() - _lastClaudeTransientErrorAt) < windowMs;
 }
 
+// Prompt-caching support — opt-in via array-form prompt or cacheSystem flag.
+// `prompt` can be a string (existing contract, no caching) OR an array of content
+// blocks `[{type:'text', text:'...', cache_control?:{type:'ephemeral'}}, ...]`.
+// `cacheSystem: true` wraps the system prompt with cache_control for the static
+// instruction stem. Both are no-ops on existing string callers — safe to land
+// without changing any call site behavior.
+//
 // Sonnet without web search — for decisions where we already have the data we need.
-async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system = null, category = 'sonnet' } = {}) {
+async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system = null, category = 'sonnet', cacheSystem = false } = {}) {
   try {
     const body = {
       model: CLAUDE_DECIDER,
       max_tokens: maxTokens,
       messages: [{ role: 'user', content: prompt }],
     };
-    if (system) body.system = system;
+    if (system) {
+      body.system = cacheSystem
+        ? [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }]
+        : system;
+    }
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       signal: AbortSignal.timeout(timeout),
       method: 'POST',
@@ -867,7 +878,9 @@ async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system 
 }
 
 // Expensive Sonnet + web search — only for final trade decisions.
-async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, timeout = 45000, system = null, category = 'search' } = {}) {
+// Same caching contract as claudeSonnet: pass array prompt for content-block caching,
+// pass `cacheSystem: true` to cache the system stem. Strings still work unchanged.
+async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, timeout = 45000, system = null, category = 'search', cacheSystem = false } = {}) {
   try {
     const body = {
       model: CLAUDE_DECIDER,
@@ -879,7 +892,11 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
       }],
       messages: [{ role: 'user', content: prompt }],
     };
-    if (system) body.system = system;
+    if (system) {
+      body.system = cacheSystem
+        ? [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }]
+        : system;
+    }
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       signal: AbortSignal.timeout(timeout),
       method: 'POST',
