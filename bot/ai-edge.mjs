@@ -794,6 +794,23 @@ async function claudeScreen(prompt, { maxTokens = 300, timeout = 10000, category
   }
 }
 
+// Module-level transient-error tracker. Wrappers below catch errors and
+// return null (the existing contract); batch callers using Promise.allSettled
+// then see status='fulfilled' with a null value, which prevents the existing
+// per-promise rejection-message check from detecting transient timeouts.
+// Wrappers stamp this when they catch a transient; batch callers check it as
+// a backstop. Race window is short and false-positives just suppress alerts.
+let _lastClaudeTransientErrorAt = 0;
+const CLAUDE_TRANSIENT_REGEX = /aborted|timeout|ECONNRESET|ETIMEDOUT|fetch failed|network/i;
+function _markClaudeTransientIfApplicable(err) {
+  if (err && CLAUDE_TRANSIENT_REGEX.test(err.message ?? String(err))) {
+    _lastClaudeTransientErrorAt = Date.now();
+  }
+}
+function _claudeTransientRecent(windowMs = 10000) {
+  return (Date.now() - _lastClaudeTransientErrorAt) < windowMs;
+}
+
 // Sonnet without web search — for decisions where we already have the data we need.
 async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system = null, category = 'sonnet' } = {}) {
   try {
@@ -822,6 +839,7 @@ async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system 
     const textBlocks = (data.content ?? []).filter(b => b.type === 'text');
     return textBlocks.length > 0 ? textBlocks[textBlocks.length - 1].text : '';
   } catch (e) {
+    _markClaudeTransientIfApplicable(e);
     console.error('[claude-sonnet] error:', e.message);
     return null;
   }
@@ -870,6 +888,7 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
     }
     return finalText;
   } catch (e) {
+    _markClaudeTransientIfApplicable(e);
     console.error('[claude-search] error:', e.message);
     return null;
   }
@@ -4811,10 +4830,13 @@ async function checkLiveScoreEdges() {
         // Distinguish transient infra failures (Anthropic web-search timeouts, network
         // aborts) from real Sonnet failures (empty response, bad model output).
         // Transient infra failures are noise — log but don't spam Telegram.
+        // Two paths can produce a transient: (a) promise rejected with a timeout-shaped
+        // message, or (b) wrapper caught the timeout and returned null — in which case
+        // we backstop via the module-level transient flag (see _claudeTransientRecent).
         const reasonMsg = batchResult.status === 'rejected' ? (batchResult.reason?.message ?? '') : '';
-        const isTransientTimeout = /aborted|timeout|ECONNRESET|ETIMEDOUT|fetch failed|network/i.test(reasonMsg);
+        const isTransientTimeout = CLAUDE_TRANSIENT_REGEX.test(reasonMsg) || _claudeTransientRecent();
         if (isTransientTimeout) {
-          console.log(`[live-edge] ⏳ Transient timeout on ${item.targetAbbr} (${item.league.toUpperCase()} ${item.awayAbbr}@${item.homeAbbr}): ${reasonMsg.slice(0, 100)} — silent skip, will retry next cycle`);
+          console.log(`[live-edge] ⏳ Transient timeout on ${item.targetAbbr} (${item.league.toUpperCase()} ${item.awayAbbr}@${item.homeAbbr})${reasonMsg ? ': ' + reasonMsg.slice(0, 100) : ' (caught by wrapper)'} — silent skip, will retry next cycle`);
         } else {
           await reportError('live-edge:sonnet-empty', `${item.targetAbbr} ${item.league.toUpperCase()} ${item.awayAbbr}@${item.homeAbbr}${reasonMsg ? ': ' + reasonMsg : ''}`);
         }
@@ -6225,11 +6247,12 @@ async function checkPreGamePredictions() {
       const batchRes = batchResults[i];
       const decideText = batchRes.status === 'fulfilled' ? batchRes.value : null;
       if (!decideText) {
-        // Same transient-timeout suppression as live-edge.
+        // Same transient-timeout suppression as live-edge. Two paths to detect:
+        // explicit rejection-message regex, or backstop via wrapper-set transient flag.
         const reasonMsg = batchRes.status === 'rejected' ? (batchRes.reason?.message ?? '') : '';
-        const isTransientTimeout = /aborted|timeout|ECONNRESET|ETIMEDOUT|fetch failed|network/i.test(reasonMsg);
+        const isTransientTimeout = CLAUDE_TRANSIENT_REGEX.test(reasonMsg) || _claudeTransientRecent();
         if (isTransientTimeout) {
-          console.log(`[pre-game] ⏳ Transient timeout on ${market.base}: ${reasonMsg.slice(0, 100)} — silent skip, will retry next cycle`);
+          console.log(`[pre-game] ⏳ Transient timeout on ${market.base}${reasonMsg ? ': ' + reasonMsg.slice(0, 100) : ' (caught by wrapper)'} — silent skip, will retry next cycle`);
         } else {
           await reportError('pre-game:sonnet-empty', `${market.base}${reasonMsg ? ': ' + reasonMsg : ''}`);
         }
