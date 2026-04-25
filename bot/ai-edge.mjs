@@ -4661,15 +4661,16 @@ async function checkLiveScoreEdges() {
           }
         }
 
-        // KILLER BUCKET BLOCK (live-edge, MLB-only after per-sport audit):
-        // NBA 15+pt × 70-74% conf bucket went 5/5 WR for +$55 — blocking broadly would
-        // kill NBA's strongest live-pred cluster. Restricted to MLB only until non-MLB
-        // sports accumulate ≥15 samples per bucket for principled blocks.
+        // KILLER BUCKET BLOCK (live-edge, all sports after per-sport extension 2026-04-24):
+        // 15+pt edge × <70% conf is the proportionality-mismatch pattern. Block fires only
+        // when conf < 70%, so the NBA 70-74% jackpot bucket (5/5 WR, +$55) is unaffected.
+        // No live-edge carve-outs needed — live decisions are time-pressured and don't
+        // suffer the narrative-stack pattern as severely as pre-game.
         {
           const _liveEdge = (decision.confidence ?? 0) - price;
-          if (league === 'mlb' && _liveEdge >= 0.15 && (decision.confidence ?? 0) < 0.70) {
-            console.log(`[live-edge] 🚫 MLB KILLER BUCKET BLOCKED ${targetAbbr} (MLB ${awayAbbr}@${homeAbbr}): ${(_liveEdge*100).toFixed(0)}pt edge at ${((decision.confidence ?? 0)*100).toFixed(0)}% conf — MLB-specific proportionality mismatch.`);
-            logScreen({ stage: 'live-edge', ticker, result: 'mlb-killer-bucket-block', reasoning: `MLB: Edge ${(_liveEdge*100).toFixed(0)}pt + conf ${((decision.confidence ?? 0)*100).toFixed(0)}% = -EV bucket` });
+          if (_liveEdge >= 0.15 && (decision.confidence ?? 0) < 0.70) {
+            console.log(`[live-edge] 🚫 KILLER BUCKET BLOCKED ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(_liveEdge*100).toFixed(0)}pt edge at ${((decision.confidence ?? 0)*100).toFixed(0)}% conf — proportionality mismatch (15+pt edges need 70%+ conf).`);
+            logScreen({ stage: 'live-edge', ticker, result: 'killer-bucket-block', reasoning: `${league.toUpperCase()}: Edge ${(_liveEdge*100).toFixed(0)}pt + conf ${((decision.confidence ?? 0)*100).toFixed(0)}% = -EV bucket` });
             continue;
           }
         }
@@ -5666,7 +5667,12 @@ async function checkPreGamePredictions() {
     // firing too late — markets were analyzed, returned malformed prose (e.g.
     // NYRBDCU 2026-04-22), triggered no-json alerts, wasted API budget.
     const tk = market.base ?? '';
-    if (tk.includes('MLSGAME') || tk.includes('SERIAAGAME') || tk.includes('BUNDESLIGAGAME') || tk.includes('LIGUE1GAME')) {
+    // 2026-04-24: MLS pre-game RE-ENABLED with cross-sport killer-bucket block now in place.
+    // Historical 4 trades, -$35 P&L was driven by NE-CLB-style narrative stacks (low-priced
+    // underdog + claimed 30+pt edge) — exactly the pattern the new block catches.
+    // Soccer prompt has been hardened (TIE leg context, draw tax, underdog cap to 40¢).
+    // SerieA/Bundesliga/Ligue1 still excluded — Kalshi has 0 markets for those leagues anyway.
+    if (tk.includes('SERIAAGAME') || tk.includes('BUNDESLIGAGAME') || tk.includes('LIGUE1GAME')) {
       return false;
     }
     return true;
@@ -6173,20 +6179,49 @@ async function checkPreGamePredictions() {
     // Per-sport auto-learning (P3.2 Wilson-CI auto-freeze) will handle non-MLB once we
     // have 15+ samples per bucket. Until then, trust Claude for non-MLB 15+pt edges.
     //
-    // MLB CARVE-OUT: exempt when opponent starter ERA > 5.5 (STL-HOU Weiss +$42 case).
+    // KILLER BUCKET BLOCK — extended to all sports 2026-04-24 with sport-specific carve-outs.
+    // Pattern: 15+pt claimed edge × <70% confidence is the historical anti-edge bucket
+    // (Claude stacks narrative without proportional conviction). MLB had 17 trades -$43.
+    // MLS NE-CLB lost $18 in this exact pattern. Now blocked on all sports unless one of
+    // the legitimate edge sources is cited:
+    //   MLB: opponent starter ERA > 5.5 / "spot starter" / "emergency" / "debut"
+    //   NHL: backup goalie OR confirmed star injury (e.g. "Hintz out", "MacKinnon scratched")
+    //   NBA: opponent missing 2+ confirmed stars (not "doubtful" — confirmed OUT)
+    //   Soccer: 2+ confirmed key player injuries cited specifically
     {
       const _claimedEdge = confidence - _pgPriceForGate;
-      const _isMLB = expectedSport === 'MLB';
-      if (_isMLB && _claimedEdge >= 0.15 && confidence < 0.70) {
+      if (_claimedEdge >= 0.15 && confidence < 0.70) {
         const _fullR = ((decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? '')).toLowerCase();
-        const _hasSpotStarterERA = /\bera\s*[67-9]\.\d{1,2}\b/i.test(_fullR) ||
-                                   /\b(emergency|spot|debut|rookie|recalled|called up)\s*(starter|arm|pitcher)\b/i.test(_fullR);
-        if (!_hasSpotStarterERA) {
-          console.log(`[pre-game] 🚫 MLB KILLER BUCKET BLOCKED: ${market.base} claims ${(_claimedEdge*100).toFixed(0)}pt edge at ${(confidence*100).toFixed(0)}% conf — MLB-specific block (17 trades -$43 historical). Non-MLB 15+pt edges still pass.`);
-          logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'mlb-killer-bucket-block', reasoning: `MLB: Edge ${(_claimedEdge*100).toFixed(0)}pt + conf ${(confidence*100).toFixed(0)}% = -EV bucket`, claudeReasoning: (decision.reasoning ?? '').slice(0, 200) });
+        // Sport-specific legitimate-edge carve-outs
+        let _hasCarveOut = false;
+        let _carveLabel = '';
+        if (expectedSport === 'MLB') {
+          _hasCarveOut = /\bera\s*[67-9]\.\d{1,2}\b/i.test(_fullR) ||
+                         /\b(emergency|spot|debut|rookie|recalled|called up)\s*(starter|arm|pitcher)\b/i.test(_fullR);
+          _carveLabel = 'MLB spot-starter ERA > 6.0';
+        } else if (expectedSport === 'NHL') {
+          // Backup goalie OR confirmed star injury (specific name + "out"/"scratched"/"injured reserve")
+          _hasCarveOut = /\b(backup goalie|backup tendy|emergency goalie|third-string|recall(ed)?\s*goalie)\b/i.test(_fullR) ||
+                         /\b[A-Z][a-z]+\s+(out|scratched|day-to-day|injured reserve|on ir|long[- ]term injured)\b/.test((decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? ''));
+          _carveLabel = 'NHL backup goalie or confirmed star injury';
+        } else if (expectedSport === 'NBA') {
+          // Two confirmed star players OUT (not doubtful) — phrase pattern "X out and Y out"
+          const outNames = ((decision.reasoning ?? '') + ' ' + (decision.exitScenario ?? ''))
+            .match(/\b[A-Z][a-zA-Z]+\s+(?:[A-Z][a-zA-Z]+\s+)?(?:is\s+)?(?:confirmed\s+)?out\b/g) ?? [];
+          _hasCarveOut = outNames.length >= 2;
+          _carveLabel = `NBA ${outNames.length}+ confirmed star injuries`;
+        } else if (expectedSport === 'SOCCER' || ['mls','epl','laliga','seriea','bundesliga','ligue1'].includes((expectedSport || '').toLowerCase())) {
+          // Soccer: require 2+ confirmed key player injuries with names cited
+          const injuryMentions = _fullR.match(/\b(out|injured|suspended|red card|acl|hamstring|torn|ligament)\b/g) ?? [];
+          _hasCarveOut = injuryMentions.length >= 3; // 3+ injury-related terms = multiple confirmed absences
+          _carveLabel = 'soccer multiple confirmed injuries';
+        }
+        if (!_hasCarveOut) {
+          console.log(`[pre-game] 🚫 KILLER BUCKET BLOCKED (${expectedSport}): ${market.base} claims ${(_claimedEdge*100).toFixed(0)}pt edge at ${(confidence*100).toFixed(0)}% conf — proportionality mismatch (no ${expectedSport}-specific carve-out cited).`);
+          logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'killer-bucket-block', reasoning: `${expectedSport}: Edge ${(_claimedEdge*100).toFixed(0)}pt + conf ${(confidence*100).toFixed(0)}% = -EV bucket, no carve-out detected`, claudeReasoning: (decision.reasoning ?? '').slice(0, 200) });
           continue;
         } else {
-          console.log(`[pre-game] ✅ MLB KILLER BUCKET CARVE-OUT: ${market.base} — spot-starter ERA > 6.0 detected, allowing through`);
+          console.log(`[pre-game] ✅ KILLER BUCKET CARVE-OUT (${expectedSport}): ${market.base} — ${_carveLabel} detected, allowing through`);
         }
       }
     }

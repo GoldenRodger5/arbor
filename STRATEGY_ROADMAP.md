@@ -283,6 +283,9 @@ Things we need tracked but aren't yet:
 | 2026-04-23 | Future-market filter + drawdown breaker | 24h window on line-move detector; −$30/24h halts new entries for 12h | TBD |
 | 2026-04-23 | Revert drawdown breaker, tighten caps instead | User: prefer smaller bets + data collection over pausing. 8%→5% game, 10%→6% trade | TBD |
 | 2026-04-23 | Pre-game cost optimization (Option B + C) | Price-movement gate + cycle cap 12→5 with priority sort. Target $20/day → $7/day API. Quality loss minimal (same Claude calls, just fewer redundant). | TBD |
+| 2026-04-24 | Daily P&L view + cost-per-trade UI metric | New /api/costs daily aggregation, sortable table, $/trade efficiency display | Live |
+| 2026-04-24 | Fix ReferenceError (stage/leading/trailing) in live-edge Phase 4 | Regression from earlier feature stack — was emitting Telegram error every cycle | Fixed |
+| 2026-04-24 | Cross-sport killer-bucket extension + re-enable MLS pre-game | Block 15+pt × <70% conf on all sports with sport-specific carve-outs (MLB ERA>5.5, NHL backup goalie, NBA 2+ stars OUT, soccer 3+ injury terms). MLS pre-game now active again. SerieA/Bundesliga/Ligue1 stay disabled (Kalshi has no markets). | TBD |
 
 ---
 
