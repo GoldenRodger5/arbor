@@ -274,11 +274,17 @@ function computeCalibrationFeedback() {
         } else {
           c[won ? 'totalW' : 'totalL']++;
         }
-        if (!c.buckets[band]) c.buckets[band] = { w: 0, l: 0, sw: 0, sl: 0, entrySum: 0, n: 0 };
+        if (!c.buckets[band]) c.buckets[band] = { w: 0, l: 0, sw: 0, sl: 0, entrySum: 0, n: 0, pmHits: 0, pmTracked: 0 };
         if (t._isShadow) {
           c.buckets[band][won ? 'sw' : 'sl']++;
         } else {
           c.buckets[band][won ? 'w' : 'l']++;
+          // Price-move tracking — only on real trades, only when MFE was recorded.
+          // Trades placed before MFE shipped have null maxFavorableMove (excluded).
+          if (t.maxFavorableMove != null) {
+            c.buckets[band].pmTracked++;
+            if (t.maxFavorableMove >= 0.05) c.buckets[band].pmHits++;
+          }
         }
         c.buckets[band].entrySum += t.entryPrice ?? 0.5;
         c.buckets[band].n++;
@@ -333,7 +339,16 @@ function computeCalibrationFeedback() {
           else if (bWR >= floor - 5) verdict = `within tolerance at ${bWR}% vs ${floor}% (n=${totalN})`;
           else if (bWR >= floor - 15) verdict = `underperforming at ${bWR}% vs ${floor}% (n=${totalN}) — trim ~${Math.min(8, floor - bWR)}pts`;
           else verdict = `LOSING at ${bWR}% vs ${floor}% (n=${totalN}) — require much stronger evidence or skip this combo`;
-          bucketLines.push(`    ${band}%: ${sourceLabel} — ${verdict}`);
+          // Tier 1.5 — once we have ≥20 real trades with MFE in this bucket, append
+          // price-move WR ("did the model find a real mispricing?") alongside game WR.
+          // This is informational; the verdict above still uses game WR. Helps Claude
+          // see when game outcomes flipped on trades the price *did* move toward.
+          let pmSuffix = '';
+          if ((b.pmTracked ?? 0) >= 20) {
+            const pmWR = Math.round((b.pmHits / b.pmTracked) * 100);
+            pmSuffix = ` | price-move ≥5¢: ${b.pmHits}/${b.pmTracked} (${pmWR}%)`;
+          }
+          bucketLines.push(`    ${band}%: ${sourceLabel}${pmSuffix} — ${verdict}`);
         }
         if (bucketLines.length === 0) {
           comboLines.push(`  ${combo}: ${c.totalW}W/${c.totalL}L (${wr}%) — buckets too thin for verdict`);
@@ -946,6 +961,27 @@ const LINE_MOVE_THRESHOLD = 0.05; // 5¢ move = something happened
 const missingFromKalshi = new Map(); // tradeId → firstMissingMs — 2-strike rule before closing
 let massDisappearStreak = 0; // consecutive sync cycles where ALL Kalshi positions are absent
 const recentCrossContraMovers = new Map(); // ticker → { velocity, when } — cross-confirmed drops for pg-guard
+
+// MFE (Maximum Favorable Excursion) tracker — highest favorable price reached per
+// open trade. Persisted to trades.jsonl on exit/settlement. Enables price-move
+// calibration alongside game-outcome calibration: even when a game flips, did the
+// model find a real mispricing that the price moved toward?
+const mfeTracking = new Map(); // tradeId → { maxPrice, maxMove }
+
+// Apply MFE fields from the tracker to a trade object (and an optional persisted
+// JSONL record). Idempotent and safe on missing tracker entries (no-op).
+function applyMFE(trade, persistedRecord = null) {
+  const mfe = mfeTracking.get(trade.id);
+  if (mfe) {
+    trade.maxFavorablePrice = mfe.maxPrice;
+    trade.maxFavorableMove = Math.round(mfe.maxMove * 10000) / 10000;
+    if (persistedRecord) {
+      persistedRecord.maxFavorablePrice = trade.maxFavorablePrice;
+      persistedRecord.maxFavorableMove = trade.maxFavorableMove;
+    }
+    mfeTracking.delete(trade.id);
+  }
+}
 
 // Claude HOLD memo — structured record of the last HOLD decision per ticker.
 // When a sell-decision prompt fires and Claude says HOLD, we stamp the context here.
@@ -8035,6 +8071,22 @@ async function managePositions() {
         const profitPerContract = currentPrice - entryPrice;
         const pctChange = profitPerContract / entryPrice;
 
+        // MFE update — track max favorable price move over the trade's lifetime.
+        // YES side: favorable = price up. NO side: favorable = price down.
+        // Persisted on exit/settlement; in-memory between updates.
+        {
+          const favorableMove = trade.side === 'yes'
+            ? (currentPrice - entryPrice)
+            : (entryPrice - currentPrice);
+          const prev = mfeTracking.get(trade.id);
+          if (!prev || favorableMove > prev.maxMove) {
+            mfeTracking.set(trade.id, {
+              maxPrice: currentPrice,
+              maxMove: favorableMove,
+            });
+          }
+        }
+
         // Fetch game context (stage, score, ESPN data)
         const ctx = await getGameContext(trade);
         const stage = ctx?.stage ?? 'unknown';
@@ -9365,6 +9417,7 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
             gTrade.exitPrice = trade.exitPrice;
             gTrade.realizedPnL = trade.realizedPnL;
             gTrade.settledAt = trade.settledAt;
+            applyMFE(trade, gTrade);
             writeFileSync(TRADES_LOG, gTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
           }
         } catch (e) { console.error(`[exit] Failed to persist guard-sold status for ${trade.ticker}:`, e.message); }
@@ -9432,6 +9485,7 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
             gTrade.exitPrice = trade.exitPrice;
             gTrade.realizedPnL = trade.realizedPnL;
             gTrade.settledAt = trade.settledAt;
+            applyMFE(trade, gTrade);
             writeFileSync(TRADES_LOG, gTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
           }
         } catch (e) { console.error(`[exit] Failed to persist 0-fill close for ${trade.ticker}:`, e.message); }
@@ -9489,6 +9543,7 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
           sTrade.exitPrice = trade.exitPrice;
           sTrade.realizedPnL = trade.realizedPnL;
           sTrade.settledAt = trade.settledAt;
+          applyMFE(trade, sTrade);
           writeFileSync(TRADES_LOG, sTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
         }
       } catch (e) { console.error(`[exit] Failed to persist sold status for ${trade.ticker}:`, e.message); }
@@ -9637,6 +9692,7 @@ async function checkSettlements() {
                 trade.exitPrice = exitPrice;
                 trade.realizedPnL = Math.round(pnl * 100) / 100;
                 trade.settledAt = new Date().toISOString();
+                applyMFE(trade);
                 updated = true;
                 const icon = pnl >= 0 ? '✅' : '❌';
                 console.log(`[pnl] POLY SETTLED: ${slug} → ${won ? 'WIN' : 'LOSS'} | P&L: ${icon} $${pnl.toFixed(2)}`);
@@ -9682,6 +9738,7 @@ async function checkSettlements() {
               trade.exitPrice = exitPrice;
               trade.realizedPnL = Math.round(pnl * 100) / 100;
               trade.settledAt = new Date().toISOString();
+              applyMFE(trade);
               updated = true;
               const icon = pnl >= 0 ? '✅' : '❌';
               console.log(`[pnl] POLY SETTLED: ${trade.ticker} → ${won ? 'WIN' : 'LOSS'} | P&L: ${icon} $${pnl.toFixed(2)}`);
@@ -9831,6 +9888,7 @@ async function checkSettlements() {
         trade.result = settlement.market_result;
         trade.gameOutcome = won ? 'correct' : 'incorrect';
         trade.gameResult = settlement.market_result;
+        applyMFE(trade);
         updated = true;
         const icon = totalPartialProfit >= 0 ? '✅' : '❌';
         const pnlStr = totalPartialProfit >= 0 ? `+$${totalPartialProfit.toFixed(2)}` : `-$${Math.abs(totalPartialProfit).toFixed(2)}`;
@@ -9863,6 +9921,7 @@ async function checkSettlements() {
           trade.result = settlement.market_result;
           trade.gameOutcome = won ? 'correct' : 'incorrect';
           trade.gameResult = settlement.market_result;
+          applyMFE(trade);
           updated = true;
           const icon = trade.realizedPnL >= 0 ? '✅' : '❌';
           console.log(`[pnl] SETTLED (closed-manual, revenue-based): ${trade.ticker} → ${settlement.market_result} | P&L: ${icon} $${trade.realizedPnL.toFixed(2)}`);
@@ -9872,6 +9931,7 @@ async function checkSettlements() {
           trade.result = settlement.market_result;
           trade.gameOutcome = won ? 'correct' : 'incorrect';
           trade.gameResult = settlement.market_result;
+          applyMFE(trade);
           updated = true;
           console.log(`[pnl] needs-reconcile: ${trade.ticker} closed-manual with null PnL and no revenue — skipping phantom full-loss overwrite`);
         }
@@ -9895,6 +9955,7 @@ async function checkSettlements() {
       trade.result = settlement.market_result;
       trade.gameOutcome = won ? 'correct' : 'incorrect';
       trade.gameResult = settlement.market_result;
+      applyMFE(trade);
       updated = true;
       // HC cooldown on natural-settlement losses too
       if (trade.highConviction && trade.realizedPnL < 0) {
