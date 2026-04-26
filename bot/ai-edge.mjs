@@ -873,6 +873,57 @@ Your conviction field should name the specific fact that neutralizes the steel_m
 
 ⚠️ STEP 3 ENFORCEMENT (referenced below): The Step 3 adjustments in the league-specific section are ON TOP OF the WE baseline, not "already baked in." If a DOWN adjustment applies, you MUST subtract it. The arguments "the baseline already accounts for this," "the WE table already includes superior trailing teams," or any equivalent meta-argument that dismisses Step 3 adjustments are FORBIDDEN. Your reasoning MUST list the adjustments you applied with their numeric values (e.g., "trailing better -6, trailing at home -4 → final 61%"). If you cannot show this math in your reasoning, your decision is invalid. ATH/ATM 2026-04-25 was a real failure of this rule: bot bought ATH at 67% conf when 71% baseline minus -6 (ATM significantly better) minus -4 (ATM at home) = 61% cap, edge collapsed within 5 minutes.
 
+═══ REASONING QUALITY STANDARDS ═══
+Your reasoning is logged for calibration analysis and reviewed for systematic patterns. Hold yourself to these standards:
+
+1. CITE SPECIFIC FACTS, NOT VIBES: "Their bullpen has been shaky" is invalid. "Their setup man has 7.20 ERA L10" is valid. Every claim in your edge_argument and key_facts must cite a verifiable number, name, or dated event from the GAME DATA below.
+
+2. DEFEAT THE STEEL-MAN, DON'T OUTWEIGH IT: A real defeat looks like "steel_man cites bullpen risk → edge_argument cites confirmed elite closer with 0.00 ERA last 8 outings, available tonight." A non-defeat looks like "steel_man is real but our edge is bigger" — that's a tie, and ties go to the market.
+
+3. NO SYNTHETIC EDGES: If you can't name a SPECIFIC mispriced factor, the gap is variance, not edge. The market sees the same public data you do. "Public is fading the favorite" is only valid if you can cite a published % public-money split. Otherwise it's projection.
+
+4. CONFIDENCE IS NOT A NEGOTIATION: When the WE-vs-confidence gate constrains you, do not inflate confidence to clear it. Either you have edge under the gate or you don't. Inflating confidence by 2-3pts to "barely clear" is the single biggest source of bot losses historically.
+
+5. UNDERDOG REVERENCE: If you're betting a sub-50% team, the math is HARDER, not easier. The market has already priced their underdog status. To earn an underdog confidence above the market, you need either (a) confirmed key opponent absence not in the price, or (b) specific tactical/stylistic mismatch with cited evidence. "They're motivated" or "they're due" are not edges.
+
+═══ COMMON ANTI-PATTERNS (specific failures to avoid) ═══
+
+❌ ANTI-PATTERN: "The market is at X¢ but my analysis says Y%, so the gap is the edge." This is not analysis — it's restating the price. Your edge requires a specific REASON the market is wrong. Without a reason, the gap IS the variance, not the edge.
+
+❌ ANTI-PATTERN: "Cannot confirm injury status — applying uncertainty buffer and rejecting." Uncertainty is NEVER a Hard NO trigger by itself. Treat unavailable info as neutral. Only the Hard NOs in Step 2 block a trade.
+
+❌ ANTI-PATTERN: Trade reasoning that doesn't include a numbered Step 3 adjustment ledger. "Confidence: 67% (from 71% baseline)" without showing the -4 adjustment line is incomplete. Show the math.
+
+❌ ANTI-PATTERN: Citing players, coaches, or stats from prior seasons or different teams. Every cited fact must apply to the SPECIFIC teams in TODAY's game. If you can't verify in the GAME DATA below, don't cite it.
+
+❌ ANTI-PATTERN: "I'd take the risk because the market is probably overcorrecting." Overcorrecting how? In what specific way? If you can't name the specific overcorrection, the gap is information you don't have, not edge.
+
+❌ ANTI-PATTERN: Going to confidence ≥ 80% on any single trade. The historical 80%+ bucket has been near 50% actual WR — those reads are systematically overconfident. If your gut says 80%, calibrate to 72-75% and accept the smaller edge.
+
+═══ REASONING TAG GLOSSARY (use only the relevant 1-3 tags) ═══
+- era-gap: starting pitcher ERA differential ≥ 1.5pt with confirmed numbers
+- starter-mismatch: top-of-rotation vs back-end starter, ace vs spot-starter
+- bullpen-mismatch: confirmed bullpen tier differential ('elite' vs 'below'/'poor')
+- pitcher-form: starter currently in dominant or struggling stretch (last 3-5 starts)
+- goalie-mismatch: SV% gap ≥ 0.020 with confirmed games-played floor
+- lineup-cold: trailing team batting average / shooting % significantly below season norm in this game
+- pace-mismatch: NBA pace differential creating asymmetric scoring opportunities
+- market-lag: prediction-market price hasn't yet absorbed a recent score/event we have data on
+- public-fade: confirmed public-money split favoring the team being faded (cite the source)
+- playoff-home-fav: home team in playoff/elimination game with crowd advantage
+- we-undervalued: WE baseline materially exceeds market price with no concrete reason for the gap
+- line-movement: recent confirming line movement validates our direction
+- momentum-shift: trailing team just scored, ran a streak, or had a galvanizing event
+- injury-news: confirmed injury (with player name) materially affecting outcome
+- star-injury: high-impact star confirmed out (CHECK ROSTER — must be on the actual team)
+- schedule-spot: back-to-back, long road trip, post-cross-country travel
+- rest-advantage: opponent on second night of back-to-back or post-overtime fatigue
+- back-to-back: opponent or our team playing consecutive nights
+- home-court: meaningful home advantage (top home record, strong crowd)
+- motivation: confirmed must-win game (relegation, playoff seeding, last game of streak)
+- underdog-spot: betting a trailing team with structural reason (must include the reason)
+- other: doesn't fit any of the above (use sparingly)
+
 ═══ END OF UNIVERSAL RULES — game-specific instructions and data follow ═══
 
 `;
