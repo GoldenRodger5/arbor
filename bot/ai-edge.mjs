@@ -710,42 +710,12 @@ function detectMlbMidGameLead({ league, period, gameDetail, diff, leadingBullpen
 //   - Price ≤72¢ (above 72 = gamma trap, runners-on-base can erase 20¢ in one swing)
 //   - WE anchor must exist (≥45% — basic sanity)
 //   - Skip if existing detectMlbMidGameLead already qualifies (avoid double-fire)
-function detectMlbEarlyMidLead({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr, leadingBullpenTier }) {
-  if (league !== 'mlb') return null;
-  if (period < 2 || period > 4) return null;
-  if (targetAbbr !== leadingAbbr) return null;
-  if (weTimeAdj == null || price == null) return null;
-  if (diff < 1) return null;
-  if (price > 0.72) return null;
-  if (weTimeAdj < 0.45) return null;
-  // Avoid double-fire: if the stricter mid-game-lead detector would qualify, let it win.
-  // That detector requires period 3-5 + diff ≥2 + good/elite bullpen + edge ≥10pt + price ≤78.
-  if (period >= 3 && diff >= 2 && (leadingBullpenTier === 'elite' || leadingBullpenTier === 'good')
-      && (weTimeAdj - price) >= 0.10 && price <= 0.78) {
-    return null; // let detectMlbMidGameLead handle this
-  }
-  const edge = weTimeAdj - price;
-  return {
-    trade: true,
-    side: 'yes',
-    confidence: weTimeAdj,
-    betAmount: null,
-    reasoning: {
-      steel_man: `MLB inning ${period} leader by ${diff} run${diff>1?'s':''} — shadow data n=48 shows 81% WR for this pattern (Wilson lower-CI 70%)`,
-      edge_source: 'market_lag',
-      edge_argument: `STRUCTURAL DETECTOR (MLB early-mid leader, ~80% WR n=48 from shadow): ${targetAbbr} leading ${diff}-run in inning ${period}, market ${(price*100).toFixed(0)}¢ underprices the lead's stickiness. Time-adjusted WE ${(weTimeAdj*100).toFixed(0)}%.`,
-      key_facts: [
-        `Inning ${period}, ${diff}-run lead`,
-        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ (${edge>=0?'+':''}${(edge*100).toFixed(0)}pt edge)`,
-        `Pattern: shadow-mined, 81% WR over 48 samples`,
-      ],
-      top_risk: 'Big inning by trailing team or starter pulled early; lead-1 in inning 2 is most fragile',
-      conviction: 'Structural pattern — shadow-validated 81% WR (CI lower-bound 70%)',
-      reasoning_tags: ['market-lag', 'we-undervalued'],
-    },
-    _structuralPattern: 'mlb-early-mid-lead',
-    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price * 100) },
-  };
+// REVERTED 2026-04-27 evening: the original "n=48, 81% WR" finding was misleading.
+// Game-level dedupe revealed only 22 unique games (68% game-WR). At avg price 73¢,
+// break-even WR is 73% — actual 68% game-WR is NEGATIVE EV. P3 specifically is 47%
+// WR (trap zone). Detector returns null permanently until we re-mine for a +EV cell.
+function detectMlbEarlyMidLead() {
+  return null;
 }
 
 // NHL P3 closing-out: 75% WR (3/4) historical pattern, +$1.91/trade.
