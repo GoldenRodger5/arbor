@@ -4304,17 +4304,18 @@ async function checkLiveScoreEdges() {
     // Bad teams DO protect leads 79% of the time (P3 1-goal). Let Claude assess
     // with full context instead of auto-blocking. Win rate is now a prompt adjustment.
 
-    // 2026-04-27 audit: hard-cap simultaneous live-prediction positions at small
-    // bankrolls. Live trades have correlated bad days (multiple games moving
-    // against us in the same window) — capping reduces variance and protects
-    // bankroll. Doesn't apply to pre-game/draw-bet/structural which have
-    // different risk profiles. Tag passes through swing mode too.
+    // 2026-04-27 audit + adjust: hard-cap simultaneous Sonnet-driven live trades
+    // to limit correlated drawdown. Tightened over-cap (was 3) to 5 because at
+    // small bankroll, position sizes are tiny ($3-5 each) and 5 losses is still
+    // recoverable. Structural-detector trades EXCLUDED from this cap — they're
+    // 75-100% WR rule-based fires we WANT to take whenever pattern matches.
+    // Draw-bets also excluded — they have their own 40% bankroll concentration cap.
     {
-      const liveStrategies = ['live-prediction', 'high-conviction', 'thesis-reentry'];
-      const openLivePredCount = openPositions.filter(p => liveStrategies.includes(p.strategy)).length;
-      const liveCap = getBankroll() < 500 ? 3 : getBankroll() < 2000 ? 5 : 8;
-      if (openLivePredCount >= liveCap) {
-        console.log(`[live-edge] BLOCKED ${targetAbbr}: ${openLivePredCount} live-prediction positions open, cap ${liveCap} for $${getBankroll().toFixed(0)} bankroll — variance protection`);
+      const sonnetDrivenStrategies = ['live-prediction', 'high-conviction', 'thesis-reentry'];
+      const openCount = openPositions.filter(p => sonnetDrivenStrategies.includes(p.strategy)).length;
+      const liveCap = getBankroll() < 500 ? 5 : getBankroll() < 2000 ? 8 : 12;
+      if (openCount >= liveCap) {
+        console.log(`[live-edge] BLOCKED ${targetAbbr}: ${openCount} Sonnet-driven live positions open, cap ${liveCap} for $${getBankroll().toFixed(0)} bankroll — variance protection (structural detectors and draw-bets bypass this)`);
         continue;
       }
     }
@@ -6822,6 +6823,32 @@ async function checkPreGamePredictions() {
         await reportError('pre-game:parse-fail', `${market.base}: ${e.message} | head=${jsonMatch.slice(0, 160)}`);
         continue;
       }
+
+      // Pre-game shadow tracking — captures every Sonnet pre-game decision for offline
+      // calibration analysis (matches the live-edge pattern). Live-edge has 350+
+      // shadow records; pre-game previously had zero. Adding this gives us 100x more
+      // calibration signal on pre-game decisions over the next 2 weeks.
+      try {
+        const _pgShadowSport = sport === 'NBA' ? 'NBA' : sport === 'MLB' ? 'MLB' : sport === 'NHL' ? 'NHL' : 'Soccer';
+        const _pgShadowTarget = (decision.team ?? '').toUpperCase() || market.team1?.team || market.team2?.team || '';
+        const _pgShadowPrice = decision.team
+          ? (decision.team.toUpperCase() === market.team1.team.toUpperCase() ? market.team1.price : market.team2.price)
+          : null;
+        logShadowDecision({
+          stage: 'pre-game',
+          ticker: market.base + (decision.team ? '-' + decision.team.toUpperCase() : ''),
+          sport: _pgShadowSport,
+          league: sport === 'NBA' ? 'nba' : sport === 'MLB' ? 'mlb' : sport === 'NHL' ? 'nhl' : (league || 'soccer'),
+          decision: decision.trade ? 'trade' : 'no-trade',
+          rejectReason: decision.trade ? null : 'claude-no',
+          claudeConfidence: decision.confidence ?? null,
+          decisionPrice: _pgShadowPrice,
+          edge: decision.confidence != null && _pgShadowPrice != null ? Math.round((decision.confidence - _pgShadowPrice) * 100) : null,
+          targetAbbr: _pgShadowTarget,
+          reasoningPreview: (decision.reasoning ?? '').slice(0, 200),
+          reasoningTags: decision.reasoning_tags ?? null,
+        });
+      } catch (e) { /* shadow logging best-effort, never block trade flow */ }
 
       // Map Claude's team pick to the correct ticker — ALWAYS buy YES on that team's market
       const chosenTeam = (decision.team ?? '').toUpperCase();
