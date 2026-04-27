@@ -5304,6 +5304,20 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
+        // 2026-04-27 audit: NHL live-prediction surgical block.
+        // Real data by period:
+        //   P1: 5 trades, 40% WR, -$0.54/trade — block
+        //   P2: 2 trades, 50% WR, -$2.83/trade — block
+        //   P3: 4 trades, 75% WR, +$1.91/trade — KEEP
+        // Shadow data confirms early-period NHL is heavily miscalibrated (Sonnet
+        // overconfident by 30-50pts). P3 is where the bot has shown actual edge.
+        // Don't pause NHL entirely; just keep the winning sub-cell.
+        if (!isSwingMode && league === 'nhl' && (period === 1 || period === 2) && targetAbbr === leadingAbbr) {
+          console.log(`[live-edge] BLOCKED ${targetAbbr}: NHL P${period} live-prediction — historical 40-50% WR (P1: 5 trades, P2: 2 trades). Only P3 has shown edge.`);
+          logScreen({ stage: 'live-edge-skip', result: 'skip-nhl-early-period', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `NHL early-period live-prediction historical: P1 40% WR, P2 50% WR, both net negative. Only P3 (75% WR) is profitable.` });
+          continue;
+        }
+
         // 2026-04-27 audit: MLB live-prediction inning 9 has 0/4 historical (-$27.52).
         // Closer-vs-trailing variance is too high; even 2-3 run leads can flip on a single
         // inning. The 1-run block above catches some but inning 9 with any lead size has
