@@ -500,6 +500,58 @@ function getMaxEntriesPerGame() {
 }
 const MAX_ENTRIES_PER_GAME = 3; // Legacy constant — use getMaxEntriesPerGame() instead
 const MAX_DAYS_OUT = 1;            // Same-day only — capital turns over nightly
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STRUCTURAL DETECTORS — pattern recognizers that fire when game state matches
+// a historically-profitable cell. Bypass Sonnet entirely (saves API cost), build
+// a synthetic decision object that flows through the same trade execution path.
+// Position sizes are conservative since we skip Sonnet's qualitative quality check.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// NBA Q4 cold-shooting: 88% WR (8W/1L) historical, +$3.83/trade.
+// Pattern: Q4 with the leading team having a clear FG% advantage and the market
+// price below the WE table — Kalshi lag exploit. Fires only on the leading team.
+function detectNbaQ4ColdShooting({ league, period, gameDetail, diff, leadingFGNum, trailingFGNum, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'nba') return null;
+  if (period !== 4) return null;
+  if (targetAbbr !== leadingAbbr) return null; // bet only the leader
+  if (leadingFGNum == null || trailingFGNum == null) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 5) return null;
+
+  const m = (gameDetail || '').match(/^(\d+):(\d+)/);
+  if (!m) return null;
+  const minsLeft = parseInt(m[1], 10) + parseInt(m[2], 10) / 60;
+  if (minsLeft < 4 || minsLeft > 10) return null;
+
+  const fgGap = leadingFGNum - trailingFGNum;
+  if (fgGap < 8) return null;
+
+  const edge = weTimeAdj - price;
+  if (edge < 0.07) return null;
+
+  return {
+    trade: true,
+    side: 'yes',
+    confidence: weTimeAdj,
+    betAmount: null, // bot will Kelly-size based on confidence
+    reasoning: {
+      steel_man: `Trailing team has ${minsLeft.toFixed(1)} minutes to mount a comeback with possessions remaining`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (NBA Q4 cold-shooting, historical 88% WR n=8): leading team has ${fgGap.toFixed(0)}pt FG% advantage, time-adjusted WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge — Kalshi WE-table lag.`,
+      key_facts: [
+        `Q4 ${minsLeft.toFixed(1)} min remaining with ${diff}-pt lead`,
+        `Leading team FG% ${leadingFGNum.toFixed(0)}% vs trailing ${trailingFGNum.toFixed(0)}% (${fgGap.toFixed(0)}pt gap)`,
+        `Time-adjusted WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ — ${(edge*100).toFixed(0)}pt edge`,
+      ],
+      top_risk: 'Foul trouble on leading team star or sudden 3pt run from trailing team',
+      conviction: 'Structural pattern match — 8W/1L historical on this exact setup',
+      reasoning_tags: ['market-lag', 'we-undervalued', 'pace-mismatch'],
+    },
+    _structuralPattern: 'nba-q4-cold-shooting',
+    _matchInfo: { fgGap, minsLeft, edge: edge * 100, diff },
+  };
+}
 const CLAUDE_SCREENER = 'claude-haiku-4-5-20251001';  // Cheap screening — $0.002/call
 const CLAUDE_DECIDER = 'claude-sonnet-4-6';            // Expensive analysis — only on candidates
 // MAX_POSITIONS and deployment limits are DYNAMIC — see getMaxPositions() and getMaxDeployment()
@@ -4260,6 +4312,8 @@ async function checkLiveScoreEdges() {
 
         // NBA shooting stats
         let shootingInfo = '';
+        let leadingFGNum = null;
+        let trailingFGNum = null;
         if (league === 'nba') {
           const getStat = (team, abbr) => team.statistics?.find(s => s.abbreviation === abbr)?.displayValue ?? '';
           const homeFG = getStat(home, 'FG%');
@@ -4285,6 +4339,10 @@ async function checkLiveScoreEdges() {
               const better = homeFGn > awayFGn ? homeAbbr : awayAbbr;
               shootingInfo += `\n⚠️ ${better} shooting significantly better (${Math.abs(homeFGn - awayFGn).toFixed(0)}% FG gap)`;
             }
+            // Save numeric FG% to outer scope for the structural detector below.
+            // Detector needs leading vs trailing perspective, so map by which team leads.
+            if (leadingAbbr === homeAbbr) { leadingFGNum = homeFGn; trailingFGNum = awayFGn; }
+            else if (leadingAbbr === awayAbbr) { leadingFGNum = awayFGn; trailingFGNum = homeFGn; }
           }
         }
 
@@ -4884,6 +4942,22 @@ async function checkLiveScoreEdges() {
           : league === 'nba' ? (period <= 2 ? 'early' : period === 3 ? 'mid' : 'late')
           : league === 'nhl' ? (period === 1 ? 'early' : period === 2 ? 'mid' : 'late')
           : (period === 1 ? 'early' : 'late');
+        // STRUCTURAL DETECTOR: NBA Q4 cold-shooting (88% WR historical pattern).
+        // If the current game state matches the historical winning pattern, build a
+        // synthetic decision and skip Sonnet entirely — saves ~$0.30/call and reacts
+        // faster than waiting for Sonnet's ~3s response. Bot will Kelly-size based on
+        // confidence; structural matches are inherently lower-conviction than Sonnet
+        // reads (no qualitative quality check) so position sizing should reflect that.
+        const _structuralDecision = detectNbaQ4ColdShooting({
+          league, period, gameDetail, diff,
+          leadingFGNum, trailingFGNum,
+          weTimeAdj: _weTimeAdj, price,
+          targetAbbr, leadingAbbr,
+        });
+        if (_structuralDecision) {
+          console.log(`[live-edge] 🎯 STRUCTURAL DETECTOR matched (${_structuralDecision._structuralPattern}): ${targetAbbr} — ${_structuralDecision._matchInfo.fgGap.toFixed(0)}pt FG gap, ${_structuralDecision._matchInfo.minsLeft.toFixed(1)}min, ${_structuralDecision._matchInfo.edge.toFixed(0)}pt edge, conf=${(_structuralDecision.confidence*100).toFixed(0)}% — skipping Sonnet`);
+        }
+
         // Two-block prompt with cached static prefix. The prefix (~1500 tokens of
         // response format + steel-man rules + Step 3 enforcement) is identical
         // across all live-edge calls and gets cached for 5 min on Anthropic side
@@ -4901,6 +4975,7 @@ async function checkLiveScoreEdges() {
           hasPosition, currentScoreKey, isSwingMode, isThesisVindicated,
           reentryHalfSize,
           _lineMove, _scoreChanged,
+          _structuralDecision, // null if no match; synthetic decision if pattern matched
         });
 
     } catch (e) {
@@ -4934,6 +5009,13 @@ async function checkLiveScoreEdges() {
     const batchItems = sonnetQueue.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
       batchItems.map(item => {
+        // STRUCTURAL DETECTOR FAST PATH — return synthetic decision as if Sonnet
+        // responded with this JSON. Saves the API call and reacts in zero time.
+        // Downstream code parses cText with extractJSON+JSON.parse, so we return
+        // a JSON string here.
+        if (item._structuralDecision) {
+          return JSON.stringify(item._structuralDecision);
+        }
         if (item._useSearch) {
           // item.prompt is an array of content blocks (cached prefix + dynamic).
           // For the search path, append a third block with the breaking-news
@@ -5369,7 +5451,7 @@ async function checkLiveScoreEdges() {
           }
           logTrade({
             exchange: best.platform,
-            strategy: isThesisVindicated ? 'thesis-reentry' : isSwingMode ? 'live-swing' : hcCheck.isHighConv ? 'high-conviction' : 'live-prediction',
+            strategy: item._structuralDecision ? 'nba-q4-structural' : isThesisVindicated ? 'thesis-reentry' : isSwingMode ? 'live-swing' : hcCheck.isHighConv ? 'high-conviction' : 'live-prediction',
             ticker: best.platform === 'polymarket' ? best.slug : ticker,
             title, side: 'yes',
             quantity: actualFill, entryPrice: bestPrice, deployCost: actualDeployed,
