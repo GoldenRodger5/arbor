@@ -192,10 +192,16 @@ function getCALExitThresholds(sport, isPlayoff, defaults, strategy) {
   };
 }
 
-/** Tier 2: Per-sport Kelly fraction (0.25–0.50). Returns 0.50 if uncalibrated. */
+/** Tier 2: Per-sport Kelly fraction (0.25–0.50). Returns 0.50 if uncalibrated.
+ *  Post-drawdown haircut: after a circuit-breaker trip, halve Kelly for 72h to
+ *  reduce variance during recovery (anti-martingale). */
 function getKellyFraction(sport) {
   const f = CAL.kellyFraction?.[sport?.toLowerCase?.()];
-  return (typeof f === 'number' && f > 0 && f <= 0.50) ? f : 0.50;
+  let base = (typeof f === 'number' && f > 0 && f <= 0.50) ? f : 0.50;
+  if (typeof kellyHaircutUntilMs === 'number' && kellyHaircutUntilMs > Date.now()) {
+    base *= 0.5;
+  }
+  return base;
 }
 
 /** Tier 2: Partial-take target price for sport/playoff (null = use existing logic). */
@@ -1835,10 +1841,21 @@ let stats = { claudeCalls: 0, tradesPlaced: 0, apiSpendCents: 0 }; // track API 
 // ─────────────────────────────────────────────────────────────────────────────
 
 let dailyOpenBankroll = 0;       // snapshot at start of day / bot restart
+let weeklyOpenBankroll = 0;      // snapshot at start of week (Monday 00:00 ET)
+let weeklyResetISOWeek = '';     // 'YYYY-Wnn' marker so we only reset once per week
 let consecutiveLosses = 0;       // reset on any win
-let tradingHalted = false;       // circuit breaker flag
+let tradingHalted = false;       // circuit breaker flag (full halt — manual unhalt required)
 let haltReason = '';
 let lastHaltCheck = 0;
+// Soft halt: blocks new entries but lets existing positions close. Auto-clears at next
+// daily/weekly reset. Used for -10% daily and -15% weekly trips. Less drastic than
+// full halt — designed to stop the bleeding without locking out recovery.
+let softHaltUntilMs = 0;
+let softHaltReason = '';
+// Kelly haircut: after a circuit-breaker trip resolves, scale all Kelly fractions
+// down 50% for 72h. "Anti-martingale" — bet less when recovering. Pro practice from
+// Pinnacle/Kelly research (recompute off current bankroll, not peak).
+let kellyHaircutUntilMs = 0;
 
 function getBankroll() {
   return kalshiBalance + kalshiPositionValue;
@@ -2009,15 +2026,42 @@ function canTrade() {
     console.log(`[risk] UI PAUSED${ctrl.pausedReason ? ` — ${ctrl.pausedReason}` : ''}`);
     return false;
   }
+  // Manual unhalt via control.json: { "unhaltRequested": true } clears full halt + soft halt.
+  // Path of last resort — used after a circuit-breaker trip when the user has audited
+  // and wants to resume without restarting the bot.
+  if (ctrl.unhaltRequested && (tradingHalted || softHaltUntilMs > Date.now())) {
+    console.log(`[risk] Manual unhalt acknowledged — clearing halt state`);
+    tradingHalted = false;
+    haltReason = '';
+    softHaltUntilMs = 0;
+    softHaltReason = '';
+    try { tg(`✅ <b>HALT LIFTED</b>\n\nManual unhalt acknowledged. Trading resumes with 72h Kelly haircut for safety.`); } catch {}
+    kellyHaircutUntilMs = Date.now() + 72 * 60 * 60 * 1000;
+    // Clear flag in control.json so we don't re-acknowledge on every cycle
+    try {
+      const next = { ...ctrl, unhaltRequested: false, unhaltAckAt: new Date().toISOString() };
+      writeFileSync(CONTROL_FILE, JSON.stringify(next, null, 2));
+    } catch {}
+  }
 
   if (tradingHalted) {
     console.log(`[risk] HALTED: ${haltReason}`);
     return false;
   }
 
-  // Daily loss limit DISABLED — preference is to keep trading smaller bets to collect
-  // data rather than pause after a bad day. Per-game and per-trade caps below keep
-  // blast radius contained.
+  // Soft halt: blocks NEW entries but lets existing positions close (managePositions
+  // runs independently of canTrade). Auto-clears when softHaltUntilMs passes.
+  if (softHaltUntilMs > Date.now()) {
+    console.log(`[risk] SOFT HALT: ${softHaltReason} — blocked until ${new Date(softHaltUntilMs).toISOString()}`);
+    return false;
+  }
+
+  // Drawdown circuit breaker — graduated. Trips soft halt at -10% daily / -15% weekly,
+  // full halt at -25% daily / -30% weekly. Re-enabled 2026-04-27 after CLV instrumentation
+  // gives us a real edge-validity signal: if we drawdown HARD with negative CLV, edge is
+  // gone (model regression). If we drawdown HARD with positive CLV, it's variance — but
+  // either way the breaker preserves runway. Better to pause + resume small than to bleed.
+  if (!checkDrawdownBreaker()) return false;
 
   // Check max positions (dynamic) — only count positions with meaningful cost
   const maxPos = getMaxPositions();
@@ -2177,16 +2221,100 @@ function updateConsecutiveLosses() {
   } catch { /* keep current */ }
 }
 
+// Returns 'YYYY-Wnn' for the current ET date — used as a once-per-week reset marker.
+// Week boundary = Monday 00:00 ET. ISO week numbering.
+function getEtIsoWeekKey() {
+  const et = etNow();
+  const day = et.getDay() || 7; // sun=0 → 7 so Monday is 1
+  const thursday = new Date(et);
+  thursday.setDate(et.getDate() + (4 - day));
+  const yearStart = new Date(thursday.getFullYear(), 0, 1);
+  const weekNo = Math.ceil((((thursday - yearStart) / 86400000) + 1) / 7);
+  return `${thursday.getFullYear()}-W${String(weekNo).padStart(2, '0')}`;
+}
+
 // Reset daily tracking (called at midnight ET or on restart)
 function resetDailyTracking() {
   dailyOpenBankroll = getBankroll();
-  tradingHalted = false;
-  haltReason = '';
+  // Soft daily halt auto-clears at midnight (the whole point — fresh bankroll basis).
+  // Full halt (tradingHalted) only clears via consecutive-loss reset OR manual unhalt:
+  // requires human review when 25%+ daily drawdown trips.
+  if (softHaltUntilMs > 0 && Date.now() > softHaltUntilMs) {
+    softHaltUntilMs = 0;
+    softHaltReason = '';
+    // Apply 72h Kelly haircut after a soft halt resolves (anti-martingale recovery)
+    kellyHaircutUntilMs = Date.now() + 72 * 60 * 60 * 1000;
+    console.log(`[risk] Soft halt cleared. Kelly haircut active for 72h.`);
+  }
   // Reset HC state daily — prior night's bets shouldn't count against today's cap
   highConvictionDeployed = 0;
   lastHighConvictionAt = 0;
   updateConsecutiveLosses();
-  console.log(`[risk] Daily reset: bankroll=$${dailyOpenBankroll.toFixed(2)} consecutiveLosses=${consecutiveLosses}`);
+  // Weekly reset on Monday — snapshot week-open bankroll, clear week-soft-halt marker
+  const wKey = getEtIsoWeekKey();
+  if (wKey !== weeklyResetISOWeek) {
+    weeklyOpenBankroll = getBankroll();
+    weeklyResetISOWeek = wKey;
+    console.log(`[risk] Weekly reset (${wKey}): weekOpenBankroll=$${weeklyOpenBankroll.toFixed(2)}`);
+  }
+  if (weeklyOpenBankroll === 0) weeklyOpenBankroll = getBankroll();
+  console.log(`[risk] Daily reset: bankroll=$${dailyOpenBankroll.toFixed(2)} consecutiveLosses=${consecutiveLosses} weekOpen=$${weeklyOpenBankroll.toFixed(2)}`);
+}
+
+// Drawdown circuit breaker — graduated. Soft halts block new entries (existing
+// positions still close). Full halts require manual unhalt. Applied inside canTrade()
+// before any other gate so a tripped breaker short-circuits cleanly.
+//
+// Thresholds (research-backed — Pinnacle/Sharp Football):
+//   −10% daily   → soft halt rest of day, 72h Kelly haircut after reset
+//   −25% daily   → full halt, manual review required
+//   −15% weekly  → soft halt rest of week
+//   −30% weekly  → full halt
+function checkDrawdownBreaker() {
+  const bk = getBankroll();
+  if (dailyOpenBankroll > 0) {
+    const dailyDD = (dailyOpenBankroll - bk) / dailyOpenBankroll;
+    if (dailyDD >= 0.25 && !tradingHalted) {
+      tradingHalted = true;
+      haltReason = `Daily drawdown -${(dailyDD * 100).toFixed(1)}% (open $${dailyOpenBankroll.toFixed(2)} → now $${bk.toFixed(2)}). Full halt — manual unhalt required.`;
+      try { tg(`🛑 <b>FULL HALT — DAILY DRAWDOWN</b>\n\n${haltReason}\n\nTo resume: set <code>{"unhaltRequested": true}</code> in <code>logs/control.json</code> or restart bot.`); } catch {}
+      console.log(`[risk] FULL HALT: ${haltReason}`);
+      return false;
+    }
+    if (dailyDD >= 0.10 && softHaltUntilMs < Date.now()) {
+      const tomorrow = etNow();
+      tomorrow.setHours(24, 0, 0, 0);
+      softHaltUntilMs = tomorrow.getTime();
+      softHaltReason = `Daily drawdown -${(dailyDD * 100).toFixed(1)}% — new entries blocked rest of day, open positions still close. 72h Kelly haircut after reset.`;
+      try { tg(`⚠️ <b>SOFT HALT — DAILY DRAWDOWN</b>\n\n${softHaltReason}`); } catch {}
+      console.log(`[risk] SOFT HALT (daily): ${softHaltReason}`);
+      return false;
+    }
+  }
+  if (weeklyOpenBankroll > 0) {
+    const weeklyDD = (weeklyOpenBankroll - bk) / weeklyOpenBankroll;
+    if (weeklyDD >= 0.30 && !tradingHalted) {
+      tradingHalted = true;
+      haltReason = `Weekly drawdown -${(weeklyDD * 100).toFixed(1)}% (week open $${weeklyOpenBankroll.toFixed(2)} → now $${bk.toFixed(2)}). Full halt — manual unhalt required.`;
+      try { tg(`🛑 <b>FULL HALT — WEEKLY DRAWDOWN</b>\n\n${haltReason}\n\nThis is a regime-change signal. Audit edge before resuming.`); } catch {}
+      console.log(`[risk] FULL HALT: ${haltReason}`);
+      return false;
+    }
+    if (weeklyDD >= 0.15 && softHaltUntilMs < Date.now() + 24 * 60 * 60 * 1000) {
+      // Block until next Monday 00:00 ET
+      const et = etNow();
+      const daysToMonday = (8 - (et.getDay() || 7)) % 7 || 7;
+      const monday = new Date(et);
+      monday.setDate(et.getDate() + daysToMonday);
+      monday.setHours(0, 0, 0, 0);
+      softHaltUntilMs = monday.getTime();
+      softHaltReason = `Weekly drawdown -${(weeklyDD * 100).toFixed(1)}% — new entries blocked until Monday.`;
+      try { tg(`⚠️ <b>SOFT HALT — WEEKLY DRAWDOWN</b>\n\n${softHaltReason}`); } catch {}
+      console.log(`[risk] SOFT HALT (weekly): ${softHaltReason}`);
+      return false;
+    }
+  }
+  return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
