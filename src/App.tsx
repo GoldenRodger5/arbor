@@ -12,6 +12,9 @@ import TodayPage from './pages/TodayPage';
 import RecapPage from './pages/RecapPage';
 import PreGameLabPage from './pages/PreGameLabPage';
 import ApiCostsPage from './pages/ApiCostsPage';
+import TradesPage from './pages/TradesPage';
+import PerformancePage from './pages/PerformancePage';
+import LivePage from './pages/LivePage';
 import { ArborProvider } from './context/ArborContext';
 import { Toaster } from '@/components/ui/sonner';
 import InstallPrompt from './components/InstallPrompt';
@@ -21,18 +24,25 @@ const App = () => (
     <BrowserRouter>
       <Layout>
         <Routes>
+          {/* === 5 PRIMARY ROUTES (sidebar + bottom tabs) === */}
           <Route path="/" element={<TodayPage />} />
+          <Route path="/trades" element={<TradesPage />} />
+          <Route path="/perf" element={<PerformancePage />} />
+          <Route path="/live" element={<LivePage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+
+          {/* === LEGACY DIRECT ROUTES (kept for back-compat + power users) === */}
           <Route path="/recap" element={<RecapPage />} />
           <Route path="/overview" element={<CommandCenter />} />
           <Route path="/positions" element={<PositionsPage />} />
           <Route path="/history" element={<TradeHistory />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
           <Route path="/review" element={<TradeReview />} />
-          <Route path="/live" element={<LiveFeed />} />
+          {/* /live is now the unified LivePage; keep direct sub-routes too */}
+          <Route path="/live-feed" element={<LiveFeed />} />
           <Route path="/games" element={<GamesPage />} />
           <Route path="/pregame-lab" element={<PreGameLabPage />} />
           <Route path="/costs" element={<ApiCostsPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </Layout>
       <InstallPrompt />
