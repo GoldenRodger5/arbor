@@ -125,6 +125,59 @@ function isStrategyAutoDisabledByCAL(strategy) {
   return Array.isArray(CAL.disabledStrategies) && CAL.disabledStrategies.includes(strategy);
 }
 
+/** Tag-credibility evaluation. Reads CAL.reasoningTagStats (auto-collected daily)
+ *  and returns the worst (lowest Wilson lower-bound) tag found in the trade's
+ *  reasoning_tags array. Used to BLOCK trades that cite reasoning tags with
+ *  poor historical hit rates (e.g., starter-mismatch 1/9, bullpen-mismatch 1/5).
+ *
+ *  Why this matters: auto-calibration has been quietly collecting this data for
+ *  weeks but never used it for trade decisions. Tags with statistical signal
+ *  (n ≥ 5) AND ciLo < 0.25 represent edge sources that have been catastrophically
+ *  wrong — Sonnet citing them is a yellow flag. Blocking these saves real money.
+ *
+ *  Returns null if all tags are clean / not enough data; returns { tag, stats }
+ *  for the worst-offending tag if blocking is warranted.
+ */
+function evaluateTagCredibility(tags) {
+  if (!Array.isArray(tags) || tags.length === 0) return null;
+  const stats = CAL.reasoningTagStats;
+  if (!stats) return null;
+  let worst = null;
+  for (const tag of tags) {
+    const s = stats[tag];
+    if (!s || (s.n ?? 0) < 5) continue; // need statistical signal
+    if ((s.ciLo ?? 0) < 0.25) {
+      if (!worst || s.ciLo < worst.stats.ciLo) {
+        worst = { tag, stats: s };
+      }
+    }
+  }
+  return worst;
+}
+
+/** Tag-credibility prompt feedback. Surfaces the auto-collected reasoning_tag
+ *  stats to Claude so it AVOIDS citing tags with bad historical hit rates as
+ *  edge sources. Only includes tags with n ≥ 5 (statistical signal).
+ */
+function getReasoningTagFeedback() {
+  const stats = CAL.reasoningTagStats;
+  if (!stats) return '';
+  const meaningful = Object.entries(stats)
+    .filter(([_, s]) => (s.n ?? 0) >= 5)
+    .sort((a, b) => (b[1].n ?? 0) - (a[1].n ?? 0));
+  if (meaningful.length === 0) return '';
+  const lines = meaningful.map(([tag, s]) => {
+    const wr = Math.round((s.winRate ?? 0) * 100);
+    const ciLo = Math.round((s.ciLo ?? 0) * 100);
+    const verdict = s.ciLo > 0.55 ? '✅ STRONG'
+                  : s.ciLo > 0.40 ? '⚠️ marginal'
+                  : s.ciLo > 0.25 ? '⚠️ WEAK'
+                  : '❌ DON\'T cite this as edge source';
+    return `  ${tag}: ${s.wins}/${s.n} (${wr}% WR, Wilson lower ${ciLo}%) — ${verdict}`;
+  }).join('\n');
+  return `═══ YOUR REASONING TAG TRACK RECORD ═══\n${lines}\nIf your edge_argument leans on a ❌ tag, your edge is unlikely to hold. Pick a different edge_source or pass.\n`;
+}
+
 /** Tier 1: Per-sport/playoff exit thresholds from CAL. Strategy-specific overrides
  *  layer on top when present (only the fields CAL actually emits — usually only
  *  when bad-stop rate ≥30% triggered a loosening). Falls back to caller defaults. */
@@ -4647,6 +4700,7 @@ async function checkLiveScoreEdges() {
           `If you can identify a specific reason, adjust your confidence for it. If you CANNOT identify a concrete reason, trust your analysis — prediction markets on Kalshi are thin and often lag real game state by 1-3 minutes. The gap IS the edge.\n` +
           `Do NOT invent hypothetical reasons to explain the gap. "The market must know something" without naming WHAT is not analysis.\n\n` +
           (getCalibrationFeedback() ? `═══ YOUR TRACK RECORD ═══\n${getCalibrationFeedback()}\n` : '') +
+          getReasoningTagFeedback() +
           `═══ STEP 4 — DECISION ═══\n` +
           (isSwingMode
             ? `⚠️ SWING TRADE MODE: This is a swing trade — we exit at +12¢ profit, NOT hold to settlement.\n` +
@@ -5245,6 +5299,24 @@ async function checkLiveScoreEdges() {
           if (_liveEdge >= 0.15 && (decision.confidence ?? 0) < 0.70) {
             console.log(`[live-edge] 🚫 KILLER BUCKET BLOCKED ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(_liveEdge*100).toFixed(0)}pt edge at ${((decision.confidence ?? 0)*100).toFixed(0)}% conf — proportionality mismatch (15+pt edges need 70%+ conf).`);
             logScreen({ stage: 'live-edge', ticker, result: 'killer-bucket-block', reasoning: `${league.toUpperCase()}: Edge ${(_liveEdge*100).toFixed(0)}pt + conf ${((decision.confidence ?? 0)*100).toFixed(0)}% = -EV bucket` });
+            continue;
+          }
+        }
+
+        // 2026-04-27 — TAG CREDIBILITY BLOCK. The auto-calibration system has been
+        // collecting reasoning_tag stats for weeks but never used them to filter trades.
+        // Tags with statistical signal (n ≥ 5) AND Wilson lower-bound < 25% are edge
+        // sources Sonnet has been WRONG about catastrophically. Examples from current
+        // calibration: starter-mismatch 1/9 (11% WR), bullpen-mismatch 1/5 (20% WR),
+        // lineup-cold 2/5 (40% WR, ciLo 12%). When Sonnet cites these as the edge,
+        // historical data says skip. Structural detector trades have synthetic tags
+        // and should bypass — they're rule-based, not Sonnet-reasoned.
+        if (!item._structuralDecision) {
+          const tags = decision.reasoningStructured?.reasoning_tags;
+          const worstTag = evaluateTagCredibility(tags);
+          if (worstTag) {
+            console.log(`[live-edge] 🚫 TAG-CREDIBILITY BLOCKED ${targetAbbr}: cites '${worstTag.tag}' which has ${worstTag.stats.wins}/${worstTag.stats.n} historical (Wilson lower ${(worstTag.stats.ciLo*100).toFixed(0)}%) — pass`);
+            logScreen({ stage: 'live-edge', ticker, result: 'tag-credibility-block', reasoning: `Reasoning tag '${worstTag.tag}' has ${worstTag.stats.wins}/${worstTag.stats.n} (${(worstTag.stats.winRate*100).toFixed(0)}% WR, ciLo ${(worstTag.stats.ciLo*100).toFixed(0)}%) — auto-cal flag` });
             continue;
           }
         }
