@@ -606,6 +606,53 @@ function detectNbaQ4ColdShooting({ league, period, gameDetail, diff, leadingFGNu
   };
 }
 
+// MLB innings 3-5 leading-team: ~67% WR over n=6 historical (small sample,
+// but consistent with the structural pattern). Mid-game leads in MLB are
+// statistically protective — the trailing team has fewer at-bats remaining,
+// and elite/good bullpens haven't yet been activated. This detector is more
+// CONSERVATIVE than the others (smaller historical sample) so requires:
+//   • ≥10pt edge (vs 5-7pt for higher-confidence detectors)
+//   • Confirmed elite or good bullpen tier (poor/below excluded)
+//   • Lead ≥2 runs (1-run leads have higher variance — already blocked elsewhere)
+//   • Price ≤78¢ (within typical mid-game NBA ceiling, leaves room to run)
+function detectMlbMidGameLead({ league, period, gameDetail, diff, leadingBullpenTier, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period < 3 || period > 5) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 2) return null; // 2+ run lead only
+
+  const tier = (leadingBullpenTier || '').toLowerCase();
+  if (tier !== 'elite' && tier !== 'good') return null; // bullpen quality required
+
+  const edge = weTimeAdj - price;
+  if (edge < 0.10) return null;
+
+  if (price > 0.78) return null; // need room to run
+
+  return {
+    trade: true,
+    side: 'yes',
+    confidence: weTimeAdj,
+    betAmount: null,
+    reasoning: {
+      steel_man: `Trailing team has ${9 - period} innings remaining to come back, comeback rates are non-trivial`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB mid-game leader, ~67% WR n=6): ${targetAbbr} leading by ${diff} runs in inning ${period}, ${tier} bullpen tier, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Inning ${period}, ${diff}-run lead`,
+        `Bullpen tier: ${tier} (sufficient to protect mid-game lead)`,
+        `Time-adjusted WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+      ],
+      top_risk: 'Big inning by trailing team or starter pulled early',
+      conviction: 'Structural pattern match — 67% WR on mid-game MLB leaders with good bullpens',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-mid-game-lead',
+    _matchInfo: { period, diff, edge: edge * 100, tier },
+  };
+}
+
 // NHL P3 closing-out: 75% WR (3/4) historical pattern, +$1.91/trade.
 // Pattern: 3rd period leader with time running out. Time decay protects leads
 // in hockey — late P3 is the safest window for the leading team.
@@ -5166,6 +5213,14 @@ async function checkLiveScoreEdges() {
             targetAbbr, leadingAbbr,
           });
         }
+        if (!_structuralDecision) {
+          _structuralDecision = detectMlbMidGameLead({
+            league, period, gameDetail, diff,
+            leadingBullpenTier,
+            weTimeAdj: _weTimeAdj, price,
+            targetAbbr, leadingAbbr,
+          });
+        }
         if (_structuralDecision) {
           const info = _structuralDecision._matchInfo;
           let summary;
@@ -5173,6 +5228,8 @@ async function checkLiveScoreEdges() {
             summary = `${info.fgGap.toFixed(0)}pt FG gap, ${info.minsLeft.toFixed(1)}min, ${info.edge.toFixed(0)}pt edge`;
           } else if (_structuralDecision._structuralPattern === 'nhl-p3-closing-out') {
             summary = `${info.minsLeft.toFixed(1)}min P3, lead ${info.diff}, ${info.edge.toFixed(0)}pt edge`;
+          } else if (_structuralDecision._structuralPattern === 'mlb-mid-game-lead') {
+            summary = `inning ${info.period}, lead ${info.diff}, ${info.tier} bullpen, ${info.edge.toFixed(0)}pt edge`;
           } else {
             summary = `min ${info.minute}', lead ${info.diff}, ${info.edge.toFixed(0)}pt edge`;
           }
