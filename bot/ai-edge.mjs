@@ -1471,6 +1471,239 @@ Your reasoning is logged for calibration analysis and reviewed for systematic pa
 
 `;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PRE-GAME STATIC FRAMEWORKS — per-sport instructions that NEVER change call
+// to call. Moved into system prompt with cache_control so Anthropic caches the
+// 1500-3000 token framework once per 5-minute window. The same content was
+// previously sent fresh in every user prompt — pure billing optimization.
+//
+// Content is byte-identical to what was in pgPromptText before. Cache-read is
+// billed at ~10% of fresh input cost. With ~110 pre-game calls/day across 4
+// sports, expected savings: ~$3-5/day on input tokens.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PG_BASE_SYSTEM = `You are a professional sports betting analyst on prediction markets. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.
+
+`;
+
+const NBA_PG_FRAMEWORK = `═══ NBA SWING-TRADE FRAMEWORK ═══
+STRATEGY: We buy pre-game and SELL when the price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building a lead, or the opponent struggling. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing.
+
+📊 HISTORICAL DATA: NBA pre-game picks have gone 1-4 on trades where the only edge was "better team record + home court." The market prices those already. Play-In Tournament bets stacking "opponent missing star X (doubtful)" + "must-win motivation" have gone 0-2 on heavy underdogs (POR 18¢ → 75% conf → loss). DOUBTFUL players play ~40% of the time; do NOT stack a +30% swing on a single doubtful star.
+
+⚠️ CORE FRAME: The market has already priced team records, home court, and obvious injury news. Your edge must be a SPECIFIC mispricing the market hasn't caught — NOT a re-confirmation of what the price already reflects.
+
+⚠️ DATA RULES: ESPN roster data is injected in the user prompt — use it. You have ONE web search. Use it to check TODAY's injury report, back-to-back schedule, and rest news for both teams. If ESPN provided active/inactive players, those are confirmed — do NOT contradict them. For any star player whose 2026 status you cannot confirm after searching, apply a 3% uncertainty penalty and continue — do NOT use uncertainty as a reason to pass unless it would affect a Hard NO.
+⚠️ ROSTER INTEGRITY: Only cite players who play for the SPECIFIC teams in this game. Do NOT reference players from other franchises.
+
+WIN PROBABILITY BASELINE: NBA home teams win ~63% of games. A motivated team vs. a resting/eliminated opponent can push to 70%+. Teams on back-to-backs win ~45% of those games.
+
+═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══
+❌ Team you want to bet is confirmed resting 2+ starters (load management) → NO
+❌ Team has clinched and cannot confirm stars playing meaningful minutes → NO
+❌ Team on back-to-back AND star player is DOUBTFUL or OUT → NO
+❌ No specific edge — just "they're the better team" → NO (already priced in)
+
+═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══
+Start from 63% win rate (home) / 37% (away). Adjust based on confirmed research:
++ Opponent confirmed resting stars / eliminated / tanking → UP 8-12%
++ Your team in must-win / seeding-critical game vs lower-stakes opponent → UP 5-8%
++ Opponent back-to-back fatigue AND your team is rested → UP 4-6%
++ Clear matchup advantage (size, pace, system) confirmed by standings/stats → UP 3-5%
+- Your team on back-to-back → DOWN 5-8%
+- Star player (15+ ppg) OUT → DOWN 10-15%
+- Opponent has a significant home/rest/motivation advantage → DOWN 4-8%
+
+═══ STEP 4 — DECISION ═══
+REMEMBER: confidence = P(this team wins the game). We exit at +12¢ — typically happens when the team builds a lead and the market reprices.
+BUY only if ALL are true:
+✓ Confidence ≥ 70% (win probability)
+✓ Confidence beats current price by 4+ points
+✓ You have a SPECIFIC edge catalyst — not just "better team"
+🚫 THIN-EDGE REJECTION: if your only case is "better record + home court" OR "opponent missing Xth-best player" OR "playoff motivation," return {"trade":false}. These are market-priced. Need a non-obvious fact.
+🚫 PLAY-IN / PLAYOFF UNDERDOG CAP: if the team is priced below 35¢ AND it's a Play-In or elimination game, MAX confidence = price + 12. A 7-seed does not have 60%+ probability to beat a 2-seed at home, even with their star doubtful.
+
+📊 CONFIDENCE CALIBRATION — use this scale precisely:
+  0.65 = marginal edge (1 weak factor confirmed)
+  0.70 = clear edge (2+ independently confirmed factors)
+  0.75 = strong edge (3 factors — injury, rest advantage, AND motivation/matchup)
+  0.80+ = exceptional (reserved for opponent missing 2+ stars + confirmed tanking/rest + blowout matchup — all must be verified from your search, not assumed)
+⛔ If you reach 0.75+, you MUST list each factor as a separate sentence in your reasoning. Stacking adjustments without independent confirmation = cap at 0.72.
+
+⚠️ UNDERDOG REALITY CHECK — If the team you want to bet is priced below 35¢:
+  The market says this team loses 65%+ of the time. NBA markets are the MOST efficient — seeding, talent, and home court are already priced in.
+  YOUR MAX CONFIDENCE = market price + 15 points. Example: team at 18¢ → max 33%. Team at 30¢ → max 45%.
+  • "Star is DOUBTFUL" ≠ "star is OUT." Doubtful players play ~40% of the time. Apply +5-8% bump for injury risk, NOT +30%.
+  • A 62-win team at home does NOT lose to a 7-seed 75% of the time — even without their best player.
+  • Playoff seeding gaps (1-4 seed vs 5-8 seed) are the strongest win predictor in NBA. Respect them.
+  • If opponent is on a hot streak (5+ consecutive wins), that is CONFIRMED momentum the market has priced. Subtract 3-5% from your estimate.
+  If your confidence exceeds price + 15 for a sub-35¢ team, you are delusional — re-anchor to the market.
+
+`;
+
+const NHL_PG_FRAMEWORK = `═══ NHL SWING-TRADE FRAMEWORK ═══
+STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring first, building a lead, or the opponent struggling early. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing. Goalie matchup and special teams are the primary drivers in NHL win probability.
+
+⚠️ DATA RULES: ESPN-confirmed goalies and their SV%/GAA are in the user prompt — those numbers are authoritative ground truth. Do NOT contradict ESPN stats with different values from training data. You have ONE web search — use it to check for late goalie changes, scratches, special teams rankings, and back-to-back schedule. If ESPN provided a goalie, treat them as CONFIRMED. Only fire Hard NO for "unconfirmed" if ESPN shows "NOT IN ESPN."
+⚠️ ROSTER INTEGRITY: Only cite players who play for the SPECIFIC teams in this game. Do NOT reference players from other franchises.
+
+WIN PROBABILITY BASELINE: NHL home teams win (in regulation + OT) ~55% of games. An elite goalie vs. a backup can push that to 62%+. A team on back-to-back drops to ~47%.
+
+═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══
+❌ Starting goalie for the team you want to bet cannot be confirmed by ESPN OR by ≥2 independent web sources (NHL.com, team official, major outlets) → NO. NOTE: if ESPN is silent but 2+ web sources name the goalie, that IS confirmed — proceed.
+❌ Team has clinched everything AND cannot confirm starting goalie → NO
+❌ Team on 3rd game in 4 nights AND opponent is rested → NO
+❌ No specific edge — just "better team overall" → NO (already priced in)
+
+═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══
+Start from 55% win rate (home) / 45% (away). Adjust based on confirmed research:
++ Elite goalie (SV% > .920) vs below-average opponent goalie (SV% < .905) → UP 8-12%
++ Your team top-5 power play AND opponent bottom-5 penalty kill → UP 4-6%
++ Opponent on back-to-back → UP 4-5%
++ Your team in must-win (seeding, playoff survival) vs lower-stakes opponent → UP 3-5%
+- Backup goalie starting for your team → DOWN 8-12%
+- Your team on back-to-back → DOWN 4-6%
+- Opponent elite PP (top-5) AND your PK bottom-10 → DOWN 4-6%
+
+═══ STEP 4 — DECISION ═══
+REMEMBER: confidence = P(this team wins the game). We exit at +12¢ — typically happens when they score first and the market reprices their win probability.
+BUY only if ALL are true:
+✓ Confidence ≥ 70% (win probability)
+✓ Confidence beats current price by 4+ points
+✓ Goalie is confirmed AND you have a specific win-probability edge
+
+📊 CONFIDENCE CALIBRATION — use this scale precisely:
+  0.65 = slight edge (goalie mismatch alone, or back-to-back alone)
+  0.70 = clear edge (elite goalie SV% > .920 vs backup, confirmed)
+  0.75 = strong edge (elite goalie + fatigue disadvantage for opponent + motivation)
+  0.80+ = exceptional (dominant goalie in playoff context + opponent depleted + home ice — all must be verified from search, not assumed)
+⛔ SV%/GAA values in user prompt are from ESPN — use them exactly. If your search returns a different SV%, note both values.
+
+⚠️ UNDERDOG REALITY CHECK — If the team you want to bet is priced below 35¢:
+  YOUR MAX CONFIDENCE = market price + 18 points. Example: team at 25¢ → max 43%. Team at 30¢ → max 48%.
+  NHL has more parity than NBA (goalie variance), but a team priced below 35¢ is a heavy underdog for a reason.
+  • Goalie matchup alone justifies at most +12% uplift — not +40%.
+  • Playoff series context matters: higher-seeded home teams win Game 1 ~60% historically. Respect home ice.
+  • If opponent is on a hot streak (5+ game point streak), the market has priced that momentum in.
+  If your confidence exceeds price + 18 for a sub-35¢ team, re-anchor to the market.
+
+`;
+
+const MLB_PG_FRAMEWORK = `═══ MLB SWING-TRADE FRAMEWORK ═══
+STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building an early lead, or the opponent's starter struggling. Your confidence = "what is the real probability this team WINS today?"
+
+⚠️ CORE FRAME: The market has already priced starting pitching, team records, home field, and recent form. These are NOT your edge — the market sees them too. Your job is to find situations where the market has MISPRICED a specific factor — OR where a spot-starter/opener disaster (ERA > 6.0) has been under-weighted. A 1-2pt ERA gap is not an edge; a 3+pt gap OR an opponent at ERA 6+ IS one.
+
+📊 HISTORICAL DATA: MLB pre-game picks with 1-2pt ERA gaps went 8-16 (33% WR) for -$94 over our last sample. Picks with opponent ERA > 6.0 went 4-1 (80% WR) for +$95. The difference is real. Stop picking thin ERA gaps.
+
+⚠️ DATA RULES: ESPN-confirmed starters and their ERA/WHIP are in the user prompt — those are authoritative ground truth. Do NOT override ESPN stats with different values from your training data or web search. You have ONE web search — use it for: last 5 starts form, bullpen rest, lineup injuries, any late scratches. Do NOT search for pitcher ERA — it is already provided.
+⚠️ ROSTER INTEGRITY: Only cite players who play for the SPECIFIC teams in this game. Verify any player name you mention belongs to the listed teams.
+
+WIN PROBABILITY BASELINE: MLB home teams win ~54% of games. An ace (ERA < 3.0) pitching vs. a weak lineup boosts that to ~62-65%. A weak starter (ERA > 5.0) drops it to ~42-46%.
+
+═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══
+⛔ THESE ARE ABSOLUTE. If ANY Hard NO applies, respond {"trade":false} immediately. Do NOT continue reasoning.
+❌ Starting pitcher for the team you want to bet cannot be confirmed by ESPN OR by ≥2 independent web sources (MLB.com, Baseball-Reference, team site, ESPN article) → NO. NOTE: if ESPN is silent but 2+ web sources name the starter, that IS confirmed — proceed. Also NOTE: if this is an opener/bullpen game (both sides have no designated starter in ESPN), skip this rule and analyze at the team level.
+⚠️ PITCHING MATCHUP GUIDANCE (NOT Hard NOs — these are confidence adjustments, not vetoes):
+  • Your starter ERA > 5.0 AND opponent starter ERA < 3.5 → apply -6-10% adjustment, but do NOT auto-veto. Even bad pitchers sometimes hang 4-5 innings and the price can still swing +12¢ if their team scores early.
+  • Both starters ERA 4.5-5.5 → coin-flip game. If WE-price edge is ≥ 8pt, a +12¢ swing is still reachable on early-inning luck. Don't auto-pass — assess the actual edge.
+  • Opponent starter ERA < 2.5 AND WHIP < 1.0 → ace pitcher, apply -8% adjustment. But remember: we exit at +12¢, not at settlement. Even against aces, prices swing on early runs, errors, and bullpen changes. Don't veto unless the WE-price edge is below 5pt.
+  The market has already priced pitching matchups. Your job is to find WE-vs-price gaps, not to re-litigate every pitcher duel.
+
+═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══
+Start from 54% win rate (home) / 46% (away). Adjust based on confirmed research:
++ Opponent starter ERA > 6.0 (genuinely terrible — spot starter, emergency call-up, debut disaster) → UP 10-14% ← THIS IS THE REAL EDGE
++ Your ace (ERA < 2.5, WHIP < 1.05) vs opponent ERA > 5.5 → UP 8-10% (need BOTH ends of the gap to be extreme)
++ Your team top-tier bullpen (ERA < 3.5) → UP 2-3% (but market knows this too — small bump)
+- Opponent has elite ace (ERA < 2.5, WHIP < 1.0) → DOWN 8-12%
+- Your key lineup bat confirmed OUT → DOWN 4-6%
+
+🚫 THIN-EDGE REJECTION: Do NOT stack 1-2pt ERA gaps + "strong lineup" + "home field" + "recent form" into a 66% confidence. Historical data says these are market-priced and net-losing. If your only case is a 1-3pt ERA gap, return {"trade":false}.
+
+⚠️ CONFIDENCE CAP: For MLB, confidence above 65% requires EITHER: (a) opponent starter ERA > 6.0 confirmed, OR (b) your ace ERA < 2.5 AND opponent ERA > 5.5 (BOTH extremes). Any 2pt ERA gap on two mid-quality pitchers is NOT enough — cap at 62% and likely pass.
+
+═══ STEP 4 — DECISION ═══
+REMEMBER: confidence = P(this team wins the game). We exit at +12¢ — typically happens after they score early and the market reprices. A clear pitching edge translates to win probability and contract price movement.
+BUY only if ALL are true:
+✓ Confidence meets the price-tiered floor: price<50¢ → ≥63%, price 50-65¢ → ≥66%, price>65¢ → ≥68%. Do NOT return exactly 65% for a mid-price favorite — either you have genuine 66%+ conviction or it's a pass.
+✓ Confidence beats current price by the required margin (typically 4+ points)
+✓ Both starters confirmed AND there's a clear pitching/matchup edge
+🎯 EDGE-FIRST HALF-SIZE EXCEPTION (NON-MLB ONLY): If this is NBA/NHL/soccer AND the team is priced ≤ 55¢ AND your honest confidence is 58-65% AND the edge (confidence − price) is ≥ 10 points, that IS a valid trade — we take it at half size. Do NOT write "HARD PASS" or return {"trade":false} just because you didn't hit 66%. Return {"trade":true} with your real confidence (58-65%), and the bot will auto-size. The reasoning you write gets stored for calibration — don't contradict yourself.
+🧊 MLB PRE-GAME EDGE-FIRST IS FROZEN (went 1-5 on 2026-04-22). For MLB, the standard 66%+ floor applies — there is NO half-size exception today. If you're under 66% on MLB pre-game, just return {"trade":false}.
+
+📊 CONFIDENCE CALIBRATION — MLB scale (MLB is the most random sport — tightened 2026-04-23 per 45-trade post-mortem):
+  0.62 = marginal — ERA gap 3-4pt, must be your only edge; expect high variance
+  0.66 = clear edge — opponent ERA > 5.5 confirmed OR your ace ERA < 2.8 vs their ERA > 4.5
+  0.70 = strong edge — opponent ERA > 6.0 (emergency starter) confirmed
+  0.73+ = exceptional — opponent ERA > 6.5 + confirmed lineup injuries; needs 3 independent factors
+  ⛔ DO NOT hit 0.68+ on "solid ace vs mediocre starter." Our data: 8-16 on that bucket (-$94). Reject those.
+⛔ ESPN ERA/WHIP in user prompt are ground truth. If you write a different ERA in your reasoning than what ESPN shows, your analysis is invalid. Use the ESPN number.
+
+⚠️ UNDERDOG REALITY CHECK — If the team you want to bet is priced below 35¢:
+  YOUR MAX CONFIDENCE = market price + 20 points. Example: team at 25¢ → max 45%. Team at 30¢ → max 50%.
+  MLB is the most random sport, so underdogs win more often — but the market knows that too.
+  • A pitching mismatch (ace vs journeyman) justifies at most +12-15% uplift, not +30%.
+  • If opponent is on a hot streak (5+ consecutive wins), their lineup is locked in — subtract 3-5% from your estimate.
+  • Even the worst MLB team wins ~38% of its games. A team priced at 30¢ is already below that floor — there's a specific reason.
+  If your confidence exceeds price + 20 for a sub-35¢ team, re-anchor to the market.
+
+`;
+
+const SOCCER_PG_FRAMEWORK = `═══ SOCCER SWING-TRADE FRAMEWORK ═══
+STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring, building a lead, or dominating possession while the opponent struggles. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing. A strong attack vs. a leaky defense produces both goals AND win probability. A draw only hurts if we're still holding at the end.
+
+⚠️ DATA RULES: You have ONE web search. Use it to check TODAY's team news, key injuries, form, and motivation context. If you cannot confirm a key injury after searching, treat the player as available but apply a 2% uncertainty buffer. Do NOT use uncertainty as a reason to pass unless it affects a Hard NO.
+
+WIN PROBABILITY BASELINE: Soccer home teams win (regulation) ~45% of games, draw ~27%, away ~28%. Strong home sides vs. weak away teams can reach 55-60% win probability.
+
+⚠️ DRAW TAX (KEY): Your confidence = P(team wins). A TIE is NOT a loss on your ledger but IS a loss on our contract — we need the team to WIN outright. If the TIE leg is priced ≥30¢, ~30%+ of outcomes are draws and your win confidence must be computed AGAINST that, not on top of it. Example: if you think home team is "clearly better," they still face ~30% draw probability before they even face loss probability. Ceiling that thinking.
+
+📊 HISTORICAL DATA: Soccer pre-game picks at <40¢ entry with 30pt+ claimed edges have gone 1-2 (-$18 on NE-CLB MLS at 36¢ / 68% conf). Don't stack "unbeaten home run" + "opponent missing scorer" + "motivation" into a 70% prob on a 36¢ team — the market is telling you they're heavy underdogs for a reason that survives all three.
+
+═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══
+❌ Your team's key striker is confirmed OUT AND opponent defense is strong → NO
+❌ Both teams are defensive/low-scoring (under 1 goal per game each) → NO (likely to draw, price won't move)
+❌ No specific edge — just "they're better overall" → NO (already priced in)
+
+═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══
+Start from 45% win rate (home) / 28% (away). Adjust based on confirmed research:
++ Your team scores 2+ per game AND opponent defense concedes 1.5+ per game → UP 8-12%
++ Your team in must-win (relegation, title run, European spot) vs lower-stakes opponent → UP 5-8%
++ Opponent missing key central defender or goalkeeper → UP 4-6%
++ Strong home record at this venue (60%+ win rate) → UP 3-5%
+- Your team's starting striker confirmed OUT → DOWN 8-12%
+- Opponent elite defense (conceding under 0.8 per game) → DOWN 6-10%
+- Your team low-scoring (under 1.2 goals per game) → DOWN 5-8%
+
+═══ STEP 4 — DECISION ═══
+REMEMBER: confidence = P(this team wins the game in regulation). We exit at +12¢ — typically happens when they score and the market reprices their win probability upward.
+BUY only if ALL are true:
+✓ Confidence ≥ 65% (win probability)
+✓ Confidence beats current price by 4+ points
+✓ You have a specific confirmed win-probability catalyst
+
+📊 CONFIDENCE CALIBRATION — Soccer scale (draw rate ~25% is a major suppressor):
+  0.65 = marginal edge (home favorite + leaky opponent defense)
+  0.70 = clear edge (prolific attack 2+/game vs defense conceding 1.5+/game, confirmed)
+  0.75 = strong edge (dominant home side + opponent missing key striker + motivation gap)
+  0.80+ = exceptional (all three: dominant attack, confirmed injuries to opponent, must-win context — all from search, not assumed)
+
+⚠️ UNDERDOG REALITY CHECK — If the team you want to bet is priced below 35¢:
+  YOUR MAX CONFIDENCE = market price + 15 points. Example: team at 25¢ → max 40%.
+  Soccer underdogs face a double penalty: they must beat the opponent AND avoid a draw (~25% of games draw).
+  • Away underdogs win only ~15-20% of matches against top-half home sides. The market knows this.
+  • A key absence for the opponent adds at most +5-8% — not enough to flip an underdog into a favorite.
+  If your confidence exceeds price + 15 for a sub-35¢ team, re-anchor to the market.
+
+`;
+
+function getPgFramework(sport) {
+  if (sport === 'NBA') return NBA_PG_FRAMEWORK;
+  if (sport === 'NHL') return NHL_PG_FRAMEWORK;
+  if (sport === 'MLB') return MLB_PG_FRAMEWORK;
+  return SOCCER_PG_FRAMEWORK;
+}
+
 // Prompt-caching support — opt-in via array-form prompt or cacheSystem flag.
 // `prompt` can be a string (existing contract, no caching) OR an array of content
 // blocks `[{type:'text', text:'...', cache_control?:{type:'ephemeral'}}, ...]`.
@@ -7261,17 +7494,17 @@ async function checkPreGamePredictions() {
       `   • "Dominic James" — not a current starter. Verify against ESPN ground truth before citing any goalie/pitcher.\n` +
       `   Add this check BEFORE writing your reasoning — if a search result surfaces one of these names and it doesn't match ${sport}, discard it.\n\n`;
 
+    // pgPromptText now holds ONLY the dynamic per-game content. The static
+    // framework (decision tree, hard NOs, calibration scale, underdog check,
+    // historical data, win prob baseline) lives in per-sport SYSTEM constants
+    // (NBA_PG_FRAMEWORK / NHL_PG_FRAMEWORK / MLB_PG_FRAMEWORK / SOCCER_PG_FRAMEWORK)
+    // which are passed as the cached system prompt below — saves ~40% on
+    // pre-game input cost via Anthropic prompt caching.
     const pgPromptText = sport === 'NBA'
-      ? `You are a professional NBA swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
-        `STRATEGY: We buy pre-game and SELL when the price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building a lead, or the opponent struggling. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing.\n\n` +
-        `📊 HISTORICAL DATA: NBA pre-game picks have gone 1-4 on trades where the only edge was "better team record + home court." The market prices those already. Play-In Tournament bets stacking "opponent missing star X (doubtful)" + "must-win motivation" have gone 0-2 on heavy underdogs (POR 18¢ → 75% conf → loss). DOUBTFUL players play ~40% of the time; do NOT stack a +30% swing on a single doubtful star.\n\n` +
-        `⚠️ CORE FRAME: The market has already priced team records, home court, and obvious injury news. Your edge must be a SPECIFIC mispricing the market hasn't caught — NOT a re-confirmation of what the price already reflects.\n\n` +
-        `⚠️ DATA RULES: ESPN roster data is injected above — use it. You have ONE web search. Use it to check TODAY's injury report, back-to-back schedule, and rest news for both teams. If ESPN provided active/inactive players above, those are confirmed — do NOT contradict them. For any star player whose 2026 status you cannot confirm after searching, apply a 3% uncertainty penalty and continue — do NOT use uncertainty as a reason to pass unless it would affect a Hard NO.\n` +
-        `⚠️ ROSTER INTEGRITY: Only cite players who play for the SPECIFIC teams in this game. Do NOT reference players from other franchises.\n\n` +
+      ? `TODAY is ${todayDate}.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
-        `WIN PROBABILITY BASELINE: NBA home teams win ~63% of games. A motivated team vs. a resting/eliminated opponent can push to 70%+. Teams on back-to-backs win ~45% of those games.\n\n` +
         `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
         `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} injury report lineup news head to head recent meetings" and use results to assess:\n` +
         `A) ROSTER QUALITY: Who are the key players for each team? Any stars OUT, DOUBTFUL, or on rest? Confirmed injuries from your search trump training knowledge.\n` +
@@ -7279,57 +7512,18 @@ async function checkPreGamePredictions() {
         `C) MOTIVATION: Where are these teams in the standings? Playoff race, seeding fights, or coasting? NBA teams tanking or fully clinched play worse.\n` +
         `D) MATCHUP EDGE: Does this team have a structural advantage — size, pace, offensive system — that makes them more likely to win specifically against this opponent?\n` +
         `E) HEAD-TO-HEAD (PLAYOFFS ONLY): If this is a playoff series or the teams have met in the same series recently, note who has won recent meetings and by what margin. Regular-season H2H is mostly noise — ignore unless playoff context. Playoff H2H is signal — +3% for a team that won 3 of the last 4 meetings in the series.\n\n` +
-        `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
-        `❌ Team you want to bet is confirmed resting 2+ starters (load management) → NO\n` +
-        `❌ Team has clinched and cannot confirm stars playing meaningful minutes → NO\n` +
-        `❌ Team on back-to-back AND star player is DOUBTFUL or OUT → NO\n` +
-        `❌ No specific edge — just "they're the better team" → NO (already priced in)\n\n` +
-        `═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══\n` +
-        `Start from 63% win rate (home) / 37% (away). Adjust based on confirmed research:\n` +
-        `+ Opponent confirmed resting stars / eliminated / tanking → UP 8-12%\n` +
-        `+ Your team in must-win / seeding-critical game vs lower-stakes opponent → UP 5-8%\n` +
-        `+ Opponent back-to-back fatigue AND your team is rested → UP 4-6%\n` +
-        `+ Clear matchup advantage (size, pace, system) confirmed by standings/stats → UP 3-5%\n` +
-        `- Your team on back-to-back → DOWN 5-8%\n` +
-        `- Star player (15+ ppg) OUT → DOWN 10-15%\n` +
-        `- Opponent has a significant home/rest/motivation advantage → DOWN 4-8%\n\n` +
-        `═══ STEP 4 — DECISION ═══\n` +
-        `REMEMBER: confidence = P(this team wins the game). We exit at +12¢ — typically happens when the team builds a lead and the market reprices.\n` +
-        `BUY only if ALL are true:\n` +
-        `✓ Confidence ≥ 70% (win probability)\n` +
-        `✓ Confidence beats current price by 4+ points\n` +
-        `✓ You have a SPECIFIC edge catalyst — not just "better team"\n` +
-        `🚫 THIN-EDGE REJECTION: if your only case is "better record + home court" OR "opponent missing Xth-best player" OR "playoff motivation," return {"trade":false}. These are market-priced. Need a non-obvious fact.\n` +
-        `🚫 PLAY-IN / PLAYOFF UNDERDOG CAP: if the team is priced below 35¢ AND it's a Play-In or elimination game, MAX confidence = price + 12. A 7-seed does not have 60%+ probability to beat a 2-seed at home, even with their star doubtful.\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
         (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
-        `📊 CONFIDENCE CALIBRATION — use this scale precisely:\n` +
-        `  0.65 = marginal edge (1 weak factor confirmed)\n` +
-        `  0.70 = clear edge (2+ independently confirmed factors)\n` +
-        `  0.75 = strong edge (3 factors — injury, rest advantage, AND motivation/matchup)\n` +
-        `  0.80+ = exceptional (reserved for opponent missing 2+ stars + confirmed tanking/rest + blowout matchup — all must be verified from your search, not assumed)\n` +
-        `⛔ If you reach 0.75+, you MUST list each factor as a separate sentence in your reasoning. Stacking adjustments without independent confirmation = cap at 0.72.\n\n` +
-        `⚠️ UNDERDOG REALITY CHECK — If the team you want to bet is priced below 35¢:\n` +
-        `  The market says this team loses 65%+ of the time. NBA markets are the MOST efficient — seeding, talent, and home court are already priced in.\n` +
-        `  YOUR MAX CONFIDENCE = market price + 15 points. Example: team at 18¢ → max 33%. Team at 30¢ → max 45%.\n` +
-        `  • "Star is DOUBTFUL" ≠ "star is OUT." Doubtful players play ~40% of the time. Apply +5-8% bump for injury risk, NOT +30%.\n` +
-        `  • A 62-win team at home does NOT lose to a 7-seed 75% of the time — even without their best player.\n` +
-        `  • Playoff seeding gaps (1-4 seed vs 5-8 seed) are the strongest win predictor in NBA. Respect them.\n` +
-        `  • If opponent is on a hot streak (5+ consecutive wins), that is CONFIRMED momentum the market has priced. Subtract 3-5% from your estimate.\n` +
-        `  If your confidence exceeds price + 15 for a sub-35¢ team, you are delusional — re-anchor to the market.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. opponent resting 3 starters, team motivated for playoff seeding — price rises when they build Q1 lead","reasoning":"one sentence","reasoning_tags":["1-3 lowercase hyphen-delimited tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, back-to-back, rest-advantage, home-court, motivation, other"]}`
 
       : sport === 'NHL'
-      ? `You are a professional NHL swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
-        `STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring first, building a lead, or the opponent struggling early. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing. Goalie matchup and special teams are the primary drivers in NHL win probability.\n\n` +
-        `⚠️ DATA RULES: ESPN-confirmed goalies and their SV%/GAA are provided above — those numbers are authoritative ground truth. Do NOT contradict ESPN stats with different values from training data. You have ONE web search — use it to check for late goalie changes, scratches, special teams rankings, and back-to-back schedule. If ESPN provided a goalie, treat them as CONFIRMED. Only fire Hard NO for "unconfirmed" if ESPN shows "NOT IN ESPN."\n` +
+      ? `TODAY is ${todayDate}.\n\n` +
         `⚠️ ROSTER INTEGRITY: Only cite players who play for ${market.team1.teamName} or ${market.team2.teamName}. Do NOT reference players from other franchises.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
-        `WIN PROBABILITY BASELINE: NHL home teams win (in regulation + OT) ~55% of games. An elite goalie vs. a backup can push that to 62%+. A team on back-to-back drops to ~47%.\n\n` +
         `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
         `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} goalie confirmed injury news playoff series head to head" and use results to assess:\n` +
         `A) GOALIES: Goalies confirmed above from ESPN — use the ESPN SV%/GAA as ground truth. Verify with search for any last-minute changes. Assess each goalie's win probability impact. An elite goalie (SV% > .920) vs. a backup (.890) is a 10-15% win probability swing. In playoff context: search for 2026 PLAYOFF SV% specifically — elite goalies outperform regular-season numbers in elimination games.\n` +
@@ -7337,119 +7531,37 @@ async function checkPreGamePredictions() {
         `C) FATIGUE: Is either team on a back-to-back? NHL back-to-back teams win at ~8% lower rates.\n` +
         `D) MOTIVATION: Playoff race intensity for each team. Teams fighting for seeding play harder in regulation.\n` +
         `E) HEAD-TO-HEAD (PLAYOFFS ONLY): If this is a playoff series game, note series score (e.g. 2-1) and who won recent meetings. Momentum in a playoff series is real: +3% for the team coming off a win in the series, -3% for a team that just lost Game N at home. Regular-season H2H is noise — ignore outside playoffs.\n\n` +
-        `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
-        `❌ Starting goalie for the team you want to bet cannot be confirmed by ESPN OR by ≥2 independent web sources (NHL.com, team official, major outlets) → NO. NOTE: if ESPN is silent but 2+ web sources name the goalie, that IS confirmed — proceed.\n` +
-        `❌ Team has clinched everything AND cannot confirm starting goalie → NO\n` +
-        `❌ Team on 3rd game in 4 nights AND opponent is rested → NO\n` +
-        `❌ No specific edge — just "better team overall" → NO (already priced in)\n\n` +
-        `═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══\n` +
-        `Start from 55% win rate (home) / 45% (away). Adjust based on confirmed research:\n` +
-        `+ Elite goalie (SV% > .920) vs below-average opponent goalie (SV% < .905) → UP 8-12%\n` +
-        `+ Your team top-5 power play AND opponent bottom-5 penalty kill → UP 4-6%\n` +
-        `+ Opponent on back-to-back → UP 4-5%\n` +
-        `+ Your team in must-win (seeding, playoff survival) vs lower-stakes opponent → UP 3-5%\n` +
-        `- Backup goalie starting for your team → DOWN 8-12%\n` +
-        `- Your team on back-to-back → DOWN 4-6%\n` +
-        `- Opponent elite PP (top-5) AND your PK bottom-10 → DOWN 4-6%\n\n` +
-        `═══ STEP 4 — DECISION ═══\n` +
-        `REMEMBER: confidence = P(this team wins the game). We exit at +12¢ — typically happens when they score first and the market reprices their win probability.\n` +
-        `BUY only if ALL are true:\n` +
-        `✓ Confidence ≥ 70% (win probability)\n` +
-        `✓ Confidence beats current price by 4+ points\n` +
-        `✓ Goalie is confirmed AND you have a specific win-probability edge\n\n` +
         (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
-        `📊 CONFIDENCE CALIBRATION — use this scale precisely:\n` +
-        `  0.65 = slight edge (goalie mismatch alone, or back-to-back alone)\n` +
-        `  0.70 = clear edge (elite goalie SV% > .920 vs backup, confirmed)\n` +
-        `  0.75 = strong edge (elite goalie + fatigue disadvantage for opponent + motivation)\n` +
-        `  0.80+ = exceptional (dominant goalie in playoff context + opponent depleted + home ice — all must be verified from search, not assumed)\n` +
-        `⛔ SV%/GAA values above are from ESPN — use them exactly. If your search returns a different SV%, note both values.\n\n` +
-        `⚠️ UNDERDOG REALITY CHECK — If the team you want to bet is priced below 35¢:\n` +
-        `  YOUR MAX CONFIDENCE = market price + 18 points. Example: team at 25¢ → max 43%. Team at 30¢ → max 48%.\n` +
-        `  NHL has more parity than NBA (goalie variance), but a team priced below 35¢ is a heavy underdog for a reason.\n` +
-        `  • Goalie matchup alone justifies at most +12% uplift — not +40%.\n` +
-        `  • Playoff series context matters: higher-seeded home teams win Game 1 ~60% historically. Respect home ice.\n` +
-        `  • If opponent is on a hot streak (5+ game point streak), the market has priced that momentum in.\n` +
-        `  If your confidence exceeds price + 18 for a sub-35¢ team, re-anchor to the market.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. elite goalie SV .928 vs backup .891 — price rises when they score first","reasoning":"one sentence","reasoning_tags":["1-3 lowercase hyphen-delimited tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, back-to-back, rest-advantage, home-court, motivation, other"]}`
 
-      : /* MLB */
-      sport === 'MLB'
-      ? `You are a professional MLB swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
-        `STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring runs, building an early lead, or the opponent's starter struggling. Your confidence = "what is the real probability this team WINS today?"\n\n` +
-        `⚠️ CORE FRAME: The market has already priced starting pitching, team records, home field, and recent form. These are NOT your edge — the market sees them too. Your job is to find situations where the market has MISPRICED a specific factor — OR where a spot-starter/opener disaster (ERA > 6.0) has been under-weighted. A 1-2pt ERA gap is not an edge; a 3+pt gap OR an opponent at ERA 6+ IS one.\n\n` +
-        `📊 HISTORICAL DATA: MLB pre-game picks with 1-2pt ERA gaps went 8-16 (33% WR) for -$94 over our last sample. Picks with opponent ERA > 6.0 went 4-1 (80% WR) for +$95. The difference is real. Stop picking thin ERA gaps.\n\n` +
-        `⚠️ DATA RULES: ESPN-confirmed starters and their ERA/WHIP are provided above — those are authoritative ground truth. Do NOT override ESPN stats with different values from your training data or web search. You have ONE web search — use it for: last 5 starts form, bullpen rest, lineup injuries, any late scratches. Do NOT search for pitcher ERA — it is already provided above.\n` +
-        `⚠️ ROSTER INTEGRITY: Only cite players who play for the SPECIFIC teams in this game. Verify any player name you mention belongs to ${market.team1.teamName} or ${market.team2.teamName}, not another franchise.\n\n` +
+      : sport === 'MLB'
+      ? `TODAY is ${todayDate}.\n\n` +
+        `⚠️ ROSTER INTEGRITY: Verify any player name you mention belongs to ${market.team1.teamName} or ${market.team2.teamName}, not another franchise.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n\n` +
-        `WIN PROBABILITY BASELINE: MLB home teams win ~54% of games. An ace (ERA < 3.0) pitching vs. a weak lineup boosts that to ~62-65%. A weak starter (ERA > 5.0) drops it to ~42-46%.\n\n` +
         `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
         `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} pitcher stats lineup news" and use results to assess:\n` +
         `A) STARTING PITCHERS: Starters are listed above from ESPN. Verify with search — confirm 2026 ERA, WHIP, recent form. An ace (ERA < 3.0) dominates and wins ~65% of starts. A weak starter (ERA > 5.0) loses more than they win and get lit up early.\n` +
         `B) BULLPEN: Does this team have a strong bullpen to protect leads? Weak bullpens blow leads in the 7th-8th even with good starters.\n` +
         `C) LINEUP POWER: Assess run-scoring ability from search results. Strong lineups (+4.5 R/G) put pressure on the opponent. Known sluggers in the 3-4 spots.\n` +
         `D) PARK FACTOR: Note the park for context only — do NOT add percentage points for park factors. The market already prices park factors in. A hitter's park at Coors doesn't give you an edge; the market knows Coors exists.\n\n` +
-        `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
-        `⛔ THESE ARE ABSOLUTE. If ANY Hard NO applies, respond {"trade":false} immediately. Do NOT continue reasoning.\n` +
-        `❌ Starting pitcher for the team you want to bet cannot be confirmed by ESPN OR by ≥2 independent web sources (MLB.com, Baseball-Reference, team site, ESPN article) → NO. NOTE: if ESPN is silent but 2+ web sources name the starter, that IS confirmed — proceed. Also NOTE: if this is an opener/bullpen game (both sides have no designated starter in ESPN), skip this rule and analyze at the team level.\n` +
-        `⚠️ PITCHING MATCHUP GUIDANCE (NOT Hard NOs — these are confidence adjustments, not vetoes):\n` +
-        `  • Your starter ERA > 5.0 AND opponent starter ERA < 3.5 → apply -6-10% adjustment, but do NOT auto-veto. Even bad pitchers sometimes hang 4-5 innings and the price can still swing +12¢ if their team scores early.\n` +
-        `  • Both starters ERA 4.5-5.5 → coin-flip game. If WE-price edge is ≥ 8pt, a +12¢ swing is still reachable on early-inning luck. Don't auto-pass — assess the actual edge.\n` +
-        `  • Opponent starter ERA < 2.5 AND WHIP < 1.0 → ace pitcher, apply -8% adjustment. But remember: we exit at +12¢, not at settlement. Even against aces, prices swing on early runs, errors, and bullpen changes. Don't veto unless the WE-price edge is below 5pt.\n` +
-        `  The market has already priced pitching matchups. Your job is to find WE-vs-price gaps, not to re-litigate every pitcher duel.\n\n` +
-        `═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══\n` +
-        `Start from 54% win rate (home) / 46% (away). Adjust based on confirmed research:\n` +
-        `+ Opponent starter ERA > 6.0 (genuinely terrible — spot starter, emergency call-up, debut disaster) → UP 10-14% ← THIS IS THE REAL EDGE\n` +
-        `+ Your ace (ERA < 2.5, WHIP < 1.05) vs opponent ERA > 5.5 → UP 8-10% (need BOTH ends of the gap to be extreme)\n` +
-        `+ Your team top-tier bullpen (ERA < 3.5) → UP 2-3% (but market knows this too — small bump)\n` +
-        `- Opponent has elite ace (ERA < 2.5, WHIP < 1.0) → DOWN 8-12%\n` +
-        `- Your key lineup bat confirmed OUT → DOWN 4-6%\n\n` +
-        `🚫 THIN-EDGE REJECTION: Do NOT stack 1-2pt ERA gaps + "strong lineup" + "home field" + "recent form" into a 66% confidence. Historical data says these are market-priced and net-losing. If your only case is a 1-3pt ERA gap, return {"trade":false}.\n\n` +
-        `⚠️ CONFIDENCE CAP: For MLB, confidence above 65% requires EITHER: (a) opponent starter ERA > 6.0 confirmed, OR (b) your ace ERA < 2.5 AND opponent ERA > 5.5 (BOTH extremes). Any 2pt ERA gap on two mid-quality pitchers is NOT enough — cap at 62% and likely pass.\n\n` +
-        `═══ STEP 4 — DECISION ═══\n` +
-        `REMEMBER: confidence = P(this team wins the game). We exit at +12¢ — typically happens after they score early and the market reprices. A clear pitching edge translates to win probability and contract price movement.\n` +
-        `BUY only if ALL are true:\n` +
-        `✓ Confidence meets the price-tiered floor: price<50¢ → ≥63%, price 50-65¢ → ≥66%, price>65¢ → ≥68%. Do NOT return exactly 65% for a mid-price favorite — either you have genuine 66%+ conviction or it's a pass.\n` +
-        `✓ Confidence beats current price by the required margin (typically 4+ points)\n` +
-        `✓ Both starters confirmed AND there's a clear pitching/matchup edge\n` +
-        `🎯 EDGE-FIRST HALF-SIZE EXCEPTION (NON-MLB ONLY): If this is NBA/NHL/soccer AND the team is priced ≤ 55¢ AND your honest confidence is 58-65% AND the edge (confidence − price) is ≥ 10 points, that IS a valid trade — we take it at half size. Do NOT write "HARD PASS" or return {"trade":false} just because you didn't hit 66%. Return {"trade":true} with your real confidence (58-65%), and the bot will auto-size. The reasoning you write gets stored for calibration — don't contradict yourself.\n` +
-        `🧊 MLB PRE-GAME EDGE-FIRST IS FROZEN (went 1-5 on 2026-04-22). For MLB, the standard 66%+ floor applies — there is NO half-size exception today. If you're under 66% on MLB pre-game, just return {"trade":false}.\n\n` +
         (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
-        `📊 CONFIDENCE CALIBRATION — MLB scale (MLB is the most random sport — tightened 2026-04-23 per 45-trade post-mortem):\n` +
-        `  0.62 = marginal — ERA gap 3-4pt, must be your only edge; expect high variance\n` +
-        `  0.66 = clear edge — opponent ERA > 5.5 confirmed OR your ace ERA < 2.8 vs their ERA > 4.5\n` +
-        `  0.70 = strong edge — opponent ERA > 6.0 (emergency starter) confirmed\n` +
-        `  0.73+ = exceptional — opponent ERA > 6.5 + confirmed lineup injuries; needs 3 independent factors\n` +
-        `  ⛔ DO NOT hit 0.68+ on "solid ace vs mediocre starter." Our data: 8-16 on that bucket (-$94). Reject those.\n` +
-        `⛔ ESPN ERA/WHIP above are ground truth. If you write a different ERA in your reasoning than what ESPN shows, your analysis is invalid. Use the ESPN number.\n\n` +
-        `⚠️ UNDERDOG REALITY CHECK — If the team you want to bet is priced below 35¢:\n` +
-        `  YOUR MAX CONFIDENCE = market price + 20 points. Example: team at 25¢ → max 45%. Team at 30¢ → max 50%.\n` +
-        `  MLB is the most random sport, so underdogs win more often — but the market knows that too.\n` +
-        `  • A pitching mismatch (ace vs journeyman) justifies at most +12-15% uplift, not +30%.\n` +
-        `  • If opponent is on a hot streak (5+ consecutive wins), their lineup is locked in — subtract 3-5% from your estimate.\n` +
-        `  • Even the worst MLB team wins ~38% of its games. A team priced at 30¢ is already below that floor — there's a specific reason.\n` +
-        `  If your confidence exceeds price + 20 for a sub-35¢ team, re-anchor to the market.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. ace ERA 2.8 vs ERA 5.1 starter — price rises when they score first and market reprices win probability","reasoning":"one sentence","reasoning_tags":["1-3 lowercase hyphen-delimited tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, back-to-back, rest-advantage, home-court, motivation, other"]}`
 
-      : /* Soccer (MLS / EPL / La Liga) */
-      `You are a professional soccer swing trader on prediction markets. TODAY is ${todayDate}.\n\n` +
-        `STRATEGY: We buy pre-game and SELL when price rises to entry + 12¢ — we do NOT hold to settlement. The price rises whenever this team starts winning — scoring, building a lead, or dominating possession while the opponent struggles. Your confidence = "what is the real probability this team WINS today?" We are looking for teams the market is undervaluing. A strong attack vs. a leaky defense produces both goals AND win probability. A draw only hurts if we're still holding at the end.\n\n` +
-        `⚠️ DATA RULES: You have ONE web search. Use it to check TODAY's team news, key injuries, form, and motivation context. If you cannot confirm a key injury after searching, treat the player as available but apply a 2% uncertainty buffer. Do NOT use uncertainty as a reason to pass unless it affects a Hard NO.\n\n` +
+      : /* Soccer (MLS / EPL / La Liga / Serie A / Bundesliga / Ligue 1) */
+      `TODAY is ${todayDate}.\n\n` +
+        `⛔ ROSTER INTEGRITY: Only cite players confirmed on ${market.team1.teamName} or ${market.team2.teamName} rosters. Do NOT reference players from other clubs.\n\n` +
         `GAME: ${market.title}\n` +
         `${market.team1.teamName} (${market.team1.team}) wins: ${(market.team1.price*100).toFixed(0)}¢\n` +
         `${market.team2.teamName} (${market.team2.team}) wins: ${(market.team2.price*100).toFixed(0)}¢\n` +
         (market.tie ? `DRAW (tie): ${(market.tie.price*100).toFixed(0)}¢  ← market-implied draw probability\n` : '') +
         (market.tie ? `⚠️ 3-WAY CHECK: ${(market.team1.price*100).toFixed(0)} + ${(market.team2.price*100).toFixed(0)} + ${(market.tie.price*100).toFixed(0)} = ${Math.round((market.team1.price + market.team2.price + market.tie.price) * 100)}¢. Draw takes ${Math.round(market.tie.price*100)}% probability off the top of the win market — your win confidence must beat both the price AND the draw leg.\n` : '') +
-        `\n`+
-        `WIN PROBABILITY BASELINE: Soccer home teams win (regulation) ~45% of games, draw ~27%, away ~28%. Strong home sides vs. weak away teams can reach 55-60% win probability.\n\n` +
-        `⚠️ DRAW TAX (KEY): Your confidence = P(team wins). A TIE is NOT a loss on your ledger but IS a loss on our contract — we need the team to WIN outright. If the TIE leg is priced ≥30¢, ~30%+ of outcomes are draws and your win confidence must be computed AGAINST that, not on top of it. Example: if you think home team is "clearly better," they still face ~30% draw probability before they even face loss probability. Ceiling that thinking.\n\n` +
-        `📊 HISTORICAL DATA: Soccer pre-game picks at <40¢ entry with 30pt+ claimed edges have gone 1-2 (-$18 on NE-CLB MLS at 36¢ / 68% conf). Don't stack "unbeaten home run" + "opponent missing scorer" + "motivation" into a 70% prob on a 36¢ team — the market is telling you they're heavy underdogs for a reason that survives all three.\n\n` +
+        `\n` +
         `═══ STEP 1 — SEARCH & ASSESS ═══\n` +
         `Search for "${market.team1.teamName} vs ${market.team2.teamName} ${todayDate} team news injuries form recent meetings head to head" and use results to assess:\n` +
         `A) ATTACK QUALITY: How prolific is each team's attack? Top-5 goals-per-game teams generate scoring chances that translate to wins.\n` +
@@ -7458,38 +7570,7 @@ async function checkPreGamePredictions() {
         `D) MOTIVATION: Is either team in a must-win (relegation, title run, European qualification)? Higher motivation = more aggressive pressing = more goals = higher win probability.\n` +
         `E) DEFENSE: Elite defenses (conceding <0.8/game) can keep motivated opponents scoreless. Porous defenses lose more games.\n` +
         `F) HEAD-TO-HEAD: Soccer H2H is more meaningful than US sports — tactical matchups, psychological edges, and stylistic mismatches persist across seasons. If one side has won ≥3 of the last 5 meetings OR dominated the last 2 with clean sheets, that is a real +3-5% signal. Cite the specific scorelines from search, not a vague "they own this matchup."\n\n` +
-        `═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══\n` +
-        `❌ Your team's key striker is confirmed OUT AND opponent defense is strong → NO\n` +
-        `❌ Both teams are defensive/low-scoring (under 1 goal per game each) → NO (likely to draw, price won't move)\n` +
-        `❌ No specific edge — just "they're better overall" → NO (already priced in)\n\n` +
-        `═══ STEP 3 — WIN PROBABILITY EDGE ANALYSIS ═══\n` +
-        `Start from 45% win rate (home) / 28% (away). Adjust based on confirmed research:\n` +
-        `+ Your team scores 2+ per game AND opponent defense concedes 1.5+ per game → UP 8-12%\n` +
-        `+ Your team in must-win (relegation, title run, European spot) vs lower-stakes opponent → UP 5-8%\n` +
-        `+ Opponent missing key central defender or goalkeeper → UP 4-6%\n` +
-        `+ Strong home record at this venue (60%+ win rate) → UP 3-5%\n` +
-        `- Your team's starting striker confirmed OUT → DOWN 8-12%\n` +
-        `- Opponent elite defense (conceding under 0.8 per game) → DOWN 6-10%\n` +
-        `- Your team low-scoring (under 1.2 goals per game) → DOWN 5-8%\n\n` +
-        `═══ STEP 4 — DECISION ═══\n` +
-        `REMEMBER: confidence = P(this team wins the game in regulation). We exit at +12¢ — typically happens when they score and the market reprices their win probability upward.\n` +
-        `BUY only if ALL are true:\n` +
-        `✓ Confidence ≥ 65% (win probability)\n` +
-        `✓ Confidence beats current price by 4+ points\n` +
-        `✓ You have a specific confirmed win-probability catalyst\n\n` +
         (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
-        `📊 CONFIDENCE CALIBRATION — Soccer scale (draw rate ~25% is a major suppressor):\n` +
-        `  0.65 = marginal edge (home favorite + leaky opponent defense)\n` +
-        `  0.70 = clear edge (prolific attack 2+/game vs defense conceding 1.5+/game, confirmed)\n` +
-        `  0.75 = strong edge (dominant home side + opponent missing key striker + motivation gap)\n` +
-        `  0.80+ = exceptional (all three: dominant attack, confirmed injuries to opponent, must-win context — all from search, not assumed)\n` +
-        `⛔ ROSTER INTEGRITY: Only cite players confirmed on ${market.team1.teamName} or ${market.team2.teamName} rosters. Do NOT reference players from other clubs.\n\n` +
-        `⚠️ UNDERDOG REALITY CHECK — If the team you want to bet is priced below 35¢:\n` +
-        `  YOUR MAX CONFIDENCE = market price + 15 points. Example: team at 25¢ → max 40%.\n` +
-        `  Soccer underdogs face a double penalty: they must beat the opponent AND avoid a draw (~25% of games draw).\n` +
-        `  • Away underdogs win only ~15-20% of matches against top-half home sides. The market knows this.\n` +
-        `  • A key absence for the opponent adds at most +5-8% — not enough to flip an underdog into a favorite.\n` +
-        `  If your confidence exceeds price + 15 for a sub-35¢ team, re-anchor to the market.\n\n` +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. prolific attack vs defense conceding 1.8/game — price rises when they score first goal","reasoning":"one sentence","reasoning_tags":["1-3 lowercase hyphen-delimited tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, back-to-back, rest-advantage, home-court, motivation, other"]}`;
@@ -7506,7 +7587,18 @@ async function checkPreGamePredictions() {
     if (preGameTradesThisCycle >= MAX_PREGAME_PER_CYCLE) break;
     const batchItems = pgPrompts.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, { maxTokens: 2000, maxSearches: 1, category: 'pre-game', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.' }))
+      batchItems.map(item => claudeWithSearch(item.prompt, {
+        maxTokens: 2000,
+        maxSearches: 1,
+        category: 'pre-game',
+        // Per-sport system prompt with cached static framework. The 1500-3000 token
+        // framework (decision tree, hard NOs, calibration scale, underdog check)
+        // caches via cache_control: ephemeral — saves ~40% on input tokens for
+        // pre-game calls within the same 5-minute window. Was previously sent
+        // fresh in every user prompt.
+        system: PG_BASE_SYSTEM + getPgFramework(item.sport),
+        cacheSystem: true,
+      }))
     );
 
     for (let i = 0; i < batchItems.length; i++) {
