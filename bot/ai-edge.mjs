@@ -963,6 +963,127 @@ async function tg(text) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Standardized Telegram notification helpers — consistent format across all
+// trade events. Every notification ends with today's running P&L summary so
+// the user can see daily progress at a glance without checking the dashboard.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Compute today's P&L from settled trades (ET day). Cached briefly. */
+let _todayPnLCache = { date: '', pnl: 0, wins: 0, losses: 0, fetchedAt: 0 };
+function getDailyPnLSummary() {
+  const today = etTodayStr();
+  if (_todayPnLCache.date === today && Date.now() - _todayPnLCache.fetchedAt < 30000) {
+    return _todayPnLCache;
+  }
+  let pnl = 0, wins = 0, losses = 0;
+  try {
+    if (existsSync(TRADES_LOG)) {
+      const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      for (const l of lines) {
+        try {
+          const t = JSON.parse(l);
+          if (t.realizedPnL == null) continue;
+          const settled = t.settledAt ?? t.timestamp;
+          if (!settled || tsToEtDate(settled) !== today) continue;
+          pnl += t.realizedPnL;
+          if (t.realizedPnL > 0) wins++;
+          else if (t.realizedPnL < 0) losses++;
+        } catch {}
+      }
+    }
+  } catch {}
+  _todayPnLCache = { date: today, pnl, wins, losses, fetchedAt: Date.now() };
+  return _todayPnLCache;
+}
+
+/** Daily P&L footer line shown on every trade event notification. */
+function dailyFooter() {
+  const d = getDailyPnLSummary();
+  const pnlStr = d.pnl >= 0 ? `+$${d.pnl.toFixed(2)}` : `-$${Math.abs(d.pnl).toFixed(2)}`;
+  return `📈 Today: ${d.wins}W/${d.losses}L | <b>${pnlStr}</b>`;
+}
+
+/** Standard trade-entry notification. Used for live, pre-game, draw-bet, structural. */
+async function tgTradeEntry({ kind, title, gameLine, team, price, qty, deployed, conf, edge, reason, strategyTag, isStructural = false }) {
+  const icon = isStructural ? '🚀' : kind.includes('DRAW') ? '⚽' : kind.includes('UFC') ? '🥊' : kind.includes('PRE-GAME') ? '🎯' : '🎯';
+  const lines = [
+    `${icon} <b>${kind}</b>`,
+    title,
+  ];
+  if (gameLine) lines.push(`<i>${gameLine}</i>`);
+  lines.push(``);
+  lines.push(`📊 <b>${team}</b> YES @ ${Math.round((price ?? 0) * 100)}¢ × ${qty} = <b>$${(deployed ?? 0).toFixed(2)}</b>`);
+  if (conf != null && edge != null) {
+    lines.push(`🎯 conf ${Math.round(conf * 100)}% · edge +${Math.round(edge)}pt${strategyTag ? ` · <code>${strategyTag}</code>` : ''}`);
+  }
+  if (reason) lines.push(`🧠 ${reason.slice(0, 200)}`);
+  lines.push(``);
+  lines.push(dailyFooter());
+  return tg(lines.join('\n'));
+}
+
+/** Standard trade-exit notification. Used for profit-locks, stop-losses, profit-takes. */
+async function tgTradeExit({ kind, title, entry, exit, qty, pnl, reason, isWin }) {
+  const icon = isWin ? '✅' : pnl != null && pnl < 0 ? '❌' : '⚠️';
+  const entryC = Math.round((entry ?? 0) * 100);
+  const exitC = Math.round((exit ?? 0) * 100);
+  const delta = exitC - entryC;
+  const pctChange = entry > 0 ? Math.round((delta / entryC) * 100) : 0;
+  const pnlStr = pnl != null ? (pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`) : 'TBD';
+  const lines = [
+    `${icon} <b>${kind}</b>`,
+    title,
+    ``,
+    `📊 ${entryC}¢ → ${exitC}¢ (${delta >= 0 ? '+' : ''}${delta}¢, ${pctChange >= 0 ? '+' : ''}${pctChange}%)${qty != null ? ` × ${qty}` : ''}`,
+    `💰 P&L: <b>${pnlStr}</b>`,
+  ];
+  if (reason) {
+    lines.push(``);
+    lines.push(`🧠 ${reason.slice(0, 200)}`);
+  }
+  lines.push(``);
+  lines.push(dailyFooter());
+  return tg(lines.join('\n'));
+}
+
+/** Standard settlement notification. */
+async function tgSettlement({ title, won, pnl, source = 'Kalshi' }) {
+  const icon = won ? '✅' : '❌';
+  const verb = won ? 'WIN' : 'LOSS';
+  const pnlStr = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
+  return tg(
+    `${icon} <b>SETTLED — ${verb}</b> (${source})\n` +
+    `${title}\n\n` +
+    `💰 P&L: <b>${pnlStr}</b>\n\n` +
+    dailyFooter()
+  );
+}
+
+/** Bankroll milestone notifications. Fires at meaningful thresholds (every doubling). */
+const BANKROLL_MILESTONES = [150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 10000];
+let _lastMilestoneHit = 0;
+async function checkBankrollMilestone() {
+  const b = getBankroll();
+  if (b <= _lastMilestoneHit) return;
+  for (const m of BANKROLL_MILESTONES) {
+    if (b >= m && _lastMilestoneHit < m) {
+      _lastMilestoneHit = m;
+      const fromInitial = b - 100; // assume $100 starting
+      const pctGrowth = ((b / 100 - 1) * 100).toFixed(0);
+      await tg(
+        `🎉 <b>BANKROLL MILESTONE — $${m}</b>\n\n` +
+        `Bankroll just crossed <b>$${m}</b>!\n` +
+        `Current: <b>$${b.toFixed(2)}</b>\n` +
+        `Growth from $100: <b>+$${fromInitial.toFixed(2)}</b> (${pctGrowth}%)\n\n` +
+        `Position sizes will scale up at this bankroll tier.\n\n` +
+        dailyFooter()
+      );
+      break;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Claude with Web Search — researches before deciding
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -4196,14 +4317,19 @@ async function checkLiveScoreEdges() {
                   isLeadingTeam: false,
                 });
 
-                await tg(
-                  `⚽ <b>DRAW BET — KALSHI</b>\n\n` +
-                  `<b>${homeAbbr} ${homeScore}-${awayScore} ${awayAbbr}</b> at ${effectiveMin}'\n\n` +
-                  `BUY TIE @ ${priceInCents}¢ × ${qty} = <b>$${deployed.toFixed(2)}</b>\n` +
-                  `Draw probability: <b>${(drawProb*100).toFixed(0)}%</b> vs price ${priceInCents}¢\n` +
-                  `Potential profit: <b>$${(qty * (1 - tiePrice)).toFixed(2)}</b>\n\n` +
-                  `🧠 <i>Claude (${drawConf}%): ${drawReasoning}</i>`
-                );
+                await tgTradeEntry({
+                  kind: `DRAW-BET — ${league.toUpperCase()}`,
+                  title: `${homeAbbr} ${homeScore}-${awayScore} ${awayAbbr}`,
+                  gameLine: `Minute ${effectiveMin}' · TIE bet`,
+                  team: 'TIE',
+                  price: tiePrice,
+                  qty: qty,
+                  deployed: deployed,
+                  conf: drawConf / 100,
+                  edge: margin * 100,
+                  reason: drawReasoning,
+                  strategyTag: 'draw-bet',
+                });
               }
             }
           }
@@ -5794,25 +5920,31 @@ async function checkLiveScoreEdges() {
             console.log(`[live-edge] 🔁 Thesis-vindicated re-entry complete on ${gameBase} — cleared stoppedBets`);
           }
 
-          const savedMsg = best.platform === 'polymarket' ? `\n💡 Bought on Poly (${(price*100).toFixed(0)}¢ Kalshi → ${priceInCents}¢ Poly)` : '';
-          const hcMsg = hcCheck.isHighConv ? `\n🔥 HIGH CONVICTION — ${hcCheck.reason}` : '';
-          const betLabel = isThesisVindicated ? '🔁 THESIS RE-ENTRY' :
-            isSwingMode ? '🔄 SWING TRADE' :
+          const isStructuralMatch = !!item._structuralDecision;
+          const betLabel = isStructuralMatch ? `STRUCTURAL — ${item._structuralDecision._structuralPattern.toUpperCase()}` :
+            isThesisVindicated ? 'THESIS RE-ENTRY' :
+            isSwingMode ? 'SWING TRADE' :
             hcCheck.isHighConv ? '🔥 HIGH CONVICTION' :
-            targetAbbr === leadingAbbr ? '🎯 PREDICTION' : '🐕 UNDERDOG';
-          await tg(
-            `<b>${betLabel} BET — ${best.platform.toUpperCase()}</b>\n\n` +
-            `📋 <b>GAME</b>\n` +
-            `${title}\n` +
-            `Score: ${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore} | ${gameDetail}\n\n` +
-            `📊 <b>METRICS</b>\n` +
-            `Team: <b>${targetAbbr}</b> YES @ ${priceInCents}¢ × ${actualFill} = <b>$${actualDeployed.toFixed(2)}</b>\n` +
-            `Confidence: <b>${(confidence*100).toFixed(0)}%</b> | Edge: <b>+${Math.round((confidence - bestPrice) * 100)}pts</b>\n` +
-            `Win expectancy: ${weAtEntry !== null ? `${(weAtEntry*100).toFixed(0)}%` : 'N/A'} | Period: ${period}\n` +
-            `${isSwingMode ? `Exit: +12¢ profit (${priceInCents + 12}¢) | Stop: -10¢ (${priceInCents - 10}¢)` : `Stop-loss: ~${Math.round(bestPrice * 100 * 0.86)}¢ | Max profit: <b>$${(actualFill * (1 - bestPrice)).toFixed(2)}</b>`}${savedMsg}${hcMsg}\n\n` +
-            `🧠 <b>REASONING</b>\n` +
-            `${renderReasoningForTelegram(decision.reasoningStructured, decision.reasoning)}`
-          );
+            targetAbbr === leadingAbbr ? 'LIVE — LEADER' : 'LIVE — UNDERDOG';
+          const stratTag = isStructuralMatch ? `structural-${item._structuralDecision._structuralPattern}`
+            : isThesisVindicated ? 'thesis-reentry'
+            : isSwingMode ? 'live-swing'
+            : hcCheck.isHighConv ? 'high-conviction'
+            : 'live-prediction';
+          await tgTradeEntry({
+            kind: betLabel,
+            title: title,
+            gameLine: `${awayAbbr} ${awayScore} - ${homeAbbr} ${homeScore} · ${gameDetail}`,
+            team: targetAbbr,
+            price: bestPrice,
+            qty: actualFill,
+            deployed: actualDeployed,
+            conf: confidence,
+            edge: (confidence - bestPrice) * 100,
+            reason: decision.reasoningStructured?.edge_argument ?? decision.reasoning,
+            strategyTag: stratTag,
+            isStructural: isStructuralMatch,
+          });
           // Deduct from cached balance so subsequent orders this cycle are aware
           kalshiBalance = Math.max(0, kalshiBalance - actualDeployed);
         } else {
@@ -7732,20 +7864,19 @@ Respond in EXACTLY this JSON:
               wouldQty: pgFill, reasoning: decision.reasoning, exitScenario: decision.exitScenario ?? null,
               pgBaseline: pgTargetBaseline,
             });
-            await tg(
-              `🎯 <b>PRE-GAME BET — KALSHI</b>\n\n` +
-              `📋 <b>GAME</b>\n` +
-              `${market.title}\n` +
-              `Sport: ${pgSportKey.toUpperCase()} | Strategy: Buy early, sell on +12¢ spike\n\n` +
-              `📊 <b>METRICS</b>\n` +
-              `Team: <b>${matchedSide.team}</b> YES @ ${pgPriceInCents}¢ × ${pgFill} = <b>$${pgDeployed.toFixed(2)}</b>\n` +
-              `Confidence: <b>${Math.round(confidence*100)}%</b> | Edge: <b>+${Math.round(edge*100)}pts</b>\n` +
-              `Baseline: ${Math.round(pgTargetBaseline*100)}% | Exit target: ${pgPriceInCents + 12}¢ (+12¢)\n` +
-              `Max profit (at exit): <b>$${(pgFill * 0.12).toFixed(2)}</b> | Max loss: $${pgDeployed.toFixed(2)}\n\n` +
-              `🧠 <b>REASONING</b>\n` +
-              `${decision.reasoning ?? 'No reasoning returned'}` +
-              (decision.exitScenario ? `\n\n📍 <b>EXIT SCENARIO</b>\n${decision.exitScenario}` : '')
-            );
+            await tgTradeEntry({
+              kind: `PRE-GAME — ${pgSportKey.toUpperCase()}`,
+              title: market.title,
+              gameLine: `Strategy: buy early, sell on +12¢ spike`,
+              team: matchedSide.team,
+              price: pgPriceInCents / 100,
+              qty: pgFill,
+              deployed: pgDeployed,
+              conf: confidence,
+              edge: edge * 100,
+              reason: decision.exitScenario || decision.reasoning,
+              strategyTag: 'pre-game-prediction',
+            });
             console.log(`[pre-game] ✅ Filled ${pgFill}/${betQty} @ ${pgPriceInCents}¢ deployed=$${pgDeployed.toFixed(2)}`);
             // Lock this game now that we've actually placed a real bet.
             preGameBetGames.add(market.base);
@@ -8767,14 +8898,16 @@ async function managePositions() {
             console.log(`[exit] 🛡️ CONTRA BLOCKED on ${trade.ticker}: ${trade.strategy} in ${stage} stage, WE=${(ourWECt*100).toFixed(0)}% still recoverable — market overreaction, not thesis death`);
           } else if (moveAgeSec <= 120) {
             console.log(`[exit] ⚠️ CONTRA EXIT: ${trade.ticker} — cross-confirmed ${contraMove.velocity.toFixed(1)}¢/min drop ${Math.round(moveAgeSec)}s ago, scratching full position @ ${(currentPrice*100).toFixed(0)}¢`);
-            await tg(
-              `⚠️ <b>CONTRA-EXIT</b>\n\n` +
-              `📋 ${trade.title}\n` +
-              `🎯 ${trade.ticker}\n` +
-              `💰 ${(entryPrice*100).toFixed(0)}¢ → ${(currentPrice*100).toFixed(0)}¢ (${pctChange >= 0 ? '+' : ''}${(pctChange*100).toFixed(0)}%)\n` +
-              `📉 Market dropped ${contraMove.velocity.toFixed(1)}¢/min cross-confirmed\n` +
-              `💡 Scratching before stop-loss`,
-            );
+            await tgTradeExit({
+              kind: 'CONTRA-EXIT (price velocity)',
+              title: trade.title,
+              entry: entryPrice,
+              exit: currentPrice,
+              qty: qty,
+              pnl: qty * (currentPrice - entryPrice),
+              reason: `Market dropped ${contraMove.velocity.toFixed(1)}¢/min cross-confirmed — scratching before stop-loss`,
+              isWin: pctChange >= 0,
+            });
             const result = await executeSell(trade, qty, currentPrice, 'contra-line-move');
             if (result) anyUpdated = true;
             continue;
@@ -8799,17 +8932,16 @@ async function managePositions() {
         if ((stage === 'early' || stage === 'mid') && currentPrice >= midLockThreshold && profitPerContract > 0 && trade.strategy !== 'pre-game-prediction') {
           const gainPct = Math.round((profitPerContract / entryPrice) * 100);
           console.log(`[exit] 💰 MID-GAME LOCK (${stage}): ${trade.ticker} at ${(currentPrice*100).toFixed(0)}¢ — up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}%, locking profit (${Math.round((1-currentPrice)*100)}¢ remaining not worth ${stage}-game risk)`);
-          await tg(
-            `💰 <b>MID-GAME PROFIT-LOCK</b>\n\n` +
-            `📋 <b>POSITION</b>\n` +
-            `${trade.title}\n` +
-            `Stage: ${stage.toUpperCase()}\n\n` +
-            `📊 <b>METRICS</b>\n` +
-            `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
-            `Selling ALL ${qty} contracts\n` +
-            `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>\n\n` +
-            `💬 Only ${Math.round((1-currentPrice)*100)}¢ remaining upside — not worth ${stage}-game reversal risk`
-          );
+          await tgTradeExit({
+            kind: `PROFIT LOCK — ${stage} game`,
+            title: trade.title,
+            entry: entryPrice,
+            exit: currentPrice,
+            qty: qty,
+            pnl: qty * profitPerContract,
+            reason: `Only ${Math.round((1-currentPrice)*100)}¢ remaining upside — locking profit before reversal risk`,
+            isWin: true,
+          });
           const result = await executeSell(trade, qty, currentPrice, 'mid-game-profit-lock');
           if (result) anyUpdated = true;
           continue;
@@ -8920,12 +9052,16 @@ async function managePositions() {
           const result = await executeSell(trade, qty, currentPrice, 'draw-bet-profit-lock');
           if (result) {
             anyUpdated = true;
-            await tg(
-              `⚽💰 <b>DRAW-BET PROFIT-LOCK</b>\n\n` +
-              `${trade.title}\n` +
-              `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(profitPerContract*100).toFixed(0)}¢, +${gainPct}%)\n` +
-              `Profit: <b>+$${(qty * profitPerContract).toFixed(2)}</b>`
-            );
+            await tgTradeExit({
+              kind: 'DRAW-BET PROFIT LOCK',
+              title: trade.title,
+              entry: entryPrice,
+              exit: currentPrice,
+              qty: qty,
+              pnl: qty * profitPerContract,
+              reason: `TIE price hit +12¢ target — clean exit`,
+              isWin: true,
+            });
           }
           continue;
         }
@@ -8935,13 +9071,16 @@ async function managePositions() {
         if (trade.strategy === 'draw-bet' && pctChange < -0.50) {
           const lossAmt = Math.abs(profitPerContract) * qty;
           console.log(`[exit] ⚽🛑 DRAW-BET STOP: ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — cutting loss at $${lossAmt.toFixed(2)}`);
-          await tg(
-            `⚽🛑 <b>DRAW-BET STOP-LOSS</b>\n\n` +
-            `${trade.title}\n` +
-            `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (${(pctChange*100).toFixed(0)}%)\n` +
-            `Loss: <b>-$${lossAmt.toFixed(2)}</b>\n\n` +
-            `💬 Goal likely broke the tie — exiting before further collapse`
-          );
+          await tgTradeExit({
+            kind: 'DRAW-BET STOP LOSS',
+            title: trade.title,
+            entry: entryPrice,
+            exit: currentPrice,
+            qty: qty,
+            pnl: qty * profitPerContract,
+            reason: `Goal likely broke the tie — exiting before further collapse`,
+            isWin: false,
+          });
           const result = await executeSell(trade, qty, currentPrice, 'draw-bet-stop');
           if (result) anyUpdated = true;
           continue;
@@ -10337,7 +10476,7 @@ async function checkSettlements() {
                 const icon = pnl >= 0 ? '✅' : '❌';
                 console.log(`[pnl] POLY SETTLED: ${slug} → ${won ? 'WIN' : 'LOSS'} | P&L: ${icon} $${pnl.toFixed(2)}`);
                 const pnlStr = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
-                await tg(`${icon} <b>SETTLED${won ? ' — WIN' : ' — LOSS'} (Poly)</b>\n\n<b>${trade.title ?? slug}</b>\nP&L: <b>${pnlStr}</b>`);
+                await tgSettlement({ title: trade.title ?? slug, won, pnl, source: 'Poly' });
               }
             }
           } catch { /* skip */ }
@@ -10533,15 +10672,7 @@ async function checkSettlements() {
         const icon = totalPartialProfit >= 0 ? '✅' : '❌';
         const pnlStr = totalPartialProfit >= 0 ? `+$${totalPartialProfit.toFixed(2)}` : `-$${Math.abs(totalPartialProfit).toFixed(2)}`;
         console.log(`[pnl] SETTLED (pre-sold): ${trade.ticker} ${trade.side} → ${settlement.market_result} | P&L: ${icon} $${totalPartialProfit.toFixed(2)} (from partial sells)`);
-        await tg(
-          `${icon} <b>SETTLED — ${won ? 'WIN ✅' : 'LOSS ❌'} (pre-sold)</b>\n\n` +
-          `📋 <b>POSITION</b>\n` +
-          `${trade.title ?? trade.ticker}\n` +
-          `Strategy: ${trade.strategy ?? 'live-prediction'}\n\n` +
-          `📊 <b>METRICS</b>\n` +
-          `Sold before settlement via partial exits\n` +
-          `P&L: <b>${pnlStr}</b>`
-        );
+        await tgSettlement({ title: trade.title ?? trade.ticker, won, pnl: totalPartialProfit, source: 'Kalshi (pre-sold)' });
         continue;
       }
 
@@ -10651,6 +10782,9 @@ async function checkSettlements() {
 
       // Update consecutive loss tracking
       updateConsecutiveLosses();
+
+      // Bankroll milestone check — fires when crossing $150/$200/$300/etc thresholds
+      try { await checkBankrollMilestone(); } catch (e) { /* milestone is best-effort */ }
 
       // Strategy performance check — disable strategies with <40% win rate after 10+ trades
       const stratStats = {};
