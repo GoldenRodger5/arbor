@@ -6288,7 +6288,7 @@ async function checkLiveScoreEdges() {
           leadingAbbr,
           targetAbbr,
           homeAbbr, awayAbbr,
-          liveStage: _qStage,
+          liveStage: stage, // destructured from item at line 6240
           reasoningPreview: (decision.reasoning ?? '').slice(0, 200),
           reasoningStructured: decision.reasoningStructured ?? null,
           reasoningTags: decision.reasoningStructured?.reasoning_tags ?? null,
