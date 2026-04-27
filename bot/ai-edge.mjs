@@ -606,6 +606,61 @@ function detectNbaQ4ColdShooting({ league, period, gameDetail, diff, leadingFGNu
   };
 }
 
+// NHL P3 closing-out: 75% WR (3/4) historical pattern, +$1.91/trade.
+// Pattern: 3rd period leader with time running out. Time decay protects leads
+// in hockey — late P3 is the safest window for the leading team.
+//
+// Excludes 1-goal leads in last 2 min (pulled-goalie chaos — high variance,
+// market correctly prices). Excludes 1-goal leads in first 8 min of P3 (still
+// 12+ min to play — too much variance to call this "closing out").
+function detectNhlP3ClosingOut({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'nhl') return null;
+  if (period !== 3) return null;
+  if (targetAbbr !== leadingAbbr) return null; // leader only
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 1) return null;
+
+  // Parse minutes left in P3. Format examples: "8:32 - 3rd", "1:45 - 3rd".
+  const m = (gameDetail || '').match(/^(\d+):(\d+)/);
+  if (!m) return null;
+  const minsLeft = parseInt(m[1], 10) + parseInt(m[2], 10) / 60;
+
+  // Closing-out window. Skip first 8 min (too much time) and last 2 min
+  // (pulled-goalie variance on 1-goal leads).
+  if (minsLeft > 10) return null;
+  if (minsLeft < 2 && diff < 2) return null;
+
+  const edge = weTimeAdj - price;
+  // 1-goal lead needs more edge to compensate for higher variance
+  const minEdge = diff === 1 ? 0.08 : 0.05;
+  if (edge < minEdge) return null;
+
+  // Don't fire above 82¢ — NHL P3 typical price ceiling
+  if (price > 0.82) return null;
+
+  return {
+    trade: true,
+    side: 'yes',
+    confidence: weTimeAdj,
+    betAmount: null,
+    reasoning: {
+      steel_man: `Trailing team has ${minsLeft.toFixed(1)} minutes to score, may pull goalie for extra attacker`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (NHL P3 closing-out, historical 75% WR n=4): ${targetAbbr} leading by ${diff} goal${diff === 1 ? '' : 's'} with ${minsLeft.toFixed(1)} min left in P3, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge. Time decay protects hockey leads.`,
+      key_facts: [
+        `P3 ${minsLeft.toFixed(1)} min left, ${diff}-goal lead`,
+        `Time-adjusted WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Pattern: NHL P3 closing-out has been 3W/1L historical`,
+      ],
+      top_risk: 'Pulled goalie + extra attacker scoring in final 2 minutes',
+      conviction: 'Structural pattern match — time decay favors leader in hockey late P3',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'nhl-p3-closing-out',
+    _matchInfo: { minsLeft, diff, edge: edge * 100 },
+  };
+}
+
 // Soccer 2H home-leader (early second half): 100% WR (5/5) historical pattern.
 // Examples: FUL@AVL halftime entry (won), WHU@EVE pattern, MTL@NYC halftime.
 // The pattern: home team leading by 1+ goals at start of second half (minute 45-65)
@@ -5104,11 +5159,23 @@ async function checkLiveScoreEdges() {
             targetAbbr, leadingAbbr, homeAbbr,
           });
         }
+        if (!_structuralDecision) {
+          _structuralDecision = detectNhlP3ClosingOut({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price,
+            targetAbbr, leadingAbbr,
+          });
+        }
         if (_structuralDecision) {
           const info = _structuralDecision._matchInfo;
-          const summary = _structuralDecision._structuralPattern === 'nba-q4-cold-shooting'
-            ? `${info.fgGap.toFixed(0)}pt FG gap, ${info.minsLeft.toFixed(1)}min, ${info.edge.toFixed(0)}pt edge`
-            : `min ${info.minute}', lead ${info.diff}, ${info.edge.toFixed(0)}pt edge`;
+          let summary;
+          if (_structuralDecision._structuralPattern === 'nba-q4-cold-shooting') {
+            summary = `${info.fgGap.toFixed(0)}pt FG gap, ${info.minsLeft.toFixed(1)}min, ${info.edge.toFixed(0)}pt edge`;
+          } else if (_structuralDecision._structuralPattern === 'nhl-p3-closing-out') {
+            summary = `${info.minsLeft.toFixed(1)}min P3, lead ${info.diff}, ${info.edge.toFixed(0)}pt edge`;
+          } else {
+            summary = `min ${info.minute}', lead ${info.diff}, ${info.edge.toFixed(0)}pt edge`;
+          }
           console.log(`[live-edge] 🎯 STRUCTURAL DETECTOR matched (${_structuralDecision._structuralPattern}): ${targetAbbr} — ${summary}, conf=${(_structuralDecision.confidence*100).toFixed(0)}% — skipping Sonnet`);
         }
 
