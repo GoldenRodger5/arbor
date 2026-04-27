@@ -996,11 +996,68 @@ function getDailyPnLSummary() {
   return _todayPnLCache;
 }
 
-/** Daily P&L footer line shown on every trade event notification. */
+/** CLV stats over a rolling window. Reads trades.jsonl, filters trades with clv != null,
+ *  returns { all, byStrategy } summaries. Cached briefly to avoid hammering disk on every footer. */
+let _clvStatsCache = { fetchedAt: 0, days: 0, summary: null };
+function getClvStats({ days = 7 } = {}) {
+  if (_clvStatsCache.summary && _clvStatsCache.days === days && Date.now() - _clvStatsCache.fetchedAt < 60_000) {
+    return _clvStatsCache.summary;
+  }
+  if (!existsSync(TRADES_LOG)) return null;
+  try {
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+    const records = [];
+    for (const l of lines) {
+      try {
+        const t = JSON.parse(l);
+        if (typeof t.clv !== 'number') continue;
+        if (!t.timestamp || Date.parse(t.timestamp) < cutoff) continue;
+        records.push(t);
+      } catch {}
+    }
+    if (records.length === 0) {
+      _clvStatsCache = { fetchedAt: Date.now(), days, summary: null };
+      return null;
+    }
+    const summarize = (recs) => {
+      const n = recs.length;
+      const sum = recs.reduce((s, t) => s + t.clv, 0);
+      const positive = recs.filter(t => t.clv > 0).length;
+      return { n, avgClv: sum / n, beatPct: positive / n };
+    };
+    const all = summarize(records);
+    const byStrat = {};
+    for (const r of records) {
+      const s = r.strategy ?? 'unknown';
+      if (!byStrat[s]) byStrat[s] = [];
+      byStrat[s].push(r);
+    }
+    const byStrategy = {};
+    for (const [s, recs] of Object.entries(byStrat)) {
+      if (recs.length >= 5) byStrategy[s] = summarize(recs);
+    }
+    const summary = { all, byStrategy, windowDays: days };
+    _clvStatsCache = { fetchedAt: Date.now(), days, summary };
+    return summary;
+  } catch {
+    return null;
+  }
+}
+
+/** Daily P&L footer line shown on every trade event notification.
+ *  Includes 7-day CLV when sample is meaningful (n≥10). */
 function dailyFooter() {
   const d = getDailyPnLSummary();
   const pnlStr = d.pnl >= 0 ? `+$${d.pnl.toFixed(2)}` : `-$${Math.abs(d.pnl).toFixed(2)}`;
-  return `📈 Today: ${d.wins}W/${d.losses}L | <b>${pnlStr}</b>`;
+  let line = `📈 Today: ${d.wins}W/${d.losses}L | <b>${pnlStr}</b>`;
+  const clv = getClvStats({ days: 7 });
+  if (clv?.all && clv.all.n >= 10) {
+    const cents = Math.round(clv.all.avgClv * 100);
+    const sign = cents >= 0 ? '+' : '';
+    line += ` · 7d CLV ${sign}${cents}¢ (n=${clv.all.n})`;
+  }
+  return line;
 }
 
 /** Standard trade-entry notification. Used for live, pre-game, draw-bet, structural. */
@@ -1511,6 +1568,19 @@ const recentCrossContraMovers = new Map(); // ticker → { velocity, when } — 
 // calibration alongside game-outcome calibration: even when a game flips, did the
 // model find a real mispricing that the price moved toward?
 const mfeTracking = new Map(); // tradeId → { maxPrice, maxMove }
+
+// CLV (Closing Line Value) tracker — pre-game trades only. The single most important
+// metric for measuring real edge: did we get a better price than the market at game
+// start? +2¢ avg CLV = winning bettor; +5¢ = elite (Pinnacle/ProbWin industry data).
+// Captured once in [game_start - 30s, game_start + 180s] window via 60s capture loop.
+// Kalshi books are 0-100¢ implied probability — no vig-stripping needed; CLV in cents.
+const clvTracking = new Map(); // tradeId → { ticker, side, entryPrice, gameStartMs, strategy }
+function registerClvCapture(tradeId, { ticker, side, entryPrice, gameStartMs, strategy }) {
+  if (!tradeId || !ticker || !Number.isFinite(gameStartMs) || gameStartMs <= 0) return;
+  if (!Number.isFinite(entryPrice) || entryPrice <= 0) return;
+  // Only meaningful for pre-game/UFC-style entries — live entries already ARE the live price
+  clvTracking.set(tradeId, { ticker, side: (side ?? 'yes').toLowerCase(), entryPrice, gameStartMs, strategy: strategy ?? 'unknown', registeredAt: Date.now() });
+}
 
 // Apply MFE fields from the tracker to a trade object (and an optional persisted
 // JSONL record). Idempotent and safe on missing tracker entries (no-op).
@@ -2235,7 +2305,103 @@ function logTrade(entry) {
   } catch (e) {
     console.error('[pnl] Failed to log trade:', e.message);
   }
+  // Auto-register CLV capture for pre-game-style trades. Live trades skip — entry IS the live price.
+  // Strategy prefix `pre-game-` covers prediction/edge-first/paper/structural pre-entries.
+  // We look up game start via pgGameStartTimes (keyed by marketBase, ie ticker without trailing -TEAM).
+  try {
+    const strat = String(record.strategy ?? '');
+    const isPreGameLike = strat.startsWith('pre-game-') || strat === 'claude-prediction' || strat === 'ufc-prediction' || strat === 'draw-bet';
+    if (isPreGameLike && record.exchange === 'kalshi' && record.ticker) {
+      const marketBase = record.ticker.includes('-') ? record.ticker.slice(0, record.ticker.lastIndexOf('-')) : record.ticker;
+      const gsm = pgGameStartTimes.get(marketBase);
+      if (Number.isFinite(gsm) && gsm > Date.now() - 5 * 60 * 1000) {
+        registerClvCapture(record.id, {
+          ticker: record.ticker,
+          side: record.side ?? 'yes',
+          entryPrice: record.entryPrice,
+          gameStartMs: gsm,
+          strategy: strat,
+        });
+      }
+    }
+  } catch { /* CLV registration is best-effort */ }
   return record.id;
+}
+
+// Patch a trade record in trades.jsonl by id (used for CLV updates and similar
+// post-entry annotations). Atomic rewrite — safe under append concurrency because
+// readers re-read fresh each cycle. Returns true if record was found+updated.
+function updateTradeRecord(tradeId, updates) {
+  if (!tradeId || !existsSync(TRADES_LOG)) return false;
+  try {
+    const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+    const records = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    let updated = false;
+    for (const r of records) {
+      if (r.id === tradeId) {
+        Object.assign(r, updates);
+        updated = true;
+        break;
+      }
+    }
+    if (updated) {
+      writeFileSync(TRADES_LOG, records.map(r => JSON.stringify(r)).join('\n') + '\n');
+    }
+    return updated;
+  } catch (e) {
+    console.error('[pnl] updateTradeRecord failed:', e.message);
+    return false;
+  }
+}
+
+// CLV capture loop — for each pending trade, when game start is in window, fetch
+// market mid and persist closingPrice + clv to the trade record. Window opens 30s
+// before game start and closes 3min after; if we miss the window the entry is
+// dropped (the price has moved too far for "closing" to be meaningful).
+async function captureClvTicks() {
+  if (clvTracking.size === 0) return;
+  const now = Date.now();
+  for (const [tradeId, info] of [...clvTracking.entries()]) {
+    const windowOpen = info.gameStartMs - 30 * 1000;
+    const windowClose = info.gameStartMs + 3 * 60 * 1000;
+    if (now < windowOpen) continue;
+    if (now > windowClose) {
+      clvTracking.delete(tradeId);
+      console.log(`[clv] missed capture window for ${info.ticker} (game started ${Math.round((now - info.gameStartMs)/60000)}min ago)`);
+      continue;
+    }
+    try {
+      const m = await kalshiGet(`/markets/${info.ticker}`);
+      const market = m.market ?? m;
+      const yesAskRaw = parseFloat(market.yes_ask_dollars ?? '0');
+      const yesBidRaw = parseFloat(market.yes_bid_dollars ?? '0');
+      // Some endpoints return cents (1-99), others return dollars (0.01-0.99). Normalize.
+      const norm = (v) => v > 1 ? v / 100 : v;
+      const yesAsk = norm(yesAskRaw);
+      const yesBid = norm(yesBidRaw);
+      let mid = 0;
+      if (yesAsk > 0 && yesBid > 0) mid = (yesAsk + yesBid) / 2;
+      else if (yesAsk > 0) mid = yesAsk;
+      else if (yesBid > 0) mid = yesBid;
+      if (mid <= 0 || mid >= 1) continue; // try again next tick
+      // For YES: closingPrice = mid. For NO: closingPrice = 1 - mid (NO market price).
+      const closingPrice = info.side === 'no' ? (1 - mid) : mid;
+      const clv = closingPrice - info.entryPrice; // positive = we got a better price than close
+      const updated = updateTradeRecord(tradeId, {
+        closingPrice: Math.round(closingPrice * 10000) / 10000,
+        clv: Math.round(clv * 10000) / 10000,
+        clvCapturedAt: new Date().toISOString(),
+      });
+      if (updated) {
+        const clvCents = Math.round(clv * 100);
+        const sign = clvCents >= 0 ? '+' : '';
+        console.log(`[clv] ${info.ticker} entry=${Math.round(info.entryPrice*100)}¢ close=${Math.round(closingPrice*100)}¢ CLV=${sign}${clvCents}¢ (${info.strategy})`);
+      }
+      clvTracking.delete(tradeId);
+    } catch (e) {
+      // Transient — next tick will retry while still inside window
+    }
+  }
 }
 
 // Log a paper (simulated) pre-game trade — no real money, for calibration
@@ -11244,13 +11410,37 @@ async function main() {
           const fmt = (r) => `${r.sport} ${r.strategy.replace('pre-game-','pg-').replace('live-','lv-')}\n   ${r.edge} × ${r.conf}: ${r.n}n, ${r.wr}% WR, $${r.pnl.toFixed(0)}`;
           const totalPnL = rows.reduce((s, r) => s + r.pnl, 0);
           console.log(`[cal-stats] Daily digest: ${settled.length} settled, net $${totalPnL.toFixed(2)}`);
+
+          // CLV breakout — overall + per-strategy (bonus C). Surfaces whether each
+          // strategy is actually beating the closing line. Industry threshold:
+          // +2¢ avg = winning bettor, +5¢ = elite, ≤+1¢ = edge is illusory.
+          const clv7 = getClvStats({ days: 7 });
+          let clvSection = '';
+          if (clv7?.all && clv7.all.n >= 5) {
+            const fmtClv = (s) => {
+              const c = Math.round(s.avgClv * 100);
+              const sign = c >= 0 ? '+' : '';
+              const beat = Math.round(s.beatPct * 100);
+              const grade = c >= 5 ? '🏆' : c >= 2 ? '🟢' : c >= 0 ? '🟡' : '🔴';
+              return `${grade} ${sign}${c}¢ avg · ${beat}% beat close · n=${s.n}`;
+            };
+            clvSection = `\n\n📐 <b>7d CLV — overall</b>\n${fmtClv(clv7.all)}`;
+            const stratEntries = Object.entries(clv7.byStrategy)
+              .sort(([,a],[,b]) => b.avgClv - a.avgClv);
+            if (stratEntries.length > 0) {
+              clvSection += `\n\n📐 <b>7d CLV — by strategy</b>\n` +
+                stratEntries.map(([s, st]) => `• <code>${s.replace('pre-game-','pg-')}</code>: ${fmtClv(st)}`).join('\n');
+            }
+          }
+
           await tg(
             `📊 <b>DAILY CALIBRATION DIGEST</b>\n` +
             `${settled.length} settled · total P&L $${totalPnL.toFixed(2)}\n\n` +
             `🟢 <b>BEST BUCKETS (n≥5)</b>\n` +
             best.map(fmt).join('\n') + '\n\n' +
             `🔴 <b>WORST BUCKETS (n≥5)</b>\n` +
-            worst.map(fmt).join('\n') + '\n\n' +
+            worst.map(fmt).join('\n') +
+            clvSection + '\n\n' +
             `📁 Full stats: logs/calibration-stats.json`
           );
         }
@@ -11271,6 +11461,14 @@ async function main() {
     try { await updateCalibrationStats(); } catch (e) { console.error('[cal-stats] error:', e.message); }
     setTimeout(settlementLoop, 5 * 60 * 1000);
   }
+
+  // CLV capture loop — fast tick (60s) so we hit the narrow [game_start - 30s, +180s]
+  // window on every pre-game trade. No-ops when nothing pending.
+  async function clvLoop() {
+    try { await captureClvTicks(); } catch (e) { console.error('[clv] error:', e.message); }
+    setTimeout(clvLoop, 60 * 1000);
+  }
+  setTimeout(clvLoop, 60 * 1000); // first run after 60s
   setTimeout(settlementLoop, 2 * 60 * 1000); // first run after 2 min
 
   // Fast soccer exit loop — every 30 seconds.
