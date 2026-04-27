@@ -2300,45 +2300,52 @@ function getBucketSizingMult(sport, strategy) {
   const now = Date.now();
   if (!_bucketMultCache.data || now - _bucketMultCache.ts > 5 * 60 * 1000) {
     try {
-      const calPath = './logs/calibration-stats.json';
-      if (existsSync(calPath)) {
-        const raw = JSON.parse(readFileSync(calPath, 'utf-8'));
-        // We need per (sport × strategy) aggregated across all buckets, using recent trades only.
-        // Reconstruct from trades.jsonl instead of the bucket file since we want "last 10".
-        const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
-        const bySportStrat = new Map();
-        for (const l of lines) {
-          try {
-            const t = JSON.parse(l);
-            if (t.realizedPnL == null || !t.gameOutcome) continue;
-            const tk = (t.ticker ?? '').toUpperCase();
-            const sportKey = tk.includes('NBA') ? 'NBA' : tk.includes('MLB') ? 'MLB'
-              : tk.includes('NHL') ? 'NHL' : (tk.match(/MLS|EPL|LALIGA|SERIEA|BUNDESLIGA|LIGUE1/) ? 'Soccer' : 'Other');
-            const key = `${sportKey}|${t.strategy}`;
-            if (!bySportStrat.has(key)) bySportStrat.set(key, []);
-            bySportStrat.get(key).push(t);
-          } catch {}
-        }
-        const data = {};
-        for (const [key, trades] of bySportStrat) {
-          // Use last 10 trades to gauge recent performance
-          const recent = trades.slice(-10);
-          const wins = recent.filter(t => t.gameOutcome === 'correct').length;
-          const wr = recent.length > 0 ? wins / recent.length : 0.5;
-          data[key] = { n: recent.length, wr };
-        }
-        _bucketMultCache.ts = now;
-        _bucketMultCache.data = data;
-      } else {
-        _bucketMultCache.ts = now;
-        _bucketMultCache.data = {};
+      const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+      const bySportStrat = new Map();
+      for (const l of lines) {
+        try {
+          const t = JSON.parse(l);
+          // Bug fix 2026-04-27: was filtering on `gameOutcome` which is only set
+          // on ~63% of settled trades. Now uses realizedPnL directly (universal).
+          // Skips manual exits (closed-manual / sold-manual) which aren't a
+          // verdict on strategy quality.
+          if (t.realizedPnL == null) continue;
+          if (t.status === 'closed-manual' || t.status === 'sold-manual') continue;
+          const tk = (t.ticker ?? '').toUpperCase();
+          const sportKey = tk.includes('NBA') ? 'NBA' : tk.includes('MLB') ? 'MLB'
+            : tk.includes('NHL') ? 'NHL' : (tk.match(/MLS|EPL|LALIGA|SERIEA|BUNDESLIGA|LIGUE1/) ? 'Soccer' : 'Other');
+          const key = `${sportKey}|${t.strategy}`;
+          if (!bySportStrat.has(key)) bySportStrat.set(key, []);
+          bySportStrat.get(key).push(t);
+        } catch {}
       }
+      const data = {};
+      for (const [key, trades] of bySportStrat) {
+        // Use last 15 trades for stability (was 10 — too volatile on small samples)
+        const recent = trades.slice(-15);
+        const wins = recent.filter(t => (t.realizedPnL ?? 0) > 0).length;
+        const wr = recent.length > 0 ? wins / recent.length : 0.5;
+        const totalPnl = recent.reduce((s, t) => s + (t.realizedPnL ?? 0), 0);
+        const avgPnl = recent.length > 0 ? totalPnl / recent.length : 0;
+        data[key] = { n: recent.length, wr, avgPnl, totalPnl };
+      }
+      _bucketMultCache.ts = now;
+      _bucketMultCache.data = data;
     } catch (e) {
       return 1; // on error, don't penalize
     }
   }
   const stats = _bucketMultCache.data?.[`${sport}|${strategy}`];
   if (!stats || stats.n < 10) return 1; // not enough samples — full sizing
+  // P&L-based throttle (NEW 2026-04-27): even if WR looks fine, asymmetric losses
+  // (small wins, big losses) destroy a strategy. Auto-throttle on negative avg P&L.
+  // This was the missing piece: MLB pre-game had 18% tWR but 63% on the 15-19pt
+  // edge bucket which lost -$9.18/trade due to high-priced favorites paying tiny
+  // upside. WR-only check missed this.
+  if (stats.n >= 15 && stats.avgPnl < -2.00) return 0.00; // heavy bleeder → freeze
+  if (stats.avgPnl < -1.00) return 0.25;
+  if (stats.avgPnl < -0.50) return 0.50;
+  // WR-based throttle (existing logic)
   if (stats.wr >= 0.50) return 1.00;
   if (stats.wr >= 0.35) return 0.50;
   if (stats.n >= 15 && stats.wr < 0.30) return 0.00; // soft freeze
