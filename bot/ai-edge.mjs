@@ -1059,11 +1059,25 @@ async function tgSettlement({ title, won, pnl, source = 'Kalshi' }) {
   );
 }
 
-/** Bankroll milestone notifications. Fires at meaningful thresholds (every doubling). */
+/** Bankroll milestone notifications. Fires when crossing meaningful thresholds.
+ *  Bug fix 2026-04-27: previously _lastMilestoneHit started at 0 every restart,
+ *  meaning on next settled trade it would fire ALL already-crossed milestones
+ *  (false alerts). Now initialized to the highest milestone already passed at
+ *  module load, so only NEW crossings fire. */
 const BANKROLL_MILESTONES = [150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 10000];
 let _lastMilestoneHit = 0;
+let _milestoneInitialized = false;
 async function checkBankrollMilestone() {
   const b = getBankroll();
+  // First call: set _lastMilestoneHit to the highest already-crossed milestone
+  // so we don't fire "you reached $150!" when bankroll is already at $300.
+  if (!_milestoneInitialized) {
+    for (const m of BANKROLL_MILESTONES) {
+      if (b >= m) _lastMilestoneHit = m;
+    }
+    _milestoneInitialized = true;
+    return;
+  }
   if (b <= _lastMilestoneHit) return;
   for (const m of BANKROLL_MILESTONES) {
     if (b >= m && _lastMilestoneHit < m) {
