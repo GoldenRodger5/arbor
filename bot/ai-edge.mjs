@@ -3912,9 +3912,25 @@ async function checkLiveScoreEdges() {
                   }
                 } catch {}
               }
-              if (hasPos) {
-                console.log(`[draw-bet] Already have position on ${homeAbbr} vs ${awayAbbr}, skipping`);
+              // 2026-04-27: allow scale-in on draw-bet via canScaleInto.
+              // Previously a blanket block (per TOT-BRI comment) — but TOT-BRI
+              // was profitable (+$206 across 4 entries on the same draw thesis).
+              // Re-enable scale-in with safety: canScaleInto requires (a) score
+              // unchanged (still 0-0 or 1-1 — thesis intact), (b) price improved
+              // 4¢+ (better entry), (c) within max-entries-per-game cap. The
+              // 40% bankroll concentration cap below still applies as backstop.
+              const drawScoreKey = scoreKey(homeScore, awayScore);
+              if (hasPos && !canScaleInto(gameBase, tiePrice, qty * tiePrice, drawScoreKey)) {
+                const drawEntry = gameEntries.get(gameBase);
+                const drawScoreChanged = drawEntry?.lastScoreKey && drawScoreKey && drawEntry.lastScoreKey !== drawScoreKey;
+                const drawReason = drawScoreChanged
+                  ? `score changed since last entry (${drawEntry.lastScoreKey} → ${drawScoreKey}) — thesis broken`
+                  : `scale-in not eligible (need ≥4¢ price drop OR same-score)`;
+                console.log(`[draw-bet] Already have position on ${homeAbbr} vs ${awayAbbr}, skipping: ${drawReason}`);
                 continue;
+              }
+              if (hasPos) {
+                console.log(`[draw-bet] 📈 Scale-in: ${homeAbbr} vs ${awayAbbr} TIE@${(tiePrice*100).toFixed(0)}¢ (score ${drawScoreKey} unchanged) — adding to existing position`);
               }
 
               // Draw-bet bankroll cap: max 40% deployed across all concurrent draw-bets.
@@ -4006,6 +4022,10 @@ async function checkLiveScoreEdges() {
               if (result.ok) {
                 stats.tradesPlaced++;
                 const deployed = qty * tiePrice;
+                // Record game entry for scale-in tracking — enables future
+                // entries on the same game when price drops further and score
+                // hasn't changed (the TOT-BRI compounding pattern).
+                recordGameEntry(gameBase, tiePrice, deployed, drawScoreKey);
                 logTrade({
                   exchange: 'kalshi', strategy: 'draw-bet',
                   ticker: tieMarket.ticker, title: tieMarket.title ?? `${homeAbbr} vs ${awayAbbr} TIE`,
