@@ -2735,6 +2735,57 @@ function logPaperTrade(entry) {
 // one shadow record per state-change to track outcome.
 const recentShadowKeys = new Map(); // key → ts
 
+// Build enriched shadow-context fields from available state (2026-04-27 expansion).
+// Adds dimensions the shadow tracker wasn't capturing — each one a candidate for
+// future pattern mining. All best-effort; missing data → null fields.
+//
+// Inputs (any may be null/undefined):
+//   priceData: cachedPrices entry with yes/no asks + yesBid/noBid (post-2026-04-27)
+//   gameDetail: ESPN status string ("8:59 - Q4", "Mid 7th", "82'", etc.)
+//   ticker: market ticker (used for last-seen-prices velocity lookup)
+//   side: 'yes' | 'no' for direction-aware velocity
+//
+// Returns object suitable for spread into the shadow record.
+function buildShadowContext({ priceData, gameDetail, ticker, side, decisionPrice }) {
+  const ctx = {
+    yesBid: null, yesAsk: null, spreadCents: null,
+    clockSeconds: null,
+    velocity60s: null, velocityDir: null,
+    etHour: etHour(),
+    dayOfWeek: ['sun','mon','tue','wed','thu','fri','sat'][etNow().getDay()],
+  };
+  // Bid/ask spread (liquidity proxy)
+  if (priceData) {
+    const ya = priceData.yes ?? 0;
+    const yb = priceData.yesBid ?? 0;
+    if (ya > 0) ctx.yesAsk = Math.round(ya * 1000) / 1000;
+    if (yb > 0) ctx.yesBid = Math.round(yb * 1000) / 1000;
+    if (ya > 0 && yb > 0) ctx.spreadCents = Math.round((ya - yb) * 100);
+  }
+  // Clock-seconds-remaining (time-pressure proxy) — parse "MM:SS" patterns
+  if (gameDetail) {
+    const m = String(gameDetail).match(/(\d{1,2}):(\d{2})/);
+    if (m) {
+      const mins = parseInt(m[1], 10), secs = parseInt(m[2], 10);
+      if (Number.isFinite(mins) && Number.isFinite(secs)) ctx.clockSeconds = mins * 60 + secs;
+    }
+  }
+  // Last-60s velocity (momentum proxy) from lastSeenPrices map
+  if (ticker) {
+    const lsp = lastSeenPrices.get(ticker);
+    if (lsp && Number.isFinite(lsp.price) && Number.isFinite(lsp.ts) && Number.isFinite(decisionPrice)) {
+      const elapsedMin = Math.max(1/60, (Date.now() - lsp.ts) / 60000);
+      if (elapsedMin <= 5) {
+        const yesMove = decisionPrice - lsp.price;
+        const moveTowardEntry = side === 'no' ? -yesMove : yesMove;
+        ctx.velocity60s = Math.round((Math.abs(yesMove) * 100) / elapsedMin * 10) / 10;
+        ctx.velocityDir = moveTowardEntry > 0.005 ? 'against' : moveTowardEntry < -0.005 ? 'aligned' : 'flat';
+      }
+    }
+  }
+  return ctx;
+}
+
 // Log a shadow Claude decision (every YES/NO from live-edge Sonnet) for calibration analysis.
 // These are NOT trades — purely data points to track Claude's confidence vs actual game outcome.
 // Settled via Kalshi market.result by settleShadowDecisions() — see Phase 2.
@@ -4411,8 +4462,12 @@ async function checkLiveScoreEdges() {
     for (const r of batchResults) {
       for (const m of (r.status === 'fulfilled' ? (r.value?.markets ?? []) : [])) {
         if (m.yes_ask_dollars && m.ticker) {
+          // Capture bid prices alongside ask so we can compute bid/ask spread
+          // for shadow logging — wide spreads correlate with mispricing.
           cachedPrices.set(m.ticker, {
             yes: parseFloat(m.yes_ask_dollars), no: parseFloat(m.no_ask_dollars ?? '0'),
+            yesBid: parseFloat(m.yes_bid_dollars ?? '0'),
+            noBid: parseFloat(m.no_bid_dollars ?? '0'),
             title: m.title ?? '', closeTime: m.close_time ?? '',
           });
         }
@@ -6000,6 +6055,13 @@ async function checkLiveScoreEdges() {
         // do downstream. Settlement reconciler (Phase 2) backfills outcome.
         const _shadowSport = league === 'mlb' ? 'MLB' : league === 'nba' ? 'NBA' : league === 'nhl' ? 'NHL'
           : ['mls','epl','laliga','seriea','bundesliga','ligue1'].includes(league) ? 'Soccer' : 'Other';
+        // Enriched shadow context (2026-04-27 expansion): bid/ask spread, clock,
+        // velocity, time-of-day, full reasoning structure. Each adds a dimension
+        // for future pattern mining. RLM context already present per-trade.
+        const _liveShadowCtx = buildShadowContext({
+          priceData: cachedPrices.get(ticker),
+          gameDetail, ticker, side: 'yes', decisionPrice: price,
+        });
         logShadowDecision({
           stage: 'live-edge',
           ticker,
@@ -6015,8 +6077,13 @@ async function checkLiveScoreEdges() {
           gameDetail,
           leadingAbbr,
           targetAbbr,
+          homeAbbr, awayAbbr,
+          liveStage: _qStage,
           reasoningPreview: (decision.reasoning ?? '').slice(0, 200),
+          reasoningStructured: decision.reasoningStructured ?? null,
           reasoningTags: decision.reasoningStructured?.reasoning_tags ?? null,
+          rlmContext: getLiveMoveContext(ticker, 'yes', price),
+          ..._liveShadowCtx,
         });
 
         if (!decision.trade) {
@@ -7480,9 +7547,17 @@ async function checkPreGamePredictions() {
         const _pgShadowPrice = decision.team
           ? (decision.team.toUpperCase() === market.team1.team.toUpperCase() ? market.team1.price : market.team2.price)
           : null;
+        // Pre-game shadow context — game hasn't started, so velocity/clock are
+        // mostly null. Bid/ask spread + time-of-day still informative.
+        const _pgShadowTicker = market.base + (decision.team ? '-' + decision.team.toUpperCase() : '');
+        const _pgShadowCtx = buildShadowContext({
+          priceData: null,
+          gameDetail: null, ticker: _pgShadowTicker, side: 'yes',
+          decisionPrice: _pgShadowPrice,
+        });
         logShadowDecision({
           stage: 'pre-game',
-          ticker: market.base + (decision.team ? '-' + decision.team.toUpperCase() : ''),
+          ticker: _pgShadowTicker,
           sport: _pgShadowSport,
           league: sport === 'NBA' ? 'nba' : sport === 'MLB' ? 'mlb' : sport === 'NHL' ? 'nhl' : (league || 'soccer'),
           decision: decision.trade ? 'trade' : 'no-trade',
@@ -7492,7 +7567,9 @@ async function checkPreGamePredictions() {
           edge: decision.confidence != null && _pgShadowPrice != null ? Math.round((decision.confidence - _pgShadowPrice) * 100) : null,
           targetAbbr: _pgShadowTarget,
           reasoningPreview: (decision.reasoning ?? '').slice(0, 200),
+          reasoningStructured: decision.reasoning_structured ?? null,
           reasoningTags: decision.reasoning_tags ?? null,
+          ..._pgShadowCtx,
         });
       } catch (e) { /* shadow logging best-effort, never block trade flow */ }
 
