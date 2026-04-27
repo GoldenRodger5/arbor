@@ -1600,6 +1600,58 @@ function registerClvCapture(tradeId, { ticker, side, entryPrice, gameStartMs, st
   clvTracking.set(tradeId, { ticker, side: (side ?? 'yes').toLowerCase(), entryPrice, gameStartMs, strategy: strategy ?? 'unknown', registeredAt: Date.now() });
 }
 
+// RLM (Reverse Line Movement) proxy — captures market-microstructure signals at
+// entry time for later validation against CLV. Pure telemetry; no behavior change.
+//
+// Why proxies (not real RLM): Kalshi public API doesn't expose volume-by-aggressor
+// or per-side ticket counts. We approximate sharp action via:
+//   1. Recent cross-confirmed contra velocity (existing `recentCrossContraMovers`)
+//   2. Direction of the recent move relative to our entry side (toward/against)
+//   3. Last-60s price velocity from `lastSeenPrices` (lightweight signal, available
+//      everywhere the bot makes a trade decision)
+//
+// Validation plan: tag on every entry, then 2-4 weeks of CLV data tells us whether
+// RLM-tagged trades have systematically higher CLV than untagged. If yes → promote
+// to confidence amplifier in next sprint. If no → kill the tag.
+function getLiveMoveContext(ticker, entrySide, entryPrice) {
+  const context = { recentCrash: null, last60s: null, directionRelativeToEntry: null };
+  // (1) Recent cross-confirmed contra-velocity crash
+  const cm = recentCrossContraMovers.get(ticker);
+  if (cm) {
+    const ageSec = (Date.now() - cm.when) / 1000;
+    if (ageSec <= 90 && cm.velocity >= 15) {
+      context.recentCrash = {
+        velocity: Math.round(cm.velocity * 10) / 10,
+        ageSec: Math.round(ageSec),
+        when: new Date(cm.when).toISOString(),
+      };
+    }
+  }
+  // (2) Last-60s velocity from price-tick map
+  const lsp = lastSeenPrices.get(ticker);
+  if (lsp && Number.isFinite(lsp.price) && Number.isFinite(lsp.ts)) {
+    const elapsedMin = Math.max(1/60, (Date.now() - lsp.ts) / 60000);
+    if (elapsedMin <= 5) {
+      // YES side: positive move = price went UP toward us. NO side: positive = price went DOWN.
+      const yesMove = lsp.price - entryPrice; // entry is current; lsp is previous tick
+      const moveTowardEntry = entrySide === 'no' ? -yesMove : yesMove;
+      const velocityCents = Math.round((Math.abs(yesMove) * 100) / elapsedMin * 10) / 10;
+      if (Math.abs(yesMove) >= 0.02) {
+        context.last60s = {
+          fromPrice: Math.round(lsp.price * 1000) / 1000,
+          toPrice: Math.round(entryPrice * 1000) / 1000,
+          velocityCentsPerMin: velocityCents,
+          ageSec: Math.round((Date.now() - lsp.ts) / 1000),
+        };
+        context.directionRelativeToEntry = moveTowardEntry > 0 ? 'against' // price moved AWAY from us → we paid more
+                                          : moveTowardEntry < 0 ? 'aligned' // price moved TOWARD us → we got better entry
+                                          : null;
+      }
+    }
+  }
+  return (context.recentCrash || context.last60s) ? context : null;
+}
+
 // Profit-locking ladder — Pinnacle/pro-grade incremental locking on volatile in-play
 // trades. Mechanical (no Claude consult) — captures volatility on partial size while
 // leaving room for the existing "hold when leading" upside on the remaining position.
@@ -6243,6 +6295,9 @@ async function checkLiveScoreEdges() {
               }
             }
           }
+          // RLM proxy: extends crash context with direction relative to entry +
+          // last-60s velocity. Pure telemetry — validated against CLV in 2-4 weeks.
+          const rlmContext = getLiveMoveContext(ticker, 'yes', bestPrice);
           logTrade({
             exchange: best.platform,
             strategy: item._structuralDecision ? `structural-${item._structuralDecision._structuralPattern}` : isThesisVindicated ? 'thesis-reentry' : isSwingMode ? 'live-swing' : hcCheck.isHighConv ? 'high-conviction' : 'live-prediction',
@@ -6265,6 +6320,7 @@ async function checkLiveScoreEdges() {
             weAtEntry,                          // WE table's prediction for this team (null if no table entry)
             isLeadingTeam: isLeadingTeamTarget, // true = betting leader, false = betting underdog
             recentCrashContext,                  // null or {velocity, ageSec, when} — see WAITLIST.md
+            rlmContext,                          // null or {recentCrash, last60s, directionRelativeToEntry} — RLM proxy telemetry
           });
           if (recentCrashContext) {
             console.log(`[live-edge] 🏷️ TAGGED recent-crash entry: ${ticker} bought ${recentCrashContext.ageSec}s after ${recentCrashContext.velocity}¢/min crash`);
@@ -8210,6 +8266,7 @@ Respond in EXACTLY this JSON:
                 : null,
               pgBaseline: pgTargetBaseline,
               sport: pgSportKey,
+              rlmContext: getLiveMoveContext(matchedSide.ticker, 'yes', price),
             });
             // Mirror to paper-trades.jsonl so conflict detector and pg-guard find it
             logPaperTrade({
