@@ -552,6 +552,55 @@ function detectNbaQ4ColdShooting({ league, period, gameDetail, diff, leadingFGNu
     _matchInfo: { fgGap, minsLeft, edge: edge * 100, diff },
   };
 }
+
+// Soccer 2H home-leader (early second half): 100% WR (5/5) historical pattern.
+// Examples: FUL@AVL halftime entry (won), WHU@EVE pattern, MTL@NYC halftime.
+// The pattern: home team leading by 1+ goals at start of second half (minute 45-65)
+// in a major European league. Captures the "home crowd + half-time tactical reset
+// favors leader" dynamic that the WE table partially misses for 1-goal margins.
+//
+// Excludes MLS (mixed historical, small sample) and minute > 65 (draw cliff
+// approaching, EPL/LaLiga 70-min hard exit kicks in soon — better to enter earlier).
+// Excludes away leaders (ATH/ATM 4/25 was the away-leader counter-example, lost).
+function detectSoccerHomeHTLeader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr, homeAbbr }) {
+  const europeanLeagues = ['epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'];
+  if (!europeanLeagues.includes(league)) return null;
+  if (period !== 2) return null; // 2nd half (includes HT)
+  if (targetAbbr !== leadingAbbr) return null; // leader only
+  if (targetAbbr !== homeAbbr) return null;     // HOME leader only — away pattern (ATH 4/25) failed
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 1) return null;
+
+  const m = (gameDetail || '').match(/^(\d+)/);
+  if (!m) return null;
+  const minute = parseInt(m[1], 10);
+  if (minute < 45 || minute > 65) return null; // early 2H window only
+
+  const edge = weTimeAdj - price;
+  if (edge < 0.05) return null;
+
+  return {
+    trade: true,
+    side: 'yes',
+    confidence: weTimeAdj,
+    betAmount: null,
+    reasoning: {
+      steel_man: `Trailing team has ~${Math.max(0, 90 - minute)} minutes to mount a comeback against home opponent`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (Soccer 2H home-leader, historical 100% WR n=5): ${targetAbbr} home, leading by ${diff} at minute ${minute}', WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge — home-crowd + tactical-reset dynamic the WE table partially misses.`,
+      key_facts: [
+        `Minute ${minute}', home team ${targetAbbr} leading by ${diff} goal${diff === 1 ? '' : 's'}`,
+        `Time-adjusted WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ (${(edge*100).toFixed(0)}pt edge)`,
+        `Pattern: European-league home-leader 2H (FUL, WHU, MTL — all wins)`,
+      ],
+      top_risk: 'Late equalizer or comeback — a draw loses the WIN contract',
+      conviction: 'Structural pattern match — 5/5 historical on home-leader 2H European',
+      reasoning_tags: ['playoff-home-fav', 'we-undervalued', 'home-court'],
+    },
+    _structuralPattern: 'soccer-2h-home-leader',
+    _matchInfo: { minute, diff, edge: edge * 100 },
+  };
+}
 const CLAUDE_SCREENER = 'claude-haiku-4-5-20251001';  // Cheap screening — $0.002/call
 const CLAUDE_DECIDER = 'claude-sonnet-4-6';            // Expensive analysis — only on candidates
 // MAX_POSITIONS and deployment limits are DYNAMIC — see getMaxPositions() and getMaxDeployment()
@@ -4942,20 +4991,29 @@ async function checkLiveScoreEdges() {
           : league === 'nba' ? (period <= 2 ? 'early' : period === 3 ? 'mid' : 'late')
           : league === 'nhl' ? (period === 1 ? 'early' : period === 2 ? 'mid' : 'late')
           : (period === 1 ? 'early' : 'late');
-        // STRUCTURAL DETECTOR: NBA Q4 cold-shooting (88% WR historical pattern).
-        // If the current game state matches the historical winning pattern, build a
-        // synthetic decision and skip Sonnet entirely — saves ~$0.30/call and reacts
-        // faster than waiting for Sonnet's ~3s response. Bot will Kelly-size based on
-        // confidence; structural matches are inherently lower-conviction than Sonnet
-        // reads (no qualitative quality check) so position sizing should reflect that.
-        const _structuralDecision = detectNbaQ4ColdShooting({
+        // STRUCTURAL DETECTORS: pattern recognizers for historically-profitable cells.
+        // Each detector returns null or a synthetic decision; first match wins. Bypasses
+        // Sonnet entirely — saves ~$0.30/call and reacts faster. Bot Kelly-sizes from
+        // the confidence in the synthetic decision; existing margin/risk gates still apply.
+        let _structuralDecision = detectNbaQ4ColdShooting({
           league, period, gameDetail, diff,
           leadingFGNum, trailingFGNum,
           weTimeAdj: _weTimeAdj, price,
           targetAbbr, leadingAbbr,
         });
+        if (!_structuralDecision) {
+          _structuralDecision = detectSoccerHomeHTLeader({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price,
+            targetAbbr, leadingAbbr, homeAbbr,
+          });
+        }
         if (_structuralDecision) {
-          console.log(`[live-edge] 🎯 STRUCTURAL DETECTOR matched (${_structuralDecision._structuralPattern}): ${targetAbbr} — ${_structuralDecision._matchInfo.fgGap.toFixed(0)}pt FG gap, ${_structuralDecision._matchInfo.minsLeft.toFixed(1)}min, ${_structuralDecision._matchInfo.edge.toFixed(0)}pt edge, conf=${(_structuralDecision.confidence*100).toFixed(0)}% — skipping Sonnet`);
+          const info = _structuralDecision._matchInfo;
+          const summary = _structuralDecision._structuralPattern === 'nba-q4-cold-shooting'
+            ? `${info.fgGap.toFixed(0)}pt FG gap, ${info.minsLeft.toFixed(1)}min, ${info.edge.toFixed(0)}pt edge`
+            : `min ${info.minute}', lead ${info.diff}, ${info.edge.toFixed(0)}pt edge`;
+          console.log(`[live-edge] 🎯 STRUCTURAL DETECTOR matched (${_structuralDecision._structuralPattern}): ${targetAbbr} — ${summary}, conf=${(_structuralDecision.confidence*100).toFixed(0)}% — skipping Sonnet`);
         }
 
         // Two-block prompt with cached static prefix. The prefix (~1500 tokens of
@@ -5451,7 +5509,7 @@ async function checkLiveScoreEdges() {
           }
           logTrade({
             exchange: best.platform,
-            strategy: item._structuralDecision ? 'nba-q4-structural' : isThesisVindicated ? 'thesis-reentry' : isSwingMode ? 'live-swing' : hcCheck.isHighConv ? 'high-conviction' : 'live-prediction',
+            strategy: item._structuralDecision ? `structural-${item._structuralDecision._structuralPattern}` : isThesisVindicated ? 'thesis-reentry' : isSwingMode ? 'live-swing' : hcCheck.isHighConv ? 'high-conviction' : 'live-prediction',
             ticker: best.platform === 'polymarket' ? best.slug : ticker,
             title, side: 'yes',
             quantity: actualFill, entryPrice: bestPrice, deployCost: actualDeployed,
