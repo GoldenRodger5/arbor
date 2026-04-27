@@ -3815,16 +3815,23 @@ async function checkLiveScoreEdges() {
         let drawProb = 0;
         if (homeScore === 0 && awayScore === 0) {
           // 0-0: neither team has shown scoring ability — safer draw profile
+          // 2026-04-27 expansion: enable 60-64' window at 60% draw prob to fire on
+          // more matches. Draw-bet historical 71% WR / +$28/trade — proven highest-
+          // ROI strategy underutilized in current rate. Earlier window adds 4-5 min
+          // of opportunity per game.
           if (effectiveMin >= 80) drawProb = 0.88;
           else if (effectiveMin >= 75) drawProb = 0.85;
           else if (effectiveMin >= 70) drawProb = 0.78;
           else if (effectiveMin >= 65) drawProb = 0.70;
+          else if (effectiveMin >= 60) drawProb = 0.60; // NEW: capture 60-64' setups
           else drawProb = 0;
         } else {
-          // 1-1, 2-2 etc: both teams CAN score — don't enter before 70'
+          // 1-1, 2-2 etc: both teams CAN score — don't enter before 65'
+          // 2026-04-27 expansion: enable 65-69' window at 62% draw prob.
           if (effectiveMin >= 80) drawProb = 0.84;
           else if (effectiveMin >= 75) drawProb = 0.80;
           else if (effectiveMin >= 70) drawProb = 0.72;
+          else if (effectiveMin >= 65) drawProb = 0.62; // NEW: capture 65-69' tied-game setups
           else drawProb = 0;
         }
         if (drawProb > 0) drawProb = Math.max(0, drawProb + drawAdj);
@@ -4121,6 +4128,21 @@ async function checkLiveScoreEdges() {
     // SJ (bottom team) won tonight with a 1-goal P3 lead. The baseline WE is real.
     // Bad teams DO protect leads 79% of the time (P3 1-goal). Let Claude assess
     // with full context instead of auto-blocking. Win rate is now a prompt adjustment.
+
+    // 2026-04-27 audit: hard-cap simultaneous live-prediction positions at small
+    // bankrolls. Live trades have correlated bad days (multiple games moving
+    // against us in the same window) — capping reduces variance and protects
+    // bankroll. Doesn't apply to pre-game/draw-bet/structural which have
+    // different risk profiles. Tag passes through swing mode too.
+    {
+      const liveStrategies = ['live-prediction', 'high-conviction', 'thesis-reentry'];
+      const openLivePredCount = openPositions.filter(p => liveStrategies.includes(p.strategy)).length;
+      const liveCap = getBankroll() < 500 ? 3 : getBankroll() < 2000 ? 5 : 8;
+      if (openLivePredCount >= liveCap) {
+        console.log(`[live-edge] BLOCKED ${targetAbbr}: ${openLivePredCount} live-prediction positions open, cap ${liveCap} for $${getBankroll().toFixed(0)} bankroll — variance protection`);
+        continue;
+      }
+    }
 
     // SWING MODE: max 3 concurrent swing trades (raised from 2)
     if (isSwingMode) {
