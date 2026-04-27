@@ -194,13 +194,25 @@ function getCALExitThresholds(sport, isPlayoff, defaults, strategy) {
 
 /** Tier 2: Per-sport Kelly fraction (0.25–0.50). Returns 0.50 if uncalibrated.
  *  Post-drawdown haircut: after a circuit-breaker trip, halve Kelly for 72h to
- *  reduce variance during recovery (anti-martingale). */
+ *  reduce variance during recovery (anti-martingale).
+ *  CLV haircut: if 7-day CLV is materially negative (below −1¢ with n≥30), halve
+ *  Kelly. CLV is the truth-meter for edge — sustained negative CLV means we're
+ *  systematically getting worse prices than the close, even if WR looks OK. */
 function getKellyFraction(sport) {
   const f = CAL.kellyFraction?.[sport?.toLowerCase?.()];
   let base = (typeof f === 'number' && f > 0 && f <= 0.50) ? f : 0.50;
   if (typeof kellyHaircutUntilMs === 'number' && kellyHaircutUntilMs > Date.now()) {
     base *= 0.5;
   }
+  // CLV-based haircut — only fires once we have enough data (n≥30) to be confident
+  try {
+    if (typeof getClvStats === 'function') {
+      const clv7 = getClvStats({ days: 7 });
+      if (clv7?.all && clv7.all.n >= 30 && clv7.all.avgClv < -0.01) {
+        base *= 0.5;
+      }
+    }
+  } catch { /* CLV haircut is best-effort */ }
   return base;
 }
 
