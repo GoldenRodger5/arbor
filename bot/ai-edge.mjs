@@ -1588,6 +1588,43 @@ function registerClvCapture(tradeId, { ticker, side, entryPrice, gameStartMs, st
   clvTracking.set(tradeId, { ticker, side: (side ?? 'yes').toLowerCase(), entryPrice, gameStartMs, strategy: strategy ?? 'unknown', registeredAt: Date.now() });
 }
 
+// Profit-locking ladder — Pinnacle/pro-grade incremental locking on volatile in-play
+// trades. Mechanical (no Claude consult) — captures volatility on partial size while
+// leaving room for the existing "hold when leading" upside on the remaining position.
+//
+// Tier 1 (+15¢ profit/contract): lock 1/3 of remaining qty
+// Tier 2 (+25¢ profit/contract): lock another 1/2 of remaining (= ~1/3 of original)
+// Tier 3 (NBA Q4 final 2:00 + price ≥85¢): GAMMA OVERRIDE — exit remainder.
+//   At 85¢+ with 2min left, one possession swings 15¢ — gamma risk dominates
+//   remaining 15¢ of edge. Research-backed (Pinnacle live-betting practice).
+//
+// Eligible strategies: live-prediction, pre-game-edge-first, structural-*. Other
+// strategies have their own exit logic (live-swing +12¢, draw-bet binary cliff,
+// pre-game-prediction holdToSettle, high-conviction Claude-gated).
+function getLadderState(trade, profitPerContract, currentPrice, league, ctx) {
+  const strat = trade.strategy ?? '';
+  const eligible = strat === 'live-prediction'
+    || strat === 'pre-game-edge-first'
+    || strat.startsWith('structural-');
+  if (!eligible) return null;
+  const tiersDone = trade.ladderTiersDone ?? 0;
+  // Tier 3 — NBA Q4 gamma override. Fires regardless of tiersDone if conditions hit.
+  if (league === 'nba'
+      && ctx?.period === 4
+      && Number.isFinite(ctx?.clockSeconds) && ctx.clockSeconds <= 120
+      && currentPrice >= 0.85
+      && profitPerContract > 0) {
+    return { fire: true, tier: 3, fraction: 1.0, label: 'NBA-Q4-gamma' };
+  }
+  if (tiersDone === 0 && profitPerContract >= 0.15) {
+    return { fire: true, tier: 1, fraction: 1/3, label: 'tier-1-+15c' };
+  }
+  if (tiersDone === 1 && profitPerContract >= 0.25) {
+    return { fire: true, tier: 2, fraction: 1/2, label: 'tier-2-+25c' };
+  }
+  return null;
+}
+
 // Apply MFE fields from the tracker to a trade object (and an optional persisted
 // JSONL record). Idempotent and safe on missing tracker entries (no-op).
 function applyMFE(trade, persistedRecord = null) {
@@ -8987,6 +9024,14 @@ async function getGameContext(trade) {
       const period = parseInt(comp.status?.period ?? '0');
       const state = comp.status?.type?.state ?? '';
       const detail = comp.status?.type?.shortDetail ?? '';
+      // displayClock format: "MM:SS" (e.g., "8:59"). Used by ladder gamma override
+      // to detect NBA Q4 final 2:00 — a price-vs-edge regime change point.
+      let clockSeconds = null;
+      const clockStr = comp.status?.displayClock;
+      if (typeof clockStr === 'string' && /^\d+:\d+$/.test(clockStr)) {
+        const [m, s] = clockStr.split(':').map(n => parseInt(n, 10));
+        if (Number.isFinite(m) && Number.isFinite(s)) clockSeconds = m * 60 + s;
+      }
       const home = comp.competitors?.find(c => c.homeAway === 'home');
       const away = comp.competitors?.find(c => c.homeAway === 'away');
 
@@ -9016,7 +9061,7 @@ async function getGameContext(trade) {
         if (sit.pitcher?.athlete?.displayName) situationStr += ` | Pitching: ${sit.pitcher.athlete.displayName} (${sit.pitcher.summary ?? ''})`;
       }
 
-      return { league, stage, period, state, detail: situationStr, homeScore, awayScore, diff, baselineWE, leading: leading?.team?.abbreviation };
+      return { league, stage, period, state, detail: situationStr, homeScore, awayScore, diff, baselineWE, leading: leading?.team?.abbreviation, clockSeconds };
     }
   } catch { /* skip */ }
   return null;
@@ -9219,6 +9264,49 @@ async function managePositions() {
             const result = await executeSell(trade, qty, currentPrice, 'contra-line-move');
             if (result) anyUpdated = true;
             continue;
+          }
+        }
+
+        // PROFIT-LOCKING LADDER — incremental mechanical locks on volatile in-play
+        // trades (live-prediction / pre-game-edge-first / structural-*). Fires BEFORE
+        // safety nets so partial profits get captured on swings without preventing
+        // the existing "hold when leading" upside on the remainder.
+        {
+          const ladder = getLadderState(trade, profitPerContract, currentPrice, league, ctx);
+          if (ladder?.fire) {
+            const sellQty = ladder.fraction >= 1.0 ? qty : Math.max(1, Math.floor(qty * ladder.fraction));
+            if (sellQty >= 1 && sellQty <= qty) {
+              const reasonTag = `ladder-${ladder.label}`;
+              const profitDollars = sellQty * profitPerContract;
+              console.log(`[ladder] 🪜 ${ladder.label}: ${trade.ticker} +${(profitPerContract*100).toFixed(0)}¢ — locking ${sellQty}/${qty} contracts @ ${(currentPrice*100).toFixed(0)}¢ (+$${profitDollars.toFixed(2)})`);
+              const result = await executeSell(trade, sellQty, currentPrice, reasonTag);
+              if (result) {
+                anyUpdated = true;
+                // Persist tier counter — full exit (tier 3) is handled by executeSell's
+                // sold-status path, but tiers 1-2 leave the trade open with reduced qty.
+                if (ladder.tier < 3) {
+                  trade.ladderTiersDone = ladder.tier;
+                  try {
+                    const lLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+                    const lTrades = lLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+                    const lTrade = lTrades.find(t => t.id === trade.id);
+                    if (lTrade) {
+                      lTrade.ladderTiersDone = ladder.tier;
+                      writeFileSync(TRADES_LOG, lTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
+                    }
+                  } catch (e) { console.error(`[ladder] Failed to persist tier for ${trade.ticker}:`, e.message); }
+                }
+                await tg(
+                  `🪜 <b>LADDER LOCK — ${ladder.label.toUpperCase()}</b>\n\n` +
+                  `${trade.title}\n` +
+                  `Entry ${Math.round(entryPrice*100)}¢ → ${Math.round(currentPrice*100)}¢ (+${(profitPerContract*100).toFixed(0)}¢)\n` +
+                  `Sold ${sellQty}/${qty} contracts (locked <b>+$${profitDollars.toFixed(2)}</b>)\n` +
+                  (ladder.tier < 3 ? `Remaining ${qty - sellQty} ride to next tier${ladder.tier === 1 ? ' (+25¢)' : ' / settlement'}` : `Full exit — gamma override`) + '\n\n' +
+                  dailyFooter()
+                );
+              }
+              continue;
+            }
           }
         }
 
