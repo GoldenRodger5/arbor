@@ -5164,6 +5164,31 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
+        // 2026-04-27 audit: MLB live-prediction inning 9 has 0/4 historical (-$27.52).
+        // Closer-vs-trailing variance is too high; even 2-3 run leads can flip on a single
+        // inning. The 1-run block above catches some but inning 9 with any lead size has
+        // been a net loser. Block all inning 9 live-prediction entries (swing mode allowed
+        // since it has its own +12¢ exit logic that doesn't depend on settlement).
+        if (!isSwingMode && league === 'mlb' && period === 9 && targetAbbr === leadingAbbr) {
+          console.log(`[live-edge] BLOCKED ${targetAbbr}: MLB inning 9 live-prediction — 0/4 historical, all losses. Closer/trailing-team variance too high.`);
+          logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-9th', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `MLB live-prediction inning 9 historical: 0/4, -$27.52. Blocked.` });
+          continue;
+        }
+
+        // 2026-04-27 audit: MLB inning 7 live-prediction is 25% WR over n=8, -$45 net. Not
+        // as terrible as inning 9 but materially negative. Tighten: require both stronger
+        // edge AND higher confidence to enter MLB 7th inning. The remaining trades passing
+        // this gate are the highest-conviction ones where we still want to participate.
+        if (!isSwingMode && league === 'mlb' && period === 7 && targetAbbr === leadingAbbr) {
+          const edge7 = (decision.confidence ?? 0) - price;
+          const conf7 = decision.confidence ?? 0;
+          if (edge7 < 0.12 || conf7 < 0.80) {
+            console.log(`[live-edge] BLOCKED ${targetAbbr}: MLB inning 7 live-prediction requires edge≥12pt AND conf≥80% (got edge=${(edge7*100).toFixed(0)}pt conf=${(conf7*100).toFixed(0)}%) — historical 25% WR over 8 trades, tightening`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-7th-thin', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `MLB inning 7 live-prediction needs edge≥12pt AND conf≥80% — 25% WR / -$45 historical at lower thresholds.` });
+            continue;
+          }
+        }
+
         // Swing mode: entry price must be ≤65¢ and confidence ≥68%
         if (isSwingMode) {
           if (price > 0.65) {
@@ -6867,16 +6892,18 @@ async function checkPreGamePredictions() {
     const _hasEdgeSource = /\b(scratch|injury list|day[- ]to[- ]day|doubtful|questionable|ruled out|out (with|for|today|the game)|bullpen game|opener|weather|wind|rain|snow|rookie (debut|start)|recalled|suspended|late scratch|\bil\b|15[- ]?day|10[- ]?day|concussion|illness|flu|covid|personal leave|bereavement|paternity|load management)\b/i.test(_reasonForSource);
     const _edgeSourceRequired = pgSportKey === 'mlb';
     // MLB pre-game edge-first FROZEN 2026-04-23: went 1-5 (−$27.54) on 2026-04-22.
-    // Re-enable after rewriting qualification rules. Other sports keep the tier.
-    const MLB_PREGAME_EDGE_FIRST_FROZEN = true;
+    // 2026-04-27 audit: extended to ALL sports. Total record across all sports: 2W/8L,
+    // -$34.49. Non-MLB record: 0W/3L (NBA/NHL/MLS combined). Pre-game-edge-first as a
+    // tier has not been profitable in any sport. Freeze entirely until rewritten.
+    const PREGAME_EDGE_FIRST_FROZEN_ALL = true;
     const isEdgeFirst = confidence >= 0.58 &&
                         _edgeAbs >= _edgeFirstFloor &&
                         price <= 0.55 &&
                         confidence < PRE_GAME_MIN_CONF && // only triggers when standard gate would reject on conf
                         (!_edgeSourceRequired || _hasEdgeSource) &&
-                        !(MLB_PREGAME_EDGE_FIRST_FROZEN && pgSportKey === 'mlb');
-    if (pgSportKey === 'mlb' && MLB_PREGAME_EDGE_FIRST_FROZEN && confidence >= 0.58 && _edgeAbs >= _edgeFirstFloor && price <= 0.55 && confidence < PRE_GAME_MIN_CONF) {
-      console.log(`[pre-game] 🧊 MLB edge-first FROZEN: ${market.base} would qualify (conf=${(confidence*100).toFixed(0)}%, edge=${(_edgeAbs*100).toFixed(0)}pt, price=${(price*100).toFixed(0)}¢) — tier paused after 1-5 yesterday`);
+                        !PREGAME_EDGE_FIRST_FROZEN_ALL;
+    if (PREGAME_EDGE_FIRST_FROZEN_ALL && confidence >= 0.58 && _edgeAbs >= _edgeFirstFloor && price <= 0.55 && confidence < PRE_GAME_MIN_CONF) {
+      console.log(`[pre-game] 🧊 edge-first FROZEN (ALL sports): ${market.base} would qualify (conf=${(confidence*100).toFixed(0)}%, edge=${(_edgeAbs*100).toFixed(0)}pt, price=${(price*100).toFixed(0)}¢) — tier paused after 2W/8L total`);
     } else if (pgSportKey === 'mlb' && confidence >= 0.58 && _edgeAbs >= _edgeFirstFloor && price <= 0.55 && confidence < PRE_GAME_MIN_CONF && !_hasEdgeSource) {
       console.log(`[pre-game] ❌ MLB edge-first rejected for ${market.base}: no cited edge source (injury/weather/starter-change/bullpen-game) in reasoning`);
     }
@@ -6896,6 +6923,15 @@ async function checkPreGamePredictions() {
 
     // Duplicate guard — one bet per game per day (survives restarts via JSONL)
     if (preGameBetGames.has(market.base)) { console.log(`[pre-game] Already bet ${market.base} today`); continue; }
+
+    // 2026-04-27 audit: MLB pre-game-prediction at 45-49¢ entry has 33% WR over n=9,
+    // -$54 net. Mid-priced underdog dead-zone — these are the trades where neither side
+    // is a clear favorite and the market is correctly uncertain. Block this band entirely.
+    // Sub-45¢ has 50% WR +$55 (extreme underdog with cited catalyst). 50¢+ is OK.
+    if (pgSportKey === 'mlb' && price >= 0.45 && price < 0.50) {
+      console.log(`[pre-game] BLOCKED ${market.base}: MLB pre-game 45-49¢ entry — historical 33% WR over 9 trades, -$54 net. Mid-priced underdog dead-zone.`);
+      continue;
+    }
     if (existsSync(PAPER_TRADES_LOG)) {
       const paperLines = readFileSync(PAPER_TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
       // Fix: compare using ET date (tsToEtDate) not UTC date string — trades at 10pm ET have next-day UTC timestamps
@@ -10111,14 +10147,38 @@ async function checkSettlements() {
           const icon = trade.realizedPnL >= 0 ? '✅' : '❌';
           console.log(`[pnl] SETTLED (closed-manual, revenue-based): ${trade.ticker} → ${settlement.market_result} | P&L: ${icon} $${trade.realizedPnL.toFixed(2)}`);
         } else {
-          trade.status = 'needs-reconcile';
-          trade.settledAt = settlement.settled_time ?? new Date().toISOString();
-          trade.result = settlement.market_result;
-          trade.gameOutcome = won ? 'correct' : 'incorrect';
-          trade.gameResult = settlement.market_result;
-          applyMFE(trade);
-          updated = true;
-          console.log(`[pnl] needs-reconcile: ${trade.ticker} closed-manual with null PnL and no revenue — skipping phantom full-loss overwrite`);
+          // BACKSTOP: Kalshi /portfolio/fills returned nothing (rare but observed —
+          // MIN DENMIN 2026-04-25 stuck in needs-reconcile until manual backfill).
+          // We have the game outcome and our recorded buy size. Compute P&L from
+          // (qty × exitPrice) − deployCost. This is reliable when the position was
+          // held to settlement (no mid-game sells we'd miss). For trades that had
+          // partial sells before settlement, partialProfitTaken would be set and
+          // we'd have hit the partial-take branch above, not here.
+          const qty2 = trade.quantity ?? Math.round((trade.deployCost ?? 0) / (trade.entryPrice || 1));
+          const deploy2 = trade.deployCost ?? 0;
+          if (qty2 > 0 && deploy2 > 0) {
+            const computedPnl = qty2 * exitPrice - deploy2;
+            trade.status = 'settled';
+            trade.exitPrice = exitPrice;
+            trade.realizedPnL = Math.round(computedPnl * 100) / 100;
+            trade.settledAt = settlement.settled_time ?? new Date().toISOString();
+            trade.result = settlement.market_result;
+            trade.gameOutcome = won ? 'correct' : 'incorrect';
+            trade.gameResult = settlement.market_result;
+            applyMFE(trade);
+            updated = true;
+            const icon = trade.realizedPnL >= 0 ? '✅' : '❌';
+            console.log(`[pnl] SETTLED (closed-manual, qty-based backstop): ${trade.ticker} → ${settlement.market_result} | P&L: ${icon} $${trade.realizedPnL.toFixed(2)}`);
+          } else {
+            trade.status = 'needs-reconcile';
+            trade.settledAt = settlement.settled_time ?? new Date().toISOString();
+            trade.result = settlement.market_result;
+            trade.gameOutcome = won ? 'correct' : 'incorrect';
+            trade.gameResult = settlement.market_result;
+            applyMFE(trade);
+            updated = true;
+            console.log(`[pnl] needs-reconcile: ${trade.ticker} closed-manual with null PnL, no revenue, no usable qty/deploy — manual review needed`);
+          }
         }
         continue;
       }
