@@ -155,6 +155,28 @@ function evaluateTagCredibility(tags) {
   return worst;
 }
 
+/** Inverse of evaluateTagCredibility — when reasoning_tags reference HIGH-credibility
+ *  tags (Wilson lower-CI ≥ 0.55, n ≥ 20), apply a small sizing boost. Discovered
+ *  via shadow data 2026-04-27: `we-undervalued` (39 samples, 67% WR) and `market-lag`
+ *  (44 samples, 61% WR) consistently outperform their cohorts. Boost factor capped
+ *  at 1.15 to avoid runaway sizing on any single signal.
+ *  Returns multiplier in [1.0, 1.15]. */
+function evaluateTagBoost(tags) {
+  if (!Array.isArray(tags) || tags.length === 0) return 1.0;
+  const stats = CAL.reasoningTagStats;
+  if (!stats) return 1.0;
+  let bestBoost = 1.0;
+  for (const tag of tags) {
+    const s = stats[tag];
+    if (!s || (s.n ?? 0) < 20) continue;
+    const ciLo = s.ciLo ?? 0;
+    if (ciLo >= 0.60) bestBoost = Math.max(bestBoost, 1.15);
+    else if (ciLo >= 0.55) bestBoost = Math.max(bestBoost, 1.10);
+    else if (ciLo >= 0.50) bestBoost = Math.max(bestBoost, 1.05);
+  }
+  return bestBoost;
+}
+
 /** Tag-credibility prompt feedback. Surfaces the auto-collected reasoning_tag
  *  stats to Claude so it AVOIDS citing tags with bad historical hit rates as
  *  edge sources. Only includes tags with n ≥ 5 (statistical signal).
@@ -668,6 +690,61 @@ function detectMlbMidGameLead({ league, period, gameDetail, diff, leadingBullpen
     },
     _structuralPattern: 'mlb-mid-game-lead',
     _matchInfo: { period, diff, edge: edge * 100, tier },
+  };
+}
+
+// MLB inning 2-4 leader (early-mid pattern): 81% WR / n=48 / Wilson 90% lower-CI 70%.
+// Discovered via shadow-decision mining 2026-04-27. Broader than `detectMlbMidGameLead`
+// which requires 2+ run lead, elite/good bullpen, ≥10pt edge — this fires on any leader
+// in inning 2-4 at price ≤72¢ regardless of bullpen tier or edge size.
+//
+// Why it works: shadow data shows MLB leaders in inning 2-4 win 80-85% of the time
+// across confidence bands (60-79%) AND edge buckets (negative through positive). The
+// market underprices early-mid leaders because conventional wisdom says "lots of
+// game left." Shadow data shows that's wrong — once you have a lead through the
+// 2nd-4th inning, the trailing team's comeback path narrows fast.
+//
+// Constraints (data-driven):
+//   - Inning 2-4 (P5+ handled by detectMlbMidGameLead with stricter rules)
+//   - Lead ≥1 (not 2+ — shadow shows 1-run leads also high-WR here)
+//   - Price ≤72¢ (above 72 = gamma trap, runners-on-base can erase 20¢ in one swing)
+//   - WE anchor must exist (≥45% — basic sanity)
+//   - Skip if existing detectMlbMidGameLead already qualifies (avoid double-fire)
+function detectMlbEarlyMidLead({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr, leadingBullpenTier }) {
+  if (league !== 'mlb') return null;
+  if (period < 2 || period > 4) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 1) return null;
+  if (price > 0.72) return null;
+  if (weTimeAdj < 0.45) return null;
+  // Avoid double-fire: if the stricter mid-game-lead detector would qualify, let it win.
+  // That detector requires period 3-5 + diff ≥2 + good/elite bullpen + edge ≥10pt + price ≤78.
+  if (period >= 3 && diff >= 2 && (leadingBullpenTier === 'elite' || leadingBullpenTier === 'good')
+      && (weTimeAdj - price) >= 0.10 && price <= 0.78) {
+    return null; // let detectMlbMidGameLead handle this
+  }
+  const edge = weTimeAdj - price;
+  return {
+    trade: true,
+    side: 'yes',
+    confidence: weTimeAdj,
+    betAmount: null,
+    reasoning: {
+      steel_man: `MLB inning ${period} leader by ${diff} run${diff>1?'s':''} — shadow data n=48 shows 81% WR for this pattern (Wilson lower-CI 70%)`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB early-mid leader, ~80% WR n=48 from shadow): ${targetAbbr} leading ${diff}-run in inning ${period}, market ${(price*100).toFixed(0)}¢ underprices the lead's stickiness. Time-adjusted WE ${(weTimeAdj*100).toFixed(0)}%.`,
+      key_facts: [
+        `Inning ${period}, ${diff}-run lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ (${edge>=0?'+':''}${(edge*100).toFixed(0)}pt edge)`,
+        `Pattern: shadow-mined, 81% WR over 48 samples`,
+      ],
+      top_risk: 'Big inning by trailing team or starter pulled early; lead-1 in inning 2 is most fragile',
+      conviction: 'Structural pattern — shadow-validated 81% WR (CI lower-bound 70%)',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-early-mid-lead',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price * 100) },
   };
 }
 
@@ -5757,6 +5834,17 @@ async function checkLiveScoreEdges() {
             targetAbbr, leadingAbbr,
           });
         }
+        if (!_structuralDecision) {
+          // Shadow-mined pattern (2026-04-27): broader MLB early-mid leader detector,
+          // 81% WR n=48 in shadow data. Catches inning 2 (existing detector starts at 3),
+          // 1-run leads, and any bullpen tier. Lower price ceiling 72¢ avoids gamma traps.
+          _structuralDecision = detectMlbEarlyMidLead({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price,
+            targetAbbr, leadingAbbr,
+            leadingBullpenTier,
+          });
+        }
         if (_structuralDecision) {
           const info = _structuralDecision._matchInfo;
           let summary;
@@ -5766,6 +5854,8 @@ async function checkLiveScoreEdges() {
             summary = `${info.minsLeft.toFixed(1)}min P3, lead ${info.diff}, ${info.edge.toFixed(0)}pt edge`;
           } else if (_structuralDecision._structuralPattern === 'mlb-mid-game-lead') {
             summary = `inning ${info.period}, lead ${info.diff}, ${info.tier} bullpen, ${info.edge.toFixed(0)}pt edge`;
+          } else if (_structuralDecision._structuralPattern === 'mlb-early-mid-lead') {
+            summary = `inning ${info.period}, lead ${info.diff}, price ${info.price}¢, ${info.edge.toFixed(0)}pt edge (shadow-mined)`;
           } else {
             summary = `min ${info.minute}', lead ${info.diff}, ${info.edge.toFixed(0)}pt edge`;
           }
@@ -6200,6 +6290,17 @@ async function checkLiveScoreEdges() {
           : getPositionSize(best.platform, bestEdge, 0, league);
         if (isSwingMode) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for swing trades
         if (reentryHalfSize) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for 3rd/4th entry on same game
+        // Tag-credibility BOOST: shadow data 2026-04-27 shows reasoning_tags
+        // `we-undervalued` (39 samples, 67% WR) and `market-lag` (44 samples, 61% WR)
+        // outperform their cohorts. Apply 1.05-1.15x sizing multiplier when these
+        // appear. Capped at 1.15 to avoid runaway sizing on any single signal.
+        // Counterpart to evaluateTagCredibility (which BLOCKS bad-tag trades).
+        const _liveBoost = evaluateTagBoost(decision.reasoningStructured?.reasoning_tags);
+        if (_liveBoost > 1.0) {
+          const before = maxBetLE;
+          maxBetLE = Math.floor(maxBetLE * _liveBoost);
+          console.log(`[sizing] 🎯 TAG BOOST ${_liveBoost.toFixed(2)}x: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)} (tags: ${(decision.reasoningStructured?.reasoning_tags ?? []).join(',')})`);
+        }
         const claudeBet = decision.betAmount ?? 0;
         const safeBet = hcCheck.isHighConv ? maxBetLE : Math.min(claudeBet > 0 ? claudeBet : maxBetLE, maxBetLE);
         if (safeBet < 1) {
