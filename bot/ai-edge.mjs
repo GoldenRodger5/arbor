@@ -176,7 +176,20 @@ function evaluateTagCredibility(tags) {
  *  Use to gate pre-game trades — without proven edge tag, reject. */
 function hasProvenPregameEdgeTag(tags) {
   if (!Array.isArray(tags) || tags.length === 0) return false;
-  const APPROVED = new Set(['playoff-home-fav', 'we-undervalued', 'market-lag', 'injury-news', 'public-fade']);
+  // Updated 2026-04-28 from deeper shadow mining (n=466 records). Added:
+  //   momentum-shift (57% WR n=7) — barely qualifies but real
+  //   line-movement (55% WR n=11) — barely qualifies but tag-credibility data shows it
+  // Removed (now treated as banned):
+  //   bullpen-mismatch (44% WR n=9) — data shows losing
+  const APPROVED = new Set([
+    'playoff-home-fav',  // 78% WR (n=9)
+    'we-undervalued',    // 69% WR (n=42)
+    'market-lag',        // 63% WR (n=46)
+    'injury-news',       // matches lineup-change pattern
+    'public-fade',       // structurally documented
+    'momentum-shift',    // 57% WR (n=7)
+    'line-movement',     // 55% WR (n=11)
+  ]);
   return tags.some(t => typeof t === 'string' && APPROVED.has(t.toLowerCase().trim()));
 }
 
@@ -786,6 +799,53 @@ function detectMlbMidGameLead({ league, period, gameDetail, diff, leadingBullpen
 // WR (trap zone). Detector returns null permanently until we re-mine for a +EV cell.
 function detectMlbEarlyMidLead() {
   return null;
+}
+
+// MLB late-inning lockdown (innings 8-9): leader at 80-90¢ with bullpen edge.
+// Mid-game detector handles innings 3-5; this catches the late-inning lockdown
+// pattern where the leading team has a closer-grade bullpen and the price has
+// risen but still has room. WE table for 1-2 run leads in 8th/9th is 85%+
+// when bullpen is elite — Kalshi sometimes prices these at 82-87¢.
+//
+// Constraints (data-driven):
+//   - Period 8-9 (MLB innings 8 and 9 — the "closer" zone)
+//   - Lead ≥1 (1 run is enough late since few outs remaining)
+//   - Bullpen tier elite or good (closer/setup quality matters)
+//   - Price 78-92¢ (lower than that = mid-game, higher = no upside)
+//   - Edge ≥4pt (looser than mid-game since pattern is mechanical)
+//   - Word "closer" was 100% WR in shadow text — closer presence is the key signal
+function detectMlbLateInningLockdown({ league, period, gameDetail, diff, leadingBullpenTier, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period < 8 || period > 9) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 1) return null;
+  if (price < 0.78 || price > 0.92) return null;
+  const tier = (leadingBullpenTier || '').toLowerCase();
+  if (tier !== 'elite' && tier !== 'good') return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.04) return null;
+  return {
+    trade: true,
+    side: 'yes',
+    confidence: weTimeAdj,
+    betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-run lead in ${period}th inning with ${tier} bullpen — closer-grade lockdown territory`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB late-inning lockdown, P${period}): ${diff}-run lead with ${tier} bullpen, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge. Late-inning leaders with closer-quality bullpens win ~88-92% historically.`,
+      key_facts: [
+        `Inning ${period}, ${diff}-run lead`,
+        `${tier} bullpen tier (closer/setup quality)`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+      ],
+      top_risk: `Big inning by trailing team or closer blow-up (rare with ${tier} tier)`,
+      conviction: 'Structural pattern — late-inning + good-bullpen leader is mechanical',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-late-inning-lockdown',
+    _matchInfo: { period, diff, edge: edge * 100, tier },
+  };
 }
 
 // NHL P3 closing-out: 75% WR (3/4) historical pattern, +$1.91/trade.
@@ -6234,6 +6294,15 @@ async function checkLiveScoreEdges() {
           });
         }
         if (!_structuralDecision) {
+          // MLB late-inning lockdown — period 8-9 with elite/good bullpen
+          _structuralDecision = detectMlbLateInningLockdown({
+            league, period, gameDetail, diff,
+            leadingBullpenTier,
+            weTimeAdj: _weTimeAdj, price,
+            targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
           // Shadow-mined pattern (2026-04-27): broader MLB early-mid leader detector,
           // 81% WR n=48 in shadow data. Catches inning 2 (existing detector starts at 3),
           // 1-run leads, and any bullpen tier. Lower price ceiling 72¢ avoids gamma traps.
@@ -7148,6 +7217,11 @@ const preGameAnalysisCache = new Map(); // marketBase → timestamp of last Clau
 const previousStarterMap = new Map(); // 'KEY:abbr' → { name, era, seenAt }
 const starterChangeMap = new Map(); // 'KEY:abbr' → { newName, newEra, prevName, prevEra, detectedAt }
 const STARTER_CHANGE_TTL_MS = 6 * 60 * 60 * 1000; // 6h — change is "fresh" for 6h after detection
+// NBA injury-change detector: tracks which players appear in inactive list per team.
+// When NEW name appears in inactive (vs previous snapshot), that's a "ruled out" event.
+// Sportsbooks reprice ~30 sec after NBA's official injury report; Kalshi lags 5-15 min.
+const previousNbaInactiveMap = new Map(); // 'NBA:abbr' → Set of inactive player names
+const nbaInjuryChangeMap = new Map(); // 'NBA:abbr' → { newlyOut: [name1, ...], detectedAt }
 // Price snapshot at time of last analysis. When cache TTL expires, we gate re-analysis
 // on whether prices actually moved. If neither side moved ≥3¢ since last look, Claude
 // would produce the same answer from the same data — skip the $0.08 call. (2026-04-23)
@@ -7567,6 +7641,26 @@ async function checkPreGamePredictions() {
             if (active.length > 0 || inactive.length > 0) {
               espnRosterMap.set(abbr, { active, inactive, teamName: team.team?.displayName ?? '' });
             }
+            // INJURY-CHANGE DETECTION: detect when a NEW player appears in inactive list.
+            // This catches "star ruled out" events where ESPN updates 30-60 min pre-game.
+            // Sportsbooks reprice fast; Kalshi lags 5-15 min. Edge window for pre-game bet.
+            const _nbaKey = `NBA:${abbr}`;
+            const _prevInactive = previousNbaInactiveMap.get(_nbaKey) ?? new Set();
+            const _newSet = new Set(inactive);
+            const _newlyOut = inactive.filter(n => n && !_prevInactive.has(n));
+            // Only fire when previous snapshot existed (avoid first-scan noise) AND
+            // newly-out list is small (1-3 names — bigger lists usually mean roster
+            // reset, e.g. game just started). Stale changes (>6h) get cleaned.
+            if (_prevInactive.size > 0 && _newlyOut.length > 0 && _newlyOut.length <= 3) {
+              nbaInjuryChangeMap.set(_nbaKey, { newlyOut: _newlyOut, detectedAt: Date.now() });
+              console.log(`[injury-change] 🚨 NBA ${abbr.toUpperCase()} ruled OUT: ${_newlyOut.join(', ')}`);
+              try { tg(`🚨 <b>NBA INJURY UPDATE — ${abbr.toUpperCase()}</b>\nRuled OUT: ${_newlyOut.join(', ')}\nKalshi may lag — bot will check next pre-game scan.`); } catch {}
+            }
+            previousNbaInactiveMap.set(_nbaKey, _newSet);
+            // Clean up stale changes (>6h old)
+            for (const [k, v] of nbaInjuryChangeMap) {
+              if (Date.now() - v.detectedAt > STARTER_CHANGE_TTL_MS) nbaInjuryChangeMap.delete(k);
+            }
           }
         }
       }
@@ -7684,6 +7778,17 @@ async function checkPreGamePredictions() {
       const lines = [];
       if (c1) lines.push(fmtChange(c1, market.team1.teamName));
       if (c2) lines.push(fmtChange(c2, market.team2.teamName));
+      // NBA injury changes (newly-out players)
+      if (sport === 'NBA') {
+        const inj1 = nbaInjuryChangeMap.get(`NBA:${t1Abbr}`);
+        const inj2 = nbaInjuryChangeMap.get(`NBA:${t2Abbr}`);
+        const fmtInj = (inj, teamName) => {
+          const ageMin = Math.round((Date.now() - inj.detectedAt) / 60000);
+          return `🚨 ${teamName} INJURY UPDATE ${ageMin}min ago — ruled OUT: ${inj.newlyOut.join(', ')}`;
+        };
+        if (inj1) lines.push(fmtInj(inj1, market.team1.teamName));
+        if (inj2) lines.push(fmtInj(inj2, market.team2.teamName));
+      }
       if (lines.length > 0) {
         lineupChangeCtx =
           `\n🚨🚨🚨 LINEUP CHANGE DETECTED — HIGH-EDGE EVENT 🚨🚨🚨\n` +
