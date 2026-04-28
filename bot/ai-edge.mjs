@@ -6210,7 +6210,7 @@ async function checkLiveScoreEdges() {
           // prefix block (LIVE_EDGE_STATIC_PREFIX) for cumulative prefix caching.
           return claudeWithSearch(searchPrompt, { maxTokens: 2000, maxSearches: 1, timeout: 45000, category: 'live-edge-search', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.', cacheSystem: true });
         }
-        return claudeSonnet(item.prompt, { maxTokens: 1500, category: 'live-edge', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.', cacheSystem: true });
+        return claudeSonnet(item.prompt, { maxTokens: 1500, timeout: 45000, category: 'live-edge', system: 'You are a sports betting analyst. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.', cacheSystem: true });
       })
     );
 
