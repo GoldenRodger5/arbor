@@ -670,6 +670,52 @@ function detectNbaQ4ColdShooting({ league, period, gameDetail, diff, leadingFGNu
   };
 }
 
+// NBA Q4 leader (broader): 89% WR (8W/1L) on actual trade data n=9 historical.
+// Fires on Q4 leader by 6+ pts at price ≤78¢ — broader than cold-shooting which
+// requires 8+pt FG gap (rare, narrow). This catches the bigger population of
+// Q4 leads where lead-protection dynamics + market-lag dominate.
+//
+// Difference from cold-shooting:
+//   - No FG% gap requirement (any team-quality, not just shooting-dominant)
+//   - 6+ pt diff (vs 5+) for safety
+//   - 4-10 min remaining (same)
+//   - Edge ≥5pt (vs 7pt) — looser since FG-gap quality check removed
+//   - Price ≤78¢ (vs 80¢) — tighter for asymmetry safety
+function detectNbaQ4Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'nba') return null;
+  if (period !== 4) return null;
+  if (targetAbbr !== leadingAbbr) return null; // leader only
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 6) return null;
+  if (price > 0.78) return null; // need room to run + asymmetry
+  const m = (gameDetail || '').match(/^(\d+):(\d+)/);
+  if (!m) return null;
+  const minsLeft = parseInt(m[1], 10) + parseInt(m[2], 10) / 60;
+  if (minsLeft < 4 || minsLeft > 10) return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.05) return null;
+  return {
+    trade: true,
+    side: 'yes',
+    confidence: weTimeAdj,
+    betAmount: null,
+    reasoning: {
+      steel_man: `Trailing team has ${minsLeft.toFixed(1)} minutes and limited possessions to overcome ${diff}-pt deficit`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (NBA Q4 leader, ~89% WR n=9 historical): ${diff}-pt lead, ${minsLeft.toFixed(1)}min left, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Q4, ${diff}-pt lead with ${minsLeft.toFixed(1)} min remaining`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+      ],
+      top_risk: '3pt barrage by trailing team or foul trouble on leading team',
+      conviction: 'Structural pattern — 89% WR historical (n=9) on Q4 leaders 6+ pts',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'nba-q4-leader',
+    _matchInfo: { minsLeft, edge: edge * 100, diff },
+  };
+}
+
 // MLB innings 3-5 leading-team: ~67% WR over n=6 historical (small sample,
 // but consistent with the structural pattern). Mid-game leads in MLB are
 // statistically protective — the trailing team has fewer at-bats remaining,
@@ -6157,6 +6203,15 @@ async function checkLiveScoreEdges() {
           targetAbbr, leadingAbbr,
         });
         if (!_structuralDecision) {
+          // Broader NBA Q4 leader detector — catches the bigger 89% WR cell
+          // that doesn't require the 8pt FG gap (rare). Same time window + leader rule.
+          _structuralDecision = detectNbaQ4Leader({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price,
+            targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
           _structuralDecision = detectSoccerHomeHTLeader({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price,
@@ -7084,6 +7139,15 @@ let preGameTradesToday = 0;
 let preGameTradesDate = '';         // reset counter on new day
 const preGameBetGames = new Set();  // games we've already bet on today (prevents re-buying)
 const preGameAnalysisCache = new Map(); // marketBase → timestamp of last Claude analysis
+// Starter-change detector: persistent across scans. Tracks the last-seen starter
+// name per (sport:teamAbbr). When ESPN updates a different name for the same key,
+// that's a STARTER SCRATCH/CHANGE — high-edge event because sportsbook lines move
+// in <1 minute but Kalshi typically lags 5-15 min on lineup news.
+// Value: { name, era, seenAt, prevName, prevSeenAt } — only set when CHANGE detected.
+// Cleared if no change seen in 24h.
+const previousStarterMap = new Map(); // 'KEY:abbr' → { name, era, seenAt }
+const starterChangeMap = new Map(); // 'KEY:abbr' → { newName, newEra, prevName, prevEra, detectedAt }
+const STARTER_CHANGE_TTL_MS = 6 * 60 * 60 * 1000; // 6h — change is "fresh" for 6h after detection
 // Price snapshot at time of last analysis. When cache TTL expires, we gate re-analysis
 // on whether prices actually moved. If neither side moved ≥3¢ since last look, Claude
 // would produce the same answer from the same data — skip the $0.08 call. (2026-04-23)
@@ -7458,7 +7522,7 @@ async function checkPreGamePredictions() {
             const getStat = (abbrev) => p.statistics?.find(s => s.abbreviation === abbrev)?.displayValue ?? null;
             // Key by `${sport}:${abbr}` so NHL PHI (Flyers) doesn't collide with
             // MLB PHI (Phillies) — that collision put Dan Vladar in an MLB prompt.
-            espnStarterMap.set(`${key}:${abbr}`, {
+            const _starterEntry = {
               name,
               era:   getStat('ERA'),
               w:     getStat('W'),
@@ -7467,7 +7531,33 @@ async function checkPreGamePredictions() {
               svPct: getStat('SV%'),
               gaa:   getStat('GAA'),
               sport: key,
-            });
+            };
+            espnStarterMap.set(`${key}:${abbr}`, _starterEntry);
+            // CHANGE DETECTION: compare to previous snapshot. If name differs, log change.
+            // This is a high-edge event because sportsbooks reprice lineup news in <1min
+            // while Kalshi typically lags 5-15 min — the edge window we want to capture.
+            const _starterKey = `${key}:${abbr}`;
+            const _prev = previousStarterMap.get(_starterKey);
+            if (_prev && _prev.name && _prev.name !== name) {
+              const _prevEraNum = parseFloat(_prev.era ?? 'NaN');
+              const _newEraNum = parseFloat(_starterEntry.era ?? 'NaN');
+              starterChangeMap.set(_starterKey, {
+                newName: name,
+                newEra: _starterEntry.era,
+                newEraNum: Number.isFinite(_newEraNum) ? _newEraNum : null,
+                prevName: _prev.name,
+                prevEra: _prev.era,
+                prevEraNum: Number.isFinite(_prevEraNum) ? _prevEraNum : null,
+                detectedAt: Date.now(),
+              });
+              console.log(`[lineup-change] 🚨 ${key} ${abbr.toUpperCase()} starter changed: ${_prev.name} (ERA ${_prev.era ?? '?'}) → ${name} (ERA ${_starterEntry.era ?? '?'})`);
+              try { tg(`🚨 <b>LINEUP CHANGE — ${key} ${abbr.toUpperCase()}</b>\nWas: ${_prev.name} (ERA ${_prev.era ?? '?'})\nNow: ${name} (ERA ${_starterEntry.era ?? '?'})\nKalshi may lag — bot will check pre-game window.`); } catch {}
+            }
+            previousStarterMap.set(_starterKey, { name, era: _starterEntry.era, seenAt: Date.now() });
+            // Clean up stale change entries (>6h old)
+            for (const [k, v] of starterChangeMap) {
+              if (Date.now() - v.detectedAt > STARTER_CHANGE_TTL_MS) starterChangeMap.delete(k);
+            }
           }
           // NBA: extract active/inactive player list to prevent hallucinated lineups
           if (key === 'NBA' && abbr) {
@@ -7573,6 +7663,38 @@ async function checkPreGamePredictions() {
       tk.includes('SERIAA') ? 'Serie A' : tk.includes('BUNDESLIGA') ? 'Bundesliga' :
       tk.includes('LIGUE1') ? 'Ligue 1' : 'Sport';
     const starterCtx = buildStarterContext(market, sport);
+    // LINEUP-CHANGE injection: if either team's starter changed within the last
+    // 6h, surface it prominently. This is a high-edge event because sportsbooks
+    // reprice in <1min while Kalshi lags 5-15min on lineup news. Sonnet should
+    // weight this heavily and the change-direction (better/worse new starter)
+    // tells the bet direction.
+    let lineupChangeCtx = '';
+    {
+      const t1Abbr = (market.team1?.team ?? '').toLowerCase();
+      const t2Abbr = (market.team2?.team ?? '').toLowerCase();
+      const c1 = starterChangeMap.get(`${sport}:${t1Abbr}`);
+      const c2 = starterChangeMap.get(`${sport}:${t2Abbr}`);
+      const fmtChange = (c, teamName) => {
+        const dir = (c.newEraNum != null && c.prevEraNum != null)
+          ? (c.newEraNum > c.prevEraNum + 0.5 ? '⬇️ WORSE' : c.newEraNum < c.prevEraNum - 0.5 ? '⬆️ BETTER' : '↔️ similar')
+          : '';
+        const ageMin = Math.round((Date.now() - c.detectedAt) / 60000);
+        return `🚨 ${teamName} STARTER CHANGED ${ageMin}min ago: ${c.prevName} (ERA ${c.prevEra ?? '?'}) → ${c.newName} (ERA ${c.newEra ?? '?'}) ${dir}`;
+      };
+      const lines = [];
+      if (c1) lines.push(fmtChange(c1, market.team1.teamName));
+      if (c2) lines.push(fmtChange(c2, market.team2.teamName));
+      if (lines.length > 0) {
+        lineupChangeCtx =
+          `\n🚨🚨🚨 LINEUP CHANGE DETECTED — HIGH-EDGE EVENT 🚨🚨🚨\n` +
+          lines.join('\n') + '\n' +
+          `EDGE LOGIC: Sportsbooks repriced this in <1 minute. Kalshi typically lags 5-15 minutes on lineup news.\n` +
+          `If the new starter is materially worse (ERA +0.8+), bet AGAINST that team. Use reasoning_tag "injury-news".\n` +
+          `If the new starter is materially better, bet FOR that team. Use reasoning_tag "injury-news".\n` +
+          `If the change is similar quality (within 0.5 ERA), the lineup-change edge is SMALL — only fire if Kalshi clearly lagged sportsbook.\n` +
+          `THIS OVERRIDES the standard "thin edge" rejection — lineup-change IS a confirmed edge.\n\n`;
+      }
+    }
     // Sportsbook anchor — fetch ESPN's no-vig consensus for this matchup so Sonnet
     // can compare its confidence to sharp-market consensus. Without this, Sonnet
     // is essentially regurgitating the same analysis sportsbooks already ran.
@@ -7725,8 +7847,10 @@ async function checkPreGamePredictions() {
       market,
       sport,
       _structuralDecision: _pgStructural,
-      // Order: anti-hallucination → sportsbook anchor (sharp consensus) → ESPN starters → analysis framework.
-      prompt: antiHallucinationHeader + sportsbookCtx + starterCtx + pgPromptText,
+      // Order: anti-hallucination → LINEUP CHANGE (highest priority) → sportsbook anchor → starters → analysis.
+      // Lineup change first because it's the BIGGEST signal — if the starter
+      // just changed, Sonnet should react to that before any other consideration.
+      prompt: antiHallucinationHeader + lineupChangeCtx + sportsbookCtx + starterCtx + pgPromptText,
     };
   });
 
