@@ -161,6 +161,25 @@ function evaluateTagCredibility(tags) {
  *  (44 samples, 61% WR) consistently outperform their cohorts. Boost factor capped
  *  at 1.15 to avoid runaway sizing on any single signal.
  *  Returns multiplier in [1.0, 1.15]. */
+/** Pre-game tag gate — pre-game-prediction has lost money across MLB/NBA/NHL/MLS
+ *  with Sonnet's generic "team X is better" reasoning. Only certain tags have
+ *  >55% WR with statistically meaningful samples:
+ *    - playoff-home-fav: 75% WR (n=8)
+ *    - we-undervalued: 67% WR (n=39)
+ *    - market-lag: 61% WR (n=44)
+ *    - injury-news: lineup-driven, sample small but logically high-edge
+ *  Bad tags (BLOCKED via evaluateTagCredibility):
+ *    - starter-mismatch: 17% WR (n=6)
+ *    - lineup-cold: 40% WR (n=15)
+ *    - era-gap (alone): mediocre, often "thin edge" trap
+ *  Returns true if at least one APPROVED edge tag is present.
+ *  Use to gate pre-game trades — without proven edge tag, reject. */
+function hasProvenPregameEdgeTag(tags) {
+  if (!Array.isArray(tags) || tags.length === 0) return false;
+  const APPROVED = new Set(['playoff-home-fav', 'we-undervalued', 'market-lag', 'injury-news', 'public-fade']);
+  return tags.some(t => typeof t === 'string' && APPROVED.has(t.toLowerCase().trim()));
+}
+
 function evaluateTagBoost(tags) {
   if (!Array.isArray(tags) || tags.length === 0) return 1.0;
   const stats = CAL.reasoningTagStats;
@@ -7306,6 +7325,13 @@ async function checkPreGamePredictions() {
   // We inject these so Claude only needs to web-search for STATS, not identity.
   const espnStarterMap = new Map(); // team abbr (lowercase) → { name, era?, wl?, svPct?, gaa?, sport }
   const espnStartTimeMap = new Map(); // "AWAY-HOME" (uppercase) → Date object (UTC start time)
+  // Sportsbook consensus from ESPN's odds field (free, no third-party API needed).
+  // Key: "AWAY-HOME" uppercase. Value: { homeProb, awayProb, source, raw }
+  // homeProb/awayProb are NO-VIG probabilities — divide raw moneyline implied probs
+  // by their sum to strip the bookmaker's vig (~4-6% typical).
+  // Used to anchor Sonnet's pre-game reasoning so it can't claim "edge" when
+  // sharp consensus already prices the matchup at the same probability.
+  const espnSportsbookMap = new Map();
   const espnSportPaths = [
     { key: 'MLB', path: 'baseball/mlb' },
     { key: 'NHL', path: 'hockey/nhl' },
@@ -7336,6 +7362,36 @@ async function checkPreGamePredictions() {
           const awayAbbr = (away.team?.abbreviation ?? '').toUpperCase();
           const homeAbbr = (home.team?.abbreviation ?? '').toUpperCase();
           espnStartTimeMap.set(`${awayAbbr}-${homeAbbr}`, new Date(ev.date));
+          // Extract sportsbook moneyline odds and compute no-vig consensus.
+          // ESPN provides multiple sportsbooks in comp.odds[]; we use the first
+          // one with both home/away moneylines populated.
+          try {
+            const oddsArr = comp.odds ?? [];
+            for (const o of oddsArr) {
+              const homeMl = o.homeTeamOdds?.moneyLine;
+              const awayMl = o.awayTeamOdds?.moneyLine;
+              if (typeof homeMl === 'number' && typeof awayMl === 'number') {
+                // American moneyline → implied probability:
+                //   negative odds:  P = -ml / (-ml + 100)
+                //   positive odds:  P =  100 / (ml + 100)
+                const mlToProb = (ml) => ml < 0 ? (-ml) / (-ml + 100) : 100 / (ml + 100);
+                const homeRaw = mlToProb(homeMl);
+                const awayRaw = mlToProb(awayMl);
+                const total = homeRaw + awayRaw;
+                if (total > 0) {
+                  const homeProb = homeRaw / total;
+                  const awayProb = awayRaw / total;
+                  espnSportsbookMap.set(`${awayAbbr}-${homeAbbr}`, {
+                    homeProb: Math.round(homeProb * 1000) / 1000,
+                    awayProb: Math.round(awayProb * 1000) / 1000,
+                    homeMl, awayMl,
+                    source: o.provider?.name ?? 'sportsbook',
+                  });
+                  break;
+                }
+              }
+            }
+          } catch { /* odds optional; skip silently */ }
         }
         for (const team of competitors) {
           const abbr = (team.team?.abbreviation ?? '').toLowerCase();
@@ -7462,6 +7518,43 @@ async function checkPreGamePredictions() {
       tk.includes('SERIAA') ? 'Serie A' : tk.includes('BUNDESLIGA') ? 'Bundesliga' :
       tk.includes('LIGUE1') ? 'Ligue 1' : 'Sport';
     const starterCtx = buildStarterContext(market, sport);
+    // Sportsbook anchor — fetch ESPN's no-vig consensus for this matchup so Sonnet
+    // can compare its confidence to sharp-market consensus. Without this, Sonnet
+    // is essentially regurgitating the same analysis sportsbooks already ran.
+    // Lookup tries both team-order keys since Kalshi market team1/team2 order
+    // isn't always away/home.
+    const _t1 = (market.team1?.team ?? '').toUpperCase();
+    const _t2 = (market.team2?.team ?? '').toUpperCase();
+    const _sportsbook = espnSportsbookMap.get(`${_t1}-${_t2}`) ?? espnSportsbookMap.get(`${_t2}-${_t1}`);
+    let sportsbookCtx = '';
+    if (_sportsbook) {
+      // Map to which side is team1 (since Kalshi prices market.team1 vs market.team2)
+      const isT1Away = espnSportsbookMap.has(`${_t1}-${_t2}`);
+      const t1Prob = isT1Away ? _sportsbook.awayProb : _sportsbook.homeProb;
+      const t2Prob = isT1Away ? _sportsbook.homeProb : _sportsbook.awayProb;
+      const t1Cents = Math.round(t1Prob * 100);
+      const t2Cents = Math.round(t2Prob * 100);
+      const k1Cents = Math.round((market.team1.price ?? 0) * 100);
+      const k2Cents = Math.round((market.team2.price ?? 0) * 100);
+      const t1Delta = k1Cents - t1Cents;
+      const t2Delta = k2Cents - t2Cents;
+      sportsbookCtx =
+        `📊 SPORTSBOOK SHARP CONSENSUS (no-vig from ${_sportsbook.source}):\n` +
+        `  ${market.team1.teamName} (${market.team1.team}): SPORTSBOOK=${t1Cents}% | KALSHI=${k1Cents}¢ | Δ=${t1Delta>=0?'+':''}${t1Delta}pt\n` +
+        `  ${market.team2.teamName} (${market.team2.team}): SPORTSBOOK=${t2Cents}% | KALSHI=${k2Cents}¢ | Δ=${t2Delta>=0?'+':''}${t2Delta}pt\n` +
+        `\n` +
+        `🎯 EDGE ANCHOR RULES:\n` +
+        `  • Sportsbook is the SHARP MARKET — its no-vig probability reflects ALL public information already (injuries, matchup, recent form, weather). It is the truth-meter.\n` +
+        `  • If your confidence MATCHES sportsbook (within 3pt), you are NOT finding edge — you are recapping consensus. Return trade=false.\n` +
+        `  • If your confidence is HIGHER than sportsbook by 5pt+, you are claiming sportsbook is wrong. You MUST cite a SPECIFIC reason (lineup news from your search not yet absorbed, structural pattern, or unique matchup factor). Generic "team X is better" is not enough.\n` +
+        `  • If your confidence is LOWER than sportsbook by 5pt+, you must explain why the sharp market is overconfident. This is rare — usually sharp markets are right.\n` +
+        `  • IF Kalshi differs from sportsbook by 5+pt in either direction, that itself is a market-lag edge — Kalshi is slow, sportsbook is fast. Bias to trust sportsbook.\n\n`;
+    } else {
+      // No sportsbook data available (rare — usually means game not on ESPN scoreboard yet)
+      sportsbookCtx =
+        `📊 SPORTSBOOK CONSENSUS: not available for this game (ESPN scoreboard didn't return odds).\n` +
+        `  Without a sharp anchor, BE EXTRA CAUTIOUS. Generic confidence in "team X is better" is exactly what sportsbooks already priced. Apply 5pt downward bias to your confidence.\n\n`;
+    }
     // Hard anti-hallucination preamble — injected before every prompt.
     const antiHallucinationHeader =
       `🛑 ZERO-FABRICATION RULES — violations invalidate your analysis and the trade will be blocked:\n` +
@@ -7560,7 +7653,10 @@ async function checkPreGamePredictions() {
     return {
       market,
       sport,
-      prompt: antiHallucinationHeader + starterCtx + pgPromptText,
+      // Order: anti-hallucination → sportsbook anchor (sharp consensus) → ESPN starters → analysis framework.
+      // Sportsbook anchor placed BEFORE starter data so Sonnet sees the consensus
+      // first and reasons against it, rather than building a thesis then checking.
+      prompt: antiHallucinationHeader + sportsbookCtx + starterCtx + pgPromptText,
     };
   });
 
@@ -7994,6 +8090,29 @@ async function checkPreGamePredictions() {
     // vs. downside of 70¢ — asymmetry is wrong. Cap at 68¢ to preserve the trade structure.
     if (price > 0.68) {
       console.log(`[pre-game] Entry price too high: ${(price*100).toFixed(0)}¢ > 68¢ cap — market has priced out the edge`);
+      continue;
+    }
+
+    // 🛑 PROVEN-EDGE TAG GATE (2026-04-28): pre-game-prediction has lost across MLB/NBA/NHL/MLS
+    // (74 trades, ~30% WR, -$74 cumulative) when reasoning was generic "team X is better."
+    // Only fire if Sonnet's reasoning_tags include AT LEAST ONE proven-edge tag:
+    //   playoff-home-fav, we-undervalued, market-lag, injury-news, public-fade
+    // Tags like `era-gap` alone, `starter-mismatch`, `lineup-cold` are documented losers.
+    // Without a proven tag, Sonnet is regurgitating sportsbook consensus = no edge.
+    const _pgTags = Array.isArray(decision.reasoning_tags) ? decision.reasoning_tags : [];
+    if (!hasProvenPregameEdgeTag(_pgTags)) {
+      console.log(`[pre-game] 🚫 NO PROVEN EDGE TAG: ${market.base} — Sonnet's tags [${_pgTags.join(',') || '(none)'}] don't include any proven-winning category. Generic analysis = no edge over sportsbook.`);
+      logScreen({ stage: 'pre-game-skip', result: 'skip-no-proven-tag', ticker: market.base, sport: pgSportKey, reasoning: `Reasoning tags ${_pgTags.join(',')} lack a proven-edge tag (need playoff-home-fav, we-undervalued, market-lag, injury-news, or public-fade)` });
+      continue;
+    }
+
+    // 🛑 SOCCER PRE-GAME PERMANENTLY DISABLED (2026-04-28): MLS/EPL/LaLiga pre-game
+    // is -$34.83 over 4 trades. Soccer underdog asymmetry + draw tax makes pre-game
+    // structurally unfavorable. Re-enable only when we have a confirmed soccer edge
+    // (e.g., lineup scraper) — generic Sonnet pre-game analysis loses money here.
+    if (['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(pgSportKey)) {
+      console.log(`[pre-game] 🛑 SOCCER PRE-GAME DISABLED: ${market.base} (${pgSportKey.toUpperCase()}) — strategy net -$34.83 historically. Need lineup-scraper edge to re-enable.`);
+      logScreen({ stage: 'pre-game-skip', result: 'skip-soccer-disabled', ticker: market.base, sport: pgSportKey, reasoning: 'Soccer pre-game-prediction permanently disabled — losing strategy with no confirmed edge source' });
       continue;
     }
 
