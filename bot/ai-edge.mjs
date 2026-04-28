@@ -1691,6 +1691,61 @@ BUY only if ALL are true:
 
 `;
 
+// Pre-game sportsbook-gap detector — mechanical fire when Kalshi underprices a
+// team relative to ESPN's sharp sportsbook consensus by 5-15pt. Bypasses Sonnet
+// entirely (saves API cost + faster reaction). The sportsbook IS the sharp market;
+// when Kalshi differs by 5+pt, that's market lag — pure +EV by definition since
+// sharps and Kalshi disagree and sharps are usually right.
+//
+// Returns synthetic decision shaped like Sonnet's output, or null if no gap.
+// Caller should attach to item._structuralDecision and bypass Sonnet call.
+//
+// Constraints:
+//   - Gap 5-15pt (smaller = noise; larger = likely data issue or stale sportsbook line)
+//   - Kalshi price 30-68¢ (avoid deep-underdog asymmetry + capped upside at 70+¢)
+//   - Reasoning_tag: market-lag (proven 61% WR cell from auto-cal data)
+function detectPregameSportsbookGap(market, sportsbookData, sport) {
+  if (!sportsbookData || !market) return null;
+  const t1Price = market.team1?.price;
+  const t2Price = market.team2?.price;
+  if (t1Price == null || t2Price == null) return null;
+  // Determine sportsbook prob for each team
+  const _t1 = (market.team1?.team ?? '').toUpperCase();
+  const _t2 = (market.team2?.team ?? '').toUpperCase();
+  // sportsbookData stored with key "AWAY-HOME" — figure out which way
+  // Simpler: the lookup function returned the entry. Caller gives us isT1Away flag context.
+  // For this detector we re-lookup to determine orientation:
+  let t1Prob, t2Prob, source;
+  if (sportsbookData.isT1Away !== undefined) {
+    t1Prob = sportsbookData.isT1Away ? sportsbookData.awayProb : sportsbookData.homeProb;
+    t2Prob = sportsbookData.isT1Away ? sportsbookData.homeProb : sportsbookData.awayProb;
+    source = sportsbookData.source;
+  } else {
+    return null;
+  }
+  // Compute gaps for each side: positive = Kalshi UNDERPRICES (we buy)
+  const t1Gap = t1Prob - t1Price;
+  const t2Gap = t2Prob - t2Price;
+  let pick = null;
+  if (t1Gap >= 0.05 && t1Gap <= 0.15 && t1Price >= 0.30 && t1Price <= 0.68) {
+    pick = { team: market.team1, gap: t1Gap, prob: t1Prob };
+  } else if (t2Gap >= 0.05 && t2Gap <= 0.15 && t2Price >= 0.30 && t2Price <= 0.68) {
+    pick = { team: market.team2, gap: t2Gap, prob: t2Prob };
+  }
+  if (!pick) return null;
+  return {
+    trade: true,
+    team: pick.team.team,
+    confidence: Math.round(pick.prob * 100) / 100,
+    betAmount: null,
+    exitScenario: `sportsbook ${Math.round(pick.prob*100)}% vs Kalshi ${Math.round(pick.team.price*100)}¢ (${Math.round(pick.gap*100)}pt gap) — Kalshi reprices when news/sharp money catches up`,
+    reasoning: `STRUCTURAL DETECTOR (sportsbook-gap mechanical): ${pick.team.team} sportsbook no-vig ${(pick.prob*100).toFixed(0)}% vs Kalshi ${Math.round(pick.team.price*100)}¢ = ${(pick.gap*100).toFixed(0)}pt gap. Sportsbook is the sharp market. Kalshi will reprice toward consensus.`,
+    reasoning_tags: ['market-lag', 'we-undervalued'],
+    _structuralPattern: 'pre-game-sportsbook-gap',
+    _matchInfo: { gap: Math.round(pick.gap * 100), prob: Math.round(pick.prob * 100), source },
+  };
+}
+
 function getPgFramework(sport) {
   if (sport === 'NBA') return NBA_PG_FRAMEWORK;
   if (sport === 'NHL') return NHL_PG_FRAMEWORK;
@@ -7650,12 +7705,27 @@ async function checkPreGamePredictions() {
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. prolific attack vs defense conceding 1.8/game — price rises when they score first goal","reasoning":"one sentence","reasoning_tags":["1-3 lowercase hyphen-delimited tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, back-to-back, rest-advantage, home-court, motivation, other"]}`;
 
+    // STRUCTURAL FAST PATH: if Kalshi differs from sportsbook consensus by 5-15pt,
+    // mechanical fire — skip Sonnet entirely. This is the highest-confidence
+    // pre-game signal (sportsbook is the sharp market; Kalshi lag = pure +EV).
+    let _pgStructural = null;
+    if (_sportsbook) {
+      const isT1Away = espnSportsbookMap.has(`${_t1}-${_t2}`);
+      _pgStructural = detectPregameSportsbookGap(
+        market,
+        { ..._sportsbook, isT1Away },
+        sport
+      );
+      if (_pgStructural) {
+        console.log(`[pre-game] 🎯 STRUCTURAL (sportsbook-gap): ${market.base} ${_pgStructural.team} — sportsbook ${_pgStructural._matchInfo.prob}% vs Kalshi ${Math.round((_pgStructural.team === market.team1.team ? market.team1.price : market.team2.price) * 100)}¢ (${_pgStructural._matchInfo.gap}pt gap) — bypassing Sonnet`);
+      }
+    }
+
     return {
       market,
       sport,
+      _structuralDecision: _pgStructural,
       // Order: anti-hallucination → sportsbook anchor (sharp consensus) → ESPN starters → analysis framework.
-      // Sportsbook anchor placed BEFORE starter data so Sonnet sees the consensus
-      // first and reasons against it, rather than building a thesis then checking.
       prompt: antiHallucinationHeader + sportsbookCtx + starterCtx + pgPromptText,
     };
   });
@@ -7665,18 +7735,26 @@ async function checkPreGamePredictions() {
     if (preGameTradesThisCycle >= MAX_PREGAME_PER_CYCLE) break;
     const batchItems = pgPrompts.slice(batch, batch + 3);
     const batchResults = await Promise.allSettled(
-      batchItems.map(item => claudeWithSearch(item.prompt, {
-        maxTokens: 2000,
-        maxSearches: 1,
-        category: 'pre-game',
-        // Per-sport system prompt with cached static framework. The 1500-3000 token
-        // framework (decision tree, hard NOs, calibration scale, underdog check)
-        // caches via cache_control: ephemeral — saves ~40% on input tokens for
-        // pre-game calls within the same 5-minute window. Was previously sent
-        // fresh in every user prompt.
-        system: PG_BASE_SYSTEM + getPgFramework(item.sport),
-        cacheSystem: true,
-      }))
+      batchItems.map(item => {
+        // Structural fast path — sportsbook-gap mechanical detector returns
+        // synthetic JSON that downstream code parses identically to Sonnet output.
+        // Saves the API call and reacts in zero time.
+        if (item._structuralDecision) {
+          return Promise.resolve(JSON.stringify(item._structuralDecision));
+        }
+        return claudeWithSearch(item.prompt, {
+          maxTokens: 2000,
+          maxSearches: 1,
+          category: 'pre-game',
+          // Per-sport system prompt with cached static framework. The 1500-3000 token
+          // framework (decision tree, hard NOs, calibration scale, underdog check)
+          // caches via cache_control: ephemeral — saves ~40% on input tokens for
+          // pre-game calls within the same 5-minute window. Was previously sent
+          // fresh in every user prompt.
+          system: PG_BASE_SYSTEM + getPgFramework(item.sport),
+          cacheSystem: true,
+        });
+      })
     );
 
     for (let i = 0; i < batchItems.length; i++) {
