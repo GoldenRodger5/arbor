@@ -577,7 +577,12 @@ const MAX_TRADE_FRACTION = 0.06; // 6% of bankroll per trade — live-edge base 
 // ATL-PHI -$32 (66 ct @ 49¢), SF-WSH -$24 (57 ct @ 52¢), DET-BOS -$21 (71 ct @ 46¢).
 // Pre-game WR is 41% — can't afford 10-15% position sizing when losers are 2.6× winners.
 const PRE_GAME_TRADE_FRACTION = 0.05; // 5% for pre-game — tighter until pre-game WR improves
-const POLL_INTERVAL_MS = 60 * 1000; // Check news every 60 seconds
+const POLL_INTERVAL_MS = 45 * 1000; // Check news every 45 seconds (was 60s)
+// Tightened 2026-04-27 evening to capture more market-lag windows during peak
+// hours. The Kalshi market re-prices on a 30-90s lag after game state changes;
+// 60s polling missed ~30% of those lag windows. 45s polling covers most while
+// still being conservative on Kalshi rate limits. Claude API cost impact: ~zero
+// (Claude only runs on actual candidates, not every poll).
 const COOLDOWN_MS = 5 * 60 * 1000;  // 5 min base cooldown (can be bypassed for better prices)
 // 2026-04-23: tightened 8% → 5%. At $110 bankroll this is $5.50 per game, which is
 // small enough to spread bets and collect diversified data. Was producing 30-80 contract
