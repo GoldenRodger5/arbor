@@ -8440,7 +8440,19 @@ async function checkPreGamePredictions() {
     // Tags like `era-gap` alone, `starter-mismatch`, `lineup-cold` are documented losers.
     // Without a proven tag, Sonnet is regurgitating sportsbook consensus = no edge.
     const _pgTags = Array.isArray(decision.reasoning_tags) ? decision.reasoning_tags : [];
-    if (!hasProvenPregameEdgeTag(_pgTags)) {
+    // Disaster-tier MLB cell exempt — opponent ERA > 6.0 is its own proven edge
+    // (4-1 historical, 80% WR). Allow era-gap or starter-mismatch tags here.
+    // Compute opponent ERA inline since this gate runs BEFORE the MIN_CONF block.
+    let _disasterTierExempt = false;
+    if (pgSportKey === 'mlb') {
+      try {
+        const _oppAbbrLc = (otherSide?.team ?? '').toLowerCase();
+        const _oppStarter = espnStarterMap.get(`MLB:${_oppAbbrLc}`);
+        const _oppEraNum = parseFloat(_oppStarter?.era ?? 'NaN');
+        if (Number.isFinite(_oppEraNum) && _oppEraNum > 6.0) _disasterTierExempt = true;
+      } catch { /* best-effort */ }
+    }
+    if (!hasProvenPregameEdgeTag(_pgTags) && !_disasterTierExempt) {
       console.log(`[pre-game] 🚫 NO PROVEN EDGE TAG: ${market.base} — Sonnet's tags [${_pgTags.join(',') || '(none)'}] don't include any proven-winning category. Generic analysis = no edge over sportsbook.`);
       logScreen({ stage: 'pre-game-skip', result: 'skip-no-proven-tag', ticker: market.base, sport: pgSportKey, reasoning: `Reasoning tags ${_pgTags.join(',')} lack a proven-edge tag (need playoff-home-fav, we-undervalued, market-lag, injury-news, or public-fade)` });
       continue;
@@ -8523,6 +8535,12 @@ async function checkPreGamePredictions() {
     //   Above 65¢:  68% — expensive favorites need conviction but not an impossible bar
     const isSoccer = ['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(pgSportKey);
     const isNhlNba = pgSportKey === 'nhl' || pgSportKey === 'nba';
+    // Disaster-tier ERA exemption already computed above (before proven-tag gate).
+    // Log here when active so it appears in the right context.
+    if (_disasterTierExempt) {
+      const _oppStarter = espnStarterMap.get(`MLB:${(otherSide?.team ?? '').toLowerCase()}`);
+      console.log(`[pre-game] 🎯 DISASTER-TIER EXEMPTION: ${market.base} — opponent ${_oppStarter?.name ?? '?'} ERA ${_oppStarter?.era ?? '?'} > 6.0 (historical 4-1, 80% WR). Lowering MIN_CONF floor.`);
+    }
     const PRE_GAME_MIN_CONF = isNhlNba
       ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.72)
       : pgSportKey === 'mlb'
@@ -8532,7 +8550,10 @@ async function checkPreGamePredictions() {
         //   <50¢ (underdog):   63% — big edge zone, let value through
         //   50-65¢ (mid):      65% — aligned with NHL/NBA
         //   >65¢ (favorite):   68% — favorites still need conviction
-        ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68)
+        // Disaster-tier exempt: -3pt across all price tiers (60/62/65 instead of 63/65/68)
+        ? (_disasterTierExempt
+            ? (price < 0.50 ? 0.60 : price <= 0.65 ? 0.62 : 0.65)
+            : (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68))
         : isSoccer
           ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68) // Soccer: unchanged
           : 0.65; // fallback for other sports
