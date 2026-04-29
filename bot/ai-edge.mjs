@@ -8462,7 +8462,8 @@ async function checkPreGamePredictions() {
         `D) MATCHUP EDGE: Does this team have a structural advantage — size, pace, offensive system — that makes them more likely to win specifically against this opponent?\n` +
         `E) HEAD-TO-HEAD (PLAYOFFS ONLY): If this is a playoff series or the teams have met in the same series recently, note who has won recent meetings and by what margin. Regular-season H2H is mostly noise — ignore unless playoff context. Playoff H2H is signal — +3% for a team that won 3 of the last 4 meetings in the series.\n\n` +
         `Max bet: $${maxBetDisplay}\n\n` +
-        (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
+        // Calibration feedback moved to cached system prompt (2026-04-29) — no longer duplicated here
+        '' +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. opponent resting 3 starters, team motivated for playoff seeding — price rises when they build Q1 lead","reasoning":"one sentence","reasoning_tags":["1-3 lowercase hyphen-delimited tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, back-to-back, rest-advantage, home-court, motivation, other"]}`
@@ -8480,7 +8481,8 @@ async function checkPreGamePredictions() {
         `C) FATIGUE: Is either team on a back-to-back? NHL back-to-back teams win at ~8% lower rates.\n` +
         `D) MOTIVATION: Playoff race intensity for each team. Teams fighting for seeding play harder in regulation.\n` +
         `E) HEAD-TO-HEAD (PLAYOFFS ONLY): If this is a playoff series game, note series score (e.g. 2-1) and who won recent meetings. Momentum in a playoff series is real: +3% for the team coming off a win in the series, -3% for a team that just lost Game N at home. Regular-season H2H is noise — ignore outside playoffs.\n\n` +
-        (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
+        // Calibration feedback moved to cached system prompt (2026-04-29) — no longer duplicated here
+        '' +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. elite goalie SV .928 vs backup .891 — price rises when they score first","reasoning":"one sentence","reasoning_tags":["1-3 lowercase hyphen-delimited tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, back-to-back, rest-advantage, home-court, motivation, other"]}`
@@ -8497,7 +8499,8 @@ async function checkPreGamePredictions() {
         `B) BULLPEN: Does this team have a strong bullpen to protect leads? Weak bullpens blow leads in the 7th-8th even with good starters.\n` +
         `C) LINEUP POWER: Assess run-scoring ability from search results. Strong lineups (+4.5 R/G) put pressure on the opponent. Known sluggers in the 3-4 spots.\n` +
         `D) PARK FACTOR: Note the park for context only — do NOT add percentage points for park factors. The market already prices park factors in. A hitter's park at Coors doesn't give you an edge; the market knows Coors exists.\n\n` +
-        (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
+        // Calibration feedback moved to cached system prompt (2026-04-29) — no longer duplicated here
+        '' +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. ace ERA 2.8 vs ERA 5.1 starter — price rises when they score first and market reprices win probability","reasoning":"one sentence","reasoning_tags":["1-3 lowercase hyphen-delimited tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, back-to-back, rest-advantage, home-court, motivation, other"]}`
@@ -8519,7 +8522,8 @@ async function checkPreGamePredictions() {
         `D) MOTIVATION: Is either team in a must-win (relegation, title run, European qualification)? Higher motivation = more aggressive pressing = more goals = higher win probability.\n` +
         `E) DEFENSE: Elite defenses (conceding <0.8/game) can keep motivated opponents scoreless. Porous defenses lose more games.\n` +
         `F) HEAD-TO-HEAD: Soccer H2H is more meaningful than US sports — tactical matchups, psychological edges, and stylistic mismatches persist across seasons. If one side has won ≥3 of the last 5 meetings OR dominated the last 2 with clean sheets, that is a real +3-5% signal. Cite the specific scorelines from search, not a vague "they own this matchup."\n\n` +
-        (getCalibrationFeedback() ? getCalibrationFeedback() + '\n' : '') +
+        // Calibration feedback moved to cached system prompt (2026-04-29) — no longer duplicated here
+        '' +
         `JSON ONLY — include exitScenario:\n` +
         `{"trade":false,"confidence":0.XX,"reasoning":"one sentence"}\n` +
         `OR {"trade":true,"team":"${market.team1.team}" or "${market.team2.team}","confidence":0.XX,"betAmount":N,"exitScenario":"specific reason e.g. prolific attack vs defense conceding 1.8/game — price rises when they score first goal","reasoning":"one sentence","reasoning_tags":["1-3 lowercase hyphen-delimited tags from this list ONLY: era-gap, playoff-home-fav, starter-mismatch, bullpen-mismatch, market-lag, public-fade, goalie-mismatch, lineup-cold, injury-news, line-movement, we-undervalued, momentum-shift, underdog-spot, schedule-spot, pitcher-form, star-injury, pace-mismatch, back-to-back, rest-advantage, home-court, motivation, other"]}`;
@@ -8564,16 +8568,22 @@ async function checkPreGamePredictions() {
         if (item._structuralDecision) {
           return Promise.resolve(JSON.stringify(item._structuralDecision));
         }
-        return claudeWithSearch(item.prompt, {
+        // 2026-04-29 COST OPTIMIZATION — switched from claudeWithSearch to claudeSonnet.
+        // Pre-game web search added ~$0.01/call ($14 over 10d at 1433 calls). The bot
+        // already provides comprehensive ESPN ground truth (starters, lineups, sportsbook
+        // anchor, lineup-change context) so search rarely surfaces meaningfully new info.
+        // For high-impact triggers (lineup change in last 30min, breaking news), the
+        // bot's existing scrapers handle fresh data. Sonnet's training data + bot context
+        // is sufficient for routine pre-game evaluation.
+        return claudeSonnet(item.prompt, {
           maxTokens: 2000,
-          maxSearches: 1,
+          timeout: 30000,
           category: 'pre-game',
           // Per-sport system prompt with cached static framework. The 1500-3000 token
           // framework (decision tree, hard NOs, calibration scale, underdog check)
-          // caches via cache_control: ephemeral — saves ~40% on input tokens for
-          // pre-game calls within the same 5-minute window. Was previously sent
-          // fresh in every user prompt.
-          system: PG_BASE_SYSTEM + getPgFramework(item.sport),
+          // caches via cache_control: ephemeral. Calibration feedback now appended
+          // here too so it's cached alongside the framework (was inline in user prompt).
+          system: PG_BASE_SYSTEM + getPgFramework(item.sport) + (getCalibrationFeedback() || ''),
           cacheSystem: true,
         });
       })
