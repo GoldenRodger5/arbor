@@ -10742,7 +10742,9 @@ async function managePositions() {
         {
           const eligibleForTrailing = trade.strategy?.startsWith?.('structural-')
             || trade.strategy === 'live-prediction'
-            || trade.strategy === 'live-swing';
+            || trade.strategy === 'live-swing'
+            || trade.strategy === 'pre-game-prediction'
+            || trade.strategy === 'pre-game-edge-first';
           if (eligibleForTrailing && trade.side === 'yes' && !trade.trailingStopFiredAt) {
             const mfe = mfeTracking.get(trade.id);
             const peakPrice = mfe?.maxPrice ?? trade.maxFavorablePrice ?? entryPrice;
@@ -12151,12 +12153,49 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
     // isn't left null — null PnL later gets overwritten to full-deployCost loss
     // by the settlement loop, which poisons calibration with overstated losses.
     let positionTrulyGone = false;
+    let qtyNow = trade.quantity ?? 0;  // Initialize to expected qty
     try {
       const recheck = await kalshiGet(`/portfolio/positions?ticker=${trade.ticker}`);
       const mktPos = (recheck.market_positions ?? []).find(p => p.ticker === trade.ticker);
-      const qtyNow = Math.max(0, parseFloat(mktPos?.position_fp ?? '0'));
+      qtyNow = Math.max(0, parseFloat(mktPos?.position_fp ?? '0'));
       positionTrulyGone = qtyNow === 0;
     } catch { /* keep positionTrulyGone=false on error */ }
+
+    // 2026-04-29 BUGFIX: when fill_count_fp comes back 0 but Kalshi position has
+    // ACTUALLY decreased, it means our order filled (race condition between order
+    // confirm and position update). Treat as a successful partial sell.
+    // CHC@SD today: bot fired tier-1 THREE TIMES because each prior fill returned
+    // 0 in the response, so ladderTiersDone was never advanced. Sold 12/14 by
+    // accident. Could over-sell or under-sell on a different scenario.
+    const expectedQty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / (trade.entryPrice || 1));
+    const inferredFill = expectedQty - qtyNow;
+    if (!positionTrulyGone && inferredFill > 0 && inferredFill <= sellQty) {
+      // Partial fill happened — Kalshi confirmed position dropped by `inferredFill`.
+      // Update trade.quantity to actual Kalshi state and compute realized P&L
+      // for this partial. Return success so caller advances tier state.
+      const partialProfit = (currentPrice - entryPrice) * inferredFill;
+      trade.quantity = qtyNow;
+      trade.partialTakeAt = trade.partialTakeAt ?? new Date().toISOString();
+      // Add to running realized total
+      trade.realizedPnL = Math.round(((trade.realizedPnL ?? 0) + partialProfit) * 100) / 100;
+      console.log(`[exit] ✓ INFERRED PARTIAL FILL on ${trade.ticker}: response showed 0 but position dropped ${expectedQty}→${qtyNow} (filled ${inferredFill}) @ ${(currentPrice*100).toFixed(0)}¢, partial P&L $${partialProfit.toFixed(2)}`);
+      // Persist updated qty + realizedPnL to JSONL
+      if (existsSync(TRADES_LOG)) {
+        try {
+          const gLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+          const gTrades = gLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+          const gTrade = gTrades.find(t => t.id === trade.id);
+          if (gTrade) {
+            gTrade.quantity = trade.quantity;
+            gTrade.partialTakeAt = trade.partialTakeAt;
+            gTrade.realizedPnL = trade.realizedPnL;
+            applyMFE(trade, gTrade);
+            writeFileSync(TRADES_LOG, gTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
+          }
+        } catch (e) { console.error(`[exit] Failed to persist inferred-partial for ${trade.ticker}:`, e.message); }
+      }
+      return true; // success — caller advances ladder tier (finally releases lock)
+    }
 
     if (positionTrulyGone) {
       const approxQty = trade.quantity ?? Math.round((trade.deployCost ?? 0) / (trade.entryPrice || 1));
