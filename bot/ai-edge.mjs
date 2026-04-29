@@ -6731,6 +6731,35 @@ async function checkLiveScoreEdges() {
           continue;
         }
 
+        // 🛑 EDGE × CONFIDENCE GATE (2026-04-28 from cross-tab audit n=174 settled trades):
+        // Specific (edge × confidence) cells are statistically losing despite passing
+        // individual confidence floor and margin checks. Most damaging cell:
+        //   edge ≥ 15pt × conf 66-70%: n=35, -$76.19 (the bot's biggest single bleeder)
+        // Sonnet over-claims edge magnitude when confidence is mid (66-70%); the
+        // implied "huge edge" is delusional. Bypass these cells. Bypass also for:
+        //   edge 5-9pt × conf 66-75% (combined n=24, -$63)
+        //   edge 0-4pt × conf 76-80% (n=9, -$13) — high-conf thin-edge trap
+        // Structural-detector trades EXCLUDED (they're mechanical, not Sonnet-driven).
+        if (!_structuralDecision) {
+          const edgePct = rawEdge * 100;
+          const confPct = confidence * 100;
+          let blockReason = null;
+          if (edgePct >= 15 && confPct < 71) {
+            blockReason = `edge ${edgePct.toFixed(0)}pt × conf ${confPct.toFixed(0)}% — historical -$76 over n=35 (Sonnet over-claims edge at mid conf)`;
+          } else if (edgePct >= 5 && edgePct < 10 && confPct < 76) {
+            blockReason = `edge ${edgePct.toFixed(0)}pt × conf ${confPct.toFixed(0)}% — historical -$63 over n=24 (mid-conf thin-edge trap)`;
+          } else if (edgePct < 5 && confPct >= 76 && confPct < 81) {
+            blockReason = `edge ${edgePct.toFixed(0)}pt × conf ${confPct.toFixed(0)}% — historical -$13 over n=9 (high-conf thin-edge trap)`;
+          } else if (edgePct >= 15 && confPct >= 80) {
+            blockReason = `edge ${edgePct.toFixed(0)}pt × conf ${confPct.toFixed(0)}% — historical -$29 over n=6 (Sonnet over-confident on huge claimed edge)`;
+          }
+          if (blockReason) {
+            console.log(`[live-edge] 🛑 EDGE×CONF GATE: ${targetAbbr} blocked — ${blockReason}`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-edge-conf-trap', ticker, league, homeAbbr, awayAbbr, diff, period, price, confidence, edge: edgePct, targetAbbr, reasoning: blockReason });
+            continue;
+          }
+        }
+
         const edge = confidence - price;
 
         console.log(`[live-edge] ✅ ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}) PASSED margin: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(edge*100).toFixed(1)}% — checking risk gates...`);
