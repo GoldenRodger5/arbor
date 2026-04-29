@@ -2397,8 +2397,14 @@ function getLiveMoveContext(ticker, entrySide, entryPrice) {
 // pre-game-prediction holdToSettle, high-conviction Claude-gated).
 function getLadderState(trade, profitPerContract, currentPrice, league, ctx) {
   const strat = trade.strategy ?? '';
+  // 2026-04-29: added pre-game-prediction to eligible. Previously only had
+  // partialTakePrice (single threshold sells 50%). Ladder gives tiered partial
+  // locks (1/3 + 1/3) which captures peaks better. The existing pre-game
+  // partialTakePrice profit-lock checks !partialTakeAt, so if ladder fires
+  // first, partial-take won't double-fire on the same trade.
   const eligible = strat === 'live-prediction'
     || strat === 'pre-game-edge-first'
+    || strat === 'pre-game-prediction'
     || strat.startsWith('structural-');
   if (!eligible) return null;
   const tiersDone = trade.ladderTiersDone ?? 0;
