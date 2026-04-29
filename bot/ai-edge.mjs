@@ -6997,6 +6997,23 @@ async function checkLiveScoreEdges() {
         if (isSwingMode) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for swing trades
         if (reentryHalfSize) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for 3rd/4th entry on same game
 
+        // 2026-04-29 — STRUCTURAL DETECTOR KELLY OVERRIDE.
+        // Auto-cal kellyFraction is calibrated against SONNET trade performance. Structural
+        // detectors are pure rules-based (period × score × price); they don't depend on
+        // Sonnet judgment, so applying Sonnet-derived Kelly throttles to them is wrong.
+        // Restore the throttled portion. Example: MLB Kelly is 0.25 (auto-cal). Default
+        // is 0.50, so kellyMult = 0.5 → halves all MLB sizing. Structural trades undo this.
+        if (item._structuralDecision && !hcCheck.isHighConv) {
+          const _baseKelly = 0.50;
+          const _calKelly = (typeof CAL.kellyFraction?.[league] === 'number') ? CAL.kellyFraction[league] : _baseKelly;
+          const _kellyMult = _calKelly / _baseKelly;
+          if (_kellyMult > 0 && _kellyMult < 1) {
+            const before = maxBetLE;
+            maxBetLE = Math.floor(maxBetLE / _kellyMult);
+            console.log(`[sizing] 🎯 STRUCTURAL KELLY-OVERRIDE: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)} (${league.toUpperCase()} kelly ${_calKelly} restored to ${_baseKelly} for rules-based detector)`);
+          }
+        }
+
         // 2026-04-29 — CELL-BASED SIZING MULTIPLIER:
         //   Boost: NBA Q4 leader structural detectors (89% WR proven cell) → 1.5x
         //   Cut:   MLB inn 7+ AND NBA Q3 (losing cells) → 0.25x quarter-size
@@ -7079,14 +7096,21 @@ async function checkLiveScoreEdges() {
         tradeCooldowns.set(`game:${awayAbbr}@${homeAbbr}`, Date.now());
 
         // Execute the order
+        // 2026-04-29 — ORDERBOOK STEP-UP: send yes_price 2¢ above target so the
+        // order walks the book and captures liquidity in the [target, target+2¢]
+        // band. Kalshi fills at min(yes_price, current_ask), so worst case we pay
+        // 2¢ more on contracts that would otherwise not fill. Observed problem
+        // (SEA-MIN 4/29): order at exact 63¢ filled only 1 of 5 target contracts
+        // before price moved up. Stepping up captures the rest of the orderbook.
         let result, deployed;
         if (best.platform === 'polymarket' && best.slug) {
           result = await polymarketPost(best.slug, best.intent, bestPrice + 0.02, qty);
           deployed = qty * bestPrice;
         } else {
+          const stepUpPrice = Math.min(99, priceInCents + 2);
           result = await kalshiPost('/portfolio/orders', {
             ticker, action: 'buy', side: 'yes', count: qty,
-            yes_price: priceInCents,
+            yes_price: stepUpPrice,
           });
           deployed = qty * bestPrice;
         }
