@@ -751,6 +751,88 @@ function detectNbaQ4Leader({ league, period, gameDetail, diff, weTimeAdj, price,
 //   • Confirmed elite or good bullpen tier (poor/below excluded)
 //   • Lead ≥2 runs (1-run leads have higher variance — already blocked elsewhere)
 //   • Price ≤78¢ (within typical mid-game NBA ceiling, leaves room to run)
+// NBA Q4 leader UNDERDOG-PRICED: catches the 4 rejected shadow cases (all won)
+// where a Q4 leader is priced at 40-55¢ despite leading by 3+ pts with 4-10 min left.
+// Pure WE-vs-price mispricing — when Kalshi prices a leader as a coin-flip but the
+// score + clock say 60-70%+, that's pure +EV. Diff threshold 3 (vs ≥5 in the
+// standard detector) because at low prices the asymmetry alone is the edge.
+// 2026-04-29: shadow data showed 4/4 wins on this cell, edge 8-19pt.
+function detectNbaQ4LeaderUnderdogPrice({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'nba') return null;
+  if (period !== 4) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 3) return null;
+  if (price < 0.40 || price > 0.55) return null; // underdog-priced band only
+  const m = (gameDetail || '').match(/^(\d+):(\d+)/);
+  if (!m) return null;
+  const minsLeft = parseInt(m[1], 10) + parseInt(m[2], 10) / 60;
+  if (minsLeft < 4 || minsLeft > 10) return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.07) return null; // need ≥7pt edge at this band
+  return {
+    trade: true,
+    side: 'yes',
+    confidence: weTimeAdj,
+    betAmount: null,
+    reasoning: {
+      steel_man: `Trailing team has ${minsLeft.toFixed(1)} min to overcome ${diff}-pt deficit; market pricing leader as coin flip`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (NBA Q4 leader underdog-priced): ${diff}-pt lead with ${minsLeft.toFixed(1)} min left, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge. Kalshi mispricing leader as toss-up.`,
+      key_facts: [
+        `Q4, ${diff}-pt lead with ${minsLeft.toFixed(1)} min`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ — underdog-priced leader`,
+      ],
+      top_risk: 'Late comeback or 3pt barrage by trailing team',
+      conviction: 'Structural pattern — 4/4 shadow data on Q4 leaders priced 40-55¢',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'nba-q4-leader-underdog-price',
+    _matchInfo: { minsLeft, edge: edge * 100, diff, price: Math.round(price * 100) },
+  };
+}
+
+// MLB inn 5-7 leader (BROADER than detectMlbMidGameLead — catches the cases that
+// fail mid-game's bullpen-tier and ≥10pt-edge requirements). Shadow data 2026-04-29:
+// 28 rejected cases at edge 1-7pt, ~80% WR, +9-23% EV.
+//
+// Constraints:
+//   • inn 5-7 (overlaps inn 5 with mid-game-lead but mid-game requires bullpen)
+//   • leader, ≥1 run lead
+//   • edge ≥4pt (vs ≥10pt for mid-game)
+//   • price ≤82¢ (room for upside)
+//   • no bullpen-tier requirement (this is the loose-fire detector)
+function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period < 5 || period > 7) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 1) return null;
+  if (price > 0.82) return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.04) return null;
+  return {
+    trade: true,
+    side: 'yes',
+    confidence: weTimeAdj,
+    betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-run lead in ${period}th inning — trailing team has limited at-bats remaining`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 5-7 leader, shadow ~80% WR n=28): ${diff}-run lead in ${period}th, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Inning ${period}, ${diff}-run lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+      ],
+      top_risk: 'Late-inning bullpen blow-up or trailing-team rally',
+      conviction: 'Structural pattern — broad MLB mid/late-mid leader',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-inn-5-7-leader',
+    _matchInfo: { period, diff, edge: edge * 100 },
+  };
+}
+
 function detectMlbMidGameLead({ league, period, gameDetail, diff, leadingBullpenTier, weTimeAdj, price, targetAbbr, leadingAbbr }) {
   if (league !== 'mlb') return null;
   if (period < 3 || period > 5) return null;
@@ -6288,6 +6370,15 @@ async function checkLiveScoreEdges() {
           });
         }
         if (!_structuralDecision) {
+          // 2026-04-29: NBA Q4 underdog-priced leader — fires when leader is at 40-55¢
+          // (Kalshi misprices as coin-flip). 4/4 shadow wins on this cell.
+          _structuralDecision = detectNbaQ4LeaderUnderdogPrice({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price,
+            targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
           _structuralDecision = detectSoccerHomeHTLeader({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price,
@@ -6305,6 +6396,15 @@ async function checkLiveScoreEdges() {
           _structuralDecision = detectMlbMidGameLead({
             league, period, gameDetail, diff,
             leadingBullpenTier,
+            weTimeAdj: _weTimeAdj, price,
+            targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-04-29: broader MLB inn 5-7 leader (no bullpen-tier requirement)
+          // Shadow data: 28 cases at 80% WR, +9-23% EV.
+          _structuralDecision = detectMlbInn5To7Leader({
+            league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price,
             targetAbbr, leadingAbbr,
           });
@@ -6344,6 +6444,17 @@ async function checkLiveScoreEdges() {
             summary = `min ${info.minute}', lead ${info.diff}, ${info.edge.toFixed(0)}pt edge`;
           }
           console.log(`[live-edge] 🎯 STRUCTURAL DETECTOR matched (${_structuralDecision._structuralPattern}): ${targetAbbr} — ${summary}, conf=${(_structuralDecision.confidence*100).toFixed(0)}% — skipping Sonnet`);
+        }
+
+        // 2026-04-29 — MLB INN 7+ SONNET BLOCK. Trade-level analysis shows
+        // Sonnet-driven MLB live-prediction in inn 7+ is -$72.79 cumulative
+        // (MLB-P7 25% WR -$45, MLB-P9 0% WR -$28). The structural detectors
+        // (mlb-late-inning-lockdown, mlb-inn-5-7-leader) cover the +EV cases.
+        // Block any inn 7+ MLB trade that ISN'T a structural detector match.
+        if (!_structuralDecision && league === 'mlb' && period >= 7) {
+          console.log(`[live-edge] 🚫 MLB-INN${period}-SONNET-BLOCK: ${targetAbbr} — Sonnet-only MLB inn 7+ has -$72 cumulative. Only structural detector matches allowed.`);
+          logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-late-sonnet', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `MLB inn ${period} Sonnet-only blocked — must be structural detector match` });
+          continue;
         }
 
         // Two-block prompt with cached static prefix. The prefix (~1500 tokens of
@@ -6538,14 +6649,34 @@ async function checkLiveScoreEdges() {
         // KILLER BUCKET BLOCK (live-edge, all sports after per-sport extension 2026-04-24):
         // 15+pt edge × <70% conf is the proportionality-mismatch pattern. Block fires only
         // when conf < 70%, so the NBA 70-74% jackpot bucket (5/5 WR, +$55) is unaffected.
-        // No live-edge carve-outs needed — live decisions are time-pressured and don't
-        // suffer the narrative-stack pattern as severely as pre-game.
+        // 2026-04-29 EXEMPTION: NBA Q4 leaders bypass — 4/4 shadow wins at 56-64% conf with
+        // 8-19pt edges. The "proportionality mismatch" rule is the WRONG signal for the
+        // single best-performing live cell (89% WR, +$34.86 trade-level). Bypasses ONLY
+        // when our pick is the actual leader in NBA Q4 (objective condition, not Sonnet-derived).
         {
           const _liveEdge = (decision.confidence ?? 0) - price;
           if (_liveEdge >= 0.15 && (decision.confidence ?? 0) < 0.70) {
-            console.log(`[live-edge] 🚫 KILLER BUCKET BLOCKED ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(_liveEdge*100).toFixed(0)}pt edge at ${((decision.confidence ?? 0)*100).toFixed(0)}% conf — proportionality mismatch (15+pt edges need 70%+ conf).`);
-            logScreen({ stage: 'live-edge', ticker, result: 'killer-bucket-block', reasoning: `${league.toUpperCase()}: Edge ${(_liveEdge*100).toFixed(0)}pt + conf ${((decision.confidence ?? 0)*100).toFixed(0)}% = -EV bucket` });
-            continue;
+            // NBA Q4 leader exemption
+            let _killBucketExempt = false;
+            try {
+              if (league === 'nba' && period === 4 && targetAbbr) {
+                const _tu = targetAbbr.toUpperCase();
+                const _hu = (homeAbbr ?? '').toUpperCase();
+                const _au = (awayAbbr ?? '').toUpperCase();
+                const _tIsHome = _tu === _hu;
+                const _tIsAway = _tu === _au;
+                const _ts = _tIsHome ? homeScore : _tIsAway ? awayScore : null;
+                const _os = _tIsHome ? awayScore : _tIsAway ? homeScore : null;
+                if (_ts != null && _os != null && _ts > _os) _killBucketExempt = true;
+              }
+            } catch { /* best-effort */ }
+            if (_killBucketExempt) {
+              console.log(`[live-edge] ✓ NBA-P4-LEADER KILLER-BUCKET EXEMPT ${targetAbbr}: ${(_liveEdge*100).toFixed(0)}pt edge at ${((decision.confidence ?? 0)*100).toFixed(0)}% conf — bypassing (89% WR cell)`);
+            } else {
+              console.log(`[live-edge] 🚫 KILLER BUCKET BLOCKED ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(_liveEdge*100).toFixed(0)}pt edge at ${((decision.confidence ?? 0)*100).toFixed(0)}% conf — proportionality mismatch (15+pt edges need 70%+ conf).`);
+              logScreen({ stage: 'live-edge', ticker, result: 'killer-bucket-block', reasoning: `${league.toUpperCase()}: Edge ${(_liveEdge*100).toFixed(0)}pt + conf ${((decision.confidence ?? 0)*100).toFixed(0)}% = -EV bucket` });
+              continue;
+            }
           }
         }
 
@@ -6557,13 +6688,31 @@ async function checkLiveScoreEdges() {
         // lineup-cold 2/5 (40% WR, ciLo 12%). When Sonnet cites these as the edge,
         // historical data says skip. Structural detector trades have synthetic tags
         // and should bypass — they're rule-based, not Sonnet-reasoned.
+        // 2026-04-29 LOOSENING: only block when there's a bad tag AND no offsetting
+        // good tag (we-undervalued / market-lag / playoff-home-fav). Sonnet often
+        // cites mixed tags; killing the trade because of one weak co-citation rejects
+        // ~3 +EV trades/week per shadow data.
         if (!item._structuralDecision) {
           const tags = decision.reasoningStructured?.reasoning_tags;
           const worstTag = evaluateTagCredibility(tags);
-          if (worstTag) {
+          // Check if any HIGH-credibility tag is also present (Wilson ≥ 0.55, n ≥ 20)
+          let hasGoodTag = false;
+          if (worstTag && Array.isArray(tags)) {
+            const stats = CAL.reasoningTagStats ?? {};
+            for (const t of tags) {
+              const s = stats[t];
+              if (s && (s.n ?? 0) >= 20 && (s.ciLo ?? 0) >= 0.55) {
+                hasGoodTag = true;
+                break;
+              }
+            }
+          }
+          if (worstTag && !hasGoodTag) {
             console.log(`[live-edge] 🚫 TAG-CREDIBILITY BLOCKED ${targetAbbr}: cites '${worstTag.tag}' which has ${worstTag.stats.wins}/${worstTag.stats.n} historical (Wilson lower ${(worstTag.stats.ciLo*100).toFixed(0)}%) — pass`);
             logScreen({ stage: 'live-edge', ticker, result: 'tag-credibility-block', reasoning: `Reasoning tag '${worstTag.tag}' has ${worstTag.stats.wins}/${worstTag.stats.n} (${(worstTag.stats.winRate*100).toFixed(0)}% WR, ciLo ${(worstTag.stats.ciLo*100).toFixed(0)}%) — auto-cal flag` });
             continue;
+          } else if (worstTag && hasGoodTag) {
+            console.log(`[live-edge] ✓ TAG-CREDIBILITY OFFSET ${targetAbbr}: bad tag '${worstTag.tag}' present but offset by high-credibility tag — allowing through`);
           }
         }
 
@@ -6590,7 +6739,9 @@ async function checkLiveScoreEdges() {
             const targetScore = targetIsHome ? homeScore : targetIsAway ? awayScore : null;
             const oppScore = targetIsHome ? awayScore : targetIsAway ? homeScore : null;
             if (targetScore != null && oppScore != null && targetScore > oppScore) {
-              const nbaQ4Floor = 0.58;
+              // 2026-04-29: lowered 58% → 53%. At 19pt edge + leader status, 50% WR
+              // is +EV; the 89% WR cell deserves more aggressive capture.
+              const nbaQ4Floor = 0.53;
               if (effectiveMinConf > nbaQ4Floor) {
                 console.log(`[live-edge] 🏀 NBA Q4 LEADER floor: ${targetAbbr} leading ${targetScore}-${oppScore} P4 — floor ${(effectiveMinConf*100).toFixed(0)}% → ${(nbaQ4Floor*100).toFixed(0)}%`);
                 effectiveMinConf = nbaQ4Floor;
@@ -6843,6 +6994,34 @@ async function checkLiveScoreEdges() {
           : getPositionSize(best.platform, bestEdge, 0, league);
         if (isSwingMode) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for swing trades
         if (reentryHalfSize) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for 3rd/4th entry on same game
+
+        // 2026-04-29 — CELL-BASED SIZING MULTIPLIER:
+        //   Boost: NBA Q4 leader structural detectors (89% WR proven cell) → 1.5x
+        //   Cut:   MLB inn 7+ AND NBA Q3 (losing cells) → 0.25x quarter-size
+        //   Both apply only to NON-swing/NON-HC trades (existing modifiers don't stack).
+        {
+          const _structPattern = item._structuralDecision?._structuralPattern ?? '';
+          const isNbaP4LeaderStructural =
+            _structPattern === 'nba-q4-leader' ||
+            _structPattern === 'nba-q4-cold-shooting' ||
+            _structPattern === 'nba-q4-leader-underdog-price';
+          if (isNbaP4LeaderStructural && !isSwingMode && !hcCheck.isHighConv) {
+            const before = maxBetLE;
+            maxBetLE = Math.floor(maxBetLE * 1.5);
+            console.log(`[sizing] 🏀 NBA-P4-LEADER BOOST 1.5x: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)} (pattern=${_structPattern}, 89% WR proven cell)`);
+          }
+          // Losing-cell quarter-size (only applies to Sonnet-only trades, structural detectors exempt)
+          const isLosingCellSonnet = !item._structuralDecision && (
+            (league === 'mlb' && period >= 7) ||  // already blocked above but defense-in-depth
+            (league === 'nba' && period === 3)    // NBA Q3 was -$11 in 4 trades
+          );
+          if (isLosingCellSonnet) {
+            const before = maxBetLE;
+            maxBetLE = Math.max(1, Math.floor(maxBetLE * 0.25));
+            console.log(`[sizing] 🧊 LOSING-CELL QUARTER-SIZE: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)} (${league.toUpperCase()}-P${period} historically -EV)`);
+          }
+        }
+
         // Tag-credibility BOOST: shadow data 2026-04-27 shows reasoning_tags
         // `we-undervalued` (39 samples, 67% WR) and `market-lag` (44 samples, 61% WR)
         // outperform their cohorts. Apply 1.05-1.15x sizing multiplier when these
