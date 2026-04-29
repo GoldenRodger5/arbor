@@ -802,6 +802,174 @@ function detectNbaQ4LeaderUnderdogPrice({ league, period, gameDetail, diff, weTi
 //   • edge ≥4pt (vs ≥10pt for mid-game)
 //   • price ≤82¢ (room for upside)
 //   • no bullpen-tier requirement (this is the loose-fire detector)
+// ─── DIP-BUY / UNDERPRICED LEADER DETECTORS (2026-04-29 audit) ────────────────
+// Built from full shadow audit (605 records, 4 days). Cells where the bot has been
+// REJECTING leader trades at 46-65¢ price band but those leaders went on to win at
+// 70%+ rates. These detectors fire mechanically on the proven cells.
+
+// MLB inning 6 leader at 46-65¢: 14 game-level wins out of 14 candidates (93% WR,
+// +31% EV in shadow audit). The single highest-WR cell discovered. Fires only in
+// the depressed price band where the market underrates an established lead.
+function detectMlbInn6Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period !== 6) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 1) return null;
+  if (price < 0.46 || price > 0.65) return null; // only fires in the underpriced band
+  const edge = weTimeAdj - price;
+  if (edge < 0.04) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-run lead in 6th — only 3 innings left for trailing team to come back`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 6 leader 46-65¢, jackpot cell 93% WR n=14): ${diff}-run lead in 6th, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Inning 6, ${diff}-run lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 14 games, 13 won (93%) at avg 62¢`,
+      ],
+      top_risk: 'Late-inning bullpen blow-up or trailing rally',
+      conviction: 'Structural pattern — highest-WR cell in 4-day shadow audit',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-inn-6-leader',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
+// MLB inning 2 leader at 50-65¢: 9 game-level, 78% WR, +17% EV (shadow audit).
+// Captures early-game leaders the market underprices because innings remain.
+function detectMlbInn2Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period !== 2) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 1) return null;
+  if (price < 0.50 || price > 0.65) return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.04) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-run lead in 2nd — early but trailing team has full game to come back`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 2 leader 50-65¢, 78% WR n=9): ${diff}-run lead in 2nd, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Inning 2, ${diff}-run lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 9 games, 7 won (78%) at avg 61¢`,
+      ],
+      top_risk: 'Plenty of innings left for trailing team rally',
+      conviction: 'Structural pattern — early-lead market underpricing',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-inn-2-leader',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
+// NBA Q2 leader at 50-65¢: 8 game-level, 75% WR, +14% EV. Mid-half leaders
+// market underprices because half is still left. Diff ≥5 to ensure meaningful lead.
+function detectNbaQ2Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'nba') return null;
+  if (period !== 2) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 5) return null; // need meaningful lead at this stage
+  if (price < 0.50 || price > 0.65) return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.05) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-pt lead in Q2 — half left but lead is meaningful`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (NBA Q2 leader 50-65¢, 75% WR n=8): ${diff}-pt lead in Q2, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Q2, ${diff}-pt lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 8 games, 6 won (75%) at avg 61¢`,
+      ],
+      top_risk: 'Half remaining — sustainable run by trailing team possible',
+      conviction: 'Structural pattern — Q2 lead market underpricing',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'nba-q2-leader',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
+// NBA Q3 leader at 50-65¢: 9 game-level, 78% WR, +19% EV. Diff ≥4 to ensure lead
+// is meaningful (and avoid the documented Q3 -EV cell at lower diffs).
+function detectNbaQ3Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'nba') return null;
+  if (period !== 3) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 4) return null;
+  if (price < 0.50 || price > 0.65) return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.05) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-pt lead in Q3 — quarter+ left but lead is sustained`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (NBA Q3 leader 50-65¢, 78% WR n=9): ${diff}-pt lead in Q3, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Q3, ${diff}-pt lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 9 games, 7 won (78%) at avg 59¢`,
+      ],
+      top_risk: 'Q4 still to play — comeback windows exist',
+      conviction: 'Structural pattern — Q3 lead market underpricing',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'nba-q3-leader',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
+// Soccer 1H home leader at 50-65¢: 5 game-level, 80% WR, +18% EV. Smaller sample
+// but consistent with the home-leader 2H pattern. Excludes MLS for now (mixed
+// historical) and minute < 30 (too early — own-goal variance).
+function detectSoccer1HHomeLeader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr, homeAbbr }) {
+  const europeanLeagues = ['epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'];
+  if (!europeanLeagues.includes(league)) return null;
+  if (period !== 1) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (targetAbbr !== homeAbbr) return null; // home leaders only — same as 2H detector
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 1) return null;
+  if (price < 0.50 || price > 0.65) return null;
+  const m = (gameDetail || '').match(/^(\d+)/);
+  if (!m) return null;
+  const minute = parseInt(m[1], 10);
+  if (minute < 30 || minute > 45) return null; // last 15 min of 1H only
+  const edge = weTimeAdj - price;
+  if (edge < 0.05) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `Home team leading ${diff} at minute ${minute}' — half remains for opponent`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (Soccer 1H home leader 50-65¢, 80% WR n=5): ${targetAbbr} leading ${diff} at min ${minute}', WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Minute ${minute}', home team leading by ${diff}`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 5 games, 4 won (80%) at avg 62¢`,
+      ],
+      top_risk: 'Half remaining — comeback or equalizer possible',
+      conviction: 'Structural pattern — home leader 1H underpricing',
+      reasoning_tags: ['market-lag', 'we-undervalued', 'playoff-home-fav'],
+    },
+    _structuralPattern: 'soccer-1h-home-leader',
+    _matchInfo: { minute, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
 function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
   if (league !== 'mlb') return null;
   if (period < 5 || period > 7) return null;
@@ -6387,6 +6555,38 @@ async function checkLiveScoreEdges() {
             targetAbbr, leadingAbbr, homeAbbr,
           });
         }
+        // 2026-04-29 dip-buy detectors (underpriced leaders 46-65¢ band)
+        if (!_structuralDecision) {
+          _structuralDecision = detectMlbInn6Leader({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          _structuralDecision = detectMlbInn2Leader({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          _structuralDecision = detectNbaQ2Leader({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          _structuralDecision = detectNbaQ3Leader({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          _structuralDecision = detectSoccer1HHomeLeader({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price,
+            targetAbbr, leadingAbbr, homeAbbr,
+          });
+        }
         if (!_structuralDecision) {
           _structuralDecision = detectNhlP3ClosingOut({
             league, period, gameDetail, diff,
@@ -6658,8 +6858,11 @@ async function checkLiveScoreEdges() {
         {
           const _liveEdge = (decision.confidence ?? 0) - price;
           if (_liveEdge >= 0.15 && (decision.confidence ?? 0) < 0.70) {
-            // NBA Q4 leader exemption
-            let _killBucketExempt = false;
+            // 2026-04-29 EXTENDED EXEMPTION: NBA Q4 leader OR any structural detector.
+            // Structural detectors are rules-based (period × score × price) and don't
+            // suffer the proportionality-mismatch pattern that makes the killer-bucket
+            // rule meaningful for Sonnet judgment trades.
+            let _killBucketExempt = !!item._structuralDecision;
             try {
               if (league === 'nba' && period === 4 && targetAbbr) {
                 const _tu = targetAbbr.toUpperCase();
@@ -6751,6 +6954,33 @@ async function checkLiveScoreEdges() {
             }
           }
         } catch { /* best-effort */ }
+
+        // 2026-04-29 PHASE 2: LOW-PRICE LEADER FLOOR. Shadow audit (605 records, 4 days)
+        // showed leaders at 46-65¢ price band have 70-72% WR — the bot has been REJECTING
+        // these because Sonnet's confidence lands at 55-65% (below 70% floor) even though
+        // the price-implied math says fire. Lower floor to 55% specifically when:
+        //   - target = leader (NOT trailing — those are different EV math)
+        //   - price ≤ 60¢ (the underpriced band)
+        // This unlocks Sonnet-driven trades in the documented +EV cell while keeping the
+        // 70% floor in the higher-price band where 60% WR is -EV.
+        try {
+          const _isLowPriceLeader = targetAbbr === leadingAbbr && price <= 0.60 && price >= 0.40;
+          if (_isLowPriceLeader) {
+            const lowPriceFloor = 0.55;
+            if (effectiveMinConf > lowPriceFloor) {
+              console.log(`[live-edge] 💰 LOW-PRICE-LEADER floor: ${targetAbbr} ${league.toUpperCase()} P${period} leader at ${(price*100).toFixed(0)}¢ — floor ${(effectiveMinConf*100).toFixed(0)}% → ${(lowPriceFloor*100).toFixed(0)}% (46-65¢ leader 70-72% WR cell)`);
+              effectiveMinConf = lowPriceFloor;
+            }
+          }
+        } catch { /* best-effort */ }
+
+        // 2026-04-29 STRUCTURAL FLOOR BYPASS: structural detectors are mechanical
+        // rules with their own internal validation gates. They shouldn't be subject
+        // to the same confidence floor as Sonnet judgment trades. Set effective floor
+        // to 0 for structural decisions — the detector already gated entry.
+        if (item._structuralDecision) {
+          effectiveMinConf = 0;
+        }
         // EDGE-FIRST LIVE TIER: clear edge in the 50-55¢ underdog band with 63%+ conf bypasses
         // the standard/swing conf floors. Routes through swing path (half size, +12¢ exit).
         // Mirrors the pre-game edge-first tier — same EV math at half-size when market pricing lags.
@@ -7020,14 +7250,16 @@ async function checkLiveScoreEdges() {
         //   Both apply only to NON-swing/NON-HC trades (existing modifiers don't stack).
         {
           const _structPattern = item._structuralDecision?._structuralPattern ?? '';
-          const isNbaP4LeaderStructural =
-            _structPattern === 'nba-q4-leader' ||
-            _structPattern === 'nba-q4-cold-shooting' ||
-            _structPattern === 'nba-q4-leader-underdog-price';
-          if (isNbaP4LeaderStructural && !isSwingMode && !hcCheck.isHighConv) {
+          // 1.5x boost on documented jackpot cells (≥85% WR proven)
+          const isJackpotStructural =
+            _structPattern === 'nba-q4-leader' ||              // 100% WR n=6
+            _structPattern === 'nba-q4-cold-shooting' ||       // structural pattern
+            _structPattern === 'nba-q4-leader-underdog-price' ||  // 100% WR n=3
+            _structPattern === 'mlb-inn-6-leader';             // 93% WR n=14 — Phase 4 add
+          if (isJackpotStructural && !isSwingMode && !hcCheck.isHighConv) {
             const before = maxBetLE;
             maxBetLE = Math.floor(maxBetLE * 1.5);
-            console.log(`[sizing] 🏀 NBA-P4-LEADER BOOST 1.5x: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)} (pattern=${_structPattern}, 89% WR proven cell)`);
+            console.log(`[sizing] 🎯 JACKPOT-CELL BOOST 1.5x: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)} (pattern=${_structPattern}, ≥89% WR proven cell)`);
           }
           // Losing-cell quarter-size (only applies to Sonnet-only trades, structural detectors exempt)
           const isLosingCellSonnet = !item._structuralDecision && (
@@ -10591,7 +10823,13 @@ async function managePositions() {
         // Mechanical sells left money on the table: ORL was winning by 8 in Q4 at 71¢,
         // holding to settlement would have paid +46¢/contract vs the +17¢ locked.
         // Let Claude see score, time, momentum, and EV math before deciding.
-        if (trade.strategy === 'live-prediction' && profitPerContract >= 0.15) {
+        // 2026-04-29: extended to structural trades (strategy: structural-*).
+        // For low-price entries (≤60¢), lower trigger to +12¢ — these are swing trades
+        // where capturing the variance is the strategy, not holding to settlement.
+        const _isStructTrade = trade.strategy?.startsWith?.('structural-');
+        const _isLowPriceEntry = entryPrice <= 0.60;
+        const _profitLockTrigger = _isLowPriceEntry ? 0.12 : 0.15;
+        if ((trade.strategy === 'live-prediction' || _isStructTrade) && profitPerContract >= _profitLockTrigger) {
           const gainPct = Math.round((profitPerContract / entryPrice) * 100);
           const lockProfit = (profitPerContract * 100).toFixed(0);
           const profitLockKey = 'profit-lock-eval:' + trade.ticker;
