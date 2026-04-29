@@ -1363,7 +1363,9 @@ async function tgTradeEntry({ kind, title, gameLine, team, price, qty, deployed,
   if (conf != null && edge != null) {
     lines.push(`🎯 conf ${Math.round(conf * 100)}% · edge +${Math.round(edge)}pt${strategyTag ? ` · <code>${strategyTag}</code>` : ''}`);
   }
-  if (reason) lines.push(`🧠 ${reason.slice(0, 200)}`);
+  // 2026-04-29: bump 200 → 350 char limit. Sonnet edge_arguments are 150-200 chars;
+  // structural trades benefit from showing edge_argument + key_facts + conviction (~300 chars).
+  if (reason) lines.push(`🧠 ${reason.slice(0, 350)}`);
   lines.push(``);
   lines.push(dailyFooter());
   return tg(lines.join('\n'));
@@ -7177,6 +7179,18 @@ async function checkLiveScoreEdges() {
             : isSwingMode ? 'live-swing'
             : hcCheck.isHighConv ? 'high-conviction'
             : 'live-prediction';
+          // 2026-04-29: enrich structural reasoning. Sonnet trades have rich context
+          // in edge_argument; structural trades have generic template text. For structural,
+          // concatenate edge_argument + first 2 key_facts + conviction so the Telegram
+          // notification surfaces specifics (period, score-diff, edge math, why-this-pattern).
+          let _notifReason = decision.reasoningStructured?.edge_argument ?? decision.reasoning;
+          if (isStructuralMatch) {
+            const _rs = decision.reasoningStructured ?? {};
+            const _facts = Array.isArray(_rs.key_facts) ? _rs.key_facts.slice(0, 2).join(' · ') : '';
+            const _conv = _rs.conviction ?? '';
+            const _parts = [_rs.edge_argument, _facts, _conv].filter(Boolean);
+            if (_parts.length) _notifReason = _parts.join(' — ');
+          }
           await tgTradeEntry({
             kind: betLabel,
             title: title,
@@ -7187,7 +7201,7 @@ async function checkLiveScoreEdges() {
             deployed: actualDeployed,
             conf: confidence,
             edge: (confidence - bestPrice) * 100,
-            reason: decision.reasoningStructured?.edge_argument ?? decision.reasoning,
+            reason: _notifReason,
             strategyTag: stratTag,
             isStructural: isStructuralMatch,
           });
@@ -9865,7 +9879,18 @@ async function claudeBroadScan() {
       const cText = await claudeWithSearch(decidePrompt, { maxTokens: 800, maxSearches: 3, category: 'broad-scan' });
       if (!cText) { await reportError('broad-scan:sonnet-empty', `${candidate.ticker}`); continue; }
       const jsonMatch = extractJSON(cText);
-      if (!jsonMatch) { await reportError('broad-scan:no-json', `${candidate.ticker}: ${cText.slice(0, 160)}`); continue; }
+      if (!jsonMatch) {
+        // 2026-04-29: silence Telegram alerts when Sonnet returned a non-JSON pass message
+        // (e.g. "resolution is imminent", "no edge", "decline to trade"). These are valid
+        // Sonnet decisions to skip, not errors. Only alert on genuine parse failures.
+        const passKeywords = /imminent|resolution|resolves|already (settled|resolved)|no (edge|trade|opportunity)|decline|cannot recommend/i;
+        if (passKeywords.test(cText)) {
+          console.log(`[broad-scan] Sonnet declined ${candidate.ticker} (no JSON): ${cText.slice(0, 100)}`);
+        } else {
+          await reportError('broad-scan:no-json', `${candidate.ticker}: ${cText.slice(0, 160)}`);
+        }
+        continue;
+      }
 
       let decision;
       try { decision = JSON.parse(jsonMatch); } catch (e) { await reportError('broad-scan:parse-fail', `${candidate.ticker}: ${e.message} | head=${jsonMatch.slice(0, 160)}`); continue; }
