@@ -2419,8 +2419,13 @@ function getLadderState(trade, profitPerContract, currentPrice, league, ctx) {
   if (tiersDone === 0 && profitPerContract >= tier1Trig) {
     return { fire: true, tier: 1, fraction: 1/3, label: tier1Label };
   }
-  if (tiersDone === 1 && profitPerContract >= 0.25) {
-    return { fire: true, tier: 2, fraction: 1/2, label: 'tier-2-+25c' };
+  // 2026-04-29: parallel adjustment for tier-2. Most swing trades peak at +18-22¢
+  // before retracing — waiting for +25¢ on low-price entries leaves money on the
+  // table. For entries ≤60¢, fire tier-2 at +20¢. Higher entries unchanged.
+  const tier2Trig = isLowPriceEntry ? 0.20 : 0.25;
+  const tier2Label = isLowPriceEntry ? 'tier-2-+20c' : 'tier-2-+25c';
+  if (tiersDone === 1 && profitPerContract >= tier2Trig) {
+    return { fire: true, tier: 2, fraction: 1/2, label: tier2Label };
   }
   return null;
 }
@@ -10686,6 +10691,49 @@ async function managePositions() {
             const result = await executeSell(trade, qty, currentPrice, 'contra-line-move');
             if (result) anyUpdated = true;
             continue;
+          }
+        }
+
+        // 2026-04-29 — TRAILING STOP. If price has retraced significantly from
+        // peak (MFE), exit before further damage. Activates only AFTER trade has
+        // been meaningfully profitable (peak ≥+10¢) so noise doesn't trigger it.
+        // Catches the case where price spikes then crashes back — e.g., NYY-TEX
+        // hit 93¢ peak today; if it had crashed to 70¢ before tier-1 fired we'd
+        // have given back $2-3. Fires on full remaining position; ladder still
+        // runs first to capture partial locks at threshold crosses.
+        {
+          const eligibleForTrailing = trade.strategy?.startsWith?.('structural-')
+            || trade.strategy === 'live-prediction'
+            || trade.strategy === 'live-swing';
+          if (eligibleForTrailing && trade.side === 'yes' && !trade.trailingStopFiredAt) {
+            const mfe = mfeTracking.get(trade.id);
+            const peakPrice = mfe?.maxPrice ?? trade.maxFavorablePrice ?? entryPrice;
+            const peakGain = peakPrice - entryPrice;
+            const retraceFromPeak = peakPrice - currentPrice;
+            const TRAILING_ACTIVATE = 0.10;  // need +10¢ peak to activate
+            const TRAILING_DISTANCE = 0.08;  // exit on 8¢ retrace from peak
+            const stillProfitable = currentPrice > entryPrice + 0.02; // ≥+2¢ to lock real profit
+            if (peakGain >= TRAILING_ACTIVATE && retraceFromPeak >= TRAILING_DISTANCE && stillProfitable) {
+              const lockProfit = ((currentPrice - entryPrice) * 100).toFixed(0);
+              const peakProfit = (peakGain * 100).toFixed(0);
+              console.log(`[exit] 🎯 TRAILING STOP: ${trade.ticker} peak=${(peakPrice*100).toFixed(0)}¢(+${peakProfit}¢) → now=${(currentPrice*100).toFixed(0)}¢ — locking +${lockProfit}¢ before further retrace`);
+              await tgTradeExit({
+                kind: 'TRAILING STOP',
+                title: trade.title,
+                entry: entryPrice,
+                exit: currentPrice,
+                qty: qty,
+                pnl: qty * profitPerContract,
+                reason: `Peak ${(peakPrice*100).toFixed(0)}¢ → now ${(currentPrice*100).toFixed(0)}¢. ${(retraceFromPeak*100).toFixed(0)}¢ retrace from peak — locking +${lockProfit}¢ profit.`,
+                isWin: true,
+              });
+              const result = await executeSell(trade, qty, currentPrice, 'trailing-stop');
+              if (result) {
+                trade.trailingStopFiredAt = new Date().toISOString();
+                anyUpdated = true;
+              }
+              continue;
+            }
           }
         }
 
