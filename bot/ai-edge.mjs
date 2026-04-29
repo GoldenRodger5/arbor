@@ -6867,6 +6867,13 @@ async function checkLiveScoreEdges() {
         // estimated trailer price (1 - leader_price as proxy if not cached). At
         // settlement, the reconciler fills ourPickWon based on the trailer ticker's
         // outcome. Lets us validate "buy-underdog" theses with real data.
+        //
+        // 2026-04-29 PHASE 1 BUY-LOW CANDIDATE TAGGING. When trailer price is in
+        // the 25-40¢ band AND game state is recoverable, tag the shadow as a
+        // "buy-low candidate". After 7 days we'll join with price-tape data to
+        // compute: (a) what % of these saw price recover ≥10-15¢ at some point,
+        // (b) what % settled as wins, (c) which sport/period gives best recovery.
+        // This is shadow-only: NEVER trades, just records what would have happened.
         try {
           const _trailerAbbr = (homeAbbr === leadingAbbr) ? awayAbbr : homeAbbr;
           if (_trailerAbbr && _trailerAbbr !== leadingAbbr) {
@@ -6874,6 +6881,30 @@ async function checkLiveScoreEdges() {
             const _trailerTicker = `${_tickerBase}-${_trailerAbbr}`;
             const _trailerCached = cachedPrices.get(_trailerTicker);
             const _trailerPrice = _trailerCached?.price ?? Math.max(0.01, Math.min(0.99, 1 - price));
+
+            // Buy-low candidate detection — sport-specific recoverable conditions.
+            let _buyLowCandidate = false;
+            let _buyLowReason = null;
+            if (_trailerPrice >= 0.25 && _trailerPrice <= 0.40) {
+              // MLB: 1-3 run deficit in innings 1-6 (after 6th, comeback windows shrink)
+              if (league === 'mlb' && diff >= 1 && diff <= 3 && period >= 1 && period <= 6) {
+                _buyLowCandidate = true;
+                _buyLowReason = `mlb-trail-${diff}run-P${period}`;
+              }
+              // NBA: 5-15 pt deficit in Q1-Q3 (Q4 too late, 16+ is blowout)
+              else if (league === 'nba' && diff >= 5 && diff <= 15 && period >= 1 && period <= 3) {
+                _buyLowCandidate = true;
+                _buyLowReason = `nba-trail-${diff}pt-P${period}`;
+              }
+              // NHL: 1-2 goal deficit in P1 or P2 (P3 with empty-net is binary chaos)
+              else if (league === 'nhl' && diff >= 1 && diff <= 2 && period >= 1 && period <= 2) {
+                _buyLowCandidate = true;
+                _buyLowReason = `nhl-trail-${diff}goal-P${period}`;
+              }
+              // Soccer excluded: draw cliff makes backing trailer mathematically unfavorable
+              // (trailing team often grinds out a draw, which loses our YES contract).
+            }
+
             logShadowDecision({
               stage: 'live-edge-trailer-synthetic',
               ticker: _trailerTicker,
@@ -6887,8 +6918,12 @@ async function checkLiveScoreEdges() {
               leadingAbbr, targetAbbr: _trailerAbbr,
               homeAbbr, awayAbbr,
               liveStage: stage,
-              reasoningPreview: 'synthetic trailer-baseline (bot does not evaluate trailers)',
+              reasoningPreview: _buyLowCandidate
+                ? `BUY-LOW CANDIDATE [${_buyLowReason}] @ ${(_trailerPrice*100).toFixed(0)}¢ — phase 1 data collection`
+                : 'synthetic trailer-baseline (bot does not evaluate trailers)',
               isTrailerSynthetic: true,
+              isBuyLowCandidate: _buyLowCandidate,
+              buyLowReason: _buyLowReason,
             });
             logPriceTapeEntry({
               ticker: _trailerTicker,
@@ -6897,6 +6932,9 @@ async function checkLiveScoreEdges() {
               score: `${awayScore}-${homeScore}`,
               period, gameDetail, leadingAbbr,
             });
+            if (_buyLowCandidate) {
+              console.log(`[shadow] 🎰 BUY-LOW candidate: ${_trailerTicker} ${_trailerAbbr} @ ${(_trailerPrice*100).toFixed(0)}¢ (${_buyLowReason}) — phase 1 data only, no trade`);
+            }
           }
         } catch { /* best-effort */ }
 
