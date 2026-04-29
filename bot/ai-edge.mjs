@@ -3167,6 +3167,28 @@ const PAPER_TRADES_LOG = './logs/paper-trades.jsonl';
 // for offline calibration analysis. Settled via Kalshi market resolution. 100x more samples
 // than real trades alone; enables proper confidence calibration with Wilson-bounded buckets.
 const SHADOW_DECISIONS_LOG = './logs/shadow-decisions.jsonl';
+// Price tape (2026-04-29): captures per-game live price snapshots even when
+// no shadow decision fires. Used for intra-game variance analysis (dip-buy thesis,
+// swing-trade exit calibration). Slim records: ticker, ts, price, score, period.
+const PRICE_TAPE_LOG = './logs/price-tape.jsonl';
+
+// Throttle map: per-ticker last-tape-write timestamp. Prevents spam when same
+// ticker appears in multiple per-cycle code paths.
+const _priceTapeThrottle = new Map();
+function logPriceTapeEntry({ ticker, price, gameBase, league, score, period, gameDetail, leadingAbbr }) {
+  if (!ticker || price == null) return;
+  // Throttle to once per 90s per ticker — captures ~1 sample/cycle without spam
+  const last = _priceTapeThrottle.get(ticker) ?? 0;
+  if (Date.now() - last < 90 * 1000) return;
+  _priceTapeThrottle.set(ticker, Date.now());
+  try {
+    appendFileSync(PRICE_TAPE_LOG, JSON.stringify({
+      ts: new Date().toISOString(),
+      ticker, gameBase, league,
+      price, score, period, gameDetail, leadingAbbr,
+    }) + '\n');
+  } catch { /* best-effort */ }
+}
 
 // Games currently in progress — populated by checkLiveScoreEdges each cycle.
 // Key: "ABBR1|ABBR2" (sorted, upper-case). Lets pre-game scanner skip live games.
@@ -6826,6 +6848,53 @@ async function checkLiveScoreEdges() {
           reasoningTags: decision.reasoningStructured?.reasoning_tags ?? null,
           rlmContext: getLiveMoveContext(ticker, 'yes', price),
           ..._liveShadowCtx,
+        });
+
+        // 2026-04-29 Gap 1 — TRAILING-TEAM SYNTHETIC SHADOW. The bot only screens
+        // leaders, so we have ZERO ground-truth on trailing teams. Log a synthetic
+        // shadow for the trailer side too — same game state, opposite team, with
+        // estimated trailer price (1 - leader_price as proxy if not cached). At
+        // settlement, the reconciler fills ourPickWon based on the trailer ticker's
+        // outcome. Lets us validate "buy-underdog" theses with real data.
+        try {
+          const _trailerAbbr = (homeAbbr === leadingAbbr) ? awayAbbr : homeAbbr;
+          if (_trailerAbbr && _trailerAbbr !== leadingAbbr) {
+            const _tickerBase = ticker.substring(0, ticker.lastIndexOf('-'));
+            const _trailerTicker = `${_tickerBase}-${_trailerAbbr}`;
+            const _trailerCached = cachedPrices.get(_trailerTicker);
+            const _trailerPrice = _trailerCached?.price ?? Math.max(0.01, Math.min(0.99, 1 - price));
+            logShadowDecision({
+              stage: 'live-edge-trailer-synthetic',
+              ticker: _trailerTicker,
+              sport: _shadowSport, league,
+              decision: 'synthetic-trail',
+              rejectReason: 'trailer-baseline',
+              claudeConfidence: null,
+              decisionPrice: _trailerPrice,
+              edge: null,
+              scoreDiff: diff, period, gameDetail,
+              leadingAbbr, targetAbbr: _trailerAbbr,
+              homeAbbr, awayAbbr,
+              liveStage: stage,
+              reasoningPreview: 'synthetic trailer-baseline (bot does not evaluate trailers)',
+              isTrailerSynthetic: true,
+            });
+            logPriceTapeEntry({
+              ticker: _trailerTicker,
+              price: _trailerPrice,
+              gameBase, league,
+              score: `${awayScore}-${homeScore}`,
+              period, gameDetail, leadingAbbr,
+            });
+          }
+        } catch { /* best-effort */ }
+
+        // 2026-04-29 Gap 2 — PRICE TAPE for the leader side. logPriceTapeEntry
+        // throttles per-ticker so multiple call sites don't spam.
+        logPriceTapeEntry({
+          ticker, price, gameBase, league,
+          score: `${awayScore}-${homeScore}`,
+          period, gameDetail, leadingAbbr,
         });
 
         if (!decision.trade) {
