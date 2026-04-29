@@ -176,21 +176,33 @@ function evaluateTagCredibility(tags) {
  *  Use to gate pre-game trades — without proven edge tag, reject. */
 function hasProvenPregameEdgeTag(tags) {
   if (!Array.isArray(tags) || tags.length === 0) return false;
-  // Updated 2026-04-28 from deeper shadow mining (n=466 records). Added:
-  //   momentum-shift (57% WR n=7) — barely qualifies but real
-  //   line-movement (55% WR n=11) — barely qualifies but tag-credibility data shows it
-  // Removed (now treated as banned):
-  //   bullpen-mismatch (44% WR n=9) — data shows losing
+  // Updated 2026-04-29 from full game-level dedup audit (n=601 shadows, 12+ unique games per tag):
+  //   REMOVED line-movement: 8 games game-level → 50% gWR, -15% EV (was wrongly added 4/28)
+  // Banned (NEW explicit list, in addition to auto-cal blocking):
+  //   bullpen-mismatch: 7 games game-level → 43% gWR, -25% EV
+  //   lineup-cold: 12 games → 50% gWR, -15% EV
+  //   starter-mismatch: 5 games → 20% gWR, -54% EV (catastrophic)
   const APPROVED = new Set([
-    'playoff-home-fav',  // 78% WR (n=9)
-    'we-undervalued',    // 69% WR (n=42)
-    'market-lag',        // 63% WR (n=46)
+    'playoff-home-fav',  // 6 games gWR 67%, +2% EV
+    'we-undervalued',    // 26 games gWR 65%, +0.7% EV
+    'market-lag',        // 28 games gWR 64%, +1.7% EV (highest sample)
     'injury-news',       // matches lineup-change pattern
     'public-fade',       // structurally documented
-    'momentum-shift',    // 57% WR (n=7)
-    'line-movement',     // 55% WR (n=11)
+    'momentum-shift',    // 5 games gWR 60%, +3.4% EV (small but +EV)
   ]);
   return tags.some(t => typeof t === 'string' && APPROVED.has(t.toLowerCase().trim()));
+}
+
+/** Hard-banned tags — even if other approved tags also present, reject if these
+ *  appear. Prevents "stack a bad tag with a good one to sneak through" gaming. */
+function hasHardBannedPregameTag(tags) {
+  if (!Array.isArray(tags) || tags.length === 0) return false;
+  const BANNED = new Set([
+    'bullpen-mismatch',  // 43% gWR -25% EV (n=7 games)
+    'starter-mismatch',  // 20% gWR -54% EV (n=5 games) — worst offender
+    'lineup-cold',       // 50% gWR -15% EV (n=12 games)
+  ]);
+  return tags.some(t => typeof t === 'string' && BANNED.has(t.toLowerCase().trim()));
 }
 
 function evaluateTagBoost(tags) {
@@ -699,7 +711,8 @@ function detectNbaQ4Leader({ league, period, gameDetail, diff, weTimeAdj, price,
   if (period !== 4) return null;
   if (targetAbbr !== leadingAbbr) return null; // leader only
   if (weTimeAdj == null || price == null) return null;
-  if (diff < 6) return null;
+  if (diff < 5) return null; // 2026-04-29: was 6 — 5pt Q4 leads with 4-10min left
+                              // are still WE-mispriced ~62-68% vs market 50-55¢ pattern
   if (price > 0.78) return null; // need room to run + asymmetry
   const m = (gameDetail || '').match(/^(\d+):(\d+)/);
   if (!m) return null;
@@ -721,7 +734,7 @@ function detectNbaQ4Leader({ league, period, gameDetail, diff, weTimeAdj, price,
         `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
       ],
       top_risk: '3pt barrage by trailing team or foul trouble on leading team',
-      conviction: 'Structural pattern — 89% WR historical (n=9) on Q4 leaders 6+ pts',
+      conviction: 'Structural pattern — 89% WR historical (n=9) on Q4 leaders 5+ pts',
       reasoning_tags: ['market-lag', 'we-undervalued'],
     },
     _structuralPattern: 'nba-q4-leader',
@@ -4609,14 +4622,17 @@ async function checkLiveScoreEdges() {
         const pctChange = (currentPrice - entryPrice) / entryPrice;
 
         // Stage-aware price threshold — early games have high variance, don't panic-sell on normal scoring.
-        //   early MLB (inn 1-4): require -35% — a single run only moves price ~10-15¢, -25% fires too fast
-        //   early other (NHL P1 / NBA Q1): require -25%
-        //   mid   (MLB inn 5-7 / NHL P2 / NBA Q2-Q3): require -15%
-        //   late  (MLB inn 8+ / NHL P3 / NBA Q4): require -10%
-        const PG_CLAUDE_THRESHOLD = (stage === 'early' && league === 'mlb') ? -0.35
-          : stage === 'early' ? -0.25
-          : stage === 'mid' ? -0.15
-          : -0.10;
+        //   early MLB (inn 1-4): require -50% (was -35%)
+        //   early other (NHL P1 / NBA Q1): require -45% (was -25%)
+        //   mid   (MLB inn 5-7 / NHL P2 / NBA Q2-Q3): require -45% (was -15%)
+        //   late  (MLB inn 8+ / NHL P3 / NBA Q4): require -45% (was -10%)
+        // 2026-04-29 widening: stop-loss audit found 17/47 stops would have won if held.
+        // Half-Kelly entry already caps blast radius — let the thesis play out unless
+        // it's truly broken. Only thesis-killers (starter pulled, goalie change) bypass.
+        const PG_CLAUDE_THRESHOLD = (stage === 'early' && league === 'mlb') ? -0.50
+          : stage === 'early' ? -0.45
+          : stage === 'mid' ? -0.45
+          : -0.45;
 
         // WE-based trigger — also fire when game situation has deteriorated significantly
         // even if price hasn't moved enough. Markets can lag WE shifts by 1-2 cycles.
@@ -6557,7 +6573,31 @@ async function checkLiveScoreEdges() {
         // Tier 2: price×confidence floor (underdog/favorite band) if calibrated
         const priceBand = price < 0.50 ? 'underdog' : 'favorite';
         const priceBandFloor = CAL.priceConfFloors?.[league]?.[priceBand] ?? 0;
-        const effectiveMinConf = Math.max(sportMinConf, priceBandFloor);
+        let effectiveMinConf = Math.max(sportMinConf, priceBandFloor);
+
+        // 2026-04-29 NBA Q4 leader floor: WE-table mispricing on late-game leads is the
+        // cleanest documented edge (PHI@BOS today fired at 72% conf, 16pt edge — won).
+        // Standard 70% floor blocks 60-69% conf cases where Sonnet correctly reads a
+        // 5-9pt 4th-quarter lead. Q4 leaders settle ~62% historically; Sonnet at 60%+
+        // with a real WE gap is +EV. Lower floor to 58% strictly for NBA Q4 leaders.
+        try {
+          if (league === 'nba' && period === 4 && targetAbbr) {
+            const targetUp = targetAbbr.toUpperCase();
+            const homeUp = (homeAbbr ?? '').toUpperCase();
+            const awayUp = (awayAbbr ?? '').toUpperCase();
+            const targetIsHome = targetUp === homeUp;
+            const targetIsAway = targetUp === awayUp;
+            const targetScore = targetIsHome ? homeScore : targetIsAway ? awayScore : null;
+            const oppScore = targetIsHome ? awayScore : targetIsAway ? homeScore : null;
+            if (targetScore != null && oppScore != null && targetScore > oppScore) {
+              const nbaQ4Floor = 0.58;
+              if (effectiveMinConf > nbaQ4Floor) {
+                console.log(`[live-edge] 🏀 NBA Q4 LEADER floor: ${targetAbbr} leading ${targetScore}-${oppScore} P4 — floor ${(effectiveMinConf*100).toFixed(0)}% → ${(nbaQ4Floor*100).toFixed(0)}%`);
+                effectiveMinConf = nbaQ4Floor;
+              }
+            }
+          }
+        } catch { /* best-effort */ }
         // EDGE-FIRST LIVE TIER: clear edge in the 50-55¢ underdog band with 63%+ conf bypasses
         // the standard/swing conf floors. Routes through swing path (half size, +12¢ exit).
         // Mirrors the pre-game edge-first tier — same EV math at half-size when market pricing lags.
@@ -7841,10 +7881,11 @@ async function checkPreGamePredictions() {
     const _t1 = (market.team1?.team ?? '').toUpperCase();
     const _t2 = (market.team2?.team ?? '').toUpperCase();
     const _sportsbook = espnSportsbookMap.get(`${_t1}-${_t2}`) ?? espnSportsbookMap.get(`${_t2}-${_t1}`);
+    const _isT1Away = _sportsbook ? espnSportsbookMap.has(`${_t1}-${_t2}`) : false;
     let sportsbookCtx = '';
     if (_sportsbook) {
       // Map to which side is team1 (since Kalshi prices market.team1 vs market.team2)
-      const isT1Away = espnSportsbookMap.has(`${_t1}-${_t2}`);
+      const isT1Away = _isT1Away;
       const t1Prob = isT1Away ? _sportsbook.awayProb : _sportsbook.homeProb;
       const t2Prob = isT1Away ? _sportsbook.homeProb : _sportsbook.awayProb;
       const t1Cents = Math.round(t1Prob * 100);
@@ -7970,10 +8011,9 @@ async function checkPreGamePredictions() {
     // pre-game signal (sportsbook is the sharp market; Kalshi lag = pure +EV).
     let _pgStructural = null;
     if (_sportsbook) {
-      const isT1Away = espnSportsbookMap.has(`${_t1}-${_t2}`);
       _pgStructural = detectPregameSportsbookGap(
         market,
-        { ..._sportsbook, isT1Away },
+        { ..._sportsbook, isT1Away: _isT1Away },
         sport
       );
       if (_pgStructural) {
@@ -7985,6 +8025,8 @@ async function checkPreGamePredictions() {
       market,
       sport,
       _structuralDecision: _pgStructural,
+      _sportsbook,
+      _isT1Away,
       // Order: anti-hallucination → LINEUP CHANGE (highest priority) → sportsbook anchor → starters → analysis.
       // Lineup change first because it's the BIGGEST signal — if the starter
       // just changed, Sonnet should react to that before any other consideration.
@@ -8020,7 +8062,7 @@ async function checkPreGamePredictions() {
     );
 
     for (let i = 0; i < batchItems.length; i++) {
-      const { market } = batchItems[i];
+      const { market, _sportsbook: _pgSportsbook, _isT1Away: _pgIsT1Away } = batchItems[i];
       const batchRes = batchResults[i];
       const decideText = batchRes.status === 'fulfilled' ? batchRes.value : null;
       if (!decideText) {
@@ -8440,6 +8482,17 @@ async function checkPreGamePredictions() {
     // Tags like `era-gap` alone, `starter-mismatch`, `lineup-cold` are documented losers.
     // Without a proven tag, Sonnet is regurgitating sportsbook consensus = no edge.
     const _pgTags = Array.isArray(decision.reasoning_tags) ? decision.reasoning_tags : [];
+
+    // 🛑 HARD-BANNED TAG CHECK (2026-04-29): Even if other proven tags also present,
+    // reject if any hard-banned tag appears. Prevents "stack a winner with a loser
+    // to sneak through" gaming. bullpen-mismatch / starter-mismatch / lineup-cold
+    // are -EV at game-level, regardless of whatever else is co-cited.
+    if (hasHardBannedPregameTag(_pgTags)) {
+      console.log(`[pre-game] 🚫 HARD-BANNED TAG: ${market.base} — tags [${_pgTags.join(',')}] include a documented loser (bullpen-mismatch / starter-mismatch / lineup-cold)`);
+      logScreen({ stage: 'pre-game-skip', result: 'skip-hard-banned-tag', ticker: market.base, sport: pgSportKey, reasoning: `Hard-banned tag present in [${_pgTags.join(',')}]` });
+      continue;
+    }
+
     // Disaster-tier MLB cell exempt — opponent ERA > 6.0 is its own proven edge
     // (4-1 historical, 80% WR). Allow era-gap or starter-mismatch tags here.
     // Compute opponent ERA inline since this gate runs BEFORE the MIN_CONF block.
@@ -8452,7 +8505,30 @@ async function checkPreGamePredictions() {
         if (Number.isFinite(_oppEraNum) && _oppEraNum > 6.0) _disasterTierExempt = true;
       } catch { /* best-effort */ }
     }
-    if (!hasProvenPregameEdgeTag(_pgTags) && !_disasterTierExempt) {
+
+    // 🎯 SPORTSBOOK-GAP EXEMPTION (2026-04-29): When Kalshi's price for the chosen
+    // team is 4+ pt below sportsbook no-vig consensus, that gap IS the proven edge
+    // (sportsbooks are the sharp market). Allow any reasoning tag through, since
+    // we don't need Sonnet to articulate the edge — the price gap proves it.
+    // Threshold 4pt chosen below the 5pt structural-detector trigger so this catches
+    // the "almost-mechanical" cases Sonnet flags but the structural detector skipped.
+    let _sportsbookGapExempt = false;
+    if (_pgSportsbook && matchedSide) {
+      try {
+        const t1IsAway = _pgIsT1Away;
+        const matchedIsT1 = matchedSide === market.team1;
+        const matchedIsAway = matchedIsT1 ? t1IsAway : !t1IsAway;
+        const sbProb = matchedIsAway ? _pgSportsbook.awayProb : _pgSportsbook.homeProb;
+        const kalshiProb = matchedSide.price ?? 0;
+        const gapPt = (sbProb - kalshiProb) * 100;
+        if (gapPt >= 4) {
+          _sportsbookGapExempt = true;
+          console.log(`[pre-game] ✓ SPORTSBOOK-GAP EXEMPT: ${market.base} ${matchedSide.team} — sportsbook ${(sbProb*100).toFixed(0)}% vs Kalshi ${Math.round(kalshiProb*100)}¢ = ${gapPt.toFixed(1)}pt gap (≥4pt threshold)`);
+        }
+      } catch { /* best-effort */ }
+    }
+
+    if (!hasProvenPregameEdgeTag(_pgTags) && !_disasterTierExempt && !_sportsbookGapExempt) {
       console.log(`[pre-game] 🚫 NO PROVEN EDGE TAG: ${market.base} — Sonnet's tags [${_pgTags.join(',') || '(none)'}] don't include any proven-winning category. Generic analysis = no edge over sportsbook.`);
       logScreen({ stage: 'pre-game-skip', result: 'skip-no-proven-tag', ticker: market.base, sport: pgSportKey, reasoning: `Reasoning tags ${_pgTags.join(',')} lack a proven-edge tag (need playoff-home-fav, we-undervalued, market-lag, injury-news, or public-fade)` });
       continue;
