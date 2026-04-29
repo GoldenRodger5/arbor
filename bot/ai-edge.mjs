@@ -6740,7 +6740,11 @@ async function checkLiveScoreEdges() {
         //   edge 5-9pt × conf 66-75% (combined n=24, -$63)
         //   edge 0-4pt × conf 76-80% (n=9, -$13) — high-conf thin-edge trap
         // Structural-detector trades EXCLUDED (they're mechanical, not Sonnet-driven).
-        if (!_structuralDecision) {
+        // Bug fix 2026-04-29: was referencing _structuralDecision but at this scope
+        // the variable is item._structuralDecision (we're in the post-Sonnet processing
+        // loop, not the candidate-build loop). Caused ReferenceError that crashed
+        // a real MIL structural fire (89% conf 21pt edge — missed +EV trade).
+        if (!item._structuralDecision) {
           const edgePct = rawEdge * 100;
           const confPct = confidence * 100;
           let blockReason = null;
