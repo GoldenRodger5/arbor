@@ -2410,8 +2410,14 @@ function getLadderState(trade, profitPerContract, currentPrice, league, ctx) {
       && profitPerContract > 0) {
     return { fire: true, tier: 3, fraction: 1.0, label: 'NBA-Q4-gamma' };
   }
-  if (tiersDone === 0 && profitPerContract >= 0.15) {
-    return { fire: true, tier: 1, fraction: 1/3, label: 'tier-1-+15c' };
+  // 2026-04-29: lower tier-1 threshold for low-price entries (≤60¢). At 50¢
+  // entry, +12¢ pop = 24% return — comparable to +15¢ on a 70¢ entry (21%).
+  // Captures swing variance reliably without overstaying.
+  const isLowPriceEntry = (trade.entryPrice ?? 0.5) <= 0.60;
+  const tier1Trig = isLowPriceEntry ? 0.12 : 0.15;
+  const tier1Label = isLowPriceEntry ? 'tier-1-+12c' : 'tier-1-+15c';
+  if (tiersDone === 0 && profitPerContract >= tier1Trig) {
+    return { fire: true, tier: 1, fraction: 1/3, label: tier1Label };
   }
   if (tiersDone === 1 && profitPerContract >= 0.25) {
     return { fire: true, tier: 2, fraction: 1/2, label: 'tier-2-+25c' };
@@ -13088,7 +13094,10 @@ async function main() {
     }
   }
 
-  // Settlement reconciliation + stop-loss review — every 5 min
+  // Settlement reconciliation + stop-loss review — every 90s (was 5 min)
+  // 2026-04-29: speed up to capture fast profit-lock opportunities. NYY-TEX hit
+  // +15¢ ladder threshold at 16:43 but ladder didn't fire until 16:46 (3-min lag)
+  // because managePositions was on 5-min cycle. Swing trades need faster reaction.
   async function settlementLoop() {
     try { await managePositions(); } catch (e) { console.error('[exit] error:', e.message); }
     try { await checkSettlements(); } catch (e) { console.error('[settlement] error:', e.message); }
@@ -13097,7 +13106,7 @@ async function main() {
     try { await reviewStopLossOutcomes(); } catch (e) { console.error('[stop-review] error:', e.message); }
     try { await checkLosingStreak(); } catch (e) { console.error('[streak] error:', e.message); }
     try { await updateCalibrationStats(); } catch (e) { console.error('[cal-stats] error:', e.message); }
-    setTimeout(settlementLoop, 5 * 60 * 1000);
+    setTimeout(settlementLoop, 90 * 1000);
   }
 
   // CLV capture loop — fast tick (60s) so we hit the narrow [game_start - 30s, +180s]
