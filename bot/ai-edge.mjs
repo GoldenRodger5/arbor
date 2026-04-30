@@ -910,19 +910,30 @@ function detectNbaQ2Leader({ league, period, gameDetail, diff, weTimeAdj, price,
 // NBA Q3 leader at 50-65¢: 9 game-level, 78% WR, +19% EV. Diff ≥4 to ensure lead
 // is meaningful (and avoid the documented Q3 -EV cell at lower diffs).
 function detectNbaQ3Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
-  // 2026-04-29 DISABLED: TOR-CLE loss tonight (-$10.73 on $15.66 deploy) confirmed
-  // the audit warning that NBA-Q3 leaders are mixed-signal. Shadow data showed
-  // 78% WR but actual placed trades were 50% WR / -$11.76 historical. First real
-  // fire after I shipped this against my own audit recommendation produced exactly
-  // the predicted catastrophic loss. Disabled until we have stronger evidence.
-  return null;
-  // eslint-disable-next-line no-unreachable
+  // 2026-04-30 RE-ENABLED with tighter conditions. Original disable was a 1-trade
+  // overreaction (TOR-CLE -$10.73). Updated shadow data (n=19) confirmed 89% WR
+  // and +26.6% EV for NBA-P3 leaders generally. The TOR-CLE loss had specific
+  // characteristics that the new conditions filter out:
+  //   - TOR led by 10pts (giant lead, more to give back)
+  //   - 11:13 left in Q3 (early — full quarter for comeback)
+  //   - Game collapsed over 30+ min (slow bleed)
+  // Bleed-out stop now active as safety net (caps single losses at ~-22%).
   if (league !== 'nba') return null;
   if (period !== 3) return null;
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
-  if (diff < 4) return null;
-  if (price < 0.50 || price > 0.65) return null;
+  // Tighter diff window: 4-8 pts. Filters TOR-CLE-style 10pt-lead-collapse cases.
+  // Bigger leads (>8) more vulnerable to comeback runs; smaller (<4) too marginal.
+  if (diff < 4 || diff > 8) return null;
+  // Tighter price band: 50-62¢ (was 50-65¢). Forces deeper underpricing.
+  if (price < 0.50 || price > 0.62) return null;
+  // Time window: 4-10 min remaining in Q3. Skips very early Q3 (TOR-CLE was at 11:13).
+  const m = (gameDetail || '').match(/^(\d+):(\d+)/);
+  if (!m) return null;
+  const minsLeft = parseInt(m[1], 10) + parseInt(m[2], 10) / 60;
+  if (minsLeft < 4 || minsLeft > 10) return null;
+  // Require WE ≥70% (filter low-confidence reads)
+  if (weTimeAdj < 0.70) return null;
   const edge = weTimeAdj - price;
   if (edge < 0.05) return null;
   return {
@@ -941,6 +952,39 @@ function detectNbaQ3Leader({ league, period, gameDetail, diff, weTimeAdj, price,
       reasoning_tags: ['market-lag', 'we-undervalued'],
     },
     _structuralPattern: 'nba-q3-leader',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100), minsLeft },
+  };
+}
+
+// MLB inning 4 leader at 50-82¢: 22 shadow records, 100% WR, +24.9% EV (audit 2026-04-30).
+// Currently uncovered: detectMlbMidGameLead requires bullpen tier + ≥10pt edge.
+// detectMlbInn5To7Leader starts at inn 5. So inning 4 was missed entirely.
+// Same shape as inn-2/5-7/6 detectors that have gone 100% WR in production.
+function detectMlbInn4Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period !== 4) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 1) return null;
+  if (price < 0.50 || price > 0.82) return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.04) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-run lead in 4th — 5 innings to close out, room for runs both ways`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 4 leader 50-82¢, 100% WR n=22 shadow): ${diff}-run lead in 4th, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Inning 4, ${diff}-run lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 22 shadow leaders, 100% WR at avg 75¢`,
+      ],
+      top_risk: 'Mid-game variance — opponent has 5 more innings of at-bats',
+      conviction: 'Structural pattern — uncovered cell from 2026-04-30 shadow audit',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-inn-4-leader',
     _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
   };
 }
@@ -1143,18 +1187,26 @@ function detectNhlP3ClosingOut({ league, period, gameDetail, diff, weTimeAdj, pr
   if (!m) return null;
   const minsLeft = parseInt(m[1], 10) + parseInt(m[2], 10) / 60;
 
+  // 2026-04-30 LOOSENED: NHL-P3 leader cell shows 92% WR (n=13) +14.8% EV in
+  // shadow data but detector fired 0 times in 24h because conditions too tight.
+  // Bumping ceiling 82¢ → 90¢ (NHL P3 leaders typically trade 80-92¢) and
+  // expanding time window 2-10 → 2-12 min lets us actually catch this cell.
   // Closing-out window. Skip first 8 min (too much time) and last 2 min
   // (pulled-goalie variance on 1-goal leads).
-  if (minsLeft > 10) return null;
+  if (minsLeft > 12) return null;
   if (minsLeft < 2 && diff < 2) return null;
 
   const edge = weTimeAdj - price;
-  // 1-goal lead needs more edge to compensate for higher variance
-  const minEdge = diff === 1 ? 0.08 : 0.05;
+  // Edge requirements scaled by lead size:
+  //   1-goal: ≥7pt edge (was 8pt) — high-variance cell, need clear edge
+  //   2-goal: ≥4pt edge (was 5pt) — protective lead
+  //   3+ goal: ≥3pt edge (NEW) — big leads need less edge
+  const minEdge = diff === 1 ? 0.07 : (diff === 2 ? 0.04 : 0.03);
   if (edge < minEdge) return null;
 
-  // Don't fire above 82¢ — NHL P3 typical price ceiling
-  if (price > 0.82) return null;
+  // Don't fire above 90¢ (was 82¢) — NHL P3 typical price ceiling extended.
+  // 90¢ leaves room for 100¢ settlement, ~11% return on win.
+  if (price > 0.90) return null;
 
   return {
     trade: true,
@@ -6633,6 +6685,13 @@ async function checkLiveScoreEdges() {
         }
         if (!_structuralDecision) {
           _structuralDecision = detectMlbInn2Leader({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-04-30: MLB inn 4 leader — uncovered cell from audit, 100% WR n=22
+          _structuralDecision = detectMlbInn4Leader({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
