@@ -2387,6 +2387,44 @@ const LINE_MOVE_THRESHOLD = 0.05; // 5¢ move = something happened
 const missingFromKalshi = new Map(); // tradeId → firstMissingMs — 2-strike rule before closing
 let massDisappearStreak = 0; // consecutive sync cycles where ALL Kalshi positions are absent
 const recentCrossContraMovers = new Map(); // ticker → { velocity, when } — cross-confirmed drops for pg-guard
+// 2026-04-30 — structural entry throttles (prevent 4-min burst-fire pattern from 4/30)
+const structuralEntryStamps = new Map(); // `${league}:${strategy}` → lastEntryMs (for 5-min same-sport-strategy spacing)
+const structuralOpenEntries = new Map(); // ticker → { league, strategy, entryPrice, entryTs } (for concurrent-bleed check)
+const STRUCTURAL_SPACING_MS = 5 * 60 * 1000;
+const STRUCTURAL_BLEED_THRESHOLD = 0.05; // 5¢ underwater triggers throttle on new entries
+
+function checkStructuralThrottles({ league, strategy, ticker }) {
+  const now = Date.now();
+  // Throttle C: 5-min spacing same-sport same-strategy
+  const stampKey = `${league}:${strategy}`;
+  const lastStamp = structuralEntryStamps.get(stampKey) ?? 0;
+  if (now - lastStamp < STRUCTURAL_SPACING_MS) {
+    const remainSec = Math.ceil((STRUCTURAL_SPACING_MS - (now - lastStamp)) / 1000);
+    return { blocked: true, reason: `5-min spacing: another ${strategy} fired ${Math.floor((now-lastStamp)/1000)}s ago in ${league.toUpperCase()} (need ${remainSec}s more)` };
+  }
+  // Throttle B: any same-sport structural position currently underwater ≥5¢
+  for (const [t, info] of structuralOpenEntries.entries()) {
+    if (t === ticker) continue;
+    if (info.league !== league) continue;
+    const last = lastSeenPrices.get(t);
+    if (!last || typeof last.price !== 'number') continue;
+    const drawdown = info.entryPrice - last.price;
+    if (drawdown >= STRUCTURAL_BLEED_THRESHOLD) {
+      return { blocked: true, reason: `concurrent bleed: ${t.split('-').pop()} underwater ${Math.round(drawdown*100)}¢ from entry (${Math.round(info.entryPrice*100)}¢ → ${Math.round(last.price*100)}¢)` };
+    }
+  }
+  return { blocked: false };
+}
+
+function recordStructuralEntry({ league, strategy, ticker, entryPrice }) {
+  const now = Date.now();
+  structuralEntryStamps.set(`${league}:${strategy}`, now);
+  structuralOpenEntries.set(ticker, { league, strategy, entryPrice, entryTs: now });
+}
+
+function clearStructuralEntry(ticker) {
+  structuralOpenEntries.delete(ticker);
+}
 
 // MFE (Maximum Favorable Excursion) tracker — highest favorable price reached per
 // open trade. Persisted to trades.jsonl on exit/settlement. Enables price-move
@@ -2995,7 +3033,13 @@ function getDynamicMaxTrade(exchange = 'kalshi', sport = null, strategy = null) 
   }
   // P1.3 — pre-game strategies capped at 5%.
   const isPreGame = strategy && (strategy === 'pre-game-prediction' || strategy === 'pre-game-edge-first');
-  const strategyFrac = isPreGame ? 0.05 : MAX_TRADE_FRACTION;
+  // 2026-04-30: NBA/NHL structural detectors capped at 5% bankroll. Late-game
+  // basketball/hockey lead variance is sharper than baseball (a single Q4 run
+  // flips a 10pt lead in 4min). TOR-CLE NBA Q3 at 10% sizing → −$10.73 single trade.
+  // MLB structural stays at 10%.
+  const isNbaNhlStructural = strategy && strategy.startsWith?.('structural-')
+    && (strategy.includes('nba') || strategy.includes('nhl'));
+  const strategyFrac = isPreGame ? 0.05 : (isNbaNhlStructural ? 0.05 : MAX_TRADE_FRACTION);
   const pctCap = bankroll * strategyFrac * kellyMult * bucketMult;
   const ceiling = getTradeCapCeiling();
   const available = getAvailableCash(exchange);
@@ -6892,6 +6936,14 @@ async function checkLiveScoreEdges() {
             summary = `min ${info.minute}', lead ${info.diff}, ${info.edge.toFixed(0)}pt edge`;
           }
           console.log(`[live-edge] 🎯 STRUCTURAL DETECTOR matched (${_structuralDecision._structuralPattern}): ${targetAbbr} — ${summary}, conf=${(_structuralDecision.confidence*100).toFixed(0)}% — skipping Sonnet`);
+          // 2026-04-30 throttles — prevent 4-min burst-fire pattern (today's losses)
+          const _structStrategy = 'structural-' + _structuralDecision._structuralPattern;
+          const _throttle = checkStructuralThrottles({ league, strategy: _structStrategy, ticker });
+          if (_throttle.blocked) {
+            console.log(`[live-edge] 🚦 STRUCTURAL THROTTLE: ${targetAbbr} — ${_throttle.reason}`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-structural-throttle', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: _throttle.reason });
+            continue;
+          }
         }
 
         // 2026-04-29 — MLB INN 7+ SONNET BLOCK. Trade-level analysis shows
@@ -7834,6 +7886,14 @@ async function checkLiveScoreEdges() {
           }
 
           const isStructuralMatch = !!item._structuralDecision;
+          if (isStructuralMatch) {
+            recordStructuralEntry({
+              league: item.league,
+              strategy: `structural-${item._structuralDecision._structuralPattern}`,
+              ticker,
+              entryPrice: bestPrice,
+            });
+          }
           const betLabel = isStructuralMatch ? `STRUCTURAL — ${item._structuralDecision._structuralPattern.toUpperCase()}` :
             isThesisVindicated ? 'THESIS RE-ENTRY' :
             isSwingMode ? 'SWING TRADE' :
@@ -10965,6 +11025,12 @@ async function managePositions() {
     const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
     const trades = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
     const openTrades = trades.filter(t => t.status === 'open');
+    // Sync structuralOpenEntries with reality: remove any ticker no longer open.
+    // Keeps the concurrent-bleed throttle from blocking on phantom/closed positions.
+    const _openTickers = new Set(openTrades.map(t => t.ticker));
+    for (const t of structuralOpenEntries.keys()) {
+      if (!_openTickers.has(t)) structuralOpenEntries.delete(t);
+    }
     if (openTrades.length === 0) return;
 
     // Batch fetch current prices
