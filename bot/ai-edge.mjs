@@ -267,6 +267,11 @@ function getCALExitThresholds(sport, isPlayoff, defaults, strategy) {
 function getKellyFraction(sport) {
   const f = CAL.kellyFraction?.[sport?.toLowerCase?.()];
   let base = (typeof f === 'number' && f > 0 && f <= 0.50) ? f : 0.50;
+  // 2026-04-30: NHL halved permanently. Shadow data over 40 trades shows -$34.79
+  // net at 41% WR (live-prediction) — market systematically overprices NHL leaders
+  // (1-goal P2/P3 leads convert 56-59% historically at 71-78¢ market price).
+  // Half sizing while we figure out the +EV path; remove this when NHL net positive.
+  if (sport?.toLowerCase?.() === 'nhl') base *= 0.5;
   if (typeof kellyHaircutUntilMs === 'number' && kellyHaircutUntilMs > Date.now()) {
     base *= 0.5;
   }
@@ -6421,6 +6426,9 @@ async function checkLiveScoreEdges() {
           `❌ Trailing team is in active playoff survival (must win or season ends) AND the leading team is confirmed to be resting multiple starters OR rotating their lineup tonight → NO. NOTE: "already eliminated" alone is NOT enough — eliminated teams often still play hard for pride/contracts. The roster decision is the signal, not the standings.\n` +
           (league === 'nba' ? `❌ NBA STAR-FOUL HARD NO: Leading team's top scorer (highest PPG on roster) has 5 personal fouls AND period ≥ 3 AND lead ≤ 10 pts → NO. Check a live box score in your search. 5 fouls means he's either pinned to the bench or must play cautious on defense — that's a 10-15pt WE swing not captured by our baseline.\n` : '') +
           (isSoccer ? `❌ SOCCER LATE-DRAW HARD NO: Leading team's season draw rate > 35% AND lead = 1 goal AND minute ≥ 75 → NO. Draw-prone teams protecting a 1-0 late don't win — they draw, which loses a YES on the WIN contract.\n` : '') +
+          (league === 'nhl' && targetAbbr === leadingAbbr
+            ? `❌ NHL LEADER OVERPRICING HARD NO: Shadow data over 96 settled NHL leader observations shows the market systematically overprices 1-goal leads. Specifically: 1-goal leads in P2 settle at 56% (n=59) at avg 71¢ market price — that's −15pt EV per contract. P3 1-goal leads settle 59% (n=37) at 78¢ — −19pt EV. Hockey is structurally different from baseball: empty-net pulls, power plays, OT (especially playoff sudden-death), and hot-goalie variance all collapse leads in seconds. UNLESS the leading team has a 2+ goal cushion AND price ≤ 60¢ AND elite goalie confirmed (SV% ≥ 0.915 last 5) AND no playoff OT risk → respond {"trade":false}. The price you see ALREADY assumes leads hold at MLB-like rates; the data says they don't.\n`
+            : '') +
           (league === 'mlb' && !isSwingMode ?
             (leadingBullpenTier === 'poor' && diff <= 2 && period >= 5
               ? `❌ MLB BULLPEN HARD NO: Leading team's bullpen is tier='poor' (ERA ≥ 5.0, L30D) and the lead is only ${diff} run${diff === 1 ? '' : 's'} in inning ${period}. A poor team pen ERA can't reliably protect a thin lead — Respond {"trade":false}. CLOSER EXCEPTION: If in your Step B search you confirmed the specific closer has a 2026 ERA below 2.0 and is not fatigued (no back-to-back), downgrade this to a −5% adjustment instead of Hard NO. The closer's individual stats override the team bullpen average in late-game situations.\n`
@@ -7538,6 +7546,33 @@ async function checkLiveScoreEdges() {
           console.log(`[live-edge] BLOCKED ${targetAbbr}: NHL P${period} live-prediction — historical 40-50% WR (P1: 5 trades, P2: 2 trades). Only P3 has shown edge.`);
           logScreen({ stage: 'live-edge-skip', result: 'skip-nhl-early-period', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `NHL early-period live-prediction historical: P1 40% WR, P2 50% WR, both net negative. Only P3 (75% WR) is profitable.` });
           continue;
+        }
+
+        // 2026-04-30: NHL hard gates — total NHL P&L is -$34.79 over 40 trades (41% WR
+        // live-prediction). Shadow cell data shows market systematically overprices
+        // NHL leaders: p2-d1 settles 56% @ 71¢ (-15pt edge), p3-d1 settles 59% @ 78¢
+        // (-19pt edge). The earlier P3 carve-out was based on n=4 trade luck — real
+        // n=37 shadow data shows P3 is a trap too. Tightening:
+        //   - price cap 60¢ (avoid the 71-80¢ kill zone)
+        //   - conf floor 78% (filter low-conviction)
+        //   - P3 block (highest-variance period; shadow proves trap)
+        if (!isSwingMode && league === 'nhl' && targetAbbr === leadingAbbr) {
+          if (price > 0.60) {
+            console.log(`[live-edge] BLOCKED ${targetAbbr}: NHL leader price ${(price*100).toFixed(0)}¢ > 60¢ — shadow data shows -$0.15 EV/contract above 70¢ entries`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-nhl-price-cap', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `NHL leader at ${(price*100).toFixed(0)}¢ above 60¢ cap — shadow shows systematic overpricing in this band.` });
+            continue;
+          }
+          const nhlConf = decision.confidence ?? 0;
+          if (nhlConf < 0.78) {
+            console.log(`[live-edge] BLOCKED ${targetAbbr}: NHL leader conf ${(nhlConf*100).toFixed(0)}% < 78% floor — sport bleeds at lower conviction`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-nhl-conf-floor', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `NHL conf ${(nhlConf*100).toFixed(0)}% below 78% floor.` });
+            continue;
+          }
+          if (period === 3) {
+            console.log(`[live-edge] BLOCKED ${targetAbbr}: NHL P3 live-prediction — shadow n=37 shows 59% WR @ 78¢ = -19pt edge. Highest-variance period.`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-nhl-p3-block', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `NHL P3 shadow data: n=37, 59% WR @ 78¢, -19pt edge. Empty net + late-game variance.` });
+            continue;
+          }
         }
 
         // 2026-04-27 audit: MLB live-prediction inning 9 has 0/4 historical (-$27.52).
