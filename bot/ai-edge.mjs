@@ -615,12 +615,15 @@ function getMaxPrice(league, period, diff = 1) {
 // 2026-04-23: tightened 10% → 6%. Preference is smaller bets for data collection
 // over concentrated bets. At $110 bankroll: 6% = $6.60 per live-edge trade.
 // When WR and calibration stabilize, can relax back toward 8-10%.
-const MAX_TRADE_FRACTION = 0.08; // 8% of bankroll per trade — bumped from 6% on 2026-04-29
-// Rationale: 6/6 wins today demonstrated edge in proven cells. Kelly math at observed
-// WR ~80% says optimal is ~30% bankroll/trade; half-Kelly is ~15%; current 8% is still
-// well below half-Kelly. Daily loss cap (25%) provides catastrophe protection.
-// Conservative bump captures ~33% more profit on the same trade flow without
-// approaching mathematical risk-of-ruin levels.
+const MAX_TRADE_FRACTION = 0.06; // 6% of bankroll per trade — REVERTED from 8% on 2026-04-29
+// REVERT REASON: bumped to 8% earlier today on 6/6 win streak. Same evening: TOR-CLE
+// NBA Q3 trade collapsed -68% for -$10.73 loss. Bumped sizing made loss bigger than
+// it would have been at 6% (would have been ~-$7.50). Single loss erased the entire
+// day's structural detector profits.
+// Lesson: Kelly math says we're under-sized in theory, but until we have 30+ trades
+// (including losses) to validate WR, anticipating the bigger size after a hot streak
+// is the textbook mistake. Earn the bump with data, don't extrapolate from 6 wins.
+// Will revisit once we have 30+ structural detector trades with calibrated WR.
 // P1.3 — Pre-game sizing cut 15% → 5% per data analysis 2026-04-23.
 // Biggest losses all came from oversized pre-game positions: SD-LAA -$33 (76 ct @ 44¢),
 // ATL-PHI -$32 (66 ct @ 49¢), SF-WSH -$24 (57 ct @ 52¢), DET-BOS -$21 (71 ct @ 46¢).
