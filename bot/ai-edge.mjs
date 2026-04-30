@@ -12080,12 +12080,36 @@ async function managePositions() {
             // Real data: tier-2 was 2-for-3 BAD stops (POR@PHX NBA at WE=65% entry, KC@DET MLB at WE=90%).
             // If our WE is still ≥30% AND opponent isn't on a visible run (no contra-velocity firing),
             // the WE-aware layers above would have flagged it if truly over. Skip Claude.
-            const _contra = recentCrossContraMovers.get(trade.ticker);
-            const _contraRecent = _contra && (Date.now() - _contra.when) <= 3 * 60 * 1000 && (_contra.velocity ?? 0) >= 5;
-            if (_t2WE != null && _t2WE >= 0.30 && !_contraRecent) {
-              console.log(`[exit] 🧘 AUTO-HOLD tier-2 (WE=${(_t2WE*100).toFixed(0)}% ≥30%, no contra): ${trade.ticker} — WE-aware layers would have flagged if truly over, skipping`);
-              tradeCooldowns.set(exitCooldownKey, Date.now());
-              continue;
+            //
+            // 2026-04-29 HARD PRICE-DROP OVERRIDE: Today's TOR-CLE NBA-Q3 trade
+            // collapsed -68% over 39 minutes while AUTO-HOLD repeatedly fired
+            // at WE=60-66% (table baseline lagged actual game-state). Price was
+            // telling the truth (54¢ → 17¢) but bot trusted stale WE.
+            //
+            // New rule: if down ≥20% AND price velocity ≥3¢/min adverse → exit
+            // immediately. Override AUTO-HOLD. Price-action wins over WE-table
+            // when both disagree by this much.
+            const _drawdownDeep = pctChange <= -0.20;
+            const _adverseVelocity = (() => {
+              try {
+                const prevSeen = lastSeenPrices.get(trade.ticker);
+                if (!prevSeen) return 0;
+                const elapsedMin = Math.max(0.5, (Date.now() - prevSeen.ts) / 60000);
+                // For YES-side trade, adverse = price down. cents/min adverse:
+                return Math.max(0, ((prevSeen.price - currentPrice) * 100) / elapsedMin);
+              } catch { return 0; }
+            })();
+            if (_drawdownDeep && _adverseVelocity >= 3) {
+              console.log(`[exit] ⚠️ HARD PRICE-DROP OVERRIDE: ${trade.ticker} down ${(pctChange*100).toFixed(0)}% with velocity ${_adverseVelocity.toFixed(1)}¢/min adverse — exiting regardless of WE=${_t2WE != null ? (_t2WE*100).toFixed(0)+'%' : '?'}`);
+              // Fall through to Claude eval (which will likely sell) — don't AUTO-HOLD
+            } else {
+              const _contra = recentCrossContraMovers.get(trade.ticker);
+              const _contraRecent = _contra && (Date.now() - _contra.when) <= 3 * 60 * 1000 && (_contra.velocity ?? 0) >= 5;
+              if (_t2WE != null && _t2WE >= 0.30 && !_contraRecent) {
+                console.log(`[exit] 🧘 AUTO-HOLD tier-2 (WE=${(_t2WE*100).toFixed(0)}% ≥30%, no contra): ${trade.ticker} — WE-aware layers would have flagged if truly over, skipping`);
+                tradeCooldowns.set(exitCooldownKey, Date.now());
+                continue;
+              }
             }
           }
           tradeCooldowns.set(exitCooldownKey, Date.now());
