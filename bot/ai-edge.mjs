@@ -7463,7 +7463,26 @@ async function checkLiveScoreEdges() {
           result = await polymarketPost(best.slug, best.intent, bestPrice + 0.02, qty);
           deployed = qty * bestPrice;
         } else {
-          const stepUpPrice = Math.min(99, priceInCents + 2);
+          // 2026-04-29 ADAPTIVE STEP-UP: in fast-moving markets (price climbing
+          // 5+¢/min in our direction), the 2¢ default tolerance gets blown past
+          // before our order reaches Kalshi. Today's STL: placed at 64¢ (62+2),
+          // price was 68¢ within 60s, order never filled. Scale step-up with
+          // observed velocity so we still capture the trade.
+          let stepUp = 2;
+          try {
+            const prevSeen = lastSeenPrices.get(ticker);
+            if (prevSeen) {
+              const elapsedMin = Math.max(0.5, (Date.now() - prevSeen.ts) / 60000);
+              const velocityCpm = ((bestPrice - prevSeen.price) * 100) / elapsedMin; // ¢/min in our buy direction
+              if (velocityCpm >= 8) stepUp = 7;
+              else if (velocityCpm >= 5) stepUp = 5;
+              else if (velocityCpm >= 3) stepUp = 3;
+              if (stepUp > 2) {
+                console.log(`[live-edge] 🌊 FAST-MARKET step-up: ${ticker} velocity=${velocityCpm.toFixed(1)}¢/min → step-up ${stepUp}¢ (was 2¢)`);
+              }
+            }
+          } catch { /* fall back to 2¢ */ }
+          const stepUpPrice = Math.min(99, priceInCents + stepUp);
           result = await kalshiPost('/portfolio/orders', {
             ticker, action: 'buy', side: 'yes', count: qty,
             yes_price: stepUpPrice,
@@ -7472,7 +7491,32 @@ async function checkLiveScoreEdges() {
         }
 
         if (result.ok) {
-          const actualFill = getActualFill(result, qty);
+          let actualFill = getActualFill(result, qty);
+          // 2026-04-29 PHANTOM-TRADE PREVENTION: getActualFill returns requestedQty
+          // when Kalshi reports 0 fills (because most orders eventually fill).
+          // BUT in a fast-moving market the limit order can rest unfilled. Today's
+          // STL @62¢ logged 16 contracts filled but Kalshi position was 0 — phantom
+          // trade with $2.40 of fake P&L. Verify position before logging.
+          const reportedFill = parseFloat(result.data?.order?.fill_count_fp ?? '0') || 0;
+          if (reportedFill === 0 && best.platform !== 'polymarket') {
+            // Kalshi reported 0 — position-check to confirm before logging
+            try {
+              await new Promise(r => setTimeout(r, 1500)); // brief delay for fill registration
+              const posCheck = await kalshiGet(`/portfolio/positions?ticker=${ticker}`);
+              const mktPos = (posCheck.market_positions ?? []).find(p => p.ticker === ticker);
+              const realPos = Math.max(0, parseFloat(mktPos?.position_fp ?? '0'));
+              if (realPos === 0) {
+                console.log(`[live-edge] 🚫 PHANTOM TRADE PREVENTED: ${ticker} order at ${(bestPrice*100).toFixed(0)}¢ didn't fill (Kalshi position=0 after 1.5s) — limit too low for fast market, skipping log`);
+                continue;
+              }
+              // Position exists — use the actual count
+              actualFill = realPos;
+              console.log(`[live-edge] ✓ Position-check confirmed: ${ticker} actual fill = ${actualFill} contracts`);
+            } catch (e) {
+              // On error, fall back to assumed full fill (current behavior, slightly risky)
+              console.log(`[live-edge] Position-check failed for ${ticker}: ${e.message} — assuming full fill`);
+            }
+          }
           if (actualFill <= 0) {
             console.log(`[live-edge] Order accepted but 0 filled for ${ticker} — skipping log`);
             continue;
