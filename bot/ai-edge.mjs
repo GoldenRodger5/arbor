@@ -615,13 +615,19 @@ function getMaxPrice(league, period, diff = 1) {
 // 2026-04-23: tightened 10% → 6%. Preference is smaller bets for data collection
 // over concentrated bets. At $110 bankroll: 6% = $6.60 per live-edge trade.
 // When WR and calibration stabilize, can relax back toward 8-10%.
-const MAX_TRADE_FRACTION = 0.08; // 8% of bankroll per trade — restored after revert
-// 2026-04-29 final: kept at 8%. Earlier day briefly reverted to 6% after the
-// NBA-Q3 loss, but that capped daily upside below 10%/day target. The real fix
-// for tonight's loss was disabling the bad detector (NBA-Q3) and adding the
-// hard price-drop override (which exits at -20% before a -68% collapse). Sizing
-// stays at 8% so winning days can compound to 10%+. Catastrophe protection
-// happens via detector quality and stop-loss timing, not bet-size caps.
+const MAX_TRADE_FRACTION = 0.10; // 10% of bankroll per trade — bumped from 8% on 2026-04-30
+// Rationale: yesterday's 8 wins at 8% sizing netted +$9.59 (9.7% of $99) — JUST
+// under the 10%/day target. Wins averaged $1.20 each. To consistently clear 10-15%/day
+// from 8 wins, need ~$1.88/win avg → bigger sizing or more trades.
+// Both shipped today: 3 new detectors (Q3 retuned, MLB-P4 added, NHL loosened)
+// AND 10% baseline. Risk profile is meaningfully different from yesterday morning's
+// 8% bump because:
+//   - Bleed-out stop active (caps single-trade loss at ~-22% drawdown)
+//   - Hard price-drop override (exits at -20% with adverse velocity)
+//   - NBA-Q3 retuned (would NOT have fired on TOR-CLE)
+// Same TOR-CLE scenario at 10% sizing with these protections = ~-$5 loss vs
+// yesterday's -$10.73. Asymmetric R:R now favors aggression.
+// Daily loss cap (25%) still in place — catastrophe protection unchanged.
 // P1.3 — Pre-game sizing cut 15% → 5% per data analysis 2026-04-23.
 // Biggest losses all came from oversized pre-game positions: SD-LAA -$33 (76 ct @ 44¢),
 // ATL-PHI -$32 (66 ct @ 49¢), SF-WSH -$24 (57 ct @ 52¢), DET-BOS -$21 (71 ct @ 46¢).
