@@ -1039,7 +1039,13 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff < 1) return null;
-  if (price > 0.82) return null;
+  // Fix A (2026-04-30): cap at 70¢ max entry — at 76¢ the bleed-out stop math is
+  // 39¢ risk / 24¢ max upside = 1.6:1 against. 70¢ cap keeps risk/reward ≤1:1.
+  if (price > 0.70) return null;
+  // Fix D (2026-04-30): 1-run leads in inning 5 above 50¢ are fragile — 4 innings
+  // remain, one big inning flips it. COL@CIN: maxFav=entry (never ticked up), stopped at 26¢.
+  // Require either 2+ run lead OR price ≤ 50¢ for inn-5 single-run entries.
+  if (period === 5 && diff === 1 && price > 0.50) return null;
   const edge = weTimeAdj - price;
   if (edge < 0.04) return null;
   return {
@@ -11092,9 +11098,29 @@ async function managePositions() {
             const peakGain = peakPrice - entryPrice;
             const retraceFromPeak = peakPrice - currentPrice;
             const TRAILING_ACTIVATE = 0.10;  // need +10¢ peak to activate
-            const TRAILING_DISTANCE = 0.08;  // exit on 8¢ retrace from peak
+            // Fix B (2026-04-30): structural detectors have ~80-100% WR — they should ride
+            // to near-settlement, not exit on an 8¢ noise dip. Widen to 12¢ for structural.
+            // Live-prediction keeps the tighter 8¢ stop (lower WR, faster reversals).
+            const isStructural = trade.strategy?.startsWith?.('structural-');
+            const TRAILING_DISTANCE = isStructural ? 0.12 : 0.08;
+
+            // Fix C (2026-04-30): if Claude voted HOLD within last 15min AND we're in a
+            // late inning (MLB inn 8-9) with win probability ≥ 80%, suppress the trailing
+            // stop entirely. Claude's HOLD explicitly says "settlement EV > sell price" —
+            // trust that over a mechanical retrace trigger. SF@PHI 8th inning was the
+            // exact case: HOLD vote → 9¢ dip from PHI baserunners → stop fired → SF won.
+            const claudeHoldTs = tradeCooldowns.get('claude-hold:' + trade.ticker) ?? 0;
+            const claudeHoldRecent = claudeHoldTs > 0 && (Date.now() - claudeHoldTs) <= 15 * 60 * 1000;
+            const lateInningSuppression = isStructural && league === 'mlb'
+              && claudeHoldRecent
+              && ctx?.period != null && ctx.period >= 8
+              && currentPrice >= 0.70; // WP ≥ 70¢ = game is in hand, noise dips are normal
+            if (lateInningSuppression) {
+              console.log(`[exit] 🧠🛡️ TRAILING STOP SUPPRESSED: ${trade.ticker} — Claude HOLD ${Math.round((Date.now()-claudeHoldTs)/1000)}s ago + inn ${ctx.period} + price ${(currentPrice*100).toFixed(0)}¢ — holding for settlement`);
+            }
+
             const stillProfitable = currentPrice > entryPrice + 0.02; // ≥+2¢ to lock real profit
-            if (peakGain >= TRAILING_ACTIVATE && retraceFromPeak >= TRAILING_DISTANCE && stillProfitable) {
+            if (!lateInningSuppression && peakGain >= TRAILING_ACTIVATE && retraceFromPeak >= TRAILING_DISTANCE && stillProfitable) {
               const lockProfit = ((currentPrice - entryPrice) * 100).toFixed(0);
               const peakProfit = (peakGain * 100).toFixed(0);
               console.log(`[exit] 🎯 TRAILING STOP: ${trade.ticker} peak=${(peakPrice*100).toFixed(0)}¢(+${peakProfit}¢) → now=${(currentPrice*100).toFixed(0)}¢ — locking +${lockProfit}¢ before further retrace`);
@@ -11181,8 +11207,12 @@ async function managePositions() {
         // trades (live-prediction / pre-game-edge-first / structural-*). Fires BEFORE
         // safety nets so partial profits get captured on swings without preventing
         // the existing "hold when leading" upside on the remainder.
+        // Fix B (2026-04-30): skip ladder entirely for structural detectors — they have
+        // ~80-100% WR and are meant to ride to settlement. Taking partial profit at +15¢
+        // (tier-1) steals upside: MIA-LAD exited at 65¢ when it settled at 100¢, costing
+        // $1.26. The 12¢ trailing stop and bleed-out stop still protect the downside.
         {
-          const ladder = getLadderState(trade, profitPerContract, currentPrice, league, ctx);
+          const ladder = trade.strategy?.startsWith?.('structural-') ? null : getLadderState(trade, profitPerContract, currentPrice, league, ctx);
           if (ladder?.fire) {
             const sellQty = ladder.fraction >= 1.0 ? qty : Math.max(1, Math.floor(qty * ladder.fraction));
             if (sellQty >= 1 && sellQty <= qty) {
