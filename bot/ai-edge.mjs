@@ -7493,14 +7493,17 @@ async function checkLiveScoreEdges() {
           }
         }
 
-        // Swing mode: entry price must be ≤65¢ and confidence ≥68%
+        // Swing mode: entry price must be ≤60¢ and confidence ≥72%
+        // 2026-04-30: tightened from ≤65¢ / ≥68% — recent 8-game sample showed 33% gWR
+        // and clipped mean −$2.31 (worst-performing strategy by clipped mean). Trims the
+        // bottom quartile of swing entries; reversible if quality data appears at n≥15.
         if (isSwingMode) {
-          if (price > 0.65) {
-            console.log(`[live-swing] BLOCKED ${targetAbbr}: price ${(price*100).toFixed(0)}¢ > 65¢ cap for swing trades`);
+          if (price > 0.60) {
+            console.log(`[live-swing] BLOCKED ${targetAbbr}: price ${(price*100).toFixed(0)}¢ > 60¢ cap for swing trades`);
             continue;
           }
-          if (confidence < 0.68 && !isEdgeFirstLive) {
-            console.log(`[live-swing] BLOCKED ${targetAbbr}: confidence ${(confidence*100).toFixed(0)}% < 68% min for swing trades`);
+          if (confidence < 0.72 && !isEdgeFirstLive) {
+            console.log(`[live-swing] BLOCKED ${targetAbbr}: confidence ${(confidence*100).toFixed(0)}% < 72% min for swing trades`);
             continue;
           }
         }
