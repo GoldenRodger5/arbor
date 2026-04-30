@@ -1920,6 +1920,18 @@ Your reasoning is logged for calibration analysis and reviewed for systematic pa
 
 const PG_BASE_SYSTEM = `You are a professional sports betting analyst on prediction markets. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.
 
+🛑 PRICE-BAND CALIBRATION WARNING (audit 2026-04-30, n=82 historical pre-game trades):
+Your historical confidence has been MISCALIBRATED in three specific price bands:
+  • PRE-GAME entries <40¢: 0/3 WR (you've over-fired on deep underdogs without true catalyst)
+  • MLB pre-game 50-54¢: 2/18 WR = 11% (small-favorite edges you cite are noise, not signal)
+  • NHL pre-game 60-69¢: 0/9 WR (you've consistently over-trusted goalie matchups; market is correctly priced)
+
+Apply a 10% downward bias to your confidence in these bands. If your raw read is 70% in NHL 60-69¢, write 60%. The bot will block the trade anyway, but your reasoning_tags + tag credibility will be more accurate going forward.
+
+BANDS THAT ACTUALLY WORK:
+  • 40-44¢ deep underdogs WITH cited catalyst: 5/12 WR = 42% (+$99 net) — keep firing these
+  • 55-65¢ MLB favorites: marginal but salvageable when sportsbook anchor agrees
+
 `;
 
 const NBA_PG_FRAMEWORK = `═══ NBA SWING-TRADE FRAMEWORK ═══
@@ -9524,6 +9536,29 @@ async function checkPreGamePredictions() {
     // Sub-45¢ has 50% WR +$55 (extreme underdog with cited catalyst). 50¢+ is OK.
     if (pgSportKey === 'mlb' && price >= 0.45 && price < 0.50) {
       console.log(`[pre-game] BLOCKED ${market.base}: MLB pre-game 45-49¢ entry — historical 33% WR over 9 trades, -$54 net. Mid-priced underdog dead-zone.`);
+      continue;
+    }
+
+    // 2026-04-30 audit (refined narrow-band analysis on n=82 pre-game trades):
+    // Three additional price bands documented as catastrophic. Surgical blocks
+    // complementary to the granular bucket throttle (which catches edge×conf cells).
+    // Price-band blocks catch patterns the bucket throttle misses.
+    //
+    // 1. ALL pre-game <40¢: 0/3 WR, -$29.91 (deep-underdog dead zone)
+    if (price < 0.40) {
+      console.log(`[pre-game] BLOCKED ${market.base}: <40¢ entry — 0/3 historical pre-game WR, -$29.91. Deep-underdog dead zone.`);
+      continue;
+    }
+    // 2. MLB pre-game 50-54¢: 2/18 WR (11%), -$29.50 (small-favorite dead zone)
+    //    Distinct from the 45-49¢ block above. Sonnet over-fires on tiny edges here.
+    if (pgSportKey === 'mlb' && price >= 0.50 && price < 0.55) {
+      console.log(`[pre-game] BLOCKED ${market.base}: MLB pre-game 50-54¢ entry — 2/18 (11%) historical WR, -$29.50. Small-favorite dead zone where Sonnet over-fires marginal edges.`);
+      continue;
+    }
+    // 3. NHL pre-game 60-69¢: 0/9 WR, -$28.64 (favorite-overconfidence dead zone)
+    //    Sonnet repeatedly picks NHL favorites in this band; market correctly priced.
+    if (pgSportKey === 'nhl' && price >= 0.60 && price < 0.70) {
+      console.log(`[pre-game] BLOCKED ${market.base}: NHL pre-game 60-69¢ entry — 0/9 historical WR, -$28.64. Favorite-overconfidence dead zone — market correctly priced these.`);
       continue;
     }
     if (existsSync(PAPER_TRADES_LOG)) {
