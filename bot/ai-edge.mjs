@@ -909,6 +909,13 @@ function detectNbaQ2Leader({ league, period, gameDetail, diff, weTimeAdj, price,
 // NBA Q3 leader at 50-65¢: 9 game-level, 78% WR, +19% EV. Diff ≥4 to ensure lead
 // is meaningful (and avoid the documented Q3 -EV cell at lower diffs).
 function detectNbaQ3Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  // 2026-04-29 DISABLED: TOR-CLE loss tonight (-$10.73 on $15.66 deploy) confirmed
+  // the audit warning that NBA-Q3 leaders are mixed-signal. Shadow data showed
+  // 78% WR but actual placed trades were 50% WR / -$11.76 historical. First real
+  // fire after I shipped this against my own audit recommendation produced exactly
+  // the predicted catastrophic loss. Disabled until we have stronger evidence.
+  return null;
+  // eslint-disable-next-line no-unreachable
   if (league !== 'nba') return null;
   if (period !== 3) return null;
   if (targetAbbr !== leadingAbbr) return null;
