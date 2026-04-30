@@ -1039,13 +1039,33 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff < 1) return null;
-  // Fix A (2026-04-30): cap at 70¢ max entry — at 76¢ the bleed-out stop math is
-  // 39¢ risk / 24¢ max upside = 1.6:1 against. 70¢ cap keeps risk/reward ≤1:1.
-  if (price > 0.70) return null;
+  // Fix A (2026-04-30): diff-aware price cap. Initial 70¢ cap was too blunt.
+  // Shadow data (2026-04-30): MLB-p5-d3 cell shows 100% WR n=12 at avg 83¢ entry,
+  // +17pt edge. MLB-p1-d3 shows 100% WR n=10 at 76¢. Capping these at 70¢ leaves
+  // proven winners on the table. But MLB-p6-d2 (today's ATL) is a -8pt trap cell.
+  //   diff <= 2: 70¢ cap holds (variance too high at higher prices)
+  //   diff >= 3: 88¢ cap (data shows these settle YES at 100¢ on near-100% rate)
+  if (diff <= 2 && price > 0.70) {
+    if (typeof logFixABlock === 'function') {
+      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-a-diff-le-2' }); } catch {}
+    }
+    return null;
+  }
+  if (diff >= 3 && price > 0.88) {
+    if (typeof logFixABlock === 'function') {
+      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-a-diff-ge-3' }); } catch {}
+    }
+    return null;
+  }
   // Fix D (2026-04-30): 1-run leads in inning 5 above 50¢ are fragile — 4 innings
   // remain, one big inning flips it. COL@CIN: maxFav=entry (never ticked up), stopped at 26¢.
   // Require either 2+ run lead OR price ≤ 50¢ for inn-5 single-run entries.
-  if (period === 5 && diff === 1 && price > 0.50) return null;
+  if (period === 5 && diff === 1 && price > 0.50) {
+    if (typeof logFixABlock === 'function') {
+      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-d-inn5-1run' }); } catch {}
+    }
+    return null;
+  }
   const edge = weTimeAdj - price;
   if (edge < 0.04) return null;
   return {
@@ -3765,6 +3785,32 @@ function logPregameRejection(market, subStage, reason, ctx = {}) {
   } catch { /* best-effort, never disrupt trading */ }
 }
 
+// 2026-04-30: Fix A/D telemetry — log when our structural detector match would
+// have fired but a price cap blocked it. Lets us verify post-deploy that the caps
+// aren't over-correcting (e.g., blocking the +17pt edge MLB-p5-d3 cell).
+function logFixABlock({ league, period, diff, price, targetAbbr, gate }) {
+  try {
+    const record = {
+      id: `fixblock-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      ts: new Date().toISOString(),
+      stage: 'live-edge-fix-block',
+      subStage: gate,
+      decision: 'no-trade',
+      rejectReason: gate,
+      league,
+      period,
+      scoreDiff: diff,
+      decisionPrice: price,
+      targetAbbr,
+      gateContext: { gate, diff, period, price },
+      status: 'pending',
+      settledAt: null,
+      ourPickWon: null,
+    };
+    appendFileSync(SHADOW_DECISIONS_LOG, JSON.stringify(record) + '\n');
+  } catch { /* best-effort */ }
+}
+
 // Settle pending paper trades against Kalshi market outcomes
 async function settlePaperTrades() {
   if (!existsSync(PAPER_TRADES_LOG)) return;
@@ -3837,6 +3883,30 @@ async function settleShadowDecisions() {
       if (r.claudeConfidence != null) {
         const outcome = r.ourPickWon ? 1 : 0;
         r.calibrationDelta = Math.round(Math.pow(r.claudeConfidence - outcome, 2) * 10000) / 10000;
+      }
+      // 2026-04-30: pre-compute price recovery on synthetic-trail records by joining
+      // with price-tape at settle time. Eliminates need for caller-side joins. Captures
+      // intra-game peak: did this trailer's price spike +12¢ before settlement?
+      if (r.stage === 'live-edge-trailer-synthetic' && existsSync(PRICE_TAPE_LOG) && r.decisionPrice) {
+        try {
+          const tapeLines = readFileSync(PRICE_TAPE_LOG, 'utf-8').split('\n').filter(l => l.trim());
+          const entryMs = Date.parse(r.ts ?? '');
+          let maxAfter = r.decisionPrice;
+          for (const tl of tapeLines) {
+            try {
+              const t = JSON.parse(tl);
+              if (t.ticker !== r.ticker) continue;
+              if (Date.parse(t.ts ?? '') <= entryMs) continue;
+              if (typeof t.price === 'number' && t.price > maxAfter) maxAfter = t.price;
+            } catch { /* skip */ }
+          }
+          r.maxPriceAfterEntry = maxAfter;
+          r.maxRecoveryFromEntry = Math.round((maxAfter - r.decisionPrice) * 10000) / 10000;
+          r.recoveryReached10c = (maxAfter - r.decisionPrice) >= 0.10;
+          r.recoveryReached12c = (maxAfter - r.decisionPrice) >= 0.12;
+          r.recoveryReached15c = (maxAfter - r.decisionPrice) >= 0.15;
+          r.recoveryReached20c = (maxAfter - r.decisionPrice) >= 0.20;
+        } catch { /* best-effort */ }
       }
       updated = true;
     } catch { /* network error or market not found — try next cycle */ }
@@ -7147,28 +7217,30 @@ async function checkLiveScoreEdges() {
             const _trailerCached = cachedPrices.get(_trailerTicker);
             const _trailerPrice = _trailerCached?.price ?? Math.max(0.01, Math.min(0.99, 1 - price));
 
-            // Buy-low candidate detection — sport-specific recoverable conditions.
+            // Buy-low cell tagging. 2026-04-30: tag every record with a cell label
+            // (sport-trail-${diff}-P${period}-${priceBand}) regardless of whether it
+            // falls in the canonical buy-low band. This ensures shadow data isn't
+            // anonymous outside the heuristic — we can still mine boundary cells
+            // (e.g., MLB 4-run deficit, NHL P3) for unexpected edges.
             let _buyLowCandidate = false;
             let _buyLowReason = null;
-            if (_trailerPrice >= 0.25 && _trailerPrice <= 0.40) {
-              // MLB: 1-3 run deficit in innings 1-6 (after 6th, comeback windows shrink)
-              if (league === 'mlb' && diff >= 1 && diff <= 3 && period >= 1 && period <= 6) {
-                _buyLowCandidate = true;
-                _buyLowReason = `mlb-trail-${diff}run-P${period}`;
-              }
-              // NBA: 5-15 pt deficit in Q1-Q3 (Q4 too late, 16+ is blowout)
-              else if (league === 'nba' && diff >= 5 && diff <= 15 && period >= 1 && period <= 3) {
-                _buyLowCandidate = true;
-                _buyLowReason = `nba-trail-${diff}pt-P${period}`;
-              }
-              // NHL: 1-2 goal deficit in P1 or P2 (P3 with empty-net is binary chaos)
-              else if (league === 'nhl' && diff >= 1 && diff <= 2 && period >= 1 && period <= 2) {
-                _buyLowCandidate = true;
-                _buyLowReason = `nhl-trail-${diff}goal-P${period}`;
-              }
-              // Soccer excluded: draw cliff makes backing trailer mathematically unfavorable
-              // (trailing team often grinds out a draw, which loses our YES contract).
+            const _priceBand = _trailerPrice < 0.25 ? 'deep'        // <25¢ deep underdog
+              : _trailerPrice <= 0.40 ? 'low'                       // 25-40¢ canonical buy-low
+              : _trailerPrice <= 0.55 ? 'mid'                       // 41-55¢ marginal
+              : 'high';                                              // >55¢ near-coinflip
+            if (league === 'mlb' && diff >= 1) {
+              _buyLowReason = `mlb-trail-${Math.min(diff, 5)}run-P${period}-${_priceBand}`;
+              if (_priceBand === 'low' && diff <= 3 && period >= 1 && period <= 6) _buyLowCandidate = true;
+            } else if (league === 'nba' && diff >= 1) {
+              const _ptBucket = diff <= 4 ? `${diff}pt` : diff <= 8 ? '5-8pt' : diff <= 12 ? '9-12pt' : diff <= 16 ? '13-16pt' : '17+pt';
+              _buyLowReason = `nba-trail-${_ptBucket}-P${period}-${_priceBand}`;
+              if (_priceBand === 'low' && diff >= 5 && diff <= 15 && period >= 1 && period <= 3) _buyLowCandidate = true;
+            } else if (league === 'nhl' && diff >= 1) {
+              _buyLowReason = `nhl-trail-${Math.min(diff, 4)}goal-P${period}-${_priceBand}`;
+              if (_priceBand === 'low' && diff <= 2 && period >= 1 && period <= 2) _buyLowCandidate = true;
             }
+            // Soccer excluded from candidate flag: draw cliff makes backing trailer
+            // mathematically unfavorable. Still tagged for visibility.
 
             logShadowDecision({
               stage: 'live-edge-trailer-synthetic',
@@ -9275,6 +9347,28 @@ async function checkPreGamePredictions() {
           console.log(`[pre-game] Sonnet rejected ${market.base}: conf=${((decision.confidence??0)*100).toFixed(0)}% | ${reasonText.slice(0, 80)}`);
         }
         logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'rejected', confidence: decision.confidence, reasoning: decision.reasoning });
+        // 2026-04-30: capture pregame Sonnet rejections in shadow for redesign analysis.
+        // 697 claude-no records exist but ALL are tagged stage=live-edge — pregame had
+        // zero visibility. Now pregame claude-no decisions land in shadow with full
+        // context so we can see the rejection histogram (sport, conf, price, tags).
+        try {
+          logPregameRejection(market, isEspnMiss ? 'sonnet-espn-miss' : 'sonnet-claude-no', 'claude-no', {
+            sport: market.sport ?? null,
+            league: market.league ?? null,
+            confidence: decision.confidence ?? null,
+            price: decision.targetPrice ?? null,
+            edge: decision.edge ?? null,
+            reasoningPreview: (decision.reasoning ?? '').slice(0, 300),
+            reasoningTags: decision.reasoningStructured?.reasoning_tags ?? null,
+            reasoningStructured: decision.reasoningStructured ?? null,
+            gateContext: {
+              isEspnMiss,
+              team1Price: market.team1?.price ?? null,
+              team2Price: market.team2?.price ?? null,
+              minsToStart: minsToStart != null ? Math.round(minsToStart) : null,
+            },
+          });
+        } catch { /* best-effort */ }
         // Only set sticky reject cache if this wasn't an ESPN-miss retry candidate —
         // otherwise the 2h reject TTL would block the T-2h retry we just queued up.
         if (!preGameEspnMissSet.has(market.base)) {
