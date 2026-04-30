@@ -2838,6 +2838,72 @@ function getAvailableCash(exchange = 'kalshi') {
   return Math.max(0, bal - reserve);
 }
 
+// GRANULAR BUCKET THROTTLE (2026-04-30): reads calibration-stats.json and returns
+// a sizing multiplier based on the FULL granular bucket: sport × strategy × edge × conf.
+// The coarse getBucketSizingMult below operates only at sport×strategy level, which
+// averages bad granular cells with profitable ones. Example documented bleeder:
+//   "MLB | pre-game-prediction | 15-19pt | 65-69%": n=8, 63% WR, -$9.18/trade
+// is invisible to the coarse throttle because MLB pre-game OVERALL is closer to
+// break-even. This catches it.
+//
+// Returns: throttle multiplier in [0, 1]
+//   pnlPerTrade < -5 (n≥5): 0.00 (freeze)
+//   pnlPerTrade < -2 (n≥5): 0.25 (quarter size)
+//   pnlPerTrade < -1 (n≥5): 0.50 (half size)
+//   pnlPerTrade < -0.5 (n≥5): 0.75 (slight cut)
+//   else (or n<5): 1.00 (full size, not enough data to throttle)
+const _granularBucketCache = { ts: 0, buckets: null };
+function _classifyEdgeBand(edge) {
+  return edge < 0.05 ? '<5pt' : edge < 0.10 ? '5-9pt' : edge < 0.15 ? '10-14pt' : edge < 0.20 ? '15-19pt' : '20+pt';
+}
+function _classifyConfBand(c) {
+  return c < 0.60 ? '<60%' : c < 0.65 ? '60-64%' : c < 0.70 ? '65-69%' : c < 0.75 ? '70-74%' : c < 0.80 ? '75-79%' : '80%+';
+}
+function getGranularBucketThrottle(sport, strategy, edge, confidence) {
+  if (!sport || !strategy || edge == null || confidence == null) return 1;
+  // Map sport name to calibration-stats convention
+  const sportKey = sport === 'mlb' || sport === 'MLB' ? 'MLB'
+                 : sport === 'nba' || sport === 'NBA' ? 'NBA'
+                 : sport === 'nhl' || sport === 'NHL' ? 'NHL'
+                 : ['mls','epl','laliga','seriea','bundesliga','ligue1'].includes(sport) ? 'Soccer'
+                 : sport;
+  const now = Date.now();
+  if (!_granularBucketCache.buckets || now - _granularBucketCache.ts > 5 * 60 * 1000) {
+    try {
+      const raw = readFileSync('./logs/calibration-stats.json', 'utf-8');
+      const cs = JSON.parse(raw);
+      _granularBucketCache.buckets = Array.isArray(cs.buckets) ? cs.buckets : [];
+      _granularBucketCache.ts = now;
+    } catch {
+      _granularBucketCache.buckets = [];
+      _granularBucketCache.ts = now;
+    }
+  }
+  const buckets = _granularBucketCache.buckets;
+  if (!buckets || buckets.length === 0) return 1;
+  const edgeBand = _classifyEdgeBand(edge);
+  const confBand = _classifyConfBand(confidence);
+  // Find matching bucket
+  const match = buckets.find(b =>
+    b.sport === sportKey &&
+    b.strategy === strategy &&
+    b.edge === edgeBand &&
+    b.conf === confBand
+  );
+  if (!match || (match.n ?? 0) < 5) return 1;
+  const ppt = match.pnlPerTrade ?? 0;
+  let mult = 1;
+  let label = '';
+  if (ppt < -5)        { mult = 0.00; label = 'FROZEN'; }
+  else if (ppt < -2)   { mult = 0.25; label = 'QUARTER-SIZE'; }
+  else if (ppt < -1)   { mult = 0.50; label = 'HALF-SIZE'; }
+  else if (ppt < -0.5) { mult = 0.75; label = 'SLIGHT CUT'; }
+  if (mult < 1) {
+    console.log(`[risk] 🎯 GRANULAR BUCKET ${label} ${sportKey}|${strategy}|${edgeBand}|${confBand}: n=${match.n} pnlPerTrade=$${ppt.toFixed(2)} → ${mult.toFixed(2)}x`);
+  }
+  return mult;
+}
+
 // GRADUATED AUTO-SIZE-DOWN (2026-04-23): reads calibration-stats.json and returns
 // a sizing multiplier based on recent (sport × strategy) WR. Softer than binary
 // auto-freeze — reduces blast radius while preserving data flow.
@@ -7446,6 +7512,28 @@ async function checkLiveScoreEdges() {
         if (isSwingMode) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for swing trades
         if (reentryHalfSize) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for 3rd/4th entry on same game
 
+        // 2026-04-30 GRANULAR BUCKET THROTTLE: catches sport×strategy×edge×conf
+        // bucket combos that are documented losers. The coarse sport×strategy
+        // throttle averages bad cells with profitable ones and misses them.
+        // Only applies to non-structural trades — structural detectors have
+        // synthetic confidence values that don't map to real conf bands cleanly.
+        if (!item._structuralDecision) {
+          const _granStrategy = isThesisVindicated ? 'thesis-reentry'
+            : isSwingMode ? 'live-swing'
+            : hcCheck.isHighConv ? 'high-conviction'
+            : 'live-prediction';
+          const _granMult = getGranularBucketThrottle(league, _granStrategy, bestEdge, confidence);
+          if (_granMult < 1) {
+            const before = maxBetLE;
+            maxBetLE = Math.floor(maxBetLE * _granMult);
+            if (_granMult === 0) {
+              console.log(`[live-edge] 🚫 GRANULAR FREEZE: ${targetAbbr} (${league.toUpperCase()}) — bucket auto-frozen, blocking trade`);
+              continue;
+            }
+            console.log(`[sizing] 🎯 GRANULAR THROTTLE ${(_granMult*100).toFixed(0)}%: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)}`);
+          }
+        }
+
         // 2026-04-29 — STRUCTURAL DETECTOR KELLY OVERRIDE.
         // Auto-cal kellyFraction is calibrated against SONNET trade performance. Structural
         // detectors are pure rules-based (period × score × price); they don't depend on
@@ -9488,7 +9576,25 @@ async function checkPreGamePredictions() {
     // Edge-first tier: half-size — entry is EV+ but below standard conf floor, so size down.
     // Soccer pre-calibration: quarter-size until league has n≥10 settled pg trades.
     const soccerSizeMult = (isSoccerPg && !soccerCalibrated) ? 0.25 : 1.0;
-    const betAmount = Math.min(getPositionSize('kalshi', edge, 0, pgSportKey), pgMaxTrade) * (isEdgeFirst ? 0.5 : 1.0) * soccerSizeMult;
+    let betAmount = Math.min(getPositionSize('kalshi', edge, 0, pgSportKey), pgMaxTrade) * (isEdgeFirst ? 0.5 : 1.0) * soccerSizeMult;
+
+    // 2026-04-30 GRANULAR BUCKET THROTTLE for pre-game.
+    // Documented bleeder: "MLB | pre-game-prediction | 15-19pt | 65-69%": -$9.18/trade.
+    // Coarse throttle missed it. This catches it.
+    {
+      const _pgStrategy = isEdgeFirst ? 'pre-game-edge-first' : 'pre-game-prediction';
+      const _granMult = getGranularBucketThrottle(pgSportKey, _pgStrategy, edge, confidence);
+      if (_granMult < 1) {
+        const _before = betAmount;
+        betAmount = betAmount * _granMult;
+        if (_granMult === 0) {
+          console.log(`[pre-game] 🚫 GRANULAR FREEZE: ${market.base} ${matchedSide.team} — bucket auto-frozen, blocking pre-game trade`);
+          continue;
+        }
+        console.log(`[pre-game] 🎯 GRANULAR THROTTLE ${(_granMult*100).toFixed(0)}%: $${_before.toFixed(2)} → $${betAmount.toFixed(2)}`);
+      }
+    }
+
     const betQty = betAmount >= 1 ? Math.max(1, Math.floor(betAmount / price)) : 0;
     if (betAmount < 1) continue;
 
