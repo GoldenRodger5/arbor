@@ -8208,6 +8208,12 @@ const preGameAnalysisCache = new Map(); // marketBase → timestamp of last Clau
 const previousStarterMap = new Map(); // 'KEY:abbr' → { name, era, seenAt }
 const starterChangeMap = new Map(); // 'KEY:abbr' → { newName, newEra, prevName, prevEra, detectedAt }
 const STARTER_CHANGE_TTL_MS = 6 * 60 * 60 * 1000; // 6h — change is "fresh" for 6h after detection
+// 2026-04-30: oscillation dedup. ESPN's probables array can list 2 candidates and
+// reorder them between polls — same names flip back and forth, generating a phantom
+// "lineup change" every 15 min for the rest of the day. Track every starter we've
+// seen for a team in the last 6h; if a "new" name is one we've already seen recently,
+// it's an ESPN ordering artifact, not a real swap. Suppress alert + map update.
+const seenStarterNames = new Map(); // 'KEY:abbr' → Map<name, lastSeenMs>
 // NBA injury-change detector: tracks which players appear in inactive list per team.
 // When NEW name appears in inactive (vs previous snapshot), that's a "ruled out" event.
 // Sportsbooks reprice ~30 sec after NBA's official injury report; Kalshi lags 5-15 min.
@@ -8612,7 +8618,13 @@ async function checkPreGamePredictions() {
             // while Kalshi typically lags 5-15 min — the edge window we want to capture.
             const _starterKey = `${key}:${abbr}`;
             const _prev = previousStarterMap.get(_starterKey);
-            if (_prev && _prev.name && _prev.name !== name) {
+            // Track every name seen in last 6h to detect ESPN ordering oscillation
+            let _seen = seenStarterNames.get(_starterKey);
+            if (!_seen) { _seen = new Map(); seenStarterNames.set(_starterKey, _seen); }
+            // Prune entries older than 6h
+            for (const [n, ts] of _seen) { if (Date.now() - ts > STARTER_CHANGE_TTL_MS) _seen.delete(n); }
+            const _isOscillation = _seen.has(name); // we've already seen this "new" name recently
+            if (_prev && _prev.name && _prev.name !== name && !_isOscillation) {
               const _prevEraNum = parseFloat(_prev.era ?? 'NaN');
               const _newEraNum = parseFloat(_starterEntry.era ?? 'NaN');
               starterChangeMap.set(_starterKey, {
@@ -8625,8 +8637,13 @@ async function checkPreGamePredictions() {
                 detectedAt: Date.now(),
               });
               console.log(`[lineup-change] 🚨 ${key} ${abbr.toUpperCase()} starter changed: ${_prev.name} (ERA ${_prev.era ?? '?'}) → ${name} (ERA ${_starterEntry.era ?? '?'})`);
-              try { tg(`🚨 <b>LINEUP CHANGE — ${key} ${abbr.toUpperCase()}</b>\nWas: ${_prev.name} (ERA ${_prev.era ?? '?'})\nNow: ${name} (ERA ${_starterEntry.era ?? '?'})\nKalshi may lag — bot will check pre-game window.`); } catch {}
+              // 2026-04-30: Telegram notification silenced per user request — was firing 30+ times/day on
+              // ESPN ordering oscillation. Console log retained for debugging. The change is still
+              // injected into pre-game prompts via starterChangeMap if it passes oscillation dedup.
+            } else if (_prev && _prev.name && _prev.name !== name && _isOscillation) {
+              // Silent: ESPN flipped probables[0] order between two known candidates
             }
+            _seen.set(name, Date.now());
             previousStarterMap.set(_starterKey, { name, era: _starterEntry.era, seenAt: Date.now() });
             // Clean up stale change entries (>6h old)
             for (const [k, v] of starterChangeMap) {
