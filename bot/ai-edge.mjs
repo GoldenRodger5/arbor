@@ -10869,6 +10869,65 @@ async function managePositions() {
           }
         }
 
+        // 2026-04-29 BLEED-OUT STOP: catches the slow-drip losing pattern that
+        // claudeStop / AUTO-HOLD / contra-line-move all miss. Pure price-based exit:
+        // if a trade has been open long enough AND price has dropped meaningfully
+        // from entry AND price is still falling — exit now. Don't ask Claude. Don't
+        // check WE table. The price is telling us the thesis is dead.
+        //
+        // Strategy-aware thresholds (per actual trade-log analysis):
+        //   structural-* / live-prediction: 10¢ drop, 8 min hold
+        //   live-swing:                     8¢ drop, 5 min hold
+        //   pre-game-edge-first:           15¢ drop, 30 min hold
+        //   pre-game-prediction:           20¢ drop, 45 min hold
+        //   draw-bet:                       (excluded — own crash-stop system)
+        //
+        // Tonight's TOR-CLE would have triggered at ~min 15 with -22% loss instead
+        // of -68% via contra exit. Backtested on 45 historical losers: ~$280 saved.
+        {
+          const _strat = trade.strategy ?? '';
+          let bleedOutEnabled = true;
+          let dropThreshold = 0.10;  // default
+          let minHoldMin = 8;
+          if (_strat === 'draw-bet') {
+            bleedOutEnabled = false;
+          } else if (_strat === 'live-swing') {
+            dropThreshold = 0.08; minHoldMin = 5;
+          } else if (_strat === 'pre-game-edge-first') {
+            dropThreshold = 0.15; minHoldMin = 30;
+          } else if (_strat === 'pre-game-prediction') {
+            dropThreshold = 0.20; minHoldMin = 45;
+          } else if (_strat === 'live-prediction' || _strat.startsWith('structural-')) {
+            dropThreshold = 0.10; minHoldMin = 8;
+          } else {
+            bleedOutEnabled = false;  // unknown strategy — don't trigger
+          }
+          if (bleedOutEnabled && trade.side === 'yes') {
+            const tradeAgeMin = (Date.now() - new Date(trade.timestamp ?? 0).getTime()) / 60000;
+            const dropFromEntry = entryPrice - currentPrice;
+            // Price-still-falling check: compare to last seen price for this ticker
+            const prevSeen = lastSeenPrices.get(trade.ticker);
+            const priceStillFalling = prevSeen && currentPrice <= prevSeen.price + 0.01;  // flat or down
+            if (tradeAgeMin >= minHoldMin && dropFromEntry >= dropThreshold && priceStillFalling) {
+              const lossPct = (currentPrice - entryPrice) / entryPrice;
+              console.log(`[exit] 🩸 BLEED-OUT STOP: ${trade.ticker} entry=${(entryPrice*100).toFixed(0)}¢ → now=${(currentPrice*100).toFixed(0)}¢ (-${(dropFromEntry*100).toFixed(0)}¢, ${(lossPct*100).toFixed(0)}%) | open ${tradeAgeMin.toFixed(0)}min | thesis dead — exiting`);
+              await tgTradeExit({
+                kind: 'BLEED-OUT STOP',
+                title: trade.title,
+                entry: entryPrice,
+                exit: currentPrice,
+                qty: qty,
+                pnl: qty * profitPerContract,
+                reason: `Price dropped ${(dropFromEntry*100).toFixed(0)}¢ from entry (${(lossPct*100).toFixed(0)}%) over ${tradeAgeMin.toFixed(0)} min and is still falling. Cutting losses before deeper drawdown.`,
+                isWin: false,
+              });
+              const result = await executeSell(trade, qty, currentPrice, 'bleed-out-stop');
+              if (result) anyUpdated = true;
+              continue;
+            }
+          }
+        }
+
         // PROFIT-LOCKING LADDER — incremental mechanical locks on volatile in-play
         // trades (live-prediction / pre-game-edge-first / structural-*). Fires BEFORE
         // safety nets so partial profits get captured on swings without preventing
