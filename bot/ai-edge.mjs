@@ -1920,18 +1920,6 @@ Your reasoning is logged for calibration analysis and reviewed for systematic pa
 
 const PG_BASE_SYSTEM = `You are a professional sports betting analyst on prediction markets. You MUST respond with a single JSON object only — no prose, no explanation outside the JSON. Your entire response must be valid JSON.
 
-🛑 PRICE-BAND CALIBRATION WARNING (audit 2026-04-30, n=82 historical pre-game trades):
-Your historical confidence has been MISCALIBRATED in three specific price bands:
-  • PRE-GAME entries <40¢: 0/3 WR (you've over-fired on deep underdogs without true catalyst)
-  • MLB pre-game 50-54¢: 2/18 WR = 11% (small-favorite edges you cite are noise, not signal)
-  • NHL pre-game 60-69¢: 0/9 WR (you've consistently over-trusted goalie matchups; market is correctly priced)
-
-Apply a 10% downward bias to your confidence in these bands. If your raw read is 70% in NHL 60-69¢, write 60%. The bot will block the trade anyway, but your reasoning_tags + tag credibility will be more accurate going forward.
-
-BANDS THAT ACTUALLY WORK:
-  • 40-44¢ deep underdogs WITH cited catalyst: 5/12 WR = 42% (+$99 net) — keep firing these
-  • 55-65¢ MLB favorites: marginal but salvageable when sportsbook anchor agrees
-
 `;
 
 const NBA_PG_FRAMEWORK = `═══ NBA SWING-TRADE FRAMEWORK ═══
@@ -3685,6 +3673,46 @@ function logShadowDecision(entry) {
   } catch (e) {
     // Silent fail — shadow data is best-effort, don't disrupt trading
   }
+}
+
+// Log a pregame rejection — captures EVERY pre-Sonnet and post-Sonnet gate that
+// kills a candidate. Bypasses logShadowDecision's filters (no 50% conf floor, no
+// dedup, no price ceiling) so we get every rejection on record. Used to find the
+// real bottleneck after pregame went 5+ days with zero fires (2026-04-30).
+function logPregameRejection(market, subStage, reason, ctx = {}) {
+  try {
+    const team = (ctx.team ?? '').toUpperCase();
+    const ticker = market?.base ? (market.base + (team ? '-' + team : '')) : (ctx.ticker ?? null);
+    const record = {
+      id: `pgrej-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      ts: new Date().toISOString(),
+      stage: 'pre-game',
+      subStage,                     // 'pre-sonnet' | 'post-sonnet-gate' | 'sonnet-error'
+      ticker,
+      marketBase: market?.base ?? null,
+      marketTitle: market?.title ?? null,
+      sport: ctx.sport ?? null,
+      league: ctx.league ?? null,
+      decision: 'no-trade',
+      rejectReason: reason,
+      claudeConfidence: ctx.confidence ?? null,
+      decisionPrice: ctx.price ?? null,
+      edge: ctx.edge ?? null,
+      targetAbbr: team || null,
+      team1Price: market?.team1?.price ?? null,
+      team2Price: market?.team2?.price ?? null,
+      reasoningPreview: ctx.reasoningPreview ?? null,
+      reasoningTags: ctx.reasoningTags ?? null,
+      reasoningStructured: ctx.reasoningStructured ?? null,
+      gateContext: ctx.gateContext ?? null,
+      status: 'pending',
+      settledAt: null,
+      winningSide: null,
+      ourPickWon: null,
+      calibrationDelta: null,
+    };
+    appendFileSync(SHADOW_DECISIONS_LOG, JSON.stringify(record) + '\n');
+  } catch { /* best-effort, never disrupt trading */ }
 }
 
 // Settle pending paper trades against Kalshi market outcomes
@@ -8300,8 +8328,14 @@ async function checkPreGamePredictions() {
     const tieTicker = game.tickers.find(t => t.team.toUpperCase() === 'TIE');
 
     // Skip if both prices are outside range
-    if (team1.yesAsk > MAX_PRICE && team2.yesAsk > MAX_PRICE) continue;
-    if (team1.yesAsk < 0.15 && team2.yesAsk < 0.15) continue;
+    if (team1.yesAsk > MAX_PRICE && team2.yesAsk > MAX_PRICE) {
+      logPregameRejection({ base, title: game.title, team1: { price: team1.yesAsk, team: team1.team }, team2: { price: team2.yesAsk, team: team2.team } }, 'pre-sonnet', 'both-prices-too-high', { gateContext: { maxPrice: MAX_PRICE, team1Price: team1.yesAsk, team2Price: team2.yesAsk } });
+      continue;
+    }
+    if (team1.yesAsk < 0.15 && team2.yesAsk < 0.15) {
+      logPregameRejection({ base, title: game.title, team1: { price: team1.yesAsk, team: team1.team }, team2: { price: team2.yesAsk, team: team2.team } }, 'pre-sonnet', 'both-prices-too-low', { gateContext: { team1Price: team1.yesAsk, team2Price: team2.yesAsk } });
+      continue;
+    }
 
     preGameMarkets.push({
       title: game.title, base, series: game.series,
@@ -8400,6 +8434,9 @@ async function checkPreGamePredictions() {
   const pgSlice = uncachedMarkets.slice(0, 5); // cap 12 → 5 per cycle (Option C)
   if (uncachedMarkets.length > 5) {
     console.log(`[pre-game] Cycle cap: analyzing top 5 of ${uncachedMarkets.length} (priority: near-kickoff + price-move)`);
+    for (const _dropped of uncachedMarkets.slice(5)) {
+      logPregameRejection(_dropped, 'pre-sonnet', 'cycle-cap-dropped', { gateContext: { totalUncached: uncachedMarkets.length, cap: 5 } });
+    }
   }
   // Pre-game sizing capped at 5% per P1.3 — pass strategy so getDynamicMaxTrade applies the cap.
   const maxBetDisplay = getDynamicMaxTrade('kalshi', null, 'pre-game-prediction').toFixed(2);
@@ -8976,6 +9013,7 @@ async function checkPreGamePredictions() {
       }
       if (!matchedSide) {
         console.log(`[pre-game] BLOCKED: Claude picked team "${chosenTeam}" but game has ${market.team1.team} vs ${market.team2.team}`);
+        logPregameRejection(market, 'post-sonnet-gate', 'team-mismatch', { team: chosenTeam, confidence: decision.confidence, reasoningPreview: (decision.reasoning ?? '').slice(0, 200), gateContext: { picked: chosenTeam, available: [market.team1.team, market.team2.team] } });
         continue;
       }
 
@@ -9015,12 +9053,14 @@ async function checkPreGamePredictions() {
       // If the other team has more positive mentions AND our chosen team has more negative mentions → confused
       if (otherPositive > chosenPositive && otherNegative < chosenNegative) {
         console.log(`[pre-game] BLOCKED: Claude picked ${chosenTeam} but reasoning favors ${otherSide.team} (other: +${otherPositive}/-${otherNegative}, chosen: +${chosenPositive}/-${chosenNegative}). Likely abbreviation confusion.`);
+        logPregameRejection(market, 'post-sonnet-gate', 'abbreviation-confusion-soft', { team: chosenTeam, confidence: decision.confidence, reasoningPreview: (decision.reasoning ?? '').slice(0, 200), gateContext: { picked: chosenTeam, otherSide: otherSide.team, chosenPos: chosenPositive, chosenNeg: chosenNegative, otherPos: otherPositive, otherNeg: otherNegative } });
         continue;
       }
 
       // Also block if other team has 3+ more positive mentions than chosen (strong signal)
       if (otherPositive >= chosenPositive + 3) {
         console.log(`[pre-game] BLOCKED: Claude picked ${chosenTeam} but reasoning overwhelmingly favors ${otherSide.team} (+${otherPositive} vs +${chosenPositive}). Likely abbreviation confusion.`);
+        logPregameRejection(market, 'post-sonnet-gate', 'abbreviation-confusion-hard', { team: chosenTeam, confidence: decision.confidence, reasoningPreview: (decision.reasoning ?? '').slice(0, 200), gateContext: { picked: chosenTeam, otherSide: otherSide.team, chosenPos: chosenPositive, otherPos: otherPositive } });
         continue;
       }
 
@@ -9032,6 +9072,7 @@ async function checkPreGamePredictions() {
       const wrongSport = detectWrongSport(expectedSport, reasoning);
       if (wrongSport) {
         console.log(`[pre-game] BLOCKED: Claude confused sport for ${market.base}. Expected ${expectedSport}, reasoning mentions ${wrongSport}.`);
+        logPregameRejection(market, 'post-sonnet-gate', 'sport-confusion', { team: chosenTeam, confidence: decision.confidence, sport: expectedSport, reasoningPreview: (decision.reasoning ?? '').slice(0, 200), gateContext: { expectedSport, mentionedSport: wrongSport } });
         continue;
       }
 
@@ -9071,6 +9112,7 @@ async function checkPreGamePredictions() {
         if (crossSportHit) {
           console.log(`[pre-game] BLOCKED: hallucination — ${crossSportHit} for ${market.base}`);
           logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'blocked-hallucination', reasoning: crossSportHit, claudeReasoning: decision.reasoning?.slice(0, 200) });
+          logPregameRejection(market, 'post-sonnet-gate', 'cross-sport-hallucination', { team: chosenTeam, confidence: decision.confidence, sport: expectedSport, reasoningPreview: (decision.reasoning ?? '').slice(0, 200), gateContext: { hallucinated: crossSportHit } });
           continue;
         }
 
@@ -9117,6 +9159,7 @@ async function checkPreGamePredictions() {
             if (bad) {
               console.log(`[pre-game] BLOCKED: hallucinated starter "${bad}" — ESPN confirms ${chosenStarter.name} for ${matchedSide.team} in ${market.base}`);
               logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'blocked-hallucination', reasoning: `cited starter "${bad}" ≠ ESPN starter "${chosenStarter.name}"`, claudeReasoning: decision.reasoning?.slice(0, 200) });
+              logPregameRejection(market, 'post-sonnet-gate', 'hallucinated-starter', { team: matchedSide.team, confidence: decision.confidence, reasoningPreview: (decision.reasoning ?? '').slice(0, 200), gateContext: { citedStarter: bad, espnStarter: chosenStarter.name } });
               continue;
             }
           }
@@ -9212,6 +9255,7 @@ async function checkPreGamePredictions() {
         if (!_hasCarveOut) {
           console.log(`[pre-game] 🚫 KILLER BUCKET BLOCKED (${expectedSport}): ${market.base} claims ${(_claimedEdge*100).toFixed(0)}pt edge at ${(confidence*100).toFixed(0)}% conf — proportionality mismatch (no ${expectedSport}-specific carve-out cited).`);
           logScreen({ stage: 'pre-game-sonnet', ticker: market.base, result: 'killer-bucket-block', reasoning: `${expectedSport}: Edge ${(_claimedEdge*100).toFixed(0)}pt + conf ${(confidence*100).toFixed(0)}% = -EV bucket, no carve-out detected`, claudeReasoning: (decision.reasoning ?? '').slice(0, 200) });
+          logPregameRejection(market, 'post-sonnet-gate', 'killer-bucket', { team: matchedSide.team, confidence, sport: expectedSport, edge: Math.round(_claimedEdge * 100), reasoningPreview: (decision.reasoning ?? '').slice(0, 200), gateContext: { claimedEdgePt: Math.round(_claimedEdge * 100), conf: Math.round(confidence * 100) } });
           continue;
         } else {
           console.log(`[pre-game] ✅ KILLER BUCKET CARVE-OUT (${expectedSport}): ${market.base} — ${_carveLabel} detected, allowing through`);
@@ -9274,6 +9318,7 @@ async function checkPreGamePredictions() {
     // EPL/La Liga allowed at 55¢+ since draw rates are slightly lower and Kalshi has liquid markets.
     if (['mls', 'seriea', 'bundesliga', 'ligue1'].includes(pgSportKey)) {
       console.log(`[pre-game] 🚫 SOCCER WINNER-BET BLOCKED: ${market.base} — ${pgSportKey.toUpperCase()} winner bets disabled (draw rate ~26-28% makes winner contracts -EV; draw-bet strategy handles soccer instead)`);
+      logPregameRejection(market, 'post-sonnet-gate', 'soccer-winner-blocked', { league: pgSportKey, sport: 'Soccer', confidence: decision.confidence, gateContext: { league: pgSportKey } });
       continue;
     }
 
@@ -9306,6 +9351,7 @@ async function checkPreGamePredictions() {
     // vs. downside of 70¢ — asymmetry is wrong. Cap at 68¢ to preserve the trade structure.
     if (price > 0.68) {
       console.log(`[pre-game] Entry price too high: ${(price*100).toFixed(0)}¢ > 68¢ cap — market has priced out the edge`);
+      logPregameRejection(market, 'post-sonnet-gate', 'price-too-high', { team: matchedSide.team, price, confidence, sport: pgSportKey, gateContext: { priceCap: 0.68 } });
       continue;
     }
 
@@ -9324,6 +9370,7 @@ async function checkPreGamePredictions() {
     if (hasHardBannedPregameTag(_pgTags)) {
       console.log(`[pre-game] 🚫 HARD-BANNED TAG: ${market.base} — tags [${_pgTags.join(',')}] include a documented loser (bullpen-mismatch / starter-mismatch / lineup-cold)`);
       logScreen({ stage: 'pre-game-skip', result: 'skip-hard-banned-tag', ticker: market.base, sport: pgSportKey, reasoning: `Hard-banned tag present in [${_pgTags.join(',')}]` });
+      logPregameRejection(market, 'post-sonnet-gate', 'hard-banned-tag', { team: matchedSide.team, price, confidence, sport: pgSportKey, reasoningTags: _pgTags, reasoningPreview: (decision.reasoning ?? '').slice(0, 200), gateContext: { tags: _pgTags } });
       continue;
     }
 
@@ -9365,6 +9412,7 @@ async function checkPreGamePredictions() {
     if (!hasProvenPregameEdgeTag(_pgTags) && !_disasterTierExempt && !_sportsbookGapExempt) {
       console.log(`[pre-game] 🚫 NO PROVEN EDGE TAG: ${market.base} — Sonnet's tags [${_pgTags.join(',') || '(none)'}] don't include any proven-winning category. Generic analysis = no edge over sportsbook.`);
       logScreen({ stage: 'pre-game-skip', result: 'skip-no-proven-tag', ticker: market.base, sport: pgSportKey, reasoning: `Reasoning tags ${_pgTags.join(',')} lack a proven-edge tag (need playoff-home-fav, we-undervalued, market-lag, injury-news, or public-fade)` });
+      logPregameRejection(market, 'post-sonnet-gate', 'no-proven-edge-tag', { team: matchedSide.team, price, confidence, sport: pgSportKey, reasoningTags: _pgTags, reasoningPreview: (decision.reasoning ?? '').slice(0, 200), gateContext: { tags: _pgTags } });
       continue;
     }
 
@@ -9375,6 +9423,7 @@ async function checkPreGamePredictions() {
     if (['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(pgSportKey)) {
       console.log(`[pre-game] 🛑 SOCCER PRE-GAME DISABLED: ${market.base} (${pgSportKey.toUpperCase()}) — strategy net -$34.83 historically. Need lineup-scraper edge to re-enable.`);
       logScreen({ stage: 'pre-game-skip', result: 'skip-soccer-disabled', ticker: market.base, sport: pgSportKey, reasoning: 'Soccer pre-game-prediction permanently disabled — losing strategy with no confirmed edge source' });
+      logPregameRejection(market, 'post-sonnet-gate', 'soccer-pregame-disabled', { team: matchedSide.team, price, confidence, league: pgSportKey, sport: 'Soccer' });
       continue;
     }
 
@@ -9385,6 +9434,7 @@ async function checkPreGamePredictions() {
     // At 55¢+, the favorite framing reduces loss severity and the payoff ratio improves.
     if (['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(pgSportKey) && price < 0.55) {
       console.log(`[pre-game] 🚫 SOCCER FLOOR: ${market.base} — ${pgSportKey.toUpperCase()} at ${(price*100).toFixed(0)}¢ below 55¢ minimum (underdog payoff asymmetry unfavorable below 55¢)`);
+      logPregameRejection(market, 'post-sonnet-gate', 'soccer-floor-below-55', { team: matchedSide.team, price, confidence, league: pgSportKey, sport: 'Soccer' });
       continue;
     }
 
@@ -9521,6 +9571,7 @@ async function checkPreGamePredictions() {
         team1Cents: Math.round((market.team1?.price ?? 0) * 100),
         team2Cents: Math.round((market.team2?.price ?? 0) * 100),
       });
+      logPregameRejection(market, 'post-sonnet-gate', 'margin-check-failed', { team: matchedSide.team, price, confidence, edge: Math.round(_edgeAbs * 100), sport: pgSportKey, reasoningTags: _pgTags, gateContext: { conf: Math.round(confidence * 100), edgePt: Math.round(_edgeAbs * 100), reqMarginPt: Math.round(pgReqMargin * 100), minConfPt: Math.round(PRE_GAME_MIN_CONF * 100) } });
       continue;
     }
     if (isEdgeFirst) {
@@ -9528,7 +9579,11 @@ async function checkPreGamePredictions() {
     }
 
     // Duplicate guard — one bet per game per day (survives restarts via JSONL)
-    if (preGameBetGames.has(market.base)) { console.log(`[pre-game] Already bet ${market.base} today`); continue; }
+    if (preGameBetGames.has(market.base)) {
+      console.log(`[pre-game] Already bet ${market.base} today`);
+      logPregameRejection(market, 'post-sonnet-gate', 'already-bet-today', { team: matchedSide.team, price, confidence, sport: pgSportKey });
+      continue;
+    }
 
     // 2026-04-27 audit: MLB pre-game-prediction at 45-49¢ entry has 33% WR over n=9,
     // -$54 net. Mid-priced underdog dead-zone — these are the trades where neither side
@@ -9536,38 +9591,21 @@ async function checkPreGamePredictions() {
     // Sub-45¢ has 50% WR +$55 (extreme underdog with cited catalyst). 50¢+ is OK.
     if (pgSportKey === 'mlb' && price >= 0.45 && price < 0.50) {
       console.log(`[pre-game] BLOCKED ${market.base}: MLB pre-game 45-49¢ entry — historical 33% WR over 9 trades, -$54 net. Mid-priced underdog dead-zone.`);
+      logPregameRejection(market, 'post-sonnet-gate', 'mlb-price-band-45-49', { team: matchedSide.team, price, confidence, sport: pgSportKey, gateContext: { band: '45-49' } });
       continue;
     }
 
-    // 2026-04-30 audit (refined narrow-band analysis on n=82 pre-game trades):
-    // Three additional price bands documented as catastrophic. Surgical blocks
-    // complementary to the granular bucket throttle (which catches edge×conf cells).
-    // Price-band blocks catch patterns the bucket throttle misses.
-    //
-    // 1. ALL pre-game <40¢: 0/3 WR, -$29.91 (deep-underdog dead zone)
-    if (price < 0.40) {
-      console.log(`[pre-game] BLOCKED ${market.base}: <40¢ entry — 0/3 historical pre-game WR, -$29.91. Deep-underdog dead zone.`);
-      continue;
-    }
-    // 2. MLB pre-game 50-54¢: 2/18 WR (11%), -$29.50 (small-favorite dead zone)
-    //    Distinct from the 45-49¢ block above. Sonnet over-fires on tiny edges here.
-    if (pgSportKey === 'mlb' && price >= 0.50 && price < 0.55) {
-      console.log(`[pre-game] BLOCKED ${market.base}: MLB pre-game 50-54¢ entry — 2/18 (11%) historical WR, -$29.50. Small-favorite dead zone where Sonnet over-fires marginal edges.`);
-      continue;
-    }
-    // 3. NHL pre-game 60-69¢: 0/9 WR, -$28.64 (favorite-overconfidence dead zone)
-    //    Sonnet repeatedly picks NHL favorites in this band; market correctly priced.
-    if (pgSportKey === 'nhl' && price >= 0.60 && price < 0.70) {
-      console.log(`[pre-game] BLOCKED ${market.base}: NHL pre-game 60-69¢ entry — 0/9 historical WR, -$28.64. Favorite-overconfidence dead zone — market correctly priced these.`);
-      continue;
-    }
     if (existsSync(PAPER_TRADES_LOG)) {
       const paperLines = readFileSync(PAPER_TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
       // Fix: compare using ET date (tsToEtDate) not UTC date string — trades at 10pm ET have next-day UTC timestamps
       const hasPaperToday = paperLines.some(l => {
         try { const t = JSON.parse(l); return tsToEtDate(t.timestamp) === todayDateStr && t.marketBase === market.base; } catch { return false; }
       });
-      if (hasPaperToday) { console.log(`[pre-game] Already logged trade for ${market.base} today (JSONL)`); continue; }
+      if (hasPaperToday) {
+        console.log(`[pre-game] Already logged trade for ${market.base} today (JSONL)`);
+        logPregameRejection(market, 'post-sonnet-gate', 'already-paper-logged-today', { team: matchedSide.team, price, confidence, sport: pgSportKey });
+        continue;
+      }
     }
 
     // Cross-day matchup guard — don't re-enter the same two-team matchup if we lost it in the last 36h.
@@ -9593,6 +9631,7 @@ async function checkPreGamePredictions() {
       });
       if (hadMatchupLoss) {
         console.log(`[pre-game] 🚫 CROSS-DAY BLOCK: ${market.base} — lost ${t1} vs ${t2} matchup in last 36h`);
+        logPregameRejection(market, 'post-sonnet-gate', 'cross-day-matchup-loss', { team: matchedSide.team, price, confidence, sport: pgSportKey, gateContext: { t1, t2 } });
         continue;
       }
     }
@@ -9624,6 +9663,7 @@ async function checkPreGamePredictions() {
         betAmount = betAmount * _granMult;
         if (_granMult === 0) {
           console.log(`[pre-game] 🚫 GRANULAR FREEZE: ${market.base} ${matchedSide.team} — bucket auto-frozen, blocking pre-game trade`);
+          logPregameRejection(market, 'post-sonnet-gate', 'granular-bucket-freeze', { team: matchedSide.team, price, confidence, edge: Math.round(edge * 100), sport: pgSportKey, gateContext: { strategy: _pgStrategy } });
           continue;
         }
         console.log(`[pre-game] 🎯 GRANULAR THROTTLE ${(_granMult*100).toFixed(0)}%: $${_before.toFixed(2)} → $${betAmount.toFixed(2)}`);
@@ -9722,6 +9762,7 @@ async function checkPreGamePredictions() {
           const eraGapThreshold = getBankroll() < 500 ? 3.0 : 2.5;
           if (eraGap < eraGapThreshold) {
             console.log(`[pre-game] 🚫 MLB ERA GAP: ${market.base} — gap ${eraGap.toFixed(2)} (${espnT1?.name ?? '?'} ${t1ERA} ERA vs ${espnT2?.name ?? '?'} ${t2ERA} ERA) below ${eraGapThreshold} threshold (bankroll ${getBankroll() < 500 ? '<$500 → 3.0' : '≥$500 → 2.5'}) — skipping`);
+            logPregameRejection(market, 'post-sonnet-gate', 'mlb-era-gap-too-small', { team: matchedSide.team, price, confidence, sport: 'MLB', league: 'mlb', gateContext: { eraGap: +eraGap.toFixed(2), threshold: eraGapThreshold, t1Name: espnT1?.name, t1ERA, t2Name: espnT2?.name, t2ERA } });
             continue; // skip to next market — no paper log needed for hard filter
           }
           console.log(`[pre-game] ✅ MLB ERA GAP: ${market.base} — gap ${eraGap.toFixed(2)} clears 2.5 threshold (${espnT1?.name ?? '?'} ${t1ERA} vs ${espnT2?.name ?? '?'} ${t2ERA})`);
@@ -9736,6 +9777,7 @@ async function checkPreGamePredictions() {
           const dirSlack = getBankroll() < 500 ? 0.5 : 1.0;
           if (pickedStarterERA > oppStarterERA + dirSlack) {
             console.log(`[pre-game] 🚫 ERA DIRECTION: ${market.base} — Claude backed ${chosenTeam} (${pickedStarterName} ERA ${pickedStarterERA.toFixed(2)}) but opponent ERA is lower at ${oppStarterERA.toFixed(2)} — wrong side of the ERA gap (slack=${dirSlack}), skipping`);
+            logPregameRejection(market, 'post-sonnet-gate', 'mlb-era-direction-wrong', { team: matchedSide.team, price, confidence, sport: 'MLB', league: 'mlb', gateContext: { pickedStarterName, pickedERA: +pickedStarterERA.toFixed(2), oppERA: +oppStarterERA.toFixed(2), dirSlack } });
             continue;
           }
 
@@ -9748,6 +9790,7 @@ async function checkPreGamePredictions() {
           const oppStarterName = pickedIsTeam1 ? (espnT2?.name ?? '?') : (espnT1?.name ?? '?');
           if (!isNaN(oppStarterERA) && !isNaN(oppWhip) && oppStarterERA < 2.5 && oppWhip < 1.0) {
             console.log(`[pre-game] 🚫 ELITE ACE BLOCK: ${market.base} — opponent ${oppStarterName} ERA ${oppStarterERA.toFixed(2)} WHIP ${oppWhip.toFixed(2)} qualifies as elite ace — lineup won't score, price won't rise, skipping`);
+            logPregameRejection(market, 'post-sonnet-gate', 'mlb-elite-ace-block', { team: matchedSide.team, price, confidence, sport: 'MLB', league: 'mlb', gateContext: { oppStarterName, oppERA: +oppStarterERA.toFixed(2), oppWHIP: +oppWhip.toFixed(2) } });
             continue;
           }
         }
