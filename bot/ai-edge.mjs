@@ -2662,6 +2662,30 @@ function renderReasoningForTelegram(r, fallbackStr) {
   return lines.length > 0 ? lines.join('\n') : (fallbackStr || '');
 }
 
+// 2026-04-29 PROFIT LOCK-IN — protects today's gains from a single big loss.
+// Once we're up ≥5% on the day, any new trade is capped at 30% of today's
+// realized P&L. This way ONE adverse trade can't wipe out 6+ wins.
+//
+// Triggered today by NBA-Q3 loss: 6 wins netted ~$8.50, then a single $15.66
+// trade (-$10.73 loss) erased the day. Without lock-in, big wins compound but
+// big losses also compound on the SAME day. Lock-in caps downside.
+//
+// Returns: null (no cap) if profit < 5% threshold, OR a dollar cap that bounds
+// the next trade's max size.
+function getProfitLockInCap() {
+  try {
+    const summary = getDailyPnLSummary();
+    const bankroll = getBankroll();
+    const todayProfit = summary.pnl ?? 0;
+    const profitPct = todayProfit / bankroll;
+    // Only activate after meaningfully profitable day
+    if (profitPct < 0.05) return null;
+    // Cap next trade at 30% of today's profit
+    const cap = todayProfit * 0.30;
+    return cap;
+  } catch { return null; }
+}
+
 // Smart cooldown: allow adding to position IF price improved AND score is
 // unchanged, block otherwise.
 //
@@ -7433,6 +7457,18 @@ async function checkLiveScoreEdges() {
           maxBetLE = Math.floor(maxBetLE * _liveBoost);
           console.log(`[sizing] 🎯 TAG BOOST ${_liveBoost.toFixed(2)}x: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)} (tags: ${(decision.reasoningStructured?.reasoning_tags ?? []).join(',')})`);
         }
+
+        // 2026-04-29 PROFIT LOCK-IN — protect today's earned gains from a single
+        // adverse trade. Once up ≥5% on the day, cap any new trade at 30% of profit.
+        // Today's NBA-Q3 ($15.66 deploy → -$10.73 loss) erased 6 prior wins. With
+        // this rule, that trade would have been capped at $2.54, loss capped at -$1.74.
+        const _profitCap = getProfitLockInCap();
+        if (_profitCap != null && maxBetLE > _profitCap) {
+          const before = maxBetLE;
+          maxBetLE = Math.floor(_profitCap);
+          console.log(`[sizing] 🔒 PROFIT LOCK-IN: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)} (capped at 30% of today's $${(getDailyPnLSummary().pnl).toFixed(2)} profit — protects gains from single big loss)`);
+        }
+
         const claudeBet = decision.betAmount ?? 0;
         const safeBet = hcCheck.isHighConv ? maxBetLE : Math.min(claudeBet > 0 ? claudeBet : maxBetLE, maxBetLE);
         if (safeBet < 1) {
