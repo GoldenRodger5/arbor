@@ -3889,10 +3889,11 @@ async function settleShadowDecisions() {
         const outcome = r.ourPickWon ? 1 : 0;
         r.calibrationDelta = Math.round(Math.pow(r.claudeConfidence - outcome, 2) * 10000) / 10000;
       }
-      // 2026-04-30: pre-compute price recovery on synthetic-trail records by joining
-      // with price-tape at settle time. Eliminates need for caller-side joins. Captures
-      // intra-game peak: did this trailer's price spike +12¢ before settlement?
-      if (r.stage === 'live-edge-trailer-synthetic' && existsSync(PRICE_TAPE_LOG) && r.decisionPrice) {
+      // 2026-04-30: pre-compute price recovery on synthetic-trail AND live-edge shadows.
+      // For live-edge: tells us how often Sonnet-rejected setups would have hit +12¢
+      // intra-game (the swing exit threshold). Critical for tuning swing-mode floors.
+      if ((r.stage === 'live-edge-trailer-synthetic' || r.stage === 'live-edge')
+          && existsSync(PRICE_TAPE_LOG) && r.decisionPrice) {
         try {
           const tapeLines = readFileSync(PRICE_TAPE_LOG, 'utf-8').split('\n').filter(l => l.trim());
           const entryMs = Date.parse(r.ts ?? '');
@@ -7053,6 +7054,13 @@ async function checkLiveScoreEdges() {
           reentryHalfSize,
           _lineMove, _scoreChanged,
           _structuralDecision, // null if no match; synthetic decision if pattern matched
+          // 2026-04-30: enrich shadow records with strategy context for cell mining
+          _shadowEnrichment: {
+            leadingBullpenTier: leadingBullpenTier ?? null,
+            swingWEFloor: typeof SWING_WE_FLOOR === 'number' ? SWING_WE_FLOOR : null,
+            minWEForSonnet: typeof MIN_WE_FOR_SONNET === 'number' ? MIN_WE_FOR_SONNET : null,
+            baseWE: typeof baseWE === 'number' ? baseWE : null,
+          },
         });
 
     } catch (e) {
@@ -7180,6 +7188,36 @@ async function checkLiveScoreEdges() {
           priceData: cachedPrices.get(ticker),
           gameDetail, ticker, side: 'yes', decisionPrice: price,
         });
+        // 2026-04-30 Tier 1 enrichment: capture strategy/swing/lineMove/bullpen
+        // context so shadow data supports per-strategy and per-cell mining.
+        const _shadowEnrich = item._shadowEnrichment ?? {};
+        const _strategyTag = item._structuralDecision
+          ? `structural-${item._structuralDecision._structuralPattern}`
+          : (isSwingMode ? 'live-swing' : 'live-prediction');
+        const _lineMoveTag = item._lineMove
+          ? (item._lineMove.confirming === true ? 'CONFIRMING'
+             : item._lineMove.confirming === false ? 'CONTRA' : 'NEUTRAL')
+          : null;
+        // Period phase: parse from gameDetail. ESPN sends "Top X"/"Bot X" mid-inning,
+        // "Mid X"/"End X" between innings. For non-MLB use period progress fraction.
+        const _periodPhase = (() => {
+          if (!gameDetail) return null;
+          if (league === 'mlb') {
+            if (/^Top\b/i.test(gameDetail)) return 'top-inning';
+            if (/^Bot\b/i.test(gameDetail)) return 'bot-inning';
+            if (/^Mid\b/i.test(gameDetail)) return 'mid-inning-break';
+            if (/^End\b/i.test(gameDetail)) return 'end-inning';
+          }
+          // NBA/NHL/Soccer: use clock if present in gameDetail
+          const m = gameDetail.match(/(\d+):(\d+)/);
+          if (m) {
+            const mins = parseInt(m[1], 10);
+            if (league === 'nba') return mins >= 8 ? 'early' : mins >= 4 ? 'mid' : 'late';
+            if (league === 'nhl') return mins >= 13 ? 'early' : mins >= 7 ? 'mid' : 'late';
+            return mins >= 30 ? 'early' : mins >= 15 ? 'mid' : 'late';
+          }
+          return null;
+        })();
         logShadowDecision({
           stage: 'live-edge',
           ticker,
@@ -7201,6 +7239,18 @@ async function checkLiveScoreEdges() {
           reasoningStructured: decision.reasoningStructured ?? null,
           reasoningTags: decision.reasoningStructured?.reasoning_tags ?? null,
           rlmContext: getLiveMoveContext(ticker, 'yes', price),
+          // Tier 1 enrichment fields
+          strategy: _strategyTag,
+          isSwingMode: !!isSwingMode,
+          swingWEFloor: _shadowEnrich.swingWEFloor ?? null,
+          minWEForSonnet: _shadowEnrich.minWEForSonnet ?? null,
+          baseWE: _shadowEnrich.baseWE ?? null,
+          lineMove: _lineMoveTag,
+          lineMoveVelocity: item._lineMove?.velocity ?? null,
+          lineMoveCrossConfirmed: item._lineMove?.crossConfirmed ?? null,
+          mlbBullpenTier: _shadowEnrich.leadingBullpenTier ?? null,
+          periodPhase: _periodPhase,
+          isLeadingTeam: targetAbbr === leadingAbbr,
           ..._liveShadowCtx,
         });
 
@@ -7246,9 +7296,17 @@ async function checkLiveScoreEdges() {
             } else if (league === 'nhl' && diff >= 1) {
               _buyLowReason = `nhl-trail-${Math.min(diff, 4)}goal-P${period}-${_priceBand}`;
               if (_priceBand === 'low' && diff <= 2 && period >= 1 && period <= 2) _buyLowCandidate = true;
+            } else if (['mls','epl','laliga','seriea','bundesliga','ligue1'].includes(league) && diff >= 1) {
+              // 2026-04-30: soccer trailer cell tagging. Period in soccer = minute (1-90).
+              // Soccer trailers face draw-cliff risk on YES contract, but we still tag
+              // for visibility — mining may reveal cells where mid-match recoveries
+              // happen often enough to swing-trade pre-final-whistle. Don't flag as
+              // buy-low candidate (still excluded from canonical band).
+              const _minBucket = period < 30 ? '<30' : period < 45 ? '30-44' : period < 60 ? '45-59' : period < 75 ? '60-74' : period < 85 ? '75-84' : '85+';
+              _buyLowReason = `${league}-trail-${Math.min(diff, 3)}goal-min${_minBucket}-${_priceBand}`;
+              // Soccer NOT auto-tagged as buy-low candidate — draw cliff makes
+              // hold-to-settlement risky. Mining only.
             }
-            // Soccer excluded from candidate flag: draw cliff makes backing trailer
-            // mathematically unfavorable. Still tagged for visibility.
 
             logShadowDecision({
               stage: 'live-edge-trailer-synthetic',
@@ -7280,6 +7338,70 @@ async function checkLiveScoreEdges() {
             if (_buyLowCandidate) {
               console.log(`[shadow] 🎰 BUY-LOW candidate: ${_trailerTicker} ${_trailerAbbr} @ ${(_trailerPrice*100).toFixed(0)}¢ (${_buyLowReason}) — phase 1 data only, no trade`);
             }
+
+            // 2026-04-30 Tier 2 — COMEBACK-BUY synthetic shadow.
+            // Comeback-buy fires only on MLB ace-vs-weak-pitcher dynamic and has
+            // n=4 actual trades total. We can't tune cells without more data.
+            // Log a synthetic shadow when bot SEES comeback-eligible state but
+            // doesn't fire (so we mine which cells convert to +12¢/+15¢ pop).
+            // Eligibility: MLB trailing team, deficit ≤ 3, period 1-7, price 25-50¢.
+            if (league === 'mlb' && diff >= 1 && diff <= 3 && period >= 1 && period <= 7
+                && _trailerPrice >= 0.25 && _trailerPrice <= 0.50) {
+              const _cbCell = `mlb-comeback-${diff}run-P${period}-${_priceBand}`;
+              logShadowDecision({
+                stage: 'live-edge-comeback-synthetic',
+                ticker: _trailerTicker,
+                sport: _shadowSport, league,
+                decision: 'synthetic-comeback-candidate',
+                rejectReason: 'comeback-baseline',
+                claudeConfidence: null,
+                decisionPrice: _trailerPrice,
+                edge: null,
+                scoreDiff: diff, period, gameDetail,
+                leadingAbbr, targetAbbr: _trailerAbbr,
+                homeAbbr, awayAbbr,
+                liveStage: stage,
+                reasoningPreview: `COMEBACK-BUY CANDIDATE [${_cbCell}] @ ${(_trailerPrice*100).toFixed(0)}¢ — bot saw setup, didn't fire`,
+                isComebackSynthetic: true,
+                comebackCell: _cbCell,
+                strategy: 'synthetic-comeback-buy',
+              });
+            }
+          }
+        } catch { /* best-effort */ }
+
+        // 2026-04-30 Tier 2 — DRAW-BET synthetic shadow.
+        // Draw-bet has $202/7 trades = highest per-trade EV but n is tiny.
+        // Log synthetic when bot sees soccer match tied at minute ≥ 60.
+        // Cell unlock: which (league × team-draw-rate × minute × score) combos
+        // make draw-bets +EV. Currently we have zero shadow visibility.
+        try {
+          const _isSoccer = ['mls','epl','laliga','seriea','bundesliga','ligue1'].includes(league);
+          if (_isSoccer && diff === 0 && period >= 60) {
+            // Tied soccer match in 2nd half — draw becomes more likely as time runs out
+            const _drawTicker = ticker.substring(0, ticker.lastIndexOf('-')) + '-TIE';
+            // Tie-side price not always cached; use 1 - both team prices as proxy
+            const _drawPriceProxy = Math.max(0.01, Math.min(0.99, 1 - price));
+            const _minuteBand = period < 70 ? '60-69' : period < 80 ? '70-79' : period < 85 ? '80-84' : '85+';
+            const _dbCell = `${league}-draw-tied-min${_minuteBand}`;
+            logShadowDecision({
+              stage: 'live-edge-drawbet-synthetic',
+              ticker: _drawTicker,
+              sport: 'Soccer', league,
+              decision: 'synthetic-drawbet-candidate',
+              rejectReason: 'drawbet-baseline',
+              claudeConfidence: null,
+              decisionPrice: _drawPriceProxy,
+              edge: null,
+              scoreDiff: 0, period, gameDetail,
+              leadingAbbr: null, targetAbbr: 'TIE',
+              homeAbbr, awayAbbr,
+              liveStage: stage,
+              reasoningPreview: `DRAW-BET CANDIDATE [${_dbCell}] tied at min ${period} — bot saw setup`,
+              isDrawBetSynthetic: true,
+              drawBetCell: _dbCell,
+              strategy: 'synthetic-draw-bet',
+            });
           }
         } catch { /* best-effort */ }
 
