@@ -2423,6 +2423,16 @@ function getLadderState(trade, profitPerContract, currentPrice, league, ctx) {
   const tier1Trig = isLowPriceEntry ? 0.12 : 0.15;
   const tier1Label = isLowPriceEntry ? 'tier-1-+12c' : 'tier-1-+15c';
   if (tiersDone === 0 && profitPerContract >= tier1Trig) {
+    // 2026-04-29: tiny-position handling. For qty ≤ 3, the 1/3 fraction floors to
+    // 1 contract, leaving 2 for tier-2 (which is then 1/2 of 2 = 1 again). Result:
+    // bot sells in painful 1-contract chunks with multiple Telegram notifications.
+    // Better: sell all at once for tiny positions. Less granularity, cleaner UX,
+    // captures the same profit. The "ride remaining for upside" logic only matters
+    // when the remaining is ≥3 contracts.
+    const totalQty = trade.quantity ?? 0;
+    if (totalQty > 0 && totalQty <= 3) {
+      return { fire: true, tier: 1, fraction: 1.0, label: tier1Label + '-full-tiny-qty' };
+    }
     return { fire: true, tier: 1, fraction: 1/3, label: tier1Label };
   }
   // 2026-04-29: parallel adjustment for tier-2. Most swing trades peak at +18-22¢
@@ -12179,7 +12189,12 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
   //   ~$0.78/trade on a 39-contract position and caused Telegram to show a different price than
   //   what Kalshi actually filled at.
   const isStopLoss = reason.includes('stop') || reason.includes('nuclear') || reason.includes('reversal');
-  const sellPrice = isStopLoss ? 1 : Math.max(1, priceInCents);
+  // 2026-04-29 BUGFIX: profit-lock sells were using currentPrice (the ask), placing
+  // limit orders ABOVE the bid → orders rested unfilled. Today's STL with qty=2 fired
+  // tier-1 ladder repeatedly (every cycle) because each sell at 93-95¢ never filled.
+  // Step DOWN 2¢ so the limit lands at-or-below the bid → instant taker fill.
+  // Mirrors the buy step-up of +2¢. Same 1-2¢ slippage cost we accept on entry.
+  const sellPrice = isStopLoss ? 1 : Math.max(1, priceInCents - 2);
 
   const result = await kalshiPost('/portfolio/orders', {
     ticker: trade.ticker,
