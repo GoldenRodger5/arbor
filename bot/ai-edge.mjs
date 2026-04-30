@@ -615,15 +615,13 @@ function getMaxPrice(league, period, diff = 1) {
 // 2026-04-23: tightened 10% → 6%. Preference is smaller bets for data collection
 // over concentrated bets. At $110 bankroll: 6% = $6.60 per live-edge trade.
 // When WR and calibration stabilize, can relax back toward 8-10%.
-const MAX_TRADE_FRACTION = 0.06; // 6% of bankroll per trade — REVERTED from 8% on 2026-04-29
-// REVERT REASON: bumped to 8% earlier today on 6/6 win streak. Same evening: TOR-CLE
-// NBA Q3 trade collapsed -68% for -$10.73 loss. Bumped sizing made loss bigger than
-// it would have been at 6% (would have been ~-$7.50). Single loss erased the entire
-// day's structural detector profits.
-// Lesson: Kelly math says we're under-sized in theory, but until we have 30+ trades
-// (including losses) to validate WR, anticipating the bigger size after a hot streak
-// is the textbook mistake. Earn the bump with data, don't extrapolate from 6 wins.
-// Will revisit once we have 30+ structural detector trades with calibrated WR.
+const MAX_TRADE_FRACTION = 0.08; // 8% of bankroll per trade — restored after revert
+// 2026-04-29 final: kept at 8%. Earlier day briefly reverted to 6% after the
+// NBA-Q3 loss, but that capped daily upside below 10%/day target. The real fix
+// for tonight's loss was disabling the bad detector (NBA-Q3) and adding the
+// hard price-drop override (which exits at -20% before a -68% collapse). Sizing
+// stays at 8% so winning days can compound to 10%+. Catastrophe protection
+// happens via detector quality and stop-loss timing, not bet-size caps.
 // P1.3 — Pre-game sizing cut 15% → 5% per data analysis 2026-04-23.
 // Biggest losses all came from oversized pre-game positions: SD-LAA -$33 (76 ct @ 44¢),
 // ATL-PHI -$32 (66 ct @ 49¢), SF-WSH -$24 (57 ct @ 52¢), DET-BOS -$21 (71 ct @ 46¢).
@@ -2662,29 +2660,12 @@ function renderReasoningForTelegram(r, fallbackStr) {
   return lines.length > 0 ? lines.join('\n') : (fallbackStr || '');
 }
 
-// 2026-04-29 PROFIT LOCK-IN — protects today's gains from a single big loss.
-// Once we're up ≥5% on the day, any new trade is capped at 30% of today's
-// realized P&L. This way ONE adverse trade can't wipe out 6+ wins.
-//
-// Triggered today by NBA-Q3 loss: 6 wins netted ~$8.50, then a single $15.66
-// trade (-$10.73 loss) erased the day. Without lock-in, big wins compound but
-// big losses also compound on the SAME day. Lock-in caps downside.
-//
-// Returns: null (no cap) if profit < 5% threshold, OR a dollar cap that bounds
-// the next trade's max size.
-function getProfitLockInCap() {
-  try {
-    const summary = getDailyPnLSummary();
-    const bankroll = getBankroll();
-    const todayProfit = summary.pnl ?? 0;
-    const profitPct = todayProfit / bankroll;
-    // Only activate after meaningfully profitable day
-    if (profitPct < 0.05) return null;
-    // Cap next trade at 30% of today's profit
-    const cap = todayProfit * 0.30;
-    return cap;
-  } catch { return null; }
-}
+// 2026-04-29: profit lock-in REMOVED. Capping post-profit trades at 30% of
+// realized P&L kept losses small but also capped daily upside below the
+// 10%/day target. User explicitly wants max upside preserved — protect
+// against catastrophic losses through detector quality + price-drop
+// override (both already shipped) instead of position-size caps.
+function getProfitLockInCap() { return null; }
 
 // Smart cooldown: allow adding to position IF price improved AND score is
 // unchanged, block otherwise.
