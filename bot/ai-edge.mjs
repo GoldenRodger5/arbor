@@ -2504,6 +2504,66 @@ const stoppedBets = new Map();    // gameBase → { team, stoppedAt, entryPrice 
 const lastGameStates = new Map(); // "ATH@NYM" → "1-0-5" (score-period, for change detection)
 const gameEntries = new Map();    // "game:ATH@NYM" → { count: 2, lastPrice: 0.62, totalDeployed: 24.36 }
 const lastSeenPrices = new Map(); // ticker → { price, ts } for line movement detection
+
+// 2026-05-01 Tier 3 — cached ESPN /summary fetcher for NBA/NHL deep extraction
+// (player fouls, goalie info, PP state). Cached per-eventId for 60s to avoid
+// hammering ESPN on every live-edge cycle. Used in live-edge shadow log path.
+const espnSummaryCache = new Map(); // eventId → { data, fetchedAt }
+const ESPN_SUMMARY_TTL_MS = 60 * 1000;
+async function getEspnSummary(eventId, sportPath) {
+  if (!eventId || !sportPath) return null;
+  const cached = espnSummaryCache.get(eventId);
+  if (cached && Date.now() - cached.fetchedAt < ESPN_SUMMARY_TTL_MS) return cached.data;
+  try {
+    const url = `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/summary?event=${eventId}`;
+    const res = await fetch(url, { headers: { 'User-Agent': 'arbor-ai/1' }, signal: AbortSignal.timeout(4000) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    espnSummaryCache.set(eventId, { data, fetchedAt: Date.now() });
+    if (espnSummaryCache.size > 200) {
+      const cutoff = Date.now() - 5 * 60 * 1000;
+      for (const [k, v] of espnSummaryCache) if (v.fetchedAt < cutoff) espnSummaryCache.delete(k);
+    }
+    return data;
+  } catch { return null; }
+}
+
+// 2026-05-01 — NHL goalie history persistence. Tracks which goalies started
+// each NHL game over the last 3 days. Used to detect back-to-back starts
+// (likely backup tonight) — a major edge factor.
+const NHL_GOALIE_HISTORY_FILE = './logs/nhl-goalie-history.json';
+function loadNhlGoalieHistory() {
+  try {
+    if (!existsSync(NHL_GOALIE_HISTORY_FILE)) return {};
+    return JSON.parse(readFileSync(NHL_GOALIE_HISTORY_FILE, 'utf-8'));
+  } catch { return {}; }
+}
+function saveNhlGoalieHistory(history) {
+  try {
+    // Prune entries older than 4 days
+    const cutoff = Date.now() - 4 * 86400 * 1000;
+    const pruned = {};
+    for (const [name, info] of Object.entries(history)) {
+      if (info?.lastStartTs > cutoff) pruned[name] = info;
+    }
+    writeFileSync(NHL_GOALIE_HISTORY_FILE, JSON.stringify(pruned, null, 2));
+  } catch { /* best-effort */ }
+}
+function recordNhlGoalieStart(goalieName, teamAbbr) {
+  if (!goalieName) return;
+  const history = loadNhlGoalieHistory();
+  history[goalieName] = { lastStartTs: Date.now(), team: teamAbbr };
+  saveNhlGoalieHistory(history);
+}
+function isGoalieBackToBack(goalieName) {
+  if (!goalieName) return false;
+  const history = loadNhlGoalieHistory();
+  const info = history[goalieName];
+  if (!info?.lastStartTs) return false;
+  const hoursAgo = (Date.now() - info.lastStartTs) / (3600 * 1000);
+  // Back-to-back = started within last 18-30 hours (yesterday's game)
+  return hoursAgo > 18 && hoursAgo < 36;
+}
 const LINE_MOVE_THRESHOLD = 0.05; // 5¢ move = something happened
 const missingFromKalshi = new Map(); // tradeId → firstMissingMs — 2-strike rule before closing
 let massDisappearStreak = 0; // consecutive sync cycles where ALL Kalshi positions are absent
@@ -7198,6 +7258,10 @@ async function checkLiveScoreEdges() {
             swingWEFloor: typeof _outerSwingWEFloor === 'number' ? _outerSwingWEFloor : null,
             minWEForSonnet: typeof _outerMinWEForSonnet === 'number' ? _outerMinWEForSonnet : null,
             baseWE: typeof _outerBaseWE === 'number' ? _outerBaseWE : null,
+            // 2026-05-01 Tier 3: pass scoreboard data for NBA/NHL deep extraction
+            espnEventId: comp?.id ?? null,
+            espnCompetitors: comp?.competitors ?? null, // contains probables (goalies), leaders
+            espnSituation: comp?.situation ?? null, // NHL strength + PP state when populated
           },
         });
 
@@ -7356,6 +7420,84 @@ async function checkLiveScoreEdges() {
           }
           return null;
         })();
+
+        // 2026-05-01 Tier 3 — NBA / NHL deep extraction from ESPN data.
+        // NBA: leading-scorer foul trouble (requires summary fetch for boxscore.players)
+        // NHL: starting goalie + back-to-back detection + PP state (mostly from scoreboard, summary fallback)
+        let _nbaLeaderTopScorer = null, _nbaLeaderTopScorerFouls = null, _nbaLeaderTopScorerInTrouble = null;
+        let _nbaTrailerTopScorer = null, _nbaTrailerTopScorerFouls = null, _nbaTrailerTopScorerInTrouble = null;
+        let _nhlHomeGoalie = null, _nhlAwayGoalie = null;
+        let _nhlHomeGoalieBackToBack = null, _nhlAwayGoalieBackToBack = null;
+        let _nhlPpStrength = null, _nhlPpTeam = null;
+        try {
+          const _enrich = item._shadowEnrichment ?? {};
+          const _competitors = _enrich.espnCompetitors;
+          const _situation = _enrich.espnSituation;
+          // Helpers
+          const _findComp = (tabbr) => (_competitors || []).find(c => (c.team?.abbreviation ?? '').toUpperCase() === (tabbr ?? '').toUpperCase());
+          // === NHL goalie (free from scoreboard probables) ===
+          if (league === 'nhl' && _competitors) {
+            const homeC = _findComp(homeAbbr);
+            const awayC = _findComp(awayAbbr);
+            _nhlHomeGoalie = homeC?.probables?.[0]?.athlete?.displayName ?? null;
+            _nhlAwayGoalie = awayC?.probables?.[0]?.athlete?.displayName ?? null;
+            _nhlHomeGoalieBackToBack = isGoalieBackToBack(_nhlHomeGoalie);
+            _nhlAwayGoalieBackToBack = isGoalieBackToBack(_nhlAwayGoalie);
+            // Record TODAY's start (only when we observe the goalie in active live game)
+            if (_nhlHomeGoalie && period >= 1) recordNhlGoalieStart(_nhlHomeGoalie, homeAbbr);
+            if (_nhlAwayGoalie && period >= 1) recordNhlGoalieStart(_nhlAwayGoalie, awayAbbr);
+          }
+          // === NHL power play state (from situation.strength when populated) ===
+          if (league === 'nhl' && _situation) {
+            // ESPN situation may have strength as "5v5", "5v4", "5v3" — capture verbatim
+            _nhlPpStrength = _situation.strength ?? _situation.lastPlay?.strength ?? null;
+            // Determine which team has the advantage (homeTeamHasGoalie / power-play indicator)
+            if (_nhlPpStrength && _nhlPpStrength !== '5v5') {
+              const homePP = _situation.homeTeamHasGoalie === false || _situation.homePowerPlay === true;
+              const awayPP = _situation.awayTeamHasGoalie === false || _situation.awayPowerPlay === true;
+              _nhlPpTeam = homePP ? homeAbbr : awayPP ? awayAbbr : null;
+            }
+          }
+          // === NBA leading-scorer foul trouble (requires /summary fetch) ===
+          if (league === 'nba' && _enrich.espnEventId) {
+            const sm = await getEspnSummary(_enrich.espnEventId, 'basketball/nba');
+            if (sm?.boxscore?.players) {
+              // For each team's players, find the top scorer (highest PTS) and their fouls (PF)
+              for (const teamGroup of sm.boxscore.players) {
+                const tabbr = (teamGroup.team?.abbreviation ?? '').toUpperCase();
+                // Find the stat group containing PTS + PF (usually first / starters group)
+                const stats = teamGroup.statistics || [];
+                let bestPts = -1, bestName = null, bestFouls = null;
+                for (const grp of stats) {
+                  const keys = grp.keys || [];
+                  const ptsIdx = keys.indexOf('PTS') !== -1 ? keys.indexOf('PTS') : keys.indexOf('points');
+                  const pfIdx = keys.indexOf('PF') !== -1 ? keys.indexOf('PF') : keys.indexOf('fouls');
+                  if (ptsIdx < 0) continue;
+                  for (const ath of (grp.athletes || [])) {
+                    const sArr = ath.stats || [];
+                    const pts = parseFloat(sArr[ptsIdx] ?? '0') || 0;
+                    if (pts > bestPts) {
+                      bestPts = pts;
+                      bestName = ath.athlete?.displayName ?? null;
+                      bestFouls = pfIdx >= 0 ? parseInt(sArr[pfIdx] ?? '0', 10) || 0 : null;
+                    }
+                  }
+                }
+                const inTrouble = bestFouls != null && (bestFouls >= 5 || (bestFouls >= 4 && (period ?? 0) >= 3));
+                if (tabbr === leadingAbbr.toUpperCase()) {
+                  _nbaLeaderTopScorer = bestName;
+                  _nbaLeaderTopScorerFouls = bestFouls;
+                  _nbaLeaderTopScorerInTrouble = inTrouble;
+                } else {
+                  _nbaTrailerTopScorer = bestName;
+                  _nbaTrailerTopScorerFouls = bestFouls;
+                  _nbaTrailerTopScorerInTrouble = inTrouble;
+                }
+              }
+            }
+          }
+        } catch { /* best-effort, never disrupt shadow logging */ }
+
         logShadowDecision({
           stage: 'live-edge',
           ticker,
@@ -7427,6 +7569,19 @@ async function checkLiveScoreEdges() {
             if (gameDetail && /^9\d\+\d/.test(gameDetail)) return true;
             return false;
           })(),
+          // 2026-05-01 Tier 3 — NBA / NHL deep extraction tags
+          nbaLeaderTopScorer: _nbaLeaderTopScorer,
+          nbaLeaderTopScorerFouls: _nbaLeaderTopScorerFouls,
+          nbaLeaderTopScorerInTrouble: _nbaLeaderTopScorerInTrouble,
+          nbaTrailerTopScorer: _nbaTrailerTopScorer,
+          nbaTrailerTopScorerFouls: _nbaTrailerTopScorerFouls,
+          nbaTrailerTopScorerInTrouble: _nbaTrailerTopScorerInTrouble,
+          nhlHomeGoalie: _nhlHomeGoalie,
+          nhlAwayGoalie: _nhlAwayGoalie,
+          nhlHomeGoalieBackToBack: _nhlHomeGoalieBackToBack,
+          nhlAwayGoalieBackToBack: _nhlAwayGoalieBackToBack,
+          nhlPowerPlayStrength: _nhlPpStrength,
+          nhlPowerPlayTeam: _nhlPpTeam,
           ..._liveShadowCtx,
         });
 
