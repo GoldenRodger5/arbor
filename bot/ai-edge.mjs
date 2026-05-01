@@ -1038,7 +1038,7 @@ function detectSoccer1HHomeLeader({ league, period, gameDetail, diff, weTimeAdj,
   };
 }
 
-function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr, ticker }) {
   if (league !== 'mlb') return null;
   if (period < 5 || period > 7) return null;
   if (targetAbbr !== leadingAbbr) return null;
@@ -1052,13 +1052,13 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
   //   diff >= 3: 88¢ cap (data shows these settle YES at 100¢ on near-100% rate)
   if (diff <= 2 && price > 0.70) {
     if (typeof logFixABlock === 'function') {
-      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-a-diff-le-2' }); } catch {}
+      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-a-diff-le-2', ticker }); } catch {}
     }
     return null;
   }
   if (diff >= 3 && price > 0.88) {
     if (typeof logFixABlock === 'function') {
-      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-a-diff-ge-3' }); } catch {}
+      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-a-diff-ge-3', ticker }); } catch {}
     }
     return null;
   }
@@ -1067,7 +1067,7 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
   // Require either 2+ run lead OR price ≤ 50¢ for inn-5 single-run entries.
   if (period === 5 && diff === 1 && price > 0.50) {
     if (typeof logFixABlock === 'function') {
-      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-d-inn5-1run' }); } catch {}
+      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-d-inn5-1run', ticker }); } catch {}
     }
     return null;
   }
@@ -3724,7 +3724,12 @@ function logShadowDecision(entry) {
   // Dedup: same (ticker, score, ~5¢ price-bucket) in last 5min = skip
   const priceCents = Math.round((entry.decisionPrice ?? 0) * 100);
   const priceBucket = Math.round(priceCents / 5) * 5; // 5-cent buckets
-  const dedupKey = `${entry.ticker}|${entry.scoreDiff}|${entry.period}|${priceBucket}`;
+  // 2026-05-01: include `stage` in dedup key. Without it, when multiple stages
+  // log records for the SAME game state (e.g., live-edge-trailer-synthetic and
+  // live-edge-comeback-synthetic both fire on the same MLB trailer), the second
+  // logger gets dedup'd and its records never persist. This was causing
+  // comeback-buy synthetic = 0 records despite many eligible setups.
+  const dedupKey = `${entry.stage ?? '?'}|${entry.ticker}|${entry.scoreDiff}|${entry.period}|${priceBucket}`;
   const lastTs = recentShadowKeys.get(dedupKey) ?? 0;
   if (Date.now() - lastTs < 5 * 60 * 1000) return; // skip within 5min
   recentShadowKeys.set(dedupKey, Date.now());
@@ -3793,7 +3798,7 @@ function logPregameRejection(market, subStage, reason, ctx = {}) {
 // 2026-04-30: Fix A/D telemetry — log when our structural detector match would
 // have fired but a price cap blocked it. Lets us verify post-deploy that the caps
 // aren't over-correcting (e.g., blocking the +17pt edge MLB-p5-d3 cell).
-function logFixABlock({ league, period, diff, price, targetAbbr, gate }) {
+function logFixABlock({ league, period, diff, price, targetAbbr, gate, ticker }) {
   try {
     const record = {
       id: `fixblock-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -3807,6 +3812,7 @@ function logFixABlock({ league, period, diff, price, targetAbbr, gate }) {
       scoreDiff: diff,
       decisionPrice: price,
       targetAbbr,
+      ticker: ticker ?? null, // 2026-05-01: needed for settlement-based outcome verification
       gateContext: { gate, diff, period, price },
       status: 'pending',
       settledAt: null,
@@ -5908,6 +5914,13 @@ async function checkLiveScoreEdges() {
     // in early games). Games between SWING_WE_FLOOR and MIN_WE_FOR_SONNET enter swing mode.
     let isSwingMode = false;
     let isThesisVindicated = false;
+    // 2026-05-01: hoisted to outer scope so queue push can capture them for shadow
+    // enrichment. Were previously block-scoped inside the WE-floor `{...}` block at
+    // ~line 5925, causing swingWEFloor/minWEForSonnet/baseWE to be undefined at the
+    // queue push site (0% population in shadow records).
+    let _outerBaseWE = null;
+    let _outerMinWEForSonnet = null;
+    let _outerSwingWEFloor = null;
     // If baseline WE < 65%, Claude can't reach 65% min confidence (Claude rarely exceeds baseline
     // in early games). This naturally handles every situation:
     //   - 1-run lead inn 2 (58% WE) → skip (noise)
@@ -5952,6 +5965,7 @@ async function checkLiveScoreEdges() {
       // overreacts to the goal).
 
       const baseWE = getWinExpectancy(league, diff, period) ?? 0.50;
+      _outerBaseWE = baseWE;
       // Thesis-vindicated: drop floor to 60% (team recovered from a deficit we stopped out of)
       const MIN_WE_FOR_SONNET = isThesisVindicated ? 0.60 : (() => {
         if (league === 'mlb') return 0.70; // 2-run leads in inn 5+ (70% WE) now qualify — was 75% which only caught 3+ run leads already priced at 80¢+
@@ -5972,6 +5986,8 @@ async function checkLiveScoreEdges() {
         if (league === 'nhl') return period === 1 ? 0.64 : 0.60; // P1 1-goal leads volatile
         return (period === 1) ? 0.58 : 0.55; // soccer: 1st half tighter than 2nd
       })();
+      _outerMinWEForSonnet = MIN_WE_FOR_SONNET;
+      _outerSwingWEFloor = SWING_WE_FLOOR;
       if (baseWE < MIN_WE_FOR_SONNET) {
         if (_lineMovePromoted) {
           isSwingMode = true;
@@ -6978,6 +6994,7 @@ async function checkLiveScoreEdges() {
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price,
             targetAbbr, leadingAbbr,
+            ticker, // 2026-05-01: pass ticker so Fix A/D telemetry can record it
           });
         }
         if (!_structuralDecision) {
@@ -7054,12 +7071,14 @@ async function checkLiveScoreEdges() {
           reentryHalfSize,
           _lineMove, _scoreChanged,
           _structuralDecision, // null if no match; synthetic decision if pattern matched
-          // 2026-04-30: enrich shadow records with strategy context for cell mining
+          // 2026-04-30: enrich shadow records with strategy context for cell mining.
+          // 2026-05-01: SWING_WE_FLOOR/MIN_WE_FOR_SONNET/baseWE were block-scoped — bug
+          // caused 0% population. Now read from outer-scope `_outer*` mirrors.
           _shadowEnrichment: {
-            leadingBullpenTier: leadingBullpenTier ?? null,
-            swingWEFloor: typeof SWING_WE_FLOOR === 'number' ? SWING_WE_FLOOR : null,
-            minWEForSonnet: typeof MIN_WE_FOR_SONNET === 'number' ? MIN_WE_FOR_SONNET : null,
-            baseWE: typeof baseWE === 'number' ? baseWE : null,
+            leadingBullpenTier: typeof leadingBullpenTier !== 'undefined' ? leadingBullpenTier : null,
+            swingWEFloor: typeof _outerSwingWEFloor === 'number' ? _outerSwingWEFloor : null,
+            minWEForSonnet: typeof _outerMinWEForSonnet === 'number' ? _outerMinWEForSonnet : null,
+            baseWE: typeof _outerBaseWE === 'number' ? _outerBaseWE : null,
           },
         });
 
