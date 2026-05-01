@@ -11436,10 +11436,17 @@ async function managePositions() {
             const retraceFromPeak = peakPrice - currentPrice;
             const TRAILING_ACTIVATE = 0.10;  // need +10¢ peak to activate
             // Fix B (2026-04-30): structural detectors have ~80-100% WR — they should ride
-            // to near-settlement, not exit on an 8¢ noise dip. Widen to 12¢ for structural.
-            // Live-prediction keeps the tighter 8¢ stop (lower WR, faster reversals).
+            // to near-settlement, not exit on an 8¢ noise dip. Widen for structural.
+            // 2026-04-30 sport-aware refinement: NBA leads swing more than MLB (Q3-Q4
+            // routinely flip 5-10pt). NBA structural needs wider trail to ride through
+            // normal variance and capture peak. NHL between MLB and NBA. MLB unchanged.
             const isStructural = trade.strategy?.startsWith?.('structural-');
-            const TRAILING_DISTANCE = isStructural ? 0.12 : 0.08;
+            const _trailLeague = ctx?.league;
+            const TRAILING_DISTANCE = isStructural
+              ? (_trailLeague === 'nba' ? 0.15
+                 : _trailLeague === 'nhl' ? 0.12
+                 : 0.12) // MLB / soccer / default
+              : 0.08;
 
             // Fix C (2026-04-30): if Claude voted HOLD within last 15min AND we're in a
             // late inning (MLB inn 8-9) with win probability ≥ 80%, suppress the trailing
@@ -11510,7 +11517,35 @@ async function managePositions() {
           } else if (_strat === 'pre-game-prediction') {
             dropThreshold = 0.20; minHoldMin = 45;
           } else if (_strat === 'live-prediction' || _strat.startsWith('structural-')) {
-            dropThreshold = 0.10; minHoldMin = 8;
+            // 2026-04-30: SPORT-AWARE bleed-out for structural detectors. Bleed-out
+            // calibrated for MLB (1-run lead loss = real thesis death; outs running out)
+            // misfires on NBA where Q2 leads flip 6-8x/game routinely. DEN@MIN tonight:
+            // bot exited at 38¢ on Q2 lead reversal, MIN came back to 66¢. -$2.64 vs.
+            // would-have-been +$3.52. Same problem applies to NHL early periods and
+            // soccer 1H. Now matches volatility profile of each sport+stage.
+            const _ctxLeague = ctx?.league;
+            const _ctxPeriod = ctx?.period;
+            const _isSoccer = ['mls','epl','laliga','seriea','bundesliga','ligue1'].includes(_ctxLeague);
+            if (_ctxLeague === 'nba' && _ctxPeriod && _ctxPeriod <= 2) {
+              // NBA Q1-Q2: lead flips are routine variance — disable bleed-out, let
+              // trailing stop handle exits at peak. n=1 incident (DEN@MIN 2026-04-30)
+              // but sport-physics-driven, not statistical artifact.
+              bleedOutEnabled = false;
+            } else if (_ctxLeague === 'nba') {
+              dropThreshold = 0.15; minHoldMin = 12;
+            } else if (_ctxLeague === 'nhl' && _ctxPeriod === 3) {
+              dropThreshold = 0.10; minHoldMin = 8;
+            } else if (_ctxLeague === 'nhl') {
+              dropThreshold = 0.12; minHoldMin = 10;
+            } else if (_isSoccer && _ctxPeriod && _ctxPeriod < 60) {
+              // Soccer 1st half: low scoring, single goal = huge swing, lots left
+              bleedOutEnabled = false;
+            } else if (_isSoccer) {
+              dropThreshold = 0.15; minHoldMin = 15;
+            } else {
+              // MLB (default) and any unrecognized league: 10¢ / 8min.
+              dropThreshold = 0.10; minHoldMin = 8;
+            }
           } else {
             bleedOutEnabled = false;  // unknown strategy — don't trigger
           }
