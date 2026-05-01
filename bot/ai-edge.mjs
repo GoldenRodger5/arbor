@@ -1000,6 +1000,102 @@ function detectMlbInn4Leader({ league, period, gameDetail, diff, weTimeAdj, pric
   };
 }
 
+// MLB inning 1 leader with 3+ run lead: shadow audit 2026-04-30 shows 100% WR n=10 at avg 76¢.
+// 3+ runs in 1st inning = early statement game; trailing team must mount full-game comeback.
+// Detector cap 80¢ since data tops out around there.
+function detectMlbInn1Leader3Plus({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period !== 1) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 3) return null;
+  if (price > 0.80) return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.04) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-run lead in 1st — early but commanding; trailing team needs full-game comeback`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 1 leader 3+ runs, 100% WR n=10 shadow): ${diff}-run lead in 1st, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Inning 1, ${diff}-run lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 10 shadow leaders, 100% WR at avg 76¢`,
+      ],
+      top_risk: 'Full game ahead — opponent has 8 innings of at-bats',
+      conviction: 'Structural pattern — early-statement leader from shadow audit',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-inn-1-leader-3run',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
+// MLB inning 2 leader with EXACTLY 2-run lead: shadow audit 2026-04-30 shows 92% WR n=40 at avg 71¢.
+// This is the BIGGEST missed cell in shadow data — Sonnet rejects most of these. Bypass with detector.
+// Existing detectMlbInn2Leader is broader (covers diff 3+); this targets the high-WR 2-run subset.
+function detectMlbInn2Leader2Run({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period !== 2) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff !== 2) return null; // EXACTLY 2-run lead — the proven cell
+  if (price > 0.80) return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.04) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `2-run lead in 2nd — early lead, but 92% historical conversion suggests market underprices these`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 2 leader 2-run, 92% WR n=40 shadow): 2-run lead in 2nd, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Inning 2, 2-run lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 40 shadow leaders, 92% WR at avg 71¢`,
+      ],
+      top_risk: 'Early game — 7+ innings remaining for trailing-team rally',
+      conviction: 'Structural pattern — highest-volume +EV cell from shadow audit (n=40)',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-inn-2-leader-2run',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
+// MLB inning 5 leader with 3+ run lead: shadow audit 2026-04-30 shows 100% WR n=12 at avg 83¢.
+// Higher prices than other cells — these are blowout-track games where market correctly favors leader.
+// Cap at 88¢ matches Fix A diff-aware exception. Verifies Fix A's higher cap actually permits these.
+function detectMlbInn5Leader3Plus({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period !== 5) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 3) return null;
+  if (price > 0.88) return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.04) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-run lead in 5th — game half over with commanding cushion; bullpen-protect math`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 5 leader 3+ runs, 100% WR n=12 shadow): ${diff}-run lead in 5th, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Inning 5, ${diff}-run lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 12 shadow leaders, 100% WR at avg 83¢`,
+      ],
+      top_risk: 'Bullpen blow-up still possible but lead size shields against single bad inning',
+      conviction: 'Structural pattern — high-price +EV cell from shadow audit (Fix A diff-aware permits)',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-inn-5-leader-3run',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
 // Soccer 1H home leader at 50-65¢: 5 game-level, 80% WR, +18% EV. Smaller sample
 // but consistent with the home-leader 2H pattern. Excludes MLS for now (mixed
 // historical) and minute < 30 (too early — own-goal variance).
@@ -5971,7 +6067,8 @@ async function checkLiveScoreEdges() {
         if (league === 'mlb') return 0.70; // 2-run leads in inn 5+ (70% WE) now qualify — was 75% which only caught 3+ run leads already priced at 80¢+
         if (league === 'nhl' && diff === 1) return 0.68; // P2 1-goal (68% WE) now passes — was 75% which only allowed P3 1-goal. P1 still blocked by separate check above.
         if (league === 'nba' && period <= 2) return 0.73; // Q1/Q2 stays strict — early NBA leads are genuinely volatile
-        if (league === 'nba' && period === 3) return 0.68; // Q3: 10pt leads (68% WE) are meaningful — was 73% blocking everything under 15pt
+        if (league === 'nba' && period === 3) return 0.65; // 2026-05-01: Q3 lowered 68%→65%. NBA live-pred 86% WR (n=14) — floor was rejecting +EV trades
+        if (league === 'nba' && period === 4) return 0.62; // 2026-05-01: Q4 explicit 62% (was default). Late-game leads protected by clock; capture more
         return 0.62; // default — was 65%, opens up soccer and other sports slightly
       })();
 
@@ -6949,6 +7046,28 @@ async function checkLiveScoreEdges() {
         if (!_structuralDecision) {
           // 2026-04-30: MLB inn 4 leader — uncovered cell from audit, 100% WR n=22
           _structuralDecision = detectMlbInn4Leader({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-05-01: MLB inn 1 leader 3+ run lead — shadow 100% WR n=10 @ avg 76¢
+          _structuralDecision = detectMlbInn1Leader3Plus({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-05-01: MLB inn 2 leader 2-run — shadow's biggest +EV cell, 92% WR n=40 @ avg 71¢
+          _structuralDecision = detectMlbInn2Leader2Run({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-05-01: MLB inn 5 leader 3+ run — shadow 100% WR n=12 @ avg 83¢
+          // Cell sits in the 80-88¢ band that Fix A diff-aware permits for diff≥3
+          _structuralDecision = detectMlbInn5Leader3Plus({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
@@ -7956,6 +8075,27 @@ async function checkLiveScoreEdges() {
               const before = maxBetLE;
               maxBetLE = Math.floor(_hardCapDollars);
               console.log(`[sizing] 🛡️ NBA/NHL HARD CAP 5%: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)} (structural ${_structPattern} on $${getBankroll().toFixed(0)} bankroll)`);
+            }
+          }
+        }
+
+        // 2026-05-01 — NBA LIVE-PREDICTION HIGH-CONF KELLY BUMP.
+        // NBA live-prediction has 86% game-WR over 14 trades (+$59.87 cumulative).
+        // Kelly criterion says size up on proven edge. At conf ≥80% the trade is
+        // high-conviction territory. Raise sizing ceiling from 10% to 13% of bankroll
+        // ONLY for NBA live-prediction at conf ≥80%. Doesn't stack with structural cap
+        // above (different code paths). Doesn't apply to swing/HC (separate logic).
+        if (!item._structuralDecision && !isSwingMode && !hcCheck.isHighConv
+            && league === 'nba' && (decision.confidence ?? 0) >= 0.80) {
+          const _nbaBumpCeil = getBankroll() * 0.13;
+          if (maxBetLE < _nbaBumpCeil) {
+            // Only RAISE — never lower. The 10% default cap was already applied by
+            // getDynamicMaxTrade. We bump the ceiling without forcing maxBetLE up to it.
+            const before = maxBetLE;
+            // Apply a 1.3x bump capped at the new 13% ceiling
+            maxBetLE = Math.min(_nbaBumpCeil, Math.floor(maxBetLE * 1.3));
+            if (maxBetLE > before) {
+              console.log(`[sizing] 🏀 NBA HIGH-CONF KELLY BUMP: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)} (live-prediction conf ${((decision.confidence??0)*100).toFixed(0)}%, 86% historical WR)`);
             }
           }
         }
