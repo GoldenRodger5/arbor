@@ -7389,6 +7389,44 @@ async function checkLiveScoreEdges() {
           mlbBullpenTier: _shadowEnrich.leadingBullpenTier ?? null,
           periodPhase: _periodPhase,
           isLeadingTeam: targetAbbr === leadingAbbr,
+          // 2026-05-01 Tier 2 derivations — free observability from existing fields
+          // Parse clock seconds from gameDetail. NBA: "8:59 - 4th" or "End 3rd Q".
+          // NHL: "8:59 - 3rd" or "End 2nd". MLB: gameDetail has "Top 5th" — no clock.
+          clockSeconds: (() => {
+            if (!gameDetail) return null;
+            const m = gameDetail.match(/(\d+):(\d{2})/);
+            if (m) return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+            return null;
+          })(),
+          // NHL empty-net pull window: P3 + clock<90s + 1-2 goal lead. Trailing team
+          // pulls goalie. Scoring rate spikes ~5x normal.
+          nhlEmptyNetWindow: (() => {
+            if (league !== 'nhl' || period !== 3) return false;
+            if (!gameDetail) return false;
+            const m = gameDetail.match(/(\d+):(\d{2})/);
+            if (!m) return false;
+            const secs = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+            return secs < 90 && Math.abs(diff ?? 0) >= 1 && Math.abs(diff ?? 0) <= 2;
+          })(),
+          // NBA garbage-time: Q4 + 20+ pt lead + >4min remaining. Bench-vs-bench
+          // variance distorts trailing-stop logic.
+          nbaGarbageTime: (() => {
+            if (league !== 'nba' || period !== 4) return false;
+            if (Math.abs(diff ?? 0) < 20) return false;
+            if (!gameDetail) return false;
+            const m = gameDetail.match(/(\d+):(\d{2})/);
+            if (!m) return false;
+            const secs = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+            return secs > 240; // >4min remaining
+          })(),
+          // Soccer stoppage time: gameDetail has "90+5'" format or period > 90
+          socInStoppage: (() => {
+            const isSoccer = ['mls','epl','laliga','seriea','bundesliga','ligue1'].includes(league);
+            if (!isSoccer) return false;
+            if (period && period >= 90) return true;
+            if (gameDetail && /^9\d\+\d/.test(gameDetail)) return true;
+            return false;
+          })(),
           ..._liveShadowCtx,
         });
 
@@ -11641,8 +11679,24 @@ async function managePositions() {
               console.log(`[exit] 🧠🛡️ TRAILING STOP SUPPRESSED: ${trade.ticker} — Claude HOLD ${Math.round((Date.now()-claudeHoldTs)/1000)}s ago + inn ${ctx.period} + price ${(currentPrice*100).toFixed(0)}¢ — holding for settlement`);
             }
 
+            // 2026-05-01: NBA GARBAGE-TIME suppression. Q4 + 20+ pt lead + >4min
+            // remaining = bench-vs-bench play. Bench scoring runs cause 5-10c noise
+            // dips that fire the trailing stop, but the OUTCOME is locked because
+            // the game is decided. Suppress trailing stop in this regime — leader
+            // settles at 100c regardless of price wiggle.
+            const _gtClockMatch = ctx?.gameDetail?.match?.(/(\d+):(\d{2})/);
+            const _gtSecsLeft = _gtClockMatch ? parseInt(_gtClockMatch[1], 10) * 60 + parseInt(_gtClockMatch[2], 10) : 999;
+            const nbaGarbageTimeSuppression = isStructural && league === 'nba'
+              && ctx?.period === 4
+              && Math.abs(ctx?.diff ?? 0) >= 20
+              && _gtSecsLeft > 240
+              && currentPrice >= 0.85; // only suppress when leader pricing reflects locked game
+            if (nbaGarbageTimeSuppression) {
+              console.log(`[exit] 🏀🛡️ NBA GARBAGE-TIME SUPPRESSION: ${trade.ticker} — Q4 with ${Math.abs(ctx.diff)}pt lead + ${Math.floor(_gtSecsLeft/60)}:${String(_gtSecsLeft%60).padStart(2,'0')} remaining + price ${(currentPrice*100).toFixed(0)}¢ — holding through bench variance`);
+            }
+
             const stillProfitable = currentPrice > entryPrice + 0.02; // ≥+2¢ to lock real profit
-            if (!lateInningSuppression && peakGain >= TRAILING_ACTIVATE && retraceFromPeak >= TRAILING_DISTANCE && stillProfitable) {
+            if (!lateInningSuppression && !nbaGarbageTimeSuppression && peakGain >= TRAILING_ACTIVATE && retraceFromPeak >= TRAILING_DISTANCE && stillProfitable) {
               const lockProfit = ((currentPrice - entryPrice) * 100).toFixed(0);
               const peakProfit = (peakGain * 100).toFixed(0);
               console.log(`[exit] 🎯 TRAILING STOP: ${trade.ticker} peak=${(peakPrice*100).toFixed(0)}¢(+${peakProfit}¢) → now=${(currentPrice*100).toFixed(0)}¢ — locking +${lockProfit}¢ before further retrace`);
