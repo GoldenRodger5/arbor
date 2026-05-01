@@ -1032,6 +1032,41 @@ function detectMlbInn1Leader3Plus({ league, period, gameDetail, diff, weTimeAdj,
   };
 }
 
+// MLB inning 3 leader with 3+ run lead: live-edge gap detector identified 2026-05-01.
+// Inn-3 was uncovered between detectMlbInn1Leader3Plus (inn 1) and detectMlbInn4Leader (inn 4).
+// TEX-DET tonight (TEX 4-0 inn-3 at 88¢) sat in this gap — global price ceiling caught it
+// but no structural detector to fast-path. Cell logic: inn-3 is "blowout track" — a 3+ run
+// lead 1/3 of game in is statistically very strong (~85-92% conversion). Cap at 88¢
+// matches the global MLB ceiling for diff>=4 and Fix A diff-aware approach for inn-5-7.
+function detectMlbInn3Leader3Plus({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period !== 3) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 3) return null;
+  if (price > 0.88) return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.04) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-run lead in 3rd — 1/3 of game played, lead is statistically commanding`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 3 leader 3+ runs): ${diff}-run lead in 3rd, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Inning 3, ${diff}-run lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Blowout-track cell — 6 innings remaining for opponent to overcome 3+ runs`,
+      ],
+      top_risk: '6 innings remaining — bullpen blow-up or opponent rally still possible',
+      conviction: 'Structural pattern — gap-fill detector for inn-3 leaders (2026-05-01 add)',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-inn-3-leader-3run',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
 // MLB inning 2 leader with EXACTLY 2-run lead: shadow audit 2026-04-30 shows 92% WR n=40 at avg 71¢.
 // This is the BIGGEST missed cell in shadow data — Sonnet rejects most of these. Bypass with detector.
 // Existing detectMlbInn2Leader is broader (covers diff 3+); this targets the high-WR 2-run subset.
@@ -2807,7 +2842,9 @@ function shouldAutoHold(ticker, ctx, ourWE) {
 // Key: gameBase. Value: { scoreKey, priceCents, ts }.
 // Invalidates when score changes, price moves ≥3¢, or age > 6min.
 const liveEdgeRejectMemo = new Map();
-const LIVE_REJECT_MAX_AGE_MS = 5 * 60 * 1000;
+// 2026-05-01: reduced from 5min → 3min. TEX-DET 4-0 inn-3 stuck for 10+ min in
+// "memo hit" loop because Sonnet's earlier rejection was stale by inn-4.
+const LIVE_REJECT_MAX_AGE_MS = 3 * 60 * 1000;
 const LIVE_REJECT_PRICE_TOL_CENTS = 5;
 
 // Check whether a tomorrow-dated ticker starts within maxHours of now (ET).
@@ -7029,21 +7066,21 @@ async function checkLiveScoreEdges() {
         // exactly the shape sharp bettors fade when their model disagrees. Let Sonnet
         // see the move (it's already in the prompt as "⚠️ CONTRA LINE MOVEMENT") and decide.
 
-        // Reject memo — same score + same price + <6min since last NO = no point re-asking.
-        // Score/price changes still let the call through (those are the only things that flip Claude's answer).
+        // Reject memo — same score + same period + same price + <3min since last NO = no point re-asking.
+        // Score/period/price changes still let the call through (those flip Claude's answer).
+        // 2026-05-01: added period to bust trigger. Score can stay same (e.g. 4-0)
+        // while game progresses through innings — each new inning is a different game
+        // state and warrants re-evaluation. TEX-DET 4-0 stayed in memo loop across
+        // inn-3 → inn-4 transition because scoreKey alone didn't change.
         const _memoEntry = liveEdgeRejectMemo.get(gameBase);
         if (_memoEntry && Date.now() - _memoEntry.ts < LIVE_REJECT_MAX_AGE_MS) {
           const _priceCentsNow = Math.round(price * 100);
           const _priceDelta = _priceCentsNow - _memoEntry.priceCents;
           const _sameScore = _memoEntry.scoreKey === currentScoreKey;
-          // Tightened tolerance: same-score memo holds only when price is within
-          // ±2¢ AND price didn't drop >1¢ (favorable move → re-ask Claude).
-          // Favorable drop = price moving toward our side; often that's the exact
-          // reprice that flips the original NO. Loose 5¢ tolerance was letting
-          // real re-rates get skipped (SD@COL 79¢→76¢ today).
+          const _samePeriod = _memoEntry.period === period;
           const _samePrice = Math.abs(_priceDelta) <= 2 && _priceDelta >= -1;
-          if (_sameScore && _samePrice) {
-            console.log(`[live-edge] Reject memo hit: ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}) score=${currentScoreKey} price=${_priceCentsNow}¢ (Δ${_priceDelta >= 0 ? '+' : ''}${_priceDelta}) — unchanged since last NO, skipping Sonnet`);
+          if (_sameScore && _samePeriod && _samePrice) {
+            console.log(`[live-edge] Reject memo hit: ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}) score=${currentScoreKey} P${period} price=${_priceCentsNow}¢ (Δ${_priceDelta >= 0 ? '+' : ''}${_priceDelta}) — unchanged since last NO, skipping Sonnet`);
             continue;
           }
         }
@@ -7113,6 +7150,14 @@ async function checkLiveScoreEdges() {
         if (!_structuralDecision) {
           // 2026-05-01: MLB inn 1 leader 3+ run lead — shadow 100% WR n=10 @ avg 76¢
           _structuralDecision = detectMlbInn1Leader3Plus({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-05-01: MLB inn 3 leader 3+ run lead — live-edge gap detector
+          // (TEX-DET tonight 4-0 inn-3 at 88¢ sat in gap between inn-1 and inn-4 detectors)
+          _structuralDecision = detectMlbInn3Leader3Plus({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
@@ -7746,7 +7791,7 @@ async function checkLiveScoreEdges() {
 
         if (!decision.trade) {
           console.log(`[live-edge] Claude says NO on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): conf=${((decision.confidence ?? 0)*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ | ${decision.reasoning?.slice(0, 80)}`);
-          liveEdgeRejectMemo.set(gameBase, { scoreKey: currentScoreKey, priceCents: Math.round(price * 100), ts: Date.now() });
+          liveEdgeRejectMemo.set(gameBase, { scoreKey: currentScoreKey, period, priceCents: Math.round(price * 100), ts: Date.now() });
           logScreen({ stage: 'live-edge', ticker, result: 'pass', confidence: decision.confidence, price, reasoning: decision.reasoning, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, gameDetail, targetAbbr });
           continue;
         }
@@ -7919,7 +7964,7 @@ async function checkLiveScoreEdges() {
         if (confidence < effectiveMinConf && !isEdgeFirstLive) {
           const floorNote = priceBandFloor > sportMinConf ? ` [price-band ${priceBand} floor]` : (CAL.minConfidenceLive?.[league] ? ' [calibrated]' : '');
           console.log(`[live-edge] Confidence too low on ${targetAbbr} (${league.toUpperCase()} ${awayAbbr}@${homeAbbr}): ${(confidence*100).toFixed(0)}% < ${(effectiveMinConf*100).toFixed(0)}%${floorNote}`);
-          liveEdgeRejectMemo.set(gameBase, { scoreKey: currentScoreKey, priceCents: Math.round(price * 100), ts: Date.now() });
+          liveEdgeRejectMemo.set(gameBase, { scoreKey: currentScoreKey, period, priceCents: Math.round(price * 100), ts: Date.now() });
           logScreen({ stage: 'live-edge-skip', result: 'skip-conf-low', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, confidence: decision.confidence, targetAbbr, reasoning: `Claude wanted to trade ${targetAbbr} at ${(confidence*100).toFixed(0)}% confidence but floor is ${(effectiveMinConf*100).toFixed(0)}%${floorNote} — ${decision.reasoning?.slice(0, 120) ?? ''}` });
           continue;
         }
