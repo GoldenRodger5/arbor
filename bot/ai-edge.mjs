@@ -7922,6 +7922,25 @@ async function checkLiveScoreEdges() {
           console.log(`[sizing] 🎯 TAG BOOST ${_liveBoost.toFixed(2)}x: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)} (tags: ${(decision.reasoningStructured?.reasoning_tags ?? []).join(',')})`);
         }
 
+        // 2026-04-30 — HARD POSITION CAP for NBA/NHL structural detectors.
+        // CRITICAL FIX: prior 5% cap in getDynamicMaxTrade was being bypassed because
+        // (1) caller didn't pass `strategy`, defaulting to 10% MAX_TRADE_FRACTION, and
+        // (2) JACKPOT-CELL BOOST 1.5x + high-conf 2-2.5x multipliers compounded on top.
+        // Tonight 2026-04-30 23:40 ET: MIN NBA Q4 sized at $34.81 = 35% of $97 bankroll.
+        // Hard cap AFTER all multipliers, no bypass. NBA/NHL = max 5% of bankroll.
+        {
+          const _structPattern = item._structuralDecision?._structuralPattern ?? '';
+          const _isNbaNhlStruct = item._structuralDecision && (_structPattern.startsWith('nba-') || _structPattern.startsWith('nhl-'));
+          if (_isNbaNhlStruct) {
+            const _hardCapDollars = getBankroll() * 0.05;
+            if (maxBetLE > _hardCapDollars) {
+              const before = maxBetLE;
+              maxBetLE = Math.floor(_hardCapDollars);
+              console.log(`[sizing] 🛡️ NBA/NHL HARD CAP 5%: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)} (structural ${_structPattern} on $${getBankroll().toFixed(0)} bankroll)`);
+            }
+          }
+        }
+
         // 2026-04-29 PROFIT LOCK-IN — protect today's earned gains from a single
         // adverse trade. Once up ≥5% on the day, cap any new trade at 30% of profit.
         // Today's NBA-Q3 ($15.66 deploy → -$10.73 loss) erased 6 prior wins. With
