@@ -7586,6 +7586,11 @@ async function checkLiveScoreEdges() {
         let _nhlHomeGoalie = null, _nhlAwayGoalie = null;
         let _nhlHomeGoalieBackToBack = null, _nhlAwayGoalieBackToBack = null;
         let _nhlPpStrength = null, _nhlPpTeam = null;
+        // 2026-05-02: ESPN lastPlay.probability — universal win-prob signal across
+        // NBA/NHL/NFL/MLB live games. Cross-validates Kalshi pricing against ESPN's
+        // model. Available on most live-game scoreboard responses (situation.lastPlay
+        // for NBA, plays[-1] elsewhere). When available, store both home and away.
+        let _espnHomeWinProb = null, _espnAwayWinProb = null, _espnTiePct = null;
         try {
           const _enrich = item._shadowEnrichment ?? {};
           const _competitors = _enrich.espnCompetitors;
@@ -7614,6 +7619,17 @@ async function checkLiveScoreEdges() {
               const awayPP = _situation.awayTeamHasGoalie === false || _situation.awayPowerPlay === true;
               _nhlPpTeam = homePP ? homeAbbr : awayPP ? awayAbbr : null;
             }
+          }
+          // === ESPN lastPlay win probability (universal signal) ===
+          // Audit 2026-05-02: confirmed NBA scoreboard situation.lastPlay.probability
+          // contains {homeWinPercentage, awayWinPercentage, tiePercentage}. NHL
+          // situation is null on scoreboard but plays array on /summary has it too.
+          // For now capture from scoreboard situation when available.
+          if (_situation?.lastPlay?.probability) {
+            const _prob = _situation.lastPlay.probability;
+            _espnHomeWinProb = typeof _prob.homeWinPercentage === 'number' ? _prob.homeWinPercentage : null;
+            _espnAwayWinProb = typeof _prob.awayWinPercentage === 'number' ? _prob.awayWinPercentage : null;
+            _espnTiePct = typeof _prob.tiePercentage === 'number' ? _prob.tiePercentage : null;
           }
           // === NBA leading-scorer foul trouble (requires /summary fetch) ===
           if (league === 'nba' && _enrich.espnEventId) {
@@ -7744,6 +7760,10 @@ async function checkLiveScoreEdges() {
           nhlAwayGoalieBackToBack: _nhlAwayGoalieBackToBack,
           nhlPowerPlayStrength: _nhlPpStrength,
           nhlPowerPlayTeam: _nhlPpTeam,
+          // 2026-05-02: ESPN win-prob signal (universal across sports)
+          espnHomeWinProb: _espnHomeWinProb,
+          espnAwayWinProb: _espnAwayWinProb,
+          espnTiePct: _espnTiePct,
           ..._liveShadowCtx,
         });
 
@@ -7820,6 +7840,20 @@ async function checkLiveScoreEdges() {
               isTrailerSynthetic: true,
               isBuyLowCandidate: _buyLowCandidate,
               buyLowReason: _buyLowReason,
+              // 2026-05-02: tier-3 enrichment was missing on synthetic logs — fixed
+              nhlHomeGoalie: _nhlHomeGoalie,
+              nhlAwayGoalie: _nhlAwayGoalie,
+              nhlHomeGoalieBackToBack: _nhlHomeGoalieBackToBack,
+              nhlAwayGoalieBackToBack: _nhlAwayGoalieBackToBack,
+              nhlPowerPlayStrength: _nhlPpStrength,
+              nhlPowerPlayTeam: _nhlPpTeam,
+              nbaLeaderTopScorer: _nbaLeaderTopScorer,
+              nbaLeaderTopScorerFouls: _nbaLeaderTopScorerFouls,
+              nbaTrailerTopScorer: _nbaTrailerTopScorer,
+              nbaTrailerTopScorerFouls: _nbaTrailerTopScorerFouls,
+              espnHomeWinProb: _espnHomeWinProb,
+              espnAwayWinProb: _espnAwayWinProb,
+              espnTiePct: _espnTiePct,
             });
             logPriceTapeEntry({
               ticker: _trailerTicker,
@@ -7858,6 +7892,16 @@ async function checkLiveScoreEdges() {
                 isComebackSynthetic: true,
                 comebackCell: _cbCell,
                 strategy: 'synthetic-comeback-buy',
+                // 2026-05-02: tier-3 enrichment
+                nhlHomeGoalie: _nhlHomeGoalie,
+                nhlAwayGoalie: _nhlAwayGoalie,
+                nhlPowerPlayStrength: _nhlPpStrength,
+                nhlPowerPlayTeam: _nhlPpTeam,
+                nbaLeaderTopScorer: _nbaLeaderTopScorer,
+                nbaLeaderTopScorerFouls: _nbaLeaderTopScorerFouls,
+                espnHomeWinProb: _espnHomeWinProb,
+                espnAwayWinProb: _espnAwayWinProb,
+                espnTiePct: _espnTiePct,
               });
             }
           }
@@ -7894,6 +7938,10 @@ async function checkLiveScoreEdges() {
               isDrawBetSynthetic: true,
               drawBetCell: _dbCell,
               strategy: 'synthetic-draw-bet',
+              // 2026-05-02: tier-3 enrichment (soccer-specific cells use these too)
+              espnHomeWinProb: _espnHomeWinProb,
+              espnAwayWinProb: _espnAwayWinProb,
+              espnTiePct: _espnTiePct,
             });
           }
         } catch { /* best-effort */ }
