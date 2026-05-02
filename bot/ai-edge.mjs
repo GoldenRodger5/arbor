@@ -8380,9 +8380,20 @@ async function checkLiveScoreEdges() {
         // Claude is mis-calibrated on the borderline 70-74% confidence band. Raising
         // floor to 75% filters the bottom-tier calls. Expected: ~30-40% volume drop,
         // WR climbs from 46% toward 55-60%. NHL also lifted (was 41% WR n=17 → -$13).
-        const SPORT_FLOOR_OVERRIDES = { mlb: 0.75, nhl: 0.74 };
+        // MLS lifted to 78% — historical 50% WR / -$61 P&L across all strategies.
+        const SPORT_FLOOR_OVERRIDES = { mlb: 0.75, nhl: 0.74, mls: 0.78 };
         const _hardcodedFloor = SPORT_FLOOR_OVERRIDES[league] ?? null;
         const sportMinConf = _hardcodedFloor ?? CAL.minConfidenceLive?.[league] ?? MIN_CONFIDENCE;
+
+        // 2026-05-02: MLS live-swing DISABLED. n=2, -$11.19 over single trade in MLS.
+        // Combined with MLS-wide 50% WR / -$61 P&L across all strategies, MLS is
+        // structurally unprofitable. Live-swing buys deep underdogs (12¢ entry) which
+        // is exactly the spot where MLS variance dominates.
+        if (league === 'mls' && isSwingMode) {
+          console.log(`[live-edge] 🚫 MLS-LIVE-SWING DISABLED: ${targetAbbr} — MLS structurally bleeding (-$61/10 trades), live-swing path needs more data before re-enabling`);
+          logScreen({ stage: 'live-edge', ticker, result: 'mls-live-swing-disabled', reasoning: `MLS live-swing DISABLED — historical -$11.19/-100% WR n=2` });
+          continue;
+        }
 
         // 2026-05-02: MAX_CONFIDENCE cap for MLB live. Confidence-band audit revealed
         // a non-monotonic profile:
@@ -11126,6 +11137,13 @@ async function checkPreGamePredictions() {
     }
     const PRE_GAME_MIN_CONF = isNhlNba
       ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.72)
+      : pgSportKey === 'mls'
+        // 2026-05-02: MLS pre-game DISABLED. Historical: n=4 trades, 50% WR, -$34.83
+        // P&L (avg -$8.71 per trade — worst single soccer category). MLS Sportsbook
+        // efficiency + open play + high draw rate makes pre-game predictions a
+        // money pit at our scale. Soccer reasoning enhancement (form/h2h/etc) is
+        // a separate investigation; until then, no MLS pre-game.
+        ? 0.99 // effectively disable — no realistic Sonnet call hits 99%
       : pgSportKey === 'mlb'
         // 2026-05-02 v2: MLB pre-game tier breakdown by PRICE (placed-bet audit n=45):
         //   40-45¢ (deep underdog):  43% WR  +$54.77  avg=+$7.82  ⭐⭐ GOLDMINE
