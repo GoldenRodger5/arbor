@@ -6208,6 +6208,41 @@ async function checkLiveScoreEdges() {
         const homeAbbr = home.team?.abbreviation ?? '';
         const awayAbbr = away.team?.abbreviation ?? '';
 
+        // 2026-05-02: SYNTHETIC DRAW-BET SHADOW — moved here from inside live-edge
+        // candidate loop (which never runs for tied games due to leader-only filter).
+        // Logs every eligible draw-bet setup for cell mining, even if we don't actually
+        // place a bet. Was producing 0 records due to the unreachable code path.
+        try {
+          const _minMatchEarly = gameDetail.match(/(\d+)/);
+          const _minutesEarly = _minMatchEarly ? parseInt(_minMatchEarly[1]) : 0;
+          const _effMinEarly = period === 2 ? Math.max(_minutesEarly, 45) : _minutesEarly;
+          if (_effMinEarly >= 60) {
+            const _ticker0 = `${series}-${ev.id ?? ''}-TIE`;
+            const _drawPriceProxy = 0.30; // proxy — actual TIE price not always cached
+            const _minuteBand = _effMinEarly < 70 ? '60-69' : _effMinEarly < 80 ? '70-79' : _effMinEarly < 85 ? '80-84' : '85+';
+            const _scoreState = (homeScore === 0 && awayScore === 0) ? '0-0' : 'goals';
+            const _dbCell = `${league}-draw-${_scoreState}-min${_minuteBand}`;
+            logShadowDecision({
+              stage: 'live-edge-drawbet-synthetic',
+              ticker: _ticker0,
+              sport: 'Soccer', league,
+              decision: 'synthetic-drawbet-candidate',
+              rejectReason: 'drawbet-baseline',
+              claudeConfidence: null,
+              decisionPrice: _drawPriceProxy,
+              edge: null,
+              scoreDiff: 0, period, gameDetail,
+              leadingAbbr: null, targetAbbr: 'TIE',
+              homeAbbr, awayAbbr,
+              liveStage: 'mid',
+              reasoningPreview: `DRAW-BET CANDIDATE [${_dbCell}] tied ${homeScore}-${awayScore} at min ${_effMinEarly} — synthetic shadow`,
+              isDrawBetSynthetic: true,
+              drawBetCell: _dbCell,
+              strategy: 'synthetic-draw-bet',
+            });
+          }
+        } catch { /* best-effort */ }
+
         // Parse minutes from detail (e.g. "72'" or "2nd - 27'")
         const minMatch = gameDetail.match(/(\d+)/);
         const minutes = minMatch ? parseInt(minMatch[1]) : 0;
@@ -8336,6 +8371,23 @@ async function checkLiveScoreEdges() {
         const SPORT_FLOOR_OVERRIDES = { mlb: 0.75, nhl: 0.74 };
         const _hardcodedFloor = SPORT_FLOOR_OVERRIDES[league] ?? null;
         const sportMinConf = _hardcodedFloor ?? CAL.minConfidenceLive?.[league] ?? MIN_CONFIDENCE;
+
+        // 2026-05-02: MAX_CONFIDENCE cap for MLB live. Confidence-band audit revealed
+        // a non-monotonic profile:
+        //   65-75%: 11% WR (-$29) ❌ — handled by min-floor above
+        //   75-80%: 55% WR (+$37) ✅ — sweet spot
+        //   80-85%: 40% WR (-$9)  ❌
+        //   85-95%: 10% WR (-$32) 🔴 — Claude over-confident on dominant-looking states
+        // High-confidence MLB live is a money pit because Claude only goes 85%+ on
+        // states that LOOK obvious (price 78-88¢) — small edge, asymmetric loss.
+        // Block MLB live entries above 85% confidence. Structural detectors handle
+        // genuinely strong situations through the cell-WR path instead.
+        const MLB_LIVE_MAX_CONF = 0.85;
+        if (league === 'mlb' && !item._structuralDecision && decision.trade && confidence > MLB_LIVE_MAX_CONF) {
+          console.log(`[live-edge] 🚫 MLB-LIVE-MAX-CONF: ${targetAbbr} at ${(confidence*100).toFixed(0)}% conf is in the 85%+ bleeder band (n=15 settled = -$32). Skipping non-structural path.`);
+          logScreen({ stage: 'live-edge', ticker, result: 'mlb-live-max-conf', reasoning: `MLB live conf ${(confidence*100).toFixed(0)}% > 85% cap — historical -$32/-15 trades band` });
+          continue;
+        }
         // Tier 2: price×confidence floor (underdog/favorite band) if calibrated
         const priceBand = price < 0.50 ? 'underdog' : 'favorite';
         const priceBandFloor = CAL.priceConfFloors?.[league]?.[priceBand] ?? 0;
@@ -11063,15 +11115,20 @@ async function checkPreGamePredictions() {
     const PRE_GAME_MIN_CONF = isNhlNba
       ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.72)
       : pgSportKey === 'mlb'
-        // 2026-05-02: MLB pre-game-prediction at old floors showed 42% WR / -$22 P&L
-        // over n=19. Raised tiers across the board to filter borderline calls:
-        //   <50¢ (underdog):   65% (was 63) — slightly higher bar on swing-bands
-        //   50-65¢ (mid):      70% (was 65) — biggest gap, most leakage was here
-        //   >65¢ (favorite):   75% (was 68) — high price = need real conviction
-        // Disaster-tier exempt keeps a -5pt discount on all tiers.
+        // 2026-05-02 v2: MLB pre-game tier breakdown by PRICE (placed-bet audit n=45):
+        //   40-45¢ (deep underdog):  43% WR  +$54.77  avg=+$7.82  ⭐⭐ GOLDMINE
+        //   45-50¢ (mid underdog):   33% WR  -$37.82  avg=-$3.15
+        //   50-55¢ (toss-up):         7% WR  -$27.41  avg=-$1.83
+        //   55-60¢ (slight fav):      9% WR  +$3.96   avg=+$0.36
+        // Tier strategy:
+        //   <45¢ (deep underdog):  60% (LOWERED from 63) — protect goldmine, capture more
+        //   45-50¢ (mid underdog): 67% (RAISED from 63)  — filter the 33%-WR bleeder band
+        //   50-65¢ (mid):          70% (RAISED from 65)  — filter 7-9%-WR catastrophe
+        //   >65¢ (favorite):       75% (RAISED from 68)  — high-price needs conviction
+        // Disaster-tier exempt keeps -5pt discount on all tiers.
         ? (_disasterTierExempt
-            ? (price < 0.50 ? 0.60 : price <= 0.65 ? 0.65 : 0.70)
-            : (price < 0.50 ? 0.65 : price <= 0.65 ? 0.70 : 0.75))
+            ? (price < 0.45 ? 0.55 : price < 0.50 ? 0.62 : price <= 0.65 ? 0.65 : 0.70)
+            : (price < 0.45 ? 0.60 : price < 0.50 ? 0.67 : price <= 0.65 ? 0.70 : 0.75))
         : isSoccer
           ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68) // Soccer: unchanged
           : 0.65; // fallback for other sports
