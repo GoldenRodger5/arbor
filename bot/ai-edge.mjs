@@ -9942,6 +9942,204 @@ async function checkLiveScoreEdges() {
       }
     }
   }
+
+  // === PHASE 8: SHORT-SIDE UNDERDOG SCANNER (2026-05-02) ====================
+  // When a leader's price is OUT OF BAND for any leader detector (i.e., market
+  // overprices the leader), buy the UNDERDOG YES at asymmetric-pay band.
+  //
+  // Math: leader at 88¢ implies 88% market WR. If true WR is 70-80%, underdog
+  // at 12¢ is genuinely underpriced.
+  //   If true WR underdog = 25% (vs 12% market): 25% × $0.88 - 75% × $0.12
+  //   = $0.22 - $0.09 = +$0.13/contract = +108% ROI per win
+  //
+  // SAFEGUARDS:
+  //   - Skip if any open position on same game-base (no double-positioning)
+  //   - Skip if same-day position already on this game in trades.jsonl
+  //   - Hard 3% bankroll cap until we accumulate placed-bet validation data
+  //   - Hold to settlement (asymmetric pay realizes at $1.00)
+  //   - Sport-specific gates (only sports where leader cells show overpriced)
+  //   - Cooldown 15min per game (no spam)
+  if (cachedPrices.size > 0) {
+    for (const g of liveGames) {
+      try {
+        const sport = g.league;
+        const isSoccerLg = ['mls','epl','laliga','seriea','bundesliga','ligue1'].includes(sport);
+        // Sport-specific eligibility: ONLY where leader cells show overpriced patterns.
+        // Skip MLS pre-game disabled, Serie A/Bundesliga/Ligue 1 too thin.
+        const eligibleSport = sport === 'mlb' || sport === 'nba' ||
+          ['epl','laliga'].includes(sport);
+        if (!eligibleSport) continue;
+        if (g.diff < 1) continue;
+
+        // Determine leader / underdog
+        const leaderIsHome = g.homeScore > g.awayScore;
+        const leaderTeam = leaderIsHome ? g.home : g.away;
+        const trailingTeam = leaderIsHome ? g.away : g.home;
+        const leadingAbbr = leaderTeam.team?.abbreviation ?? '';
+        const trailingAbbr = trailingTeam.team?.abbreviation ?? '';
+        if (!leadingAbbr || !trailingAbbr) continue;
+
+        // Find leader + underdog Kalshi tickers
+        const leaderTicker = [...cachedPrices.keys()].find(t =>
+          t.startsWith(g.league === 'mlb' ? 'KXMLBGAME' :
+                       g.league === 'nba' ? 'KXNBAGAME' :
+                       'KXEPLGAME') &&
+          (t.split('-').pop()?.toUpperCase() ?? '') === leadingAbbr.toUpperCase()
+        );
+        const underdogTicker = [...cachedPrices.keys()].find(t =>
+          t.startsWith(g.league === 'mlb' ? 'KXMLBGAME' :
+                       g.league === 'nba' ? 'KXNBAGAME' :
+                       'KXEPLGAME') &&
+          (t.split('-').pop()?.toUpperCase() ?? '') === trailingAbbr.toUpperCase()
+        );
+        if (!leaderTicker || !underdogTicker) continue;
+
+        const leaderPrice = cachedPrices.get(leaderTicker)?.yes ?? 0;
+        const underdogPrice = cachedPrices.get(underdogTicker)?.yes ?? 0;
+
+        // Sport-specific OUT-OF-BAND triggers — leader must be priced ABOVE
+        // any allowed leader-detector cap, indicating market overprices.
+        let isOutOfBand = false;
+        let cellLabel = '';
+        if (sport === 'mlb') {
+          // MLB inn 4-7 leader at 80-88¢ above all caps for d=1/2 (max 78 d=2)
+          if (g.period >= 4 && g.period <= 7 && leaderPrice >= 0.80 && leaderPrice <= 0.92) {
+            isOutOfBand = true;
+            cellLabel = `mlb-inn${g.period}-d${g.diff}-leader-80-92`;
+          }
+        } else if (sport === 'nba') {
+          // NBA Q4 leader 85-95¢ — beyond our 78¢ cap, asymmetric play
+          if (g.period === 4 && leaderPrice >= 0.85 && leaderPrice <= 0.95) {
+            // Time check: must have ≥3min remaining (else genuinely settled)
+            const m = (g.detail || '').match(/^(\d+):(\d{2})/);
+            if (m) {
+              const minsLeft = parseInt(m[1], 10) + parseInt(m[2], 10) / 60;
+              if (minsLeft >= 3 && minsLeft <= 9) {
+                isOutOfBand = true;
+                cellLabel = `nba-q4-leader-85-95-${minsLeft.toFixed(0)}min`;
+              }
+            }
+          }
+        } else if (isSoccerLg) {
+          // Soccer 2H home leader at 70-85¢ — 3-way market means draw still possible
+          if (g.period === 2 && leaderIsHome && leaderPrice >= 0.70 && leaderPrice <= 0.85) {
+            const minMatch = (g.detail || '').match(/^(\d+)/);
+            if (minMatch) {
+              const minute = parseInt(minMatch[1], 10);
+              if (minute >= 50 && minute <= 75) {
+                isOutOfBand = true;
+                cellLabel = `soccer-2h-home-leader-70-85-min${minute}`;
+              }
+            }
+          }
+        }
+        if (!isOutOfBand) continue;
+
+        // Underdog asymmetric-pay band check (8-22¢)
+        if (underdogPrice < 0.08 || underdogPrice > 0.22) continue;
+
+        // Same-game-base dedup — prevent double-positioning
+        const gameBase = leaderTicker.lastIndexOf('-') > 0
+          ? leaderTicker.slice(0, leaderTicker.lastIndexOf('-'))
+          : leaderTicker;
+        const hasPortfolioPos = openPositions.some(p => {
+          const pBase = p.ticker.lastIndexOf('-') > 0
+            ? p.ticker.slice(0, p.ticker.lastIndexOf('-'))
+            : p.ticker;
+          return pBase === gameBase;
+        });
+        if (hasPortfolioPos) continue;
+
+        // Same-day jsonl dedup
+        let hasJsonlPos = false;
+        if (existsSync(TRADES_LOG)) {
+          try {
+            const dupStart = new Date(etNow().toISOString().slice(0,10) + 'T04:00:00Z').getTime();
+            const jLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+            for (const l of jLines) {
+              try {
+                const jt = JSON.parse(l);
+                if (jt.status === 'testing-void') continue;
+                const jtMs = jt.timestamp ? Date.parse(jt.timestamp) : 0;
+                if (jtMs < dupStart) continue;
+                if (tickerHasTeam((jt.ticker ?? '').toLowerCase(), trailingAbbr) &&
+                    tickerHasTeam((jt.ticker ?? '').toLowerCase(), leadingAbbr)) {
+                  hasJsonlPos = true; break;
+                }
+              } catch {}
+            }
+          } catch {}
+        }
+        if (hasJsonlPos) continue;
+
+        // Per-game cooldown (15 min)
+        const udKey = 'underdog-short:' + gameBase;
+        if (Date.now() - (tradeCooldowns.get(udKey) ?? 0) < 15 * 60 * 1000) continue;
+        tradeCooldowns.set(udKey, Date.now());
+
+        // Sized SMALL until validated. 3% bankroll cap.
+        const udMaxTrade = Math.min(getBankroll() * 0.03, getAvailableCash('kalshi'));
+        const udQty = Math.max(1, Math.floor(udMaxTrade / underdogPrice));
+        const udBetAmount = udQty * underdogPrice;
+        if (udBetAmount < 4) continue;
+
+        const priceCents = Math.round(underdogPrice * 100);
+        console.log(`[underdog-short] 🎯 BUY ${trailingAbbr} YES @ ${priceCents}¢ × ${udQty} | leader ${leadingAbbr} @ ${(leaderPrice*100).toFixed(0)}¢ | cell=${cellLabel}`);
+
+        const udResult = await kalshiPost('/portfolio/orders', {
+          ticker: underdogTicker,
+          action: 'buy',
+          side: 'yes',
+          count: udQty,
+          yes_price: Math.min(99, priceCents + 2),
+        });
+        if (udResult.ok) {
+          const udOrder = udResult.data?.order ?? {};
+          const udFill = udOrder.count ?? udQty;
+          const udDeployed = Math.round(udFill * underdogPrice * 100) / 100;
+          const udTrade = {
+            id: udOrder.order_id ?? `ud-${Date.now()}`,
+            timestamp: new Date().toISOString(),
+            strategy: 'underdog-short',
+            exchange: 'kalshi',
+            ticker: underdogTicker,
+            title: cachedPrices.get(underdogTicker)?.title ?? `${trailingAbbr} vs ${leadingAbbr}`,
+            side: 'yes',
+            entryPrice: underdogPrice,
+            entryDiff: g.diff,
+            entryPeriod: g.period,
+            quantity: udFill,
+            deployCost: udDeployed,
+            confidence: 0.30,
+            reasoning: `STRUCTURAL UNDERDOG-SHORT: leader ${leadingAbbr} priced ${(leaderPrice*100).toFixed(0)}¢ (out of band — market overprices). ${trailingAbbr} YES at ${priceCents}¢ asymmetric pay. Cell: ${cellLabel}.`,
+            status: 'open',
+            holdToSettlement: true,
+            _structuralPattern: cellLabel,
+            _undergCellLabel: cellLabel,
+          };
+          appendFileSync(TRADES_LOG, JSON.stringify(udTrade) + '\n');
+          openPositions.push(udTrade);
+          gameEntries.set(gameBase, { ticker: underdogTicker, price: underdogPrice, lastScoreKey: scoreKey(g.awayScore, g.homeScore) });
+          await tg(
+            `🎯 <b>UNDERDOG-SHORT — KALSHI</b>\n\n` +
+            `📋 <b>GAME</b>\n` +
+            `${cachedPrices.get(underdogTicker)?.title ?? underdogTicker}\n` +
+            `Score: ${g.awayScore}-${g.homeScore} (${trailingAbbr} trailing)\n\n` +
+            `📊 <b>METRICS</b>\n` +
+            `Bought ${trailingAbbr} YES @ ${priceCents}¢ × ${udFill} = <b>$${udDeployed.toFixed(2)}</b>\n` +
+            `Leader ${leadingAbbr} priced ${(leaderPrice*100).toFixed(0)}¢ (out of band)\n` +
+            `Cell: ${cellLabel}\n\n` +
+            `🧠 <b>REASONING</b>\n` +
+            `Market overprices leader at ${(leaderPrice*100).toFixed(0)}¢. Underdog at ${priceCents}¢ has asymmetric pay structure. Hold to settlement.`
+          );
+        } else {
+          console.error(`[underdog-short] Order failed:`, udResult.status, JSON.stringify(udResult.data));
+        }
+      } catch (e) {
+        console.error(`[underdog-short] Error for game:`, e.message);
+      }
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
