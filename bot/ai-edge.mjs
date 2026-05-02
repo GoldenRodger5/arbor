@@ -1405,9 +1405,13 @@ function detectNhlP3ClosingOut({ league, period, gameDetail, diff, weTimeAdj, pr
   const minEdge = diff === 1 ? 0.07 : (diff === 2 ? 0.04 : 0.03);
   if (edge < minEdge) return null;
 
-  // Don't fire above 90¢ (was 82¢) — NHL P3 typical price ceiling extended.
-  // 90¢ leaves room for 100¢ settlement, ~11% return on win.
-  if (price > 0.90) return null;
+  // 2026-05-02: diff-aware cap from bucket audit. Shadow data on NHL P3 d=1:
+  //   70-75¢: 50% WR (n=6) ⚠️ — coin flip, blocked
+  //   75-80¢: 75% WR (n=12) ✅ — sweet spot
+  //   80-85¢: 56% WR (n=18) ⚠️ — late-pulled-goalie variance, blocked
+  // d=2/3+ have stronger profiles, keep 90¢.
+  if (diff === 1 && price > 0.78) return null;
+  if (diff >= 2 && price > 0.90) return null;
 
   return {
     trade: true,
@@ -1454,6 +1458,13 @@ function detectSoccerHomeHTLeader({ league, period, gameDetail, diff, weTimeAdj,
   if (!m) return null;
   const minute = parseInt(m[1], 10);
   if (minute < 45 || minute > 65) return null; // early 2H window only
+
+  // 2026-05-02: add price cap from bucket audit. Shadow soccer-2H d=1:
+  //   65-70¢: 60% WR (n=5) borderline
+  //   70-75¢: 56% WR (n=9) ⚠️
+  // Sub-65 sample is thin (n=3, 100% WR) but the trend is clear:
+  // the high-price band leaks money. Cap at 65¢.
+  if (price > 0.65) return null;
 
   const edge = weTimeAdj - price;
   if (edge < 0.05) return null;
