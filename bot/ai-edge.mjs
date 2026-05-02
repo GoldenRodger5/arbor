@@ -3597,7 +3597,12 @@ function checkDrawdownBreaker() {
       console.log(`[risk] FULL HALT: ${haltReason}`);
       return false;
     }
-    if (dailyDD >= 0.10 && softHaltUntilMs < Date.now()) {
+    // 2026-05-02: bankroll floor on soft halt. At small bankroll (< $1000), normal
+    // session variance can trigger -10% drawdown easily — soft-halting paralyzes
+    // the bot during the bootstrap phase where we need it firing to compound.
+    // Above $1000, drawdown protection kicks back in to avoid catastrophic days.
+    const SOFT_HALT_BANKROLL_FLOOR = 1000;
+    if (dailyDD >= 0.10 && softHaltUntilMs < Date.now() && bk >= SOFT_HALT_BANKROLL_FLOOR) {
       const tomorrow = etNow();
       tomorrow.setHours(24, 0, 0, 0);
       softHaltUntilMs = tomorrow.getTime();
@@ -3605,6 +3610,9 @@ function checkDrawdownBreaker() {
       try { tg(`⚠️ <b>SOFT HALT — DAILY DRAWDOWN</b>\n\n${softHaltReason}`); } catch {}
       console.log(`[risk] SOFT HALT (daily): ${softHaltReason}`);
       return false;
+    } else if (dailyDD >= 0.10 && bk < SOFT_HALT_BANKROLL_FLOOR) {
+      // Log but don't halt — bankroll too small for drawdown circuit to be useful
+      console.log(`[risk] SOFT HALT SKIPPED — bankroll $${bk.toFixed(2)} below $${SOFT_HALT_BANKROLL_FLOOR} floor (DD=-${(dailyDD * 100).toFixed(1)}%)`);
     }
   }
   if (weeklyOpenBankroll > 0) {
