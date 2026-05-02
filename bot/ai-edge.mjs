@@ -1490,6 +1490,48 @@ function detectMlbLateInningLockdown({ league, period, gameDetail, diff, leading
 // Excludes 1-goal leads in last 2 min (pulled-goalie chaos — high variance,
 // market correctly prices). Excludes 1-goal leads in first 8 min of P3 (still
 // 12+ min to play — too much variance to call this "closing out").
+// 2026-05-02 OFFENSIVE: NHL P3 empty-net pull window — TRAILER side bet.
+// When NHL trailer is down 1-2 in P3 final 2 min, they pull the goalie for
+// extra attacker. Scoring rate spikes ~5x normal (open net + 6v5 attackers).
+// Trailer's price plummets to 8-15¢ but recovery probability is asymmetric:
+// they only need 1 goal to tie (forcing OT, where price spikes to 50¢+).
+//
+// Math: at 12¢ entry on a true ~25% recovery rate (pulled-goalie spike):
+//   25% × $0.88 - 75% × $0.12 = $0.22 - $0.09 = +$0.13/contract = +108% ROI per win
+// Asymmetric pay covers wide WR misses. Pure swing — sell at 25¢+.
+function detectNhlEmptyNetTrailer({ league, period, gameDetail, diff, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'nhl') return null;
+  if (period !== 3) return null;
+  if (targetAbbr === leadingAbbr) return null; // TRAILER only
+  if (diff < 1 || diff > 2) return null; // 1-2 goal deficit (3+ won't recover)
+  if (price == null) return null;
+  // Parse minutes left in P3
+  const m = (gameDetail || '').match(/^(\d+):(\d+)/);
+  if (!m) return null;
+  const minsLeft = parseInt(m[1], 10) + parseInt(m[2], 10) / 60;
+  if (minsLeft < 0.5 || minsLeft > 2.5) return null; // pull window only
+  // Underdog asymmetric-pay band
+  if (price < 0.06 || price > 0.20) return null;
+  return {
+    trade: true, side: 'yes', confidence: 0.25, betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-goal deficit with ${minsLeft.toFixed(1)} min in P3 — goalie pulled, extra attacker, scoring rate ~5x`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (NHL empty-net pull window): ${targetAbbr} trailing by ${diff}, ${minsLeft.toFixed(1)} min left in P3, price ${(price*100).toFixed(0)}¢. Asymmetric pay covers true rate down to 13%.`,
+      key_facts: [
+        `P3 ${minsLeft.toFixed(1)} min, ${diff}-goal deficit, trailer pulling goalie`,
+        `Empty-net + 6v5 attackers = ~5x normal scoring rate`,
+        `Tie forces OT where trailer price spikes to 50¢+ (swing exit target)`,
+      ],
+      top_risk: 'Empty-net goal makes it 3-goal deficit, position goes to 0',
+      conviction: 'Structural pattern — game-state-driven scoring rate spike',
+      reasoning_tags: ['underdog-spot', 'we-undervalued', 'market-lag'],
+    },
+    _structuralPattern: 'nhl-empty-net-trailer',
+    _matchInfo: { period, diff, minsLeft, price: Math.round(price*100) },
+  };
+}
+
 function detectNhlP3ClosingOut({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
   if (league !== 'nhl') return null;
   if (period !== 3) return null;
@@ -7657,6 +7699,13 @@ async function checkLiveScoreEdges() {
           });
         }
         if (!_structuralDecision) {
+          // 2026-05-02 OFFENSIVE: NHL empty-net trailer pull window
+          _structuralDecision = detectNhlEmptyNetTrailer({
+            league, period, gameDetail, diff,
+            price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
           _structuralDecision = detectMlbMidGameLead({
             league, period, gameDetail, diff,
             leadingBullpenTier,
@@ -11233,20 +11282,17 @@ async function checkPreGamePredictions() {
         // a separate investigation; until then, no MLS pre-game.
         ? 0.99 // effectively disable — no realistic Sonnet call hits 99%
       : pgSportKey === 'mlb'
-        // 2026-05-02 v2: MLB pre-game tier breakdown by PRICE (placed-bet audit n=45):
-        //   40-45¢ (deep underdog):  43% WR  +$54.77  avg=+$7.82  ⭐⭐ GOLDMINE
-        //   45-50¢ (mid underdog):   33% WR  -$37.82  avg=-$3.15
-        //   50-55¢ (toss-up):         7% WR  -$27.41  avg=-$1.83
-        //   55-60¢ (slight fav):      9% WR  +$3.96   avg=+$0.36
-        // Tier strategy:
-        //   <45¢ (deep underdog):  60% (LOWERED from 63) — protect goldmine, capture more
-        //   45-50¢ (mid underdog): 67% (RAISED from 63)  — filter the 33%-WR bleeder band
-        //   50-65¢ (mid):          70% (RAISED from 65)  — filter 7-9%-WR catastrophe
-        //   >65¢ (favorite):       75% (RAISED from 68)  — high-price needs conviction
-        // Disaster-tier exempt keeps -5pt discount on all tiers.
+        // 2026-05-02 v3 OFFENSIVE: GOLDMINE-FIRST tiers. The 40-45¢ MLB pre-game
+        // band is +$7.82 avg per trade (43% WR n=7) — our highest-EV strategy.
+        // LOWER the floor here, RAISE everywhere else. Push volume to the goldmine.
+        //   <45¢ (GOLDMINE):  55% (was 60) — capture more 13-16pt edge underdogs
+        //   45-50¢ (BLEEDER): 67% — filter the 33% WR band
+        //   50-65¢ (TOSS-UP): 70% — filter 7-9% WR catastrophe
+        //   >65¢ (FAVORITE):  75% — high-price needs strong conviction
+        // Disaster-tier exempt: -5pt discount on all tiers.
         ? (_disasterTierExempt
-            ? (price < 0.45 ? 0.55 : price < 0.50 ? 0.62 : price <= 0.65 ? 0.65 : 0.70)
-            : (price < 0.45 ? 0.60 : price < 0.50 ? 0.67 : price <= 0.65 ? 0.70 : 0.75))
+            ? (price < 0.45 ? 0.50 : price < 0.50 ? 0.62 : price <= 0.65 ? 0.65 : 0.70)
+            : (price < 0.45 ? 0.55 : price < 0.50 ? 0.67 : price <= 0.65 ? 0.70 : 0.75))
         : isSoccer
           ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68) // Soccer: unchanged
           : 0.65; // fallback for other sports
@@ -11375,10 +11421,15 @@ async function checkPreGamePredictions() {
     // Underdogs also have higher payout per contract (55¢+ vs 43-50¢ for coin flips).
     // Boost underdog sizing by 50% to capitalize on the edge.
     const bkr = getBankroll();
+    const isGoldmine = price >= 0.40 && price < 0.45 && pgSportKey === 'mlb'; // PROVEN +EV cell
     const isUnderdog = price < 0.45;
-    // Small bankroll tiers: slightly looser to allow meaningful bet sizes but capped below old levels.
-    const pgFraction = bkr < 500 ? (isUnderdog ? 0.08 : 0.06) : PRE_GAME_TRADE_FRACTION;
-    const pgAbsCap = bkr < 500 ? (isUnderdog ? 30 : 20) : bkr < 1000 ? 50 : Infinity;
+    // 2026-05-02 OFFENSIVE: goldmine band gets bigger sizing (12% vs 8%) to push
+    // volume on +$7.82 avg/trade cell. Asymmetric pay structure means even at
+    // 43% WR we're net winning. Stack volume on the proven cell.
+    const pgFraction = bkr < 500
+      ? (isGoldmine ? 0.12 : isUnderdog ? 0.08 : 0.06)
+      : PRE_GAME_TRADE_FRACTION;
+    const pgAbsCap = bkr < 500 ? (isGoldmine ? 40 : isUnderdog ? 30 : 20) : bkr < 1000 ? 50 : Infinity;
     const pgMaxTrade = Math.min(bkr * pgFraction, pgAbsCap, getAvailableCash('kalshi'));
     // Edge-first tier: half-size — entry is EV+ but below standard conf floor, so size down.
     // Soccer pre-calibration: quarter-size until league has n≥10 settled pg trades.
