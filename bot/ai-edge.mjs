@@ -4011,6 +4011,12 @@ function logPregameRejection(market, subStage, reason, ctx = {}) {
       decisionPrice: ctx.price ?? null,
       edge: ctx.edge ?? null,
       targetAbbr: team || null,
+      // 2026-05-02: persist team1/team2 abbrs so the settler can resolve game outcome
+      // even when ticker is the base (no team suffix). Without these, pgrej records
+      // never settle (247 stuck pending in audit) because Kalshi `/markets/{base}`
+      // returns 404 — markets need a team-suffix form.
+      team1Abbr: (market?.team1?.team ?? '').toUpperCase() || null,
+      team2Abbr: (market?.team2?.team ?? '').toUpperCase() || null,
       team1Price: market?.team1?.price ?? null,
       team2Price: market?.team2?.price ?? null,
       reasoningPreview: ctx.reasoningPreview ?? null,
@@ -4107,7 +4113,14 @@ async function settleShadowDecisions() {
   let updated = false;
   for (const r of batch) {
     try {
-      const market = await kalshiGet(`/markets/${r.ticker}`);
+      // 2026-05-02: pgrej records have ticker = market base (no team suffix), so a
+      // direct kalshiGet fails. When base + team1Abbr/team2Abbr are present, query
+      // team1's market and infer game winner from result. We don't set ourPickWon
+      // for these (no pick was placed) but we set gameWinner for analysis.
+      const isBaseTicker = r.stage === 'pre-game' && r.team1Abbr && r.team2Abbr
+        && r.ticker && !r.ticker.includes(`-${r.team1Abbr}`) && !r.ticker.includes(`-${r.team2Abbr}`);
+      const lookupTicker = isBaseTicker ? `${r.ticker}-${r.team1Abbr}` : r.ticker;
+      const market = await kalshiGet(`/markets/${lookupTicker}`);
       const result = market?.market?.result;
       if (!result || (result !== 'yes' && result !== 'no')) {
         // Mark as expired (game over but no resolution we can read) so we don't loop on it forever
@@ -4120,8 +4133,15 @@ async function settleShadowDecisions() {
       r.status = 'settled';
       r.settledAt = market.market.close_time ?? new Date().toISOString();
       r.winningSide = result;
-      // We log every shadow as the YES side of targetAbbr — won iff result === 'yes'
-      r.ourPickWon = result === 'yes';
+      if (isBaseTicker) {
+        // For base-ticker pgrej records: query result is for team1 side.
+        // result === 'yes' means team1 won, 'no' means team2 won.
+        r.gameWinner = result === 'yes' ? r.team1Abbr : r.team2Abbr;
+        // ourPickWon stays null — no pick was placed
+      } else {
+        // We log every shadow as the YES side of targetAbbr — won iff result === 'yes'
+        r.ourPickWon = result === 'yes';
+      }
       // Brier component: (predicted - outcome)². Lower is better. 0 = perfect.
       if (r.claudeConfidence != null) {
         const outcome = r.ourPickWon ? 1 : 0;
@@ -7642,6 +7662,11 @@ async function checkLiveScoreEdges() {
           league,
           decision: decision.trade ? 'trade' : 'no-trade',
           rejectReason: decision.trade ? null : 'claude-no',
+          // 2026-05-02: persist structural-pattern tag on shadow records for placed
+          // bets. Was missing — making it impossible to audit which detector is
+          // responsible for losing bets (47 placed MLB live-edge shadows all tagged
+          // (claude/manual) in audit). Now we can join shadow → settlement → detector.
+          structuralPattern: decision._structuralPattern ?? null,
           claudeConfidence: decision.confidence ?? null,
           decisionPrice: price,
           edge: decision.confidence != null ? Math.round((decision.confidence - price) * 100) : null,
@@ -9140,6 +9165,141 @@ async function checkLiveScoreEdges() {
         }
       } catch (e) {
         console.error(`[trailer-hold] Error for game:`, e.message);
+      }
+    }
+  }
+
+  // === PHASE 7: TRAIL-2RUN-P2 SWING (2026-05-02) ==============================
+  // Inverse of trailer-hold: this cell LOSES games (20% game-WR n=10) but
+  // has a 50% rate of recovering ≥15¢ intra-game with avg max-rec +22¢. The
+  // edge is in the swing, not the settlement — opposite exit discipline.
+  //
+  // Cell: mlb-trail-2run-P2 (trailer down 2 runs, inning 2)
+  // EV at 34¢ entry: 50% × +15¢ + 50% × -10¢ = +2.5¢/contract = +7% ROI
+  // Marginal but real; ship small.
+  if (cachedPrices.size > 0) {
+    for (const g of liveGames) {
+      try {
+        if (g.league !== 'mlb') continue;
+        if (g.diff !== 2) continue;
+        if (g.period !== 2) continue;
+
+        const trailingIsHome = g.homeScore < g.awayScore;
+        const trailingTeam   = trailingIsHome ? g.home : g.away;
+        const leadingTeam    = trailingIsHome ? g.away : g.home;
+        const trailingAbbr   = trailingTeam.team?.abbreviation ?? '';
+        const leadingAbbr    = leadingTeam.team?.abbreviation ?? '';
+        if (!trailingAbbr || !leadingAbbr) continue;
+
+        const trailingTicker = [...cachedPrices.keys()].find(t => {
+          const suffix = t.split('-').pop()?.toUpperCase() ?? '';
+          return t.startsWith('KXMLBGAME') &&
+                 suffix === trailingAbbr.toUpperCase() &&
+                 tickerHasTeam(t.toLowerCase(), trailingAbbr) &&
+                 tickerHasTeam(t.toLowerCase(), leadingAbbr);
+        });
+        if (!trailingTicker) continue;
+
+        const trailingPrice = cachedPrices.get(trailingTicker)?.yes ?? 0;
+        if (trailingPrice < 0.28 || trailingPrice > 0.40) continue;
+
+        const trailingBase = trailingTicker.lastIndexOf('-') > 0
+          ? trailingTicker.slice(0, trailingTicker.lastIndexOf('-'))
+          : trailingTicker;
+
+        const lockUntil = stopLocks.get(trailingBase);
+        if (lockUntil && Date.now() < lockUntil) continue;
+
+        const hasPortfolioPos = openPositions.some(p => {
+          const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
+          return pBase === trailingBase;
+        });
+        if (hasPortfolioPos) continue;
+
+        let hasJsonlPos = false;
+        if (existsSync(TRADES_LOG)) {
+          try {
+            const dupStart = new Date(etNow().toISOString().slice(0,10) + 'T04:00:00Z').getTime();
+            const jLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+            for (const l of jLines) {
+              try {
+                const jt = JSON.parse(l);
+                if (jt.status === 'testing-void') continue;
+                const jtMs = jt.timestamp ? Date.parse(jt.timestamp) : 0;
+                if (jtMs < dupStart) continue;
+                if (tickerHasTeam((jt.ticker ?? '').toLowerCase(), trailingAbbr) &&
+                    tickerHasTeam((jt.ticker ?? '').toLowerCase(), leadingAbbr)) {
+                  hasJsonlPos = true; break;
+                }
+              } catch {}
+            }
+          } catch {}
+        }
+        if (hasJsonlPos) continue;
+
+        const tsKey = 'trail-swing:' + trailingBase;
+        if (Date.now() - (tradeCooldowns.get(tsKey) ?? 0) < 8 * 60 * 1000) continue;
+        tradeCooldowns.set(tsKey, Date.now());
+
+        // Smaller sizing than trailer-hold (3% vs 4%) — n=10 sample, marginal EV
+        const tsMaxTrade = Math.min(getBankroll() * 0.03, getAvailableCash('kalshi'));
+        const tsQty = Math.max(1, Math.floor(tsMaxTrade / trailingPrice));
+        const tsBetAmount = tsQty * trailingPrice;
+        if (tsBetAmount < 5) continue;
+
+        const priceCents = Math.round(trailingPrice * 100);
+        console.log(`[trail-swing] 🔁 BUY ${trailingAbbr} @ ${priceCents}¢ × ${tsQty} | inn2 d=2 swing | target +15¢`);
+
+        const tsResult = await kalshiPost('/portfolio/orders', {
+          ticker: trailingTicker,
+          action: 'buy',
+          side: 'yes',
+          count: tsQty,
+          yes_price: Math.min(99, priceCents + 2),
+        });
+        if (tsResult.ok) {
+          const tsOrder = tsResult.data?.order ?? {};
+          const tsFill = tsOrder.count ?? tsQty;
+          const tsDeployed = Math.round(tsFill * trailingPrice * 100) / 100;
+          const tsTrade = {
+            id: tsOrder.order_id ?? `ts-${Date.now()}`,
+            timestamp: new Date().toISOString(),
+            strategy: 'trail-swing',
+            exchange: 'kalshi',
+            ticker: trailingTicker,
+            title: cachedPrices.get(trailingTicker)?.title ?? `${trailingAbbr} vs ${leadingAbbr}`,
+            side: 'yes',
+            entryPrice: trailingPrice,
+            entryDiff: g.diff,
+            entryPeriod: g.period,
+            quantity: tsFill,
+            deployCost: tsDeployed,
+            confidence: 0.50,
+            reasoning: `STRUCTURAL SWING: MLB trail-2run-P2 cell at ${priceCents}¢ — 50% recover ≥15¢ n=10. Sell at +15¢ or -10¢.`,
+            status: 'open',
+            _structuralPattern: 'mlb-trail-2run-P2-swing',
+          };
+          appendFileSync(TRADES_LOG, JSON.stringify(tsTrade) + '\n');
+          openPositions.push(tsTrade);
+          gameEntries.set(trailingBase, { ticker: trailingTicker, price: trailingPrice, lastScoreKey: scoreKey(g.awayScore, g.homeScore) });
+          tradeCooldowns.set(trailingBase, Date.now());
+          await tg(
+            `🔁 <b>TRAIL-SWING — KALSHI</b>\n\n` +
+            `📋 <b>GAME</b>\n` +
+            `${cachedPrices.get(trailingTicker)?.title ?? trailingTicker}\n` +
+            `Score: ${g.awayScore}-${g.homeScore} (${trailingAbbr} trailing 2) | Inning 2\n\n` +
+            `📊 <b>METRICS</b>\n` +
+            `Bought ${trailingAbbr} YES @ ${priceCents}¢ × ${tsFill} = <b>$${tsDeployed.toFixed(2)}</b>\n` +
+            `Cell history: 50% recover ≥15¢ (n=10), avg max-rec +22¢\n` +
+            `Strategy: SWING — sell at +15¢ profit OR -10¢ loss\n\n` +
+            `🧠 <b>REASONING</b>\n` +
+            `Inverse of trailer-hold: this cell loses 80% of games but generates intra-game swings. Capture the +15¢ pop and exit; do NOT hold.`
+          );
+        } else {
+          console.error(`[trail-swing] Order failed:`, tsResult.status, JSON.stringify(tsResult.data));
+        }
+      } catch (e) {
+        console.error(`[trail-swing] Error for game:`, e.message);
       }
     }
   }
@@ -12945,6 +13105,86 @@ async function managePositions() {
 
           // Otherwise: HOLD. Skip all other exit paths (no trailing stop, no
           // bleed-out, no WE-floor, no swing-expiry). Settlement reconciler resolves.
+          continue;
+        }
+
+        // === TRAIL-SWING EXIT PATHS (2026-05-02) ===
+        // mlb-trail-2run-P2 cell: 20% game-WR but 50% recover ≥15¢ intra-game.
+        // We MUST exit on swing — holding kills the trade. Hard rules:
+        //   1. +15¢ profit-lock → sell ALL
+        //   2. -10¢ hard stop → cut
+        //   3. Deficit grows → thesis broken, sell
+        //   4. Inning > 4 → swing window closing, exit at market
+        if (trade.strategy === 'trail-swing') {
+          const tsProfit = currentPrice - entryPrice;
+
+          if (tsProfit >= 0.15) {
+            const gainPct = Math.round((tsProfit / entryPrice) * 100);
+            console.log(`[exit] 🔁💰 TRAIL-SWING PROFIT-LOCK: ${trade.ticker} +${(tsProfit*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
+            const result = await executeSell(trade, qty, currentPrice, 'trail-swing-profit-lock');
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `🔁💰 <b>TRAIL-SWING PROFIT-LOCK</b>\n\n` +
+                `${trade.title}\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(tsProfit*100).toFixed(0)}¢, +${gainPct}%)\n` +
+                `Profit: <b>+$${(qty * tsProfit).toFixed(2)}</b>\n\n` +
+                `💬 +15¢ swing target hit — locked before reversal`
+              );
+            }
+            continue;
+          }
+
+          if (tsProfit <= -0.10) {
+            console.log(`[exit] 🔁🚨 TRAIL-SWING HARD STOP: ${trade.ticker} ${(tsProfit*100).toFixed(0)}¢ — cutting`);
+            const result = await executeSell(trade, qty, currentPrice, 'trail-swing-hard-stop');
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `🔁🚨 <b>TRAIL-SWING HARD STOP</b>\n\n` +
+                `${trade.title}\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢\n` +
+                `Loss: $${(qty * tsProfit).toFixed(2)}\n\n` +
+                `💬 -10¢ stop — swing failed, cut`
+              );
+            }
+            continue;
+          }
+
+          if (trade.entryDiff != null && ctx?.diff != null && ctx.diff > trade.entryDiff) {
+            console.log(`[exit] 🔁🛑 TRAIL-SWING THESIS BROKEN: ${trade.ticker} deficit ${trade.entryDiff}→${ctx.diff} — exiting`);
+            const result = await executeSell(trade, qty, currentPrice, 'trail-swing-thesis-broken');
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `🔁🛑 <b>TRAIL-SWING THESIS BROKEN</b>\n\n` +
+                `${trade.title}\n` +
+                `Entry deficit: ${trade.entryDiff} run(s) → Now: ${ctx.diff} run(s)\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢\n` +
+                `${tsProfit >= 0 ? `Profit: +$${(qty * tsProfit).toFixed(2)}` : `Loss: $${(qty * tsProfit).toFixed(2)}`}\n\n` +
+                `💬 Deficit grew — swing window gone`
+              );
+            }
+            continue;
+          }
+
+          if (ctx?.period != null && ctx.period > 4) {
+            console.log(`[exit] 🔁⏰ TRAIL-SWING WINDOW CLOSED: ${trade.ticker} now inn${ctx.period} — selling at market`);
+            const result = await executeSell(trade, qty, currentPrice, 'trail-swing-window-closed');
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `🔁⏰ <b>TRAIL-SWING WINDOW CLOSED</b>\n\n` +
+                `${trade.title}\n` +
+                `Now in inning ${ctx.period} — past P2 swing thesis\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢\n` +
+                `${tsProfit >= 0 ? `Profit: +$${(qty * tsProfit).toFixed(2)}` : `Loss: $${(qty * tsProfit).toFixed(2)}`}`
+              );
+            }
+            continue;
+          }
+
+          // Otherwise: hold for swing — skip all other exit paths
           continue;
         }
 
