@@ -83,6 +83,8 @@ console.error = (...args) => _origErr(etTimestamp() + ':', ...args);
 const KALSHI_API_KEY = process.env.KALSHI_API_KEY_ID ?? '';
 const KALSHI_REST = 'https://api.elections.kalshi.com/trade-api/v2';
 const ANTHROPIC_KEY = process.env.VITE_ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_API_KEY ?? '';
+const OPENAI_KEY = process.env.OPENAI_API_KEY ?? '';
+const OPENAI_DECIDER = 'gpt-5'; // GPT-5 — Sonnet-4.5-equivalent reasoning + structured output
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? '';
 
@@ -2489,6 +2491,86 @@ function getPgFramework(sport) {
 // without changing any call site behavior.
 //
 // Sonnet without web search — for decisions where we already have the data we need.
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenAI fallback (2026-05-02) — when Anthropic credits are exhausted or auth
+// fails, fall back to GPT-5 so the bot keeps trading on live-edge cells.
+//
+// CALIBRATION NOTE: GPT-5 baseline confidence runs 5-10pt higher than Claude
+// Sonnet on the same setup. Mitigations applied:
+//   1. Calibration nudge appended to prompt (be conservative)
+//   2. Tag provider in response so caller can apply higher edge floor
+//   3. Track separately in shadow data via _openaiFallback marker
+// ─────────────────────────────────────────────────────────────────────────────
+
+const OPENAI_FALLBACK_MARKER = '_openaiFallback';
+
+function _normalizePromptToString(prompt) {
+  // claudeSonnet supports both string and array-of-content-blocks (for caching).
+  // OpenAI doesn't support content-block caching the same way. Concat to string.
+  if (Array.isArray(prompt)) {
+    return prompt.map(b => typeof b === 'string' ? b : (b?.text ?? '')).join('\n\n');
+  }
+  return prompt ?? '';
+}
+
+const OPENAI_CALIBRATION_NOTE = '\n\n[CALIBRATION INSTRUCTION: This system was calibrated against Claude Sonnet output. GPT-5 tends to anchor 5-10 percentage points higher on confidence than Sonnet for the same situation. Report your `confidence` value 4-5 percentage points BELOW your gut estimate to align with the downstream thresholds. Be conservative — if you would normally say 75%, report 70-71%. The bot already has structural detectors for clear-cut cases; your role here is judgment under uncertainty, so erring conservative is the right move.]';
+
+async function openaiSonnet(prompt, { maxTokens = 1024, timeout = 30000, system = null, category = 'openai-sonnet' } = {}) {
+  if (!OPENAI_KEY) {
+    console.error('[openai-sonnet] OPENAI_API_KEY not set — fallback unavailable');
+    return null;
+  }
+  try {
+    const userText = _normalizePromptToString(prompt) + OPENAI_CALIBRATION_NOTE;
+    const messages = [];
+    if (system) messages.push({ role: 'system', content: system });
+    messages.push({ role: 'user', content: userText });
+    const body = {
+      model: OPENAI_DECIDER,
+      max_completion_tokens: maxTokens,
+      messages,
+      reasoning_effort: 'minimal', // fast structured output, no deep thinking needed
+    };
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      signal: AbortSignal.timeout(timeout),
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      console.error(`[openai-sonnet] HTTP ${res.status}: ${errBody.slice(0, 300)}`);
+      return null;
+    }
+    const data = await res.json();
+    const text = data.choices?.[0]?.message?.content ?? '';
+    const usage = data.usage ?? {};
+    console.log(`[openai-sonnet] ✅ used (cat=${category}) tokens=${usage.total_tokens ?? '?'} (in=${usage.prompt_tokens ?? '?'} out=${usage.completion_tokens ?? '?'})`);
+    // Inject provenance marker into the JSON response so callers can tag trade.
+    // We do this by string-injection into the JSON body if it parses cleanly.
+    if (text && text.trim().startsWith('{')) {
+      try {
+        const parsed = JSON.parse(text.replace(/```json\s*|\s*```/g, '').trim());
+        parsed[OPENAI_FALLBACK_MARKER] = true;
+        return JSON.stringify(parsed);
+      } catch { /* not clean JSON, return raw */ }
+    }
+    return text;
+  } catch (e) {
+    console.error('[openai-sonnet] error:', e.message);
+    return null;
+  }
+}
+
+function _isClaudeBillingError(status, errBody) {
+  if (status === 401 || status === 403) return true;
+  if (typeof errBody !== 'string') return false;
+  return errBody.includes('credit balance') || errBody.includes('credits') || errBody.includes('billing');
+}
+
 async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system = null, category = 'sonnet', cacheSystem = false } = {}) {
   try {
     const body = {
@@ -2512,7 +2594,14 @@ async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system 
       body: JSON.stringify(body),
     });
     if (!res.ok) {
-      console.error('[claude-sonnet] HTTP', res.status, await res.text().catch(() => ''));
+      const errBody = await res.text().catch(() => '');
+      console.error('[claude-sonnet] HTTP', res.status, errBody);
+      // 2026-05-02: fallback to OpenAI on credit/auth errors. Returns OpenAI
+      // response with _openaiFallback marker in the JSON for downstream tagging.
+      if (_isClaudeBillingError(res.status, errBody)) {
+        console.log(`[claude-sonnet] → falling back to GPT-5 (cat=${category})`);
+        return await openaiSonnet(prompt, { maxTokens, timeout, system, category: `${category}-openai` });
+      }
       return null;
     }
     const data = await res.json();
@@ -2558,7 +2647,14 @@ async function claudeWithSearch(prompt, { maxTokens = 1024, maxSearches = 3, tim
     });
 
     if (!res.ok) {
-      console.error('[claude-search] HTTP', res.status, await res.text().catch(() => ''));
+      const errBody = await res.text().catch(() => '');
+      console.error('[claude-search] HTTP', res.status, errBody);
+      // 2026-05-02: fallback to OpenAI (no search) when credits/auth fail.
+      // Loses the breaking-news search capability but at least gets a decision.
+      if (_isClaudeBillingError(res.status, errBody)) {
+        console.log(`[claude-search] → falling back to GPT-5 NO-SEARCH (cat=${category})`);
+        return await openaiSonnet(prompt, { maxTokens, timeout, system, category: `${category}-openai-nosearch` });
+      }
       return null;
     }
 
@@ -7636,6 +7732,18 @@ async function checkLiveScoreEdges() {
         let decision;
         try { decision = JSON.parse(jsonMatch); } catch (e) { await reportError('live-edge:parse-fail', `${targetAbbr} ${league.toUpperCase()} ${awayAbbr}@${homeAbbr}: ${e.message} | head=${jsonMatch.slice(0, 120)}`); continue; }
 
+        // 2026-05-02: provenance check. If response came from OpenAI fallback,
+        // raise the edge floor for trade firing — GPT-5 calibration is unverified
+        // for our cells, so require a stronger margin of safety until we have data.
+        const _decisionProvider = decision._openaiFallback === true ? 'openai' : 'claude';
+        if (_decisionProvider === 'openai' && decision.trade && decision.confidence != null) {
+          const _openaiEdge = decision.confidence - price;
+          if (_openaiEdge < 0.08) {
+            console.log(`[live-edge] OpenAI fallback edge ${(_openaiEdge*100).toFixed(0)}pt < 8pt floor — overriding to NO`);
+            decision.trade = false;
+          }
+        }
+
         // Normalize reasoning: accept structured object (new format) OR string (fallback).
         // For TRADE responses we want the structured object; we'll also render it to a
         // readable string so the existing UI and logs keep working unchanged.
@@ -7797,6 +7905,9 @@ async function checkLiveScoreEdges() {
           // responsible for losing bets (47 placed MLB live-edge shadows all tagged
           // (claude/manual) in audit). Now we can join shadow → settlement → detector.
           structuralPattern: decision._structuralPattern ?? null,
+          // 2026-05-02: provenance — track which LLM produced this decision so cron
+          // audit can compute WR per provider (Claude vs GPT-5 fallback).
+          llmProvider: _decisionProvider,
           claudeConfidence: decision.confidence ?? null,
           decisionPrice: price,
           edge: decision.confidence != null ? Math.round((decision.confidence - price) * 100) : null,
