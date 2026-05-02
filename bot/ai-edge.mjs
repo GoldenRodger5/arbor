@@ -897,9 +897,15 @@ function detectNbaQ2Leader({ league, period, gameDetail, diff, weTimeAdj, price,
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff < 5) return null; // need meaningful lead at this stage
-  if (price < 0.50 || price > 0.65) return null;
+  // 2026-05-02 DIFF-AWARE CAP from bucket audit. Big leads (d>=9) hold up at
+  // higher prices: shadow shows 70-75¢ at 100% WR (n=4), 75-80¢ at 100% (n=2).
+  // Smaller leads (d=5-8) leak above 65¢: 70-75¢ shows 36% WR (n=11) ⚠️.
+  if (diff >= 9 && (price < 0.50 || price > 0.78)) return null;
+  if (diff < 9 && (price < 0.50 || price > 0.65)) return null;
+  // 2026-05-02 BUCKET-WR ANCHORING: dropped 5pt edge floor. Cell ≥9pt-lead
+  // shows 100% WR at 70-80¢ — empirical authority over WE adjustments.
   const edge = weTimeAdj - price;
-  if (edge < 0.05) return null;
+  if (edge < -0.05) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
@@ -938,8 +944,12 @@ function detectNbaQ3Leader({ league, period, gameDetail, diff, weTimeAdj, price,
   // Tighter diff window: 4-8 pts. Filters TOR-CLE-style 10pt-lead-collapse cases.
   // Bigger leads (>8) more vulnerable to comeback runs; smaller (<4) too marginal.
   if (diff < 4 || diff > 8) return null;
-  // Tighter price band: 50-62¢ (was 50-65¢). Forces deeper underpricing.
-  if (price < 0.50 || price > 0.62) return null;
+  // 2026-05-02 BUCKET REFINEMENT: cap loosened 62¢ → 70¢. Bucket audit shows
+  // d=7-8 at 60-65¢: 100% WR (n=3), 65-70¢: 100% (n=3). Previous 62¢ cap was
+  // missing the 65-70¢ winners. Bucket profile across the cell:
+  //   50-55: 100% n=3 / 60-65: 100% / 65-70: 100% (small but consistent)
+  //   70-75: 17% (n=6) ⚠️ — keep blocked
+  if (price < 0.50 || price > 0.70) return null;
   // Time window: 4-10 min remaining in Q3. Skips very early Q3 (TOR-CLE was at 11:13).
   const m = (gameDetail || '').match(/^(\d+):(\d+)/);
   if (!m) return null;
@@ -947,8 +957,9 @@ function detectNbaQ3Leader({ league, period, gameDetail, diff, weTimeAdj, price,
   if (minsLeft < 4 || minsLeft > 10) return null;
   // Require WE ≥70% (filter low-confidence reads)
   if (weTimeAdj < 0.70) return null;
+  // 2026-05-02 BUCKET-WR ANCHORING: dropped 5pt edge floor.
   const edge = weTimeAdj - price;
-  if (edge < 0.05) return null;
+  if (edge < -0.05) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
@@ -1284,8 +1295,13 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
       return null;
     }
   }
-  if (period === 6 && diff === 1 && price > 0.50) {
-    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn6-1run', ticker }); } catch {} }
+  // 2026-05-02 BUCKET REFINEMENT for inn-6 d=1: extended audit reveals the
+  // 65-70¢ band has 82% WR n=11 (+14pt EV) — was blocked by old ≤50¢ rule.
+  // Bucket profile: 60-65: 100% (n=5), 65-70: 82% (n=11) ✅
+  //                 70-75: 57% (n=14), 75-80: 33% (n=6) ⚠️ block
+  // Allow inn-6 d=1 up to 70¢; block above.
+  if (period === 6 && diff === 1 && price > 0.70) {
+    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn6-1run-above70', ticker }); } catch {} }
     return null;
   }
   if (period === 6 && diff === 2) {
