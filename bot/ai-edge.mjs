@@ -597,6 +597,11 @@ const MAX_PRICE = 0.75;           // Default ceiling — use getMaxPrice(league,
 // When omitted, falls back to the conservative (1-point) value.
 function getMaxPrice(league, period, diff = 1) {
   if (league === 'mlb') {
+    // 2026-05-02: inn 8-9 raised to 0.91 ceiling so detectMlbInn89Leader's
+    // 70-90¢ band isn't silently blocked by the generic ceiling at line 7592.
+    // Closer-territory leaders settle 88-95% historically; an 85-90¢ entry
+    // is structurally sound, not "market already priced in".
+    if (period >= 8) return 0.91;
     if (diff >= 4) return 0.88;
     if (diff >= 3) return 0.86;
     if (diff >= 2) return 0.82;
