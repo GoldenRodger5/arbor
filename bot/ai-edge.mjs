@@ -3726,8 +3726,14 @@ function getPositionSize(exchange = 'kalshi', confidenceMargin = 0, highConvTier
     const multiplier = Math.min(2.5, 1 + (confidenceMargin - 0.05) * 10);
     const scaledSize = size * multiplier;
     const ceiling = getTradeCapCeiling();
-    size = Math.min(scaledSize, ceiling);
-    if (multiplier > 1.1) console.log(`[sizing] High confidence (+${(confidenceMargin*100).toFixed(0)}%): ${multiplier.toFixed(1)}x → $${size.toFixed(2)}`);
+    // 2026-05-02: BANKROLL HARD CAP — even with confidence multiplier, no single
+    // trade exceeds 15% of bankroll. ALA@ATH 2026-05-02 sized at $22 (26% of $84
+    // bankroll) on a 16pt edge. Cell crashed -55% in 1min. Single-game variance
+    // at small bankroll is too dangerous to size that aggressively. Was relying
+    // on getTradeCapCeiling ($200) which doesn't scale with bankroll.
+    const bankrollCap = bankroll * 0.15;
+    size = Math.min(scaledSize, ceiling, bankrollCap);
+    if (multiplier > 1.1) console.log(`[sizing] High confidence (+${(confidenceMargin*100).toFixed(0)}%): ${multiplier.toFixed(1)}x → $${size.toFixed(2)} (15%-bankroll cap=$${bankrollCap.toFixed(2)})`);
   }
 
   // Reduce size after consecutive losses
@@ -3873,7 +3879,11 @@ function checkDrawdownBreaker() {
       console.log(`[risk] FULL HALT: ${haltReason}`);
       return false;
     }
-    if (weeklyDD >= 0.15 && softHaltUntilMs < Date.now() + 24 * 60 * 60 * 1000) {
+    // 2026-05-02: bankroll floor for weekly halt — same logic as daily.
+    // SOFT_HALT_BANKROLL_FLOOR ($1000) is defined above. Below scale, weekly
+    // variance can hit 15% drawdown easily on $80-$200 bankrolls; halting
+    // paralyzes the compounding phase we need most.
+    if (weeklyDD >= 0.15 && softHaltUntilMs < Date.now() + 24 * 60 * 60 * 1000 && bk >= 1000) {
       // Block until next Monday 00:00 ET
       const et = etNow();
       const daysToMonday = (8 - (et.getDay() || 7)) % 7 || 7;
@@ -3885,6 +3895,8 @@ function checkDrawdownBreaker() {
       try { tg(`⚠️ <b>SOFT HALT — WEEKLY DRAWDOWN</b>\n\n${softHaltReason}`); } catch {}
       console.log(`[risk] SOFT HALT (weekly): ${softHaltReason}`);
       return false;
+    } else if (weeklyDD >= 0.15 && bk < 1000) {
+      console.log(`[risk] WEEKLY SOFT HALT SKIPPED — bankroll $${bk.toFixed(2)} below $1000 floor (DD=-${(weeklyDD * 100).toFixed(1)}%)`);
     }
   }
   return true;
@@ -12829,11 +12841,16 @@ async function managePositions() {
               dropThreshold = 0.10; minHoldMin = 8;
             } else if (_ctxLeague === 'nhl') {
               dropThreshold = 0.12; minHoldMin = 10;
-            } else if (_isSoccer && _ctxPeriod && _ctxPeriod < 60) {
-              // Soccer 1st half: low scoring, single goal = huge swing, lots left
+            } else if (_isSoccer && _ctxPeriod === 1) {
+              // 2026-05-02 FIX: was `_ctxPeriod < 60` which was a period-vs-minute
+              // confusion bug — period=2 (2nd half) is < 60 so soccer bleed-out
+              // was permanently DISABLED in any half. ALA@ATH 2026-05-02 dropped
+              // -55% in 1 min with no exit attempt because of this.
+              // Real intent: only disable bleed-out in 1st half (single goal swing huge).
+              // 2nd half: enable with sport-tuned thresholds.
               bleedOutEnabled = false;
             } else if (_isSoccer) {
-              dropThreshold = 0.15; minHoldMin = 15;
+              dropThreshold = 0.15; minHoldMin = 10;
             } else {
               // MLB (default) and any unrecognized league: 10¢ / 8min.
               dropThreshold = 0.10; minHoldMin = 8;
