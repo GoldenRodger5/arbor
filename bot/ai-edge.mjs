@@ -8863,7 +8863,10 @@ async function checkLiveScoreEdges() {
         //   - price cap 60¢ (avoid the 71-80¢ kill zone)
         //   - conf floor 78% (filter low-conviction)
         //   - P3 block (highest-variance period; shadow proves trap)
-        if (!isSwingMode && league === 'nhl' && targetAbbr === leadingAbbr) {
+        // 2026-05-02: NHL gate bypassed when structural detector matches.
+        // detectNhlP3ClosingOut allows d=1 75-78¢ and d≥2 ≤90¢ — the gate's
+        // generic "60¢ cap" was blocking valid structural fires.
+        if (!isSwingMode && !item._structuralDecision && league === 'nhl' && targetAbbr === leadingAbbr) {
           if (price > 0.60) {
             console.log(`[live-edge] BLOCKED ${targetAbbr}: NHL leader price ${(price*100).toFixed(0)}¢ > 60¢ — shadow data shows -$0.15 EV/contract above 70¢ entries`);
             logScreen({ stage: 'live-edge-skip', result: 'skip-nhl-price-cap', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `NHL leader at ${(price*100).toFixed(0)}¢ above 60¢ cap — shadow shows systematic overpricing in this band.` });
@@ -8887,7 +8890,10 @@ async function checkLiveScoreEdges() {
         // inning. The 1-run block above catches some but inning 9 with any lead size has
         // been a net loser. Block all inning 9 live-prediction entries (swing mode allowed
         // since it has its own +12¢ exit logic that doesn't depend on settlement).
-        if (!isSwingMode && league === 'mlb' && period === 9 && targetAbbr === leadingAbbr) {
+        // 2026-05-02: MLB inn-9 gate bypassed when structural detector matches.
+        // detectMlbInn89Leader explicitly covers inn 8-9 with diff-aware caps;
+        // the generic block was preventing those fires.
+        if (!isSwingMode && !item._structuralDecision && league === 'mlb' && period === 9 && targetAbbr === leadingAbbr) {
           console.log(`[live-edge] BLOCKED ${targetAbbr}: MLB inning 9 live-prediction — 0/4 historical, all losses. Closer/trailing-team variance too high.`);
           logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-9th', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `MLB live-prediction inning 9 historical: 0/4, -$27.52. Blocked.` });
           continue;
@@ -8897,7 +8903,11 @@ async function checkLiveScoreEdges() {
         // as terrible as inning 9 but materially negative. Tighten: require both stronger
         // edge AND higher confidence to enter MLB 7th inning. The remaining trades passing
         // this gate are the highest-conviction ones where we still want to participate.
-        if (!isSwingMode && league === 'mlb' && period === 7 && targetAbbr === leadingAbbr) {
+        // 2026-05-02: MLB inn-7 gate bypassed when structural detector matches.
+        // detectMlbInn5To7Leader inn-7 has its own per-cell rules (d=1 ≤45¢,
+        // d=2 50-72 OR 80-85, d≥3 ≤88¢). The generic edge≥12 / conf≥80 gate
+        // was blocking those structural cells.
+        if (!isSwingMode && !item._structuralDecision && league === 'mlb' && period === 7 && targetAbbr === leadingAbbr) {
           const edge7 = (decision.confidence ?? 0) - price;
           const conf7 = decision.confidence ?? 0;
           if (edge7 < 0.12 || conf7 < 0.80) {
