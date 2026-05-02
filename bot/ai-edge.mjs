@@ -1503,6 +1503,22 @@ async function kalshiPost(path, body) {
   return { ok: res.ok, status: res.status, data: await res.json().catch(() => ({})) };
 }
 
+// 2026-05-01: kalshiDelete helper for cancelling orders.
+// Previously phantom-trade-prevention logic just GAVE UP on orders that didn't
+// fill within 1.5s, leaving them resting in the orderbook. They could then fill
+// hours later when market moved through the limit price → orphan position the
+// bot doesn't track. Now we actively CANCEL phantoms to prevent late fills.
+async function kalshiDelete(path) {
+  if (DRY_RUN) {
+    console.log(`[DRY RUN] Would DELETE ${path}`);
+    return { ok: true, status: 200, data: {} };
+  }
+  const res = await fetch(`${KALSHI_REST}${path}`, {
+    method: 'DELETE', headers: kalshiHeaders('DELETE', path),
+  });
+  return { ok: res.ok, status: res.status, data: await res.json().catch(() => ({})) };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Telegram
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2539,6 +2555,19 @@ const stoppedBets = new Map();    // gameBase → { team, stoppedAt, entryPrice 
 const lastGameStates = new Map(); // "ATH@NYM" → "1-0-5" (score-period, for change detection)
 const gameEntries = new Map();    // "game:ATH@NYM" → { count: 2, lastPrice: 0.62, totalDeployed: 24.36 }
 const lastSeenPrices = new Map(); // ticker → { price, ts } for line movement detection
+
+// 2026-05-01: Phantom order tracker for orphan recovery. When phantom-trade-prevention
+// fires AND we couldn't successfully cancel the order (race condition with fill), we
+// track the order context here. If the order later fills (showing up as an "untracked
+// position" in Kalshi sync), the reconciler can adopt it as a recovered bot trade with
+// proper strategy + entry context — instead of mislabeling it as a manual bet.
+//
+// Real incident 2026-05-01 21:17 ET: bot placed ORL buy at 53¢ at 7:45 PM, gave up
+// after 1.5s, order rested 1h 18min, filled at 9:03 PM at 55¢ × 9 contracts. Bot
+// then bought ANOTHER 8 contracts at 9:04 PM via structural detector. Net: 17
+// contracts on Kalshi vs 8 in bot's records → orphan 9 contracts unmanaged.
+const phantomOrderTracker = new Map(); // orderId -> { ticker, attemptedQty, price, ts, league, confidence, strategy }
+const PHANTOM_TRACKER_TTL_MS = 4 * 60 * 60 * 1000; // 4h — orders rarely rest longer
 
 // 2026-05-01 Tier 3 — cached ESPN /summary fetcher for NBA/NHL deep extraction
 // (player fouls, goalie info, PP state). Cached per-eventId for 60s to avoid
@@ -4383,7 +4412,14 @@ async function refreshPortfolio() {
       }
 
       // ── Part 2: Detect manual bets (Kalshi positions with no JSONL entry) ──
+      // 2026-05-01: BEFORE labeling as manual, check if this matches a recent
+      // phantom order the bot placed. If yes — adopt it as a recovered bot
+      // trade with proper strategy/entry context, not a manual mystery bet.
       const trackedTickers = new Set(trades.filter(t => t.exchange === 'kalshi').map(t => t.ticker));
+      // Prune phantom tracker entries older than TTL
+      for (const [oid, p] of phantomOrderTracker.entries()) {
+        if (Date.now() - (p.ts ?? 0) > PHANTOM_TRACKER_TTL_MS) phantomOrderTracker.delete(oid);
+      }
       for (const pos of kalshiPositions) {
         if (pos.exposure <= 0) continue;
         // Check if this position matches any tracked trade (prefix-aware)
@@ -4391,7 +4427,49 @@ async function refreshPortfolio() {
           tt === pos.ticker || tt.startsWith(pos.ticker + '-') || pos.ticker.startsWith(tt + '-')
         );
         if (!isTracked) {
-          // New untracked position — log it so P&L and calibration stay complete
+          // 2026-05-01: check phantom tracker — was this a bot order that filled late?
+          let phantomMatch = null;
+          for (const [orderId, p] of phantomOrderTracker.entries()) {
+            // Match exact ticker (phantom orders have full team-suffix tickers)
+            if (p.ticker === pos.ticker) {
+              phantomMatch = { orderId, ...p };
+              break;
+            }
+          }
+          if (phantomMatch) {
+            // RECOVERED phantom — adopt with original bot context
+            const recoveredQty = Math.round(parseFloat(pos.position_fp ?? '0')) || phantomMatch.attemptedQty;
+            const record = {
+              id: `recovered-${phantomMatch.orderId}`,
+              timestamp: new Date(phantomMatch.ts).toISOString(),
+              exchange: 'kalshi',
+              strategy: phantomMatch.strategy ?? 'live-prediction',
+              ticker: pos.ticker, title: pos.ticker,
+              side: 'yes',
+              deployCost: pos.cost,
+              quantity: recoveredQty,
+              entryPrice: phantomMatch.price,
+              filled: recoveredQty,
+              orderId: phantomMatch.orderId,
+              edge: null,
+              confidence: phantomMatch.confidence ?? null,
+              reasoning: `RECOVERED phantom — bot placed order ${Math.round((Date.now() - phantomMatch.ts) / 60000)}min ago, filled after retry window. Now adopted for management.`,
+              league: phantomMatch.league ?? null,
+              status: 'open',
+              exitPrice: null,
+              realizedPnL: null,
+              isRecoveredPhantom: true,
+            };
+            appendFileSync(TRADES_LOG, JSON.stringify(record) + '\n');
+            trackedTickers.add(pos.ticker);
+            phantomOrderTracker.delete(phantomMatch.orderId);
+            console.log(`[sync] ✓ RECOVERED phantom fill: ${pos.ticker} adopted as ${phantomMatch.strategy} trade (entry ${(phantomMatch.price*100).toFixed(0)}¢, qty ${recoveredQty})`);
+            try {
+              tg(`♻️ <b>RECOVERED PHANTOM POSITION</b>\nTicker: ${pos.ticker}\nStrategy: ${phantomMatch.strategy}\nEntry: ${(phantomMatch.price*100).toFixed(0)}¢ × ${recoveredQty}\nThe bot's order from ${Math.round((Date.now() - phantomMatch.ts) / 60000)}min ago filled late — now under bot management for exits.`);
+            } catch {}
+            continue;
+          }
+          // No phantom match — genuinely manual or untracked
           const record = {
             id: `manual-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
             timestamp: new Date().toISOString(),
@@ -5333,20 +5411,22 @@ async function checkLiveScoreEdges() {
                     freshPgTrade._pgFirstSellFraction = sellFraction;
                     writeFileSync(TRADES_LOG, freshPgTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
                   }
-                  console.log(`[pg-profit] ${trade.ticker} SELLING ${sellQty}/${qty} contracts @ ${Math.round(currentPricePg*100)}¢ | ${sellReason} | gain=$${(gainCents*sellQty).toFixed(2)}`);
-                  await tg(
-                    `📈 <b>PRE-GAME PROFIT TAKE</b>\n\n` +
-                    `📋 <b>POSITION</b>\n` +
-                    `${trade.title ?? trade.ticker}\n\n` +
-                    `📊 <b>METRICS</b>\n` +
-                    `Selling ${sellQty}/${qty} contracts @ ${Math.round(currentPricePg*100)}¢\n` +
-                    `Entry: ${Math.round(entryPg*100)}¢ → Now: ${Math.round(currentPricePg*100)}¢ (+${Math.round(gainCents*100)}¢)\n` +
-                    `Profit this sale: <b>+$${(gainCents*sellQty).toFixed(2)}</b>\n` +
-                    `${qty - sellQty > 0 ? `Holding ${qty - sellQty} contracts remaining` : 'Full position closed'}\n\n` +
-                    `💬 <b>REASON</b>\n` +
-                    sellReason
-                  );
-                  await executeSell(trade, sellQty, currentPricePg, sellReason);
+                  console.log(`[pg-profit] ${trade.ticker} ATTEMPTING SELL ${sellQty}/${qty} contracts @ ${Math.round(currentPricePg*100)}¢ | ${sellReason} | gain=$${(gainCents*sellQty).toFixed(2)}`);
+                  const _pgProfitResult = await executeSell(trade, sellQty, currentPricePg, sellReason);
+                  if (_pgProfitResult) {
+                    await tg(
+                      `📈 <b>PRE-GAME PROFIT TAKE</b>\n\n` +
+                      `📋 <b>POSITION</b>\n` +
+                      `${trade.title ?? trade.ticker}\n\n` +
+                      `📊 <b>METRICS</b>\n` +
+                      `Sold ${sellQty}/${qty} contracts @ ${Math.round(currentPricePg*100)}¢\n` +
+                      `Entry: ${Math.round(entryPg*100)}¢ → Now: ${Math.round(currentPricePg*100)}¢ (+${Math.round(gainCents*100)}¢)\n` +
+                      `Profit this sale: <b>+$${(gainCents*sellQty).toFixed(2)}</b>\n` +
+                      `${qty - sellQty > 0 ? `Holding ${qty - sellQty} contracts remaining` : 'Full position closed'}\n\n` +
+                      `💬 <b>REASON</b>\n` +
+                      sellReason
+                    );
+                  }
                   if (remaining >= 1) {
                     console.log(`[pg-profit] ${remaining} contracts remain — riding to ${stage === 'early' ? 'mid-game' : 'settlement'}`);
                   }
@@ -5377,14 +5457,16 @@ async function checkLiveScoreEdges() {
               writeFileSync(TRADES_LOG, expTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
             }
             const expGain = expirePrice - (trade.entryPrice ?? 0);
-            console.log(`[pg-expire] ${trade.ticker} stalled — 0-0 at inn ${game.period}, price not moving, exiting @ ${Math.round(expirePrice*100)}¢ (${expGain >= 0 ? '+' : ''}${Math.round(expGain*100)}¢)`);
-            await tg(
-              `⏰ <b>PRE-GAME STALLED EXIT</b>\n\n` +
-              `${trade.title ?? trade.ticker}\n` +
-              `Still 0-0 at inning ${game.period} — price hasn't moved, cutting to preserve capital.\n\n` +
-              `Exiting @ ${Math.round(expirePrice*100)}¢ | Entry: ${Math.round((trade.entryPrice ?? 0)*100)}¢ | P&L: ${expGain >= 0 ? '+' : ''}$${(expGain * expQty).toFixed(2)}`
-            );
-            await executeSell(trade, expQty, expirePrice, 'pg-thesis-expired-0-0-mlb');
+            console.log(`[pg-expire] ${trade.ticker} stalled — 0-0 at inn ${game.period}, attempting exit @ ${Math.round(expirePrice*100)}¢ (${expGain >= 0 ? '+' : ''}${Math.round(expGain*100)}¢)`);
+            const _expResult = await executeSell(trade, expQty, expirePrice, 'pg-thesis-expired-0-0-mlb');
+            if (_expResult) {
+              await tg(
+                `⏰ <b>PRE-GAME STALLED EXIT</b>\n\n` +
+                `${trade.title ?? trade.ticker}\n` +
+                `Still 0-0 at inning ${game.period} — price hasn't moved, cutting to preserve capital.\n\n` +
+                `Exited @ ${Math.round(expirePrice*100)}¢ | Entry: ${Math.round((trade.entryPrice ?? 0)*100)}¢ | P&L: ${expGain >= 0 ? '+' : ''}$${(expGain * expQty).toFixed(2)}`
+              );
+            }
           }
           continue;
         }
@@ -5569,17 +5651,6 @@ async function checkLiveScoreEdges() {
 
               if (d.action === 'sell_all' || d.action === 'sell') {
                 console.log(`[pg-guard] 🧠 SELL ALL (${estPct}): ${trade.ticker} | ${d.reasoning?.slice(0, 100)}`);
-                await tg(
-                  `⚠️ <b>PRE-GAME EXIT</b>\n\n` +
-                  `📋 <b>POSITION</b>\n` +
-                  `${trade.title}\n\n` +
-                  `📊 <b>METRICS</b>\n` +
-                  `Sold all @ ${Math.round(currentPrice*100)}¢\n` +
-                  `Entry: ${Math.round(entryPrice*100)}¢ | Stage: ${stage.toUpperCase()}\n` +
-                  (d.myWinEstimate != null ? `Claude's estimate: ${Math.round(d.myWinEstimate*100)}% vs market ${Math.round(currentPrice*100)}¢ — no edge\n` : '') +
-                  `\n💬 <b>REASON</b>\n` +
-                  (d.reasoning ?? 'No edge vs market price')
-                );
                 const freshLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
                 const freshTrades = freshLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
                 const freshTrade = freshTrades.find(t => t.id === trade.id);
@@ -5588,21 +5659,21 @@ async function checkLiveScoreEdges() {
                   if (result) {
                     writeFileSync(TRADES_LOG, freshTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
                     console.log(`[pg-guard] Pre-game position fully closed: ${trade.ticker}`);
+                    await tg(
+                      `⚠️ <b>PRE-GAME EXIT</b>\n\n` +
+                      `📋 <b>POSITION</b>\n` +
+                      `${trade.title}\n\n` +
+                      `📊 <b>METRICS</b>\n` +
+                      `Sold all @ ${Math.round(currentPrice*100)}¢\n` +
+                      `Entry: ${Math.round(entryPrice*100)}¢ | Stage: ${stage.toUpperCase()}\n` +
+                      (d.myWinEstimate != null ? `Claude's estimate: ${Math.round(d.myWinEstimate*100)}% vs market ${Math.round(currentPrice*100)}¢ — no edge\n` : '') +
+                      `\n💬 <b>REASON</b>\n` +
+                      (d.reasoning ?? 'No edge vs market price')
+                    );
                   }
                 }
               } else if (d.action === 'sell_half') {
                 console.log(`[pg-guard] 🧠 SELL HALF (${estPct}): ${trade.ticker} | selling ${halfSellQty}/${qty} | ${d.reasoning?.slice(0, 80)}`);
-                await tg(
-                  `⚠️ <b>PRE-GAME SELL HALF</b>\n\n` +
-                  `📋 <b>POSITION</b>\n` +
-                  `${trade.title}\n\n` +
-                  `📊 <b>METRICS</b>\n` +
-                  `Selling ${halfSellQty}/${qty} @ ${Math.round(currentPrice*100)}¢\n` +
-                  `Entry: ${Math.round(entryPrice*100)}¢ | Stage: ${stage.toUpperCase()}\n` +
-                  (d.myWinEstimate != null ? `Claude's estimate: ${Math.round(d.myWinEstimate*100)}% vs market ${Math.round(currentPrice*100)}¢ — uncertain edge\n` : '') +
-                  `\n💬 <b>REASON</b>\n` +
-                  (d.reasoning ?? 'Partial exit — estimate above market but uncertain')
-                );
                 if (halfSellQty < qty) {
                   const freshLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
                   const freshTrades = freshLines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
@@ -5612,6 +5683,17 @@ async function checkLiveScoreEdges() {
                     if (result) {
                       writeFileSync(TRADES_LOG, freshTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
                       console.log(`[pg-guard] Pre-game position halved: ${trade.ticker} (${halfSellQty} sold, ${qty - halfSellQty} holding)`);
+                      await tg(
+                        `⚠️ <b>PRE-GAME SELL HALF</b>\n\n` +
+                        `📋 <b>POSITION</b>\n` +
+                        `${trade.title}\n\n` +
+                        `📊 <b>METRICS</b>\n` +
+                        `Sold ${halfSellQty}/${qty} @ ${Math.round(currentPrice*100)}¢\n` +
+                        `Entry: ${Math.round(entryPrice*100)}¢ | Stage: ${stage.toUpperCase()}\n` +
+                        (d.myWinEstimate != null ? `Claude's estimate: ${Math.round(d.myWinEstimate*100)}% vs market ${Math.round(currentPrice*100)}¢ — uncertain edge\n` : '') +
+                        `\n💬 <b>REASON</b>\n` +
+                        (d.reasoning ?? 'Partial exit — estimate above market but uncertain')
+                      );
                     }
                   }
                 }
@@ -8447,12 +8529,63 @@ async function checkLiveScoreEdges() {
               const mktPos = (posCheck.market_positions ?? []).find(p => p.ticker === ticker);
               const realPos = Math.max(0, parseFloat(mktPos?.position_fp ?? '0'));
               if (realPos === 0) {
-                console.log(`[live-edge] 🚫 PHANTOM TRADE PREVENTED: ${ticker} order at ${(bestPrice*100).toFixed(0)}¢ didn't fill (Kalshi position=0 after 1.5s) — limit too low for fast market, skipping log`);
-                continue;
+                // 2026-05-01 BUGFIX: previously we just gave up here. The order
+                // remained resting in Kalshi's orderbook and could fill HOURS
+                // later → orphan position bot can't manage. Real incident:
+                // ORL 7:45 PM order rested 1h 18min, filled at 9:03 PM. Bot then
+                // double-bought via structural detector. Now: actively CANCEL
+                // the order. If cancel races with fill, adopt the fill.
+                const orderId = result.data?.order?.order_id ?? result.data?.id;
+                let outcomeHandled = false;
+                if (orderId) {
+                  try {
+                    const cancelRes = await kalshiDelete(`/portfolio/orders/${orderId}`);
+                    if (cancelRes.ok || cancelRes.status === 404) {
+                      console.log(`[live-edge] 🚫 PHANTOM CANCELLED: ${ticker} order ${orderId} (limit ${(bestPrice*100).toFixed(0)}¢) cancelled before it could rest-fill`);
+                      outcomeHandled = true;
+                    } else {
+                      // Cancel non-200 — possible race with fill. Re-check position.
+                      await new Promise(r => setTimeout(r, 500));
+                      const recheck = await kalshiGet(`/portfolio/positions?ticker=${ticker}`);
+                      const newMktPos = (recheck.market_positions ?? []).find(p => p.ticker === ticker);
+                      const newPos = Math.max(0, parseFloat(newMktPos?.position_fp ?? '0'));
+                      if (newPos > 0) {
+                        actualFill = newPos;
+                        console.log(`[live-edge] ✓ ADOPTED late fill: ${ticker} ${actualFill} contracts (cancel raced with fill)`);
+                        // fall through to log this as a real trade below
+                      } else {
+                        // Cancel failed AND still no position — track for reconciliation
+                        const _structPattern = item._structuralDecision?._structuralPattern ?? null;
+                        phantomOrderTracker.set(orderId, {
+                          ticker, attemptedQty: qty, price: bestPrice, ts: Date.now(),
+                          league, confidence,
+                          strategy: _structPattern ? `structural-${_structPattern}` : (isSwingMode ? 'live-swing' : 'live-prediction'),
+                        });
+                        console.log(`[live-edge] ⚠️ PHANTOM TRACKED for reconciliation: ${ticker} order ${orderId} (cancel failed, position 0) — sync will adopt if it fills later`);
+                        outcomeHandled = true;
+                      }
+                    }
+                  } catch (cancelErr) {
+                    console.log(`[live-edge] Cancel error for ${orderId}: ${cancelErr.message} — tracking for reconciliation`);
+                    const _structPattern2 = item._structuralDecision?._structuralPattern ?? null;
+                    phantomOrderTracker.set(orderId, {
+                      ticker, attemptedQty: qty, price: bestPrice, ts: Date.now(),
+                      league, confidence,
+                      strategy: _structPattern2 ? `structural-${_structPattern2}` : (isSwingMode ? 'live-swing' : 'live-prediction'),
+                    });
+                    outcomeHandled = true;
+                  }
+                } else {
+                  console.log(`[live-edge] 🚫 PHANTOM (no order ID): ${ticker} — cannot cancel, hoping for the best`);
+                  outcomeHandled = true;
+                }
+                if (outcomeHandled) continue;
+                // else fall through to log as adopted late fill (actualFill set above)
+              } else {
+                // Position exists — use the actual count
+                actualFill = realPos;
+                console.log(`[live-edge] ✓ Position-check confirmed: ${ticker} actual fill = ${actualFill} contracts`);
               }
-              // Position exists — use the actual count
-              actualFill = realPos;
-              console.log(`[live-edge] ✓ Position-check confirmed: ${ticker} actual fill = ${actualFill} contracts`);
             } catch (e) {
               // On error, fall back to assumed full fill (current behavior, slightly risky)
               console.log(`[live-edge] Position-check failed for ${ticker}: ${e.message} — assuming full fill`);
@@ -11815,8 +11948,8 @@ async function managePositions() {
           } else if (moveAgeSec <= 120 && pgEarlyWeOk) {
             console.log(`[exit] 🛡️ CONTRA BLOCKED on ${trade.ticker}: ${trade.strategy} in ${stage} stage, WE=${(ourWECt*100).toFixed(0)}% still recoverable — market overreaction, not thesis death`);
           } else if (moveAgeSec <= 120) {
-            console.log(`[exit] ⚠️ CONTRA EXIT: ${trade.ticker} — cross-confirmed ${contraMove.velocity.toFixed(1)}¢/min drop ${Math.round(moveAgeSec)}s ago, scratching full position @ ${(currentPrice*100).toFixed(0)}¢`);
-            await tgTradeExit({
+            console.log(`[exit] ⚠️ CONTRA EXIT: ${trade.ticker} — cross-confirmed ${contraMove.velocity.toFixed(1)}¢/min drop ${Math.round(moveAgeSec)}s ago, attempting to scratch full position @ ${(currentPrice*100).toFixed(0)}¢`);
+            const result = await executeSellAndNotify(trade, qty, currentPrice, 'contra-line-move', {
               kind: 'CONTRA-EXIT (price velocity)',
               title: trade.title,
               entry: entryPrice,
@@ -11826,7 +11959,6 @@ async function managePositions() {
               reason: `Market dropped ${contraMove.velocity.toFixed(1)}¢/min cross-confirmed — scratching before stop-loss`,
               isWin: pctChange >= 0,
             });
-            const result = await executeSell(trade, qty, currentPrice, 'contra-line-move');
             if (result) anyUpdated = true;
             continue;
           }
@@ -11899,8 +12031,8 @@ async function managePositions() {
             if (!lateInningSuppression && !nbaGarbageTimeSuppression && peakGain >= TRAILING_ACTIVATE && retraceFromPeak >= TRAILING_DISTANCE && stillProfitable) {
               const lockProfit = ((currentPrice - entryPrice) * 100).toFixed(0);
               const peakProfit = (peakGain * 100).toFixed(0);
-              console.log(`[exit] 🎯 TRAILING STOP: ${trade.ticker} peak=${(peakPrice*100).toFixed(0)}¢(+${peakProfit}¢) → now=${(currentPrice*100).toFixed(0)}¢ — locking +${lockProfit}¢ before further retrace`);
-              await tgTradeExit({
+              console.log(`[exit] 🎯 TRAILING STOP: ${trade.ticker} peak=${(peakPrice*100).toFixed(0)}¢(+${peakProfit}¢) → now=${(currentPrice*100).toFixed(0)}¢ — attempting to lock +${lockProfit}¢ before further retrace`);
+              const result = await executeSellAndNotify(trade, qty, currentPrice, 'trailing-stop', {
                 kind: 'TRAILING STOP',
                 title: trade.title,
                 entry: entryPrice,
@@ -11910,7 +12042,6 @@ async function managePositions() {
                 reason: `Peak ${(peakPrice*100).toFixed(0)}¢ → now ${(currentPrice*100).toFixed(0)}¢. ${(retraceFromPeak*100).toFixed(0)}¢ retrace from peak — locking +${lockProfit}¢ profit.`,
                 isWin: true,
               });
-              const result = await executeSell(trade, qty, currentPrice, 'trailing-stop');
               if (result) {
                 trade.trailingStopFiredAt = new Date().toISOString();
                 anyUpdated = true;
@@ -11989,8 +12120,8 @@ async function managePositions() {
             const priceStillFalling = prevSeen && currentPrice <= prevSeen.price + 0.01;  // flat or down
             if (tradeAgeMin >= minHoldMin && dropFromEntry >= dropThreshold && priceStillFalling) {
               const lossPct = (currentPrice - entryPrice) / entryPrice;
-              console.log(`[exit] 🩸 BLEED-OUT STOP: ${trade.ticker} entry=${(entryPrice*100).toFixed(0)}¢ → now=${(currentPrice*100).toFixed(0)}¢ (-${(dropFromEntry*100).toFixed(0)}¢, ${(lossPct*100).toFixed(0)}%) | open ${tradeAgeMin.toFixed(0)}min | thesis dead — exiting`);
-              await tgTradeExit({
+              console.log(`[exit] 🩸 BLEED-OUT STOP: ${trade.ticker} entry=${(entryPrice*100).toFixed(0)}¢ → now=${(currentPrice*100).toFixed(0)}¢ (-${(dropFromEntry*100).toFixed(0)}¢, ${(lossPct*100).toFixed(0)}%) | open ${tradeAgeMin.toFixed(0)}min | thesis dead — attempting exit`);
+              const result = await executeSellAndNotify(trade, qty, currentPrice, 'bleed-out-stop', {
                 kind: 'BLEED-OUT STOP',
                 title: trade.title,
                 entry: entryPrice,
@@ -12000,7 +12131,6 @@ async function managePositions() {
                 reason: `Price dropped ${(dropFromEntry*100).toFixed(0)}¢ from entry (${(lossPct*100).toFixed(0)}%) over ${tradeAgeMin.toFixed(0)} min and is still falling. Cutting losses before deeper drawdown.`,
                 isWin: false,
               });
-              const result = await executeSell(trade, qty, currentPrice, 'bleed-out-stop');
               if (result) anyUpdated = true;
               continue;
             }
@@ -12071,8 +12201,8 @@ async function managePositions() {
         const midLockThreshold = stage === 'early' ? 0.95 : 0.92;
         if ((stage === 'early' || stage === 'mid') && currentPrice >= midLockThreshold && profitPerContract > 0 && trade.strategy !== 'pre-game-prediction') {
           const gainPct = Math.round((profitPerContract / entryPrice) * 100);
-          console.log(`[exit] 💰 MID-GAME LOCK (${stage}): ${trade.ticker} at ${(currentPrice*100).toFixed(0)}¢ — up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}%, locking profit (${Math.round((1-currentPrice)*100)}¢ remaining not worth ${stage}-game risk)`);
-          await tgTradeExit({
+          console.log(`[exit] 💰 MID-GAME LOCK (${stage}): ${trade.ticker} at ${(currentPrice*100).toFixed(0)}¢ — up ${(profitPerContract*100).toFixed(0)}¢ / +${gainPct}%, attempting profit lock`);
+          const result = await executeSellAndNotify(trade, qty, currentPrice, 'mid-game-profit-lock', {
             kind: `PROFIT LOCK — ${stage} game`,
             title: trade.title,
             entry: entryPrice,
@@ -12082,7 +12212,6 @@ async function managePositions() {
             reason: `Only ${Math.round((1-currentPrice)*100)}¢ remaining upside — locking profit before reversal risk`,
             isWin: true,
           });
-          const result = await executeSell(trade, qty, currentPrice, 'mid-game-profit-lock');
           if (result) anyUpdated = true;
           continue;
         }
@@ -12210,8 +12339,8 @@ async function managePositions() {
         // sends TIE from ~50¢ to ~5¢ instantly. No Claude deliberation, just exit.
         if (trade.strategy === 'draw-bet' && pctChange < -0.50) {
           const lossAmt = Math.abs(profitPerContract) * qty;
-          console.log(`[exit] ⚽🛑 DRAW-BET STOP: ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — cutting loss at $${lossAmt.toFixed(2)}`);
-          await tgTradeExit({
+          console.log(`[exit] ⚽🛑 DRAW-BET STOP: ${trade.ticker} down ${(pctChange*100).toFixed(0)}% — attempting to cut loss at $${lossAmt.toFixed(2)}`);
+          const result = await executeSellAndNotify(trade, qty, currentPrice, 'draw-bet-stop', {
             kind: 'DRAW-BET STOP LOSS',
             title: trade.title,
             entry: entryPrice,
@@ -12221,7 +12350,6 @@ async function managePositions() {
             reason: `Goal likely broke the tie — exiting before further collapse`,
             isWin: false,
           });
-          const result = await executeSell(trade, qty, currentPrice, 'draw-bet-stop');
           if (result) anyUpdated = true;
           continue;
         }
@@ -12437,14 +12565,7 @@ async function managePositions() {
                   if (match) {
                     const d = JSON.parse(match);
                     if (d.action === 'sell') {
-                      console.log(`[exit] 🧠🔄🛑 CLAUDE SWING-STOP: ${trade.ticker} down ${Math.round(-swingProfit*100)}¢ — selling | ${d.reasoning?.slice(0,80)}`);
-                      await tg(
-                        `🔄🛑 <b>SWING STOP (Claude)</b>\n\n` +
-                        `${trade.title}\n` +
-                        `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (${(swingProfit*100).toFixed(0)}¢)\n` +
-                        `Loss: <b>$${(qty * swingProfit).toFixed(2)}</b>\n` +
-                        `Claude: ${d.reasoning?.slice(0,100) ?? 'thesis failed'}`
-                      );
+                      console.log(`[exit] 🧠🔄🛑 CLAUDE SWING-STOP: ${trade.ticker} down ${Math.round(-swingProfit*100)}¢ — attempting sell | ${d.reasoning?.slice(0,80)}`);
                       {
                         const lh = trade.ticker.lastIndexOf('-');
                         const gb = lh > 0 ? trade.ticker.slice(0, lh) : trade.ticker;
@@ -12452,7 +12573,16 @@ async function managePositions() {
                         swingExitState.set(gb, { ts: Date.now(), scoreKey: sk, exitPrice: currentPrice, reason: 'hard-stop' });
                       }
                       const result = await executeSell(trade, qty, currentPrice, 'swing-hard-stop');
-                      if (result) anyUpdated = true;
+                      if (result) {
+                        anyUpdated = true;
+                        await tg(
+                          `🔄🛑 <b>SWING STOP (Claude)</b>\n\n` +
+                          `${trade.title}\n` +
+                          `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (${(swingProfit*100).toFixed(0)}¢)\n` +
+                          `Loss: <b>$${(qty * swingProfit).toFixed(2)}</b>\n` +
+                          `Claude: ${d.reasoning?.slice(0,100) ?? 'thesis failed'}`
+                        );
+                      }
                       continue;
                     } else {
                       console.log(`[exit] 🧠🛡️ CLAUDE HOLD swing-stop: ${trade.ticker} down ${Math.round(-swingProfit*100)}¢ — holding | ${d.reasoning?.slice(0,80)}`);
@@ -12495,13 +12625,7 @@ async function managePositions() {
               if (myWE - currentPrice >= 0.03) edgeStillAlive = true;
             }
             if (periodsElapsed >= minPeriodsForExpiry && swingProfit < 0.08 && !edgeStillAlive) {
-              console.log(`[exit] 🔄⏰ SWING THESIS-EXPIRY: ${trade.ticker} only +${(swingProfit*100).toFixed(0)}¢ after ${periodsElapsed} periods (${league}, need ≥${minPeriodsForExpiry}) — WE-price edge stale, exiting`);
-              await tg(
-                `🔄⏰ <b>SWING THESIS-EXPIRY</b>\n\n` +
-                `${trade.title}\n` +
-                `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢ (+${(swingProfit*100).toFixed(0)}¢)\n` +
-                `${swingProfit > 0 ? `Small gain: +$${(qty * swingProfit).toFixed(2)}` : `Loss: $${(qty * swingProfit).toFixed(2)}`} — ${periodsElapsed}+ periods, no momentum, WE no longer supports hold`
-              );
+              console.log(`[exit] 🔄⏰ SWING THESIS-EXPIRY: ${trade.ticker} only +${(swingProfit*100).toFixed(0)}¢ after ${periodsElapsed} periods — attempting exit`);
               {
                 const lh = trade.ticker.lastIndexOf('-');
                 const gb = lh > 0 ? trade.ticker.slice(0, lh) : trade.ticker;
@@ -12509,7 +12633,15 @@ async function managePositions() {
                 swingExitState.set(gb, { ts: Date.now(), scoreKey: sk, exitPrice: currentPrice, reason: 'thesis-expiry' });
               }
               const result = await executeSell(trade, qty, currentPrice, 'swing-thesis-expiry');
-              if (result) anyUpdated = true;
+              if (result) {
+                anyUpdated = true;
+                await tg(
+                  `🔄⏰ <b>SWING THESIS-EXPIRY</b>\n\n` +
+                  `${trade.title}\n` +
+                  `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(swingProfit*100).toFixed(0)}¢)\n` +
+                  `${swingProfit > 0 ? `Small gain: +$${(qty * swingProfit).toFixed(2)}` : `Loss: $${(qty * swingProfit).toFixed(2)}`} — ${periodsElapsed}+ periods, no momentum, WE no longer supports hold`
+                );
+              }
               continue;
             }
           }
@@ -12595,18 +12727,20 @@ async function managePositions() {
           } else if (_liveSignatureActive) {
             console.log(`[exit] 🛡️ PRE-GAME DROP BLOCKED (${trade.ticker}): cross-confirmed ${_pgExitContra.velocity.toFixed(1)}¢/min move ${Math.round((Date.now() - _pgExitContra.when)/1000)}s ago = game is LIVE, not pre-game news — suppressing pre-game exit`);
           } else {
-            console.log(`[exit] ⚠️ PRE-GAME PRICE DROP (pre-start): ${trade.ticker} dropped ${dropCents}¢ before game start — lineup/news change likely, exiting`);
-            await tg(
-              `⚠️ <b>PRE-GAME EXIT (pre-start)</b>\n\n` +
-              `📋 <b>POSITION</b>\n` +
-              `${trade.title}\n\n` +
-              `📊 <b>METRICS</b>\n` +
-              `Entry: ${Math.round((trade.entryPrice ?? 0)*100)}¢ → Now: ${Math.round(currentPrice*100)}¢ (−${dropCents}¢)\n\n` +
-              `💬 <b>REASON</b>\n` +
-              `Price dropped ${dropCents}¢ before game start — likely lineup change or injury news`
-            );
+            console.log(`[exit] ⚠️ PRE-GAME PRICE DROP (pre-start): ${trade.ticker} dropped ${dropCents}¢ before game start — attempting exit`);
             const result = await executeSell(trade, qty, currentPrice, 'pre-game-news-exit');
-            if (result) anyUpdated = true;
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `⚠️ <b>PRE-GAME EXIT (pre-start)</b>\n\n` +
+                `📋 <b>POSITION</b>\n` +
+                `${trade.title}\n\n` +
+                `📊 <b>METRICS</b>\n` +
+                `Entry: ${Math.round((trade.entryPrice ?? 0)*100)}¢ → Exit: ${Math.round(currentPrice*100)}¢ (−${dropCents}¢)\n\n` +
+                `💬 <b>REASON</b>\n` +
+                `Price dropped ${dropCents}¢ before game start — likely lineup change or injury news`
+              );
+            }
             continue;
           }
         }
@@ -13326,6 +13460,28 @@ async function managePositions() {
 const activeSells = new Set();
 
 // Execute a sell order on Kalshi and update the trade record
+// 2026-05-01: helper that ensures Telegram exit alerts ONLY fire after the sell
+// is verified. Previously alerts (BLEED-OUT STOP, TRAILING STOP, etc.) fired
+// BEFORE executeSell completed, leading to misleading notifications when sells
+// failed (e.g., 0 fills). Now: sell first, alert only on success. If sell fails,
+// executeSell itself sends a "0 FILLS" warning (no double-notification needed).
+async function executeSellAndNotify(trade, sellQty, currentPrice, reason, tgPayload) {
+  const result = await executeSell(trade, sellQty, currentPrice, reason);
+  if (result) {
+    // executeSell may have updated trade.realizedPnL — use the verified value
+    // for the alert instead of the pre-call estimate.
+    const verifiedPayload = { ...tgPayload };
+    if (trade.realizedPnL != null && verifiedPayload.pnl != null) {
+      verifiedPayload.pnl = trade.realizedPnL;
+    }
+    if (trade.exitPrice != null && verifiedPayload.exit != null) {
+      verifiedPayload.exit = trade.exitPrice;
+    }
+    try { await tgTradeExit(verifiedPayload); } catch (e) { console.error('[exit] tg notify failed:', e.message); }
+  }
+  return result;
+}
+
 async function executeSell(trade, sellQty, currentPrice, reason) {
   const entryPrice = trade.entryPrice ?? 0;
   const priceInCents = Math.round(currentPrice * 100);
@@ -14540,16 +14696,7 @@ async function main() {
             // but fires 10x faster — catches the spike before it drifts back.
             const sellQty = Math.max(1, Math.floor(qty * 0.90));
             const gainCents = Math.round(profitPerContract * 100);
-            console.log(`[soccer-exit] ⚡ FAST SPIKE EXIT: ${trade.ticker} up ${gainCents}¢ — selling ${sellQty}/${qty} @ ${Math.round(currentPrice*100)}¢ (first-goal spike)`);
-            await tg(
-              `⚡ <b>SOCCER FIRST-GOAL SPIKE</b>\n\n` +
-              `📋 <b>POSITION</b>\n` +
-              `${trade.title}\n\n` +
-              `📊 <b>METRICS</b>\n` +
-              `Entry: ${Math.round((trade.entryPrice ?? 0)*100)}¢ → Now: ${Math.round(currentPrice*100)}¢ (+${gainCents}¢)\n` +
-              `Selling 90% (${sellQty} contracts) — first goal scored, exit triggered\n` +
-              `Profit this sale: <b>+$${(gainCents * sellQty / 100).toFixed(2)}</b>`
-            );
+            console.log(`[soccer-exit] ⚡ FAST SPIKE EXIT: ${trade.ticker} up ${gainCents}¢ — attempting sell ${sellQty}/${qty} @ ${Math.round(currentPrice*100)}¢ (first-goal spike)`);
 
             // Re-read fresh to avoid stale state
             const freshLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
@@ -14560,6 +14707,15 @@ async function main() {
               if (result) {
                 freshTrade.partialTakeAt = new Date().toISOString();
                 writeFileSync(TRADES_LOG, freshTrades.map(t => JSON.stringify(t)).join('\n') + '\n');
+                await tg(
+                  `⚡ <b>SOCCER FIRST-GOAL SPIKE</b>\n\n` +
+                  `📋 <b>POSITION</b>\n` +
+                  `${trade.title}\n\n` +
+                  `📊 <b>METRICS</b>\n` +
+                  `Entry: ${Math.round((trade.entryPrice ?? 0)*100)}¢ → Exit: ${Math.round(currentPrice*100)}¢ (+${gainCents}¢)\n` +
+                  `Sold 90% (${sellQty} contracts) — first goal scored, exit triggered\n` +
+                  `Profit this sale: <b>+$${(gainCents * sellQty / 100).toFixed(2)}</b>`
+                );
               }
             }
           } catch { /* skip individual trade errors */ }
