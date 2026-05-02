@@ -8982,6 +8982,167 @@ async function checkLiveScoreEdges() {
       }
     }
   }
+
+  // === PHASE 6: TRAILER-HOLD (2026-05-02) =====================================
+  // Shadow audit: MLB trailing team in inn 5-6 with 1-run deficit at 25-45¢
+  // wins the GAME 72% of the time (n=18: P5 75% n=12, P6 67% n=6). But avg
+  // intra-game price recovery is only 6¢ — comeback-buy's swing-exit can't
+  // capture this. Hold-to-settlement is the right exit framework.
+  //
+  // EV math at 36¢ entry, 72% WR observed (60% pessimistic floor):
+  //   72%: 0.72*0.64 - 0.28*0.36 = +$0.36/contract = +100% ROI
+  //   60%: 0.60*0.64 - 0.40*0.36 = +$0.24/contract = +67% ROI
+  //
+  // Different from comeback-buy:
+  //   - No ace-ERA filter (cell wins regardless of pitcher quality)
+  //   - No Sonnet eval (structural)
+  //   - No swing-exit at +15¢ — hold to settlement
+  //   - Exit only on: deficit growth, hard stop -15¢, or game settles
+  if (cachedPrices.size > 0) {
+    for (const g of liveGames) {
+      try {
+        if (g.league !== 'mlb') continue;
+        if (g.diff !== 1) continue;             // d=1 only — d=2+ cells lose money
+        if (g.period < 5 || g.period > 6) continue;
+
+        const trailingIsHome = g.homeScore < g.awayScore;
+        const trailingTeam   = trailingIsHome ? g.home : g.away;
+        const leadingTeam    = trailingIsHome ? g.away : g.home;
+        const trailingAbbr   = trailingTeam.team?.abbreviation ?? '';
+        const leadingAbbr    = leadingTeam.team?.abbreviation ?? '';
+        if (!trailingAbbr || !leadingAbbr) continue;
+
+        const trailingTicker = [...cachedPrices.keys()].find(t => {
+          const suffix = t.split('-').pop()?.toUpperCase() ?? '';
+          return t.startsWith('KXMLBGAME') &&
+                 suffix === trailingAbbr.toUpperCase() &&
+                 tickerHasTeam(t.toLowerCase(), trailingAbbr) &&
+                 tickerHasTeam(t.toLowerCase(), leadingAbbr);
+        });
+        if (!trailingTicker) continue;
+
+        const trailingPrice = cachedPrices.get(trailingTicker)?.yes ?? 0;
+        if (trailingPrice < 0.25 || trailingPrice > 0.45) continue;
+
+        const trailingBase = trailingTicker.lastIndexOf('-') > 0
+          ? trailingTicker.slice(0, trailingTicker.lastIndexOf('-'))
+          : trailingTicker;
+
+        // Stop-lock check
+        const lockUntil = stopLocks.get(trailingBase);
+        if (lockUntil && Date.now() < lockUntil) continue;
+
+        // Existing position check (portfolio + JSONL same-day)
+        const hasPortfolioPos = openPositions.some(p => {
+          const pBase = p.ticker.lastIndexOf('-') > 0 ? p.ticker.slice(0, p.ticker.lastIndexOf('-')) : p.ticker;
+          return pBase === trailingBase;
+        });
+        if (hasPortfolioPos) continue;
+
+        let hasJsonlPos = false;
+        if (existsSync(TRADES_LOG)) {
+          try {
+            const dupStart = new Date(etNow().toISOString().slice(0,10) + 'T04:00:00Z').getTime();
+            const jLines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+            for (const l of jLines) {
+              try {
+                const jt = JSON.parse(l);
+                if (jt.status === 'testing-void') continue;
+                const jtMs = jt.timestamp ? Date.parse(jt.timestamp) : 0;
+                if (jtMs < dupStart) continue;
+                if (tickerHasTeam((jt.ticker ?? '').toLowerCase(), trailingAbbr) &&
+                    tickerHasTeam((jt.ticker ?? '').toLowerCase(), leadingAbbr)) {
+                  hasJsonlPos = true; break;
+                }
+              } catch {}
+            }
+          } catch {}
+        }
+        if (hasJsonlPos) continue;
+
+        // Cooldown: re-evaluate same trailer at most every 8 min
+        const thKey = 'trailer-hold:' + trailingBase;
+        if (Date.now() - (tradeCooldowns.get(thKey) ?? 0) < 8 * 60 * 1000) continue;
+        tradeCooldowns.set(thKey, Date.now());
+
+        // KALSHI-ESPN SYNC CHECK (same as comeback-buy): skip if Kalshi-implied
+        // leader prob is 12+ pts higher than ESPN model — ESPN is lagging real score.
+        const leaderTickerForSync = [...cachedPrices.keys()].find(t =>
+          t.startsWith('KXMLBGAME') &&
+          tickerHasTeam(t.toLowerCase(), leadingAbbr) &&
+          tickerHasTeam(t.toLowerCase(), trailingAbbr) &&
+          (t.split('-').pop()?.toUpperCase() ?? '') === leadingAbbr.toUpperCase()
+        );
+        const leaderKalshiPx = leaderTickerForSync ? (cachedPrices.get(leaderTickerForSync)?.yes ?? 0) : 0;
+        const espnLeaderProb = getWinExpectancy('mlb', g.diff, g.period, !trailingIsHome) ?? 0.65;
+        if (leaderKalshiPx > 0 && (Math.round(leaderKalshiPx*100) - Math.round(espnLeaderProb*100)) >= 12) {
+          console.log(`[trailer-hold] Skip ${trailingAbbr}: Kalshi/ESPN mismatch ${Math.round(leaderKalshiPx*100)}¢ vs ${Math.round(espnLeaderProb*100)}¢ — ESPN lagging`);
+          continue;
+        }
+
+        // Sizing: smaller than comeback-buy (variance is real, sample n=18)
+        const thMaxTrade = Math.min(getBankroll() * 0.04, getAvailableCash('kalshi'));
+        const thQty = Math.max(1, Math.floor(thMaxTrade / trailingPrice));
+        const thBetAmount = thQty * trailingPrice;
+        if (thBetAmount < 5) { console.log(`[trailer-hold] Bet too small ($${thBetAmount.toFixed(2)}), skipping`); continue; }
+
+        const priceCents = Math.round(trailingPrice * 100);
+        console.log(`[trailer-hold] 🎯 BUY ${trailingAbbr} @ ${priceCents}¢ × ${thQty} | inn${g.period} d=${g.diff} | hold-to-settlement`);
+
+        const thResult = await kalshiPost('/portfolio/orders', {
+          ticker: trailingTicker,
+          action: 'buy',
+          side: 'yes',
+          count: thQty,
+          yes_price: Math.min(99, priceCents + 2),
+        });
+        if (thResult.ok) {
+          const thOrder = thResult.data?.order ?? {};
+          const thFill = thOrder.count ?? thQty;
+          const thDeployed = Math.round(thFill * trailingPrice * 100) / 100;
+          const thTrade = {
+            id: thOrder.order_id ?? `th-${Date.now()}`,
+            timestamp: new Date().toISOString(),
+            strategy: 'trailer-hold',
+            exchange: 'kalshi',
+            ticker: trailingTicker,
+            title: cachedPrices.get(trailingTicker)?.title ?? `${trailingAbbr} vs ${leadingAbbr}`,
+            side: 'yes',
+            entryPrice: trailingPrice,
+            entryDiff: g.diff,
+            entryPeriod: g.period,
+            quantity: thFill,
+            deployCost: thDeployed,
+            confidence: 0.72,
+            reasoning: `STRUCTURAL: MLB trailer 1-run deficit inn${g.period} at ${priceCents}¢ — shadow cell 72% game-WR n=18. Hold to settlement.`,
+            status: 'open',
+            holdToSettlement: true,
+            _structuralPattern: `mlb-trailer-${g.period}-1run-hold`,
+          };
+          appendFileSync(TRADES_LOG, JSON.stringify(thTrade) + '\n');
+          openPositions.push(thTrade);
+          gameEntries.set(trailingBase, { ticker: trailingTicker, price: trailingPrice, lastScoreKey: scoreKey(g.awayScore, g.homeScore) });
+          tradeCooldowns.set(trailingBase, Date.now());
+          await tg(
+            `🎯 <b>TRAILER-HOLD — KALSHI</b>\n\n` +
+            `📋 <b>GAME</b>\n` +
+            `${cachedPrices.get(trailingTicker)?.title ?? trailingTicker}\n` +
+            `Score: ${g.awayScore}-${g.homeScore} (${trailingAbbr} trailing) | Inning ${g.period}\n\n` +
+            `📊 <b>METRICS</b>\n` +
+            `Bought ${trailingAbbr} YES @ ${priceCents}¢ × ${thFill} = <b>$${thDeployed.toFixed(2)}</b>\n` +
+            `Cell history: 72% WR n=18 (P5 75% n=12 + P6 67% n=6)\n` +
+            `Strategy: HOLD TO SETTLEMENT — exit only if deficit grows\n\n` +
+            `🧠 <b>REASONING</b>\n` +
+            `Shadow audit identified this cell as +EV. Trailing teams in inn 5-6 down 1 run win the game ~72% of the time, but price barely moves intra-game (avg max-rec 6¢) so swing-exit fails. We hold for the settlement payout.`
+          );
+        } else {
+          console.error(`[trailer-hold] Order failed:`, thResult.status, JSON.stringify(thResult.data));
+        }
+      } catch (e) {
+        console.error(`[trailer-hold] Error for game:`, e.message);
+      }
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -12717,6 +12878,74 @@ async function managePositions() {
           // (which have their own comeback-aware adjustments below)
           // No pre-game hard stop, no pg-guard, no WE-drop, no Claude stop.
           // Falls through to nuclear + WE-reversal below.
+        }
+
+        // === TRAILER-HOLD EXIT PATHS (2026-05-02) ===
+        // Strategy: bought trailing team at 25-45¢ in inn 5-6, holding to settlement.
+        // Cell-level WR is 72% but price barely moves intra-game (avg max-rec 6¢),
+        // so we IGNORE all swing-exit paths. Only thesis-breakers fire here.
+        if (trade.strategy === 'trailer-hold') {
+          const thProfit = currentPrice - entryPrice;
+
+          // 1. SCORE-WORSENING: deficit grew → cell thesis broken. Trail-2run cells
+          // show 10-20% WR vs 72% for 1-run; the math flips the moment leader scores again.
+          if (trade.entryDiff != null && ctx?.diff != null && ctx.diff > trade.entryDiff) {
+            console.log(`[exit] 🎯🛑 TRAILER-HOLD THESIS BROKEN: ${trade.ticker} deficit grew ${trade.entryDiff}→${ctx.diff} runs — exiting`);
+            const result = await executeSell(trade, qty, currentPrice, 'trailer-hold-thesis-broken');
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `🎯🛑 <b>TRAILER-HOLD THESIS BROKEN</b>\n\n` +
+                `${trade.title}\n` +
+                `Entry deficit: ${trade.entryDiff} run(s) → Now: ${ctx.diff} run(s)\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢\n` +
+                `${thProfit >= 0 ? `Profit: +$${(qty * thProfit).toFixed(2)}` : `Loss: $${(qty * thProfit).toFixed(2)}`}\n\n` +
+                `💬 Cell flips from 72% WR (d=1) to ~15% WR (d=2+) — exit now`
+              );
+            }
+            continue;
+          }
+
+          // 2. RARE PROFIT-LOCK at +25¢: avg max-rec is only 6¢ so this almost never
+          // fires, but capture the rare blowout-equalizer case (trailer ties the game).
+          if (thProfit >= 0.25) {
+            const gainPct = Math.round((thProfit / entryPrice) * 100);
+            console.log(`[exit] 🎯💰 TRAILER-HOLD PROFIT-LOCK: ${trade.ticker} up ${(thProfit*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
+            const result = await executeSell(trade, qty, currentPrice, 'trailer-hold-profit-lock');
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `🎯💰 <b>TRAILER-HOLD PROFIT-LOCK</b>\n\n` +
+                `${trade.title}\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(thProfit*100).toFixed(0)}¢, +${gainPct}%)\n` +
+                `Profit: <b>+$${(qty * thProfit).toFixed(2)}</b>\n\n` +
+                `💬 Big intra-game pop captured before reversal risk`
+              );
+            }
+            continue;
+          }
+
+          // 3. HARD STOP at -15¢: defensive backstop in case ctx.diff lags real score.
+          // Entry 36¢ → 21¢ implies ESPN may not have caught a leader-team run yet.
+          if (thProfit <= -0.15) {
+            console.log(`[exit] 🎯🚨 TRAILER-HOLD HARD STOP: ${trade.ticker} down ${(thProfit*100).toFixed(0)}¢ — likely score change ESPN missed`);
+            const result = await executeSell(trade, qty, currentPrice, 'trailer-hold-hard-stop');
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `🎯🚨 <b>TRAILER-HOLD HARD STOP</b>\n\n` +
+                `${trade.title}\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢\n` +
+                `Loss: $${(qty * thProfit).toFixed(2)}\n\n` +
+                `💬 -15¢ drawdown — defensive exit (likely score change in flight)`
+              );
+            }
+            continue;
+          }
+
+          // Otherwise: HOLD. Skip all other exit paths (no trailing stop, no
+          // bleed-out, no WE-floor, no swing-expiry). Settlement reconciler resolves.
+          continue;
         }
 
         // PRE-GAME PRICE DROP MONITOR — exit before game starts if market reprices sharply.
