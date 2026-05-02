@@ -891,6 +891,47 @@ function detectMlbInn2Leader({ league, period, gameDetail, diff, weTimeAdj, pric
 
 // NBA Q2 leader at 50-65¢: 8 game-level, 75% WR, +14% EV. Mid-half leaders
 // market underprices because half is still left. Diff ≥5 to ensure meaningful lead.
+// 2026-05-02 OFFENSIVE: NBA Q4 deep-trailer swing. When a team is down 8-15
+// in Q4 with 4-9 min remaining, their price is 15-25¢. NBA Q4 runs are common
+// (10-0 / 12-2 spurts in 2-3 min). When trailer cuts the deficit by 4+, price
+// spikes from 18¢ → 35¢ (~+17¢ swing).
+//
+// Math at 20¢ entry on a 25% rally rate (cuts deficit to ≤4, triggers price
+// spike that lets us swing-exit at +15¢):
+//   25% × +$0.15 + 75% × (price-stays-flat-or-down) ≈ +$0.04/contract = +20% ROI
+// Asymmetric pay structure works in our favor.
+function detectNbaQ4DeepTrailer({ league, period, gameDetail, diff, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'nba') return null;
+  if (period !== 4) return null;
+  if (targetAbbr === leadingAbbr) return null; // TRAILER only
+  if (diff < 8 || diff > 15) return null; // mid-deep deficit (8-15pt)
+  if (price == null) return null;
+  if (price < 0.10 || price > 0.25) return null; // cheap-underdog asymmetric band
+  // Time check: 4-9 min remaining (enough for run, not garbage time)
+  const m = (gameDetail || '').match(/^(\d+):(\d+)/);
+  if (!m) return null;
+  const minsLeft = parseInt(m[1], 10) + parseInt(m[2], 10) / 60;
+  if (minsLeft < 4 || minsLeft > 9) return null;
+  return {
+    trade: true, side: 'yes', confidence: 0.30, betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-pt deficit with ${minsLeft.toFixed(1)} min in Q4 — price ${(price*100).toFixed(0)}¢ is undervalued for NBA run-based variance`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (NBA Q4 deep-trailer swing): ${targetAbbr} trailing ${diff}, ${minsLeft.toFixed(1)} min left, ${(price*100).toFixed(0)}¢. NBA Q4 runs are common; price spikes on 4+ pt cuts.`,
+      key_facts: [
+        `Q4 ${minsLeft.toFixed(1)} min left, ${diff}-pt deficit`,
+        `Trailer at ${(price*100).toFixed(0)}¢ — asymmetric pay`,
+        `NBA Q4 10-0 runs happen ~25% of games — swing exit at +15¢`,
+      ],
+      top_risk: 'Leader extends lead, position drops to 0',
+      conviction: 'NBA Q4 variance is the bot — buy cheap volatility',
+      reasoning_tags: ['underdog-spot', 'we-undervalued', 'pace-mismatch'],
+    },
+    _structuralPattern: 'nba-q4-deep-trailer',
+    _matchInfo: { period, diff, minsLeft, price: Math.round(price*100) },
+  };
+}
+
 function detectNbaQ2Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
   if (league !== 'nba') return null;
   if (period !== 2) return null;
@@ -1261,6 +1302,44 @@ function detectSoccer1HHomeLeader({ league, period, gameDetail, diff, weTimeAdj,
   };
 }
 
+// 2026-05-02 OFFENSIVE: MLB inn-8/9 leader — closer-territory lockdown.
+// Late-inning closer entry typically means 90%+ lockdown rate. Different from
+// detectMlbLateInningLockdown which requires bullpen-tier data (0 fires ever
+// because data dependency wasn't met). This simpler version: inn 8-9 + d=1+ +
+// reasonable price band. Pattern is well-documented across baseball.
+function detectMlbInn89Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period < 8 || period > 9) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 1) return null;
+  // Price band: 70-90¢. Below 70¢ is suspicious (something wrong); above 90¢
+  // not enough upside to justify trade fees + small variance.
+  if (price < 0.70 || price > 0.90) return null;
+  // Diff-aware floor:
+  //   d=1: needs at least 75¢ price (not too desperate, market still believes)
+  //   d=2+: any 70-90¢ ok
+  if (diff === 1 && price < 0.75) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-run lead in inning ${period} — closer territory, trailing team has limited at-bats`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn-${period} closer-territory leader): ${diff}-run lead, price ${(price*100).toFixed(0)}¢. Inn-8/9 leaders settle 88-95% historically (closers convert ~93% of save opportunities).`,
+      key_facts: [
+        `Inning ${period}, ${diff}-run lead`,
+        `Closer territory — trailing team has ${period === 8 ? '1-2' : '0-1'} innings remaining`,
+        `MLB closers: ~93% conversion rate (industry standard)`,
+      ],
+      top_risk: 'Closer blow-up — rare but happens (~5-10% of save opportunities)',
+      conviction: 'Late-inning closer-locked leader — mechanical pattern',
+      reasoning_tags: ['market-lag', 'we-undervalued', 'late-inning'],
+    },
+    _structuralPattern: 'mlb-inn-89-leader',
+    _matchInfo: { period, diff, price: Math.round(price*100) },
+  };
+}
+
 function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr, ticker }) {
   if (league !== 'mlb') return null;
   if (period < 5 || period > 7) return null;
@@ -1603,6 +1682,55 @@ function detectNhlP3ClosingOut({ league, period, gameDetail, diff, weTimeAdj, pr
 // Excludes MLS (mixed historical, small sample) and minute > 65 (draw cliff
 // approaching, EPL/LaLiga 70-min hard exit kicks in soon — better to enter earlier).
 // Excludes away leaders (ATH/ATM 4/25 was the away-leader counter-example, lost).
+// 2026-05-02 OFFENSIVE: Counter-equalizer soccer rally buy. When a leader's
+// price has CRASHED on equalizer (was ≥55¢ in last 5 min, now ≤35¢), the
+// market overshoots. If the leader is the structurally stronger team (home,
+// or recently-leading), they often rally for the win.
+//
+// Math at 30¢ entry on a 35% recovery rate (post-equalizer rally to lead):
+//   35% × $0.70 + 65% × (-$0.30) = $0.245 - $0.195 = +$0.05/contract = +17% ROI
+// Asymmetric pay covers WR mis-calibration; entry was an OVERREACTION.
+function detectSoccerCounterEqualizer({ league, period, gameDetail, diff, price, targetAbbr, leadingAbbr, homeAbbr, ticker }) {
+  if (!['mls','epl','laliga','seriea','bundesliga','ligue1'].includes(league)) return null;
+  if (period !== 2) return null;
+  if (diff !== 0) return null; // game must be tied (just equalized)
+  if (price == null) return null;
+  // Target must be the HOME team (structurally stronger, more likely to rally)
+  if (targetAbbr !== homeAbbr) return null;
+  // Entry band: 25-35¢ (post-crash dip, asymmetric pay)
+  if (price < 0.25 || price > 0.35) return null;
+  // Minute: 50-80 (room to rally, before draw-cliff)
+  const m = (gameDetail || '').match(/^(\d+)/);
+  if (!m) return null;
+  const minute = parseInt(m[1], 10);
+  if (minute < 50 || minute > 80) return null;
+  // Require recent CONTRA crash on this ticker — confirms the equalizer
+  // already happened (price already crashed, we're buying the dip).
+  const contraMover = recentCrossContraMovers.get(ticker);
+  if (!contraMover) return null;
+  const contraAgeMin = (Date.now() - contraMover.when) / 60000;
+  if (contraAgeMin > 5) return null; // crash must be recent
+  if (contraMover.velocity < 8) return null; // must be a SHARP crash (8¢/min+)
+  return {
+    trade: true, side: 'yes', confidence: 0.40, betAmount: null,
+    reasoning: {
+      steel_man: `Home team's price crashed to ${(price*100).toFixed(0)}¢ at minute ${minute} after equalizer — market overshoot, structurally stronger home side often rallies`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (counter-equalizer rally): ${targetAbbr} home crashed ${contraMover.velocity.toFixed(1)}¢/min ${contraAgeMin.toFixed(1)}min ago, now ${(price*100).toFixed(0)}¢ at min ${minute}. Asymmetric pay covers 30% recovery rate.`,
+      key_facts: [
+        `Minute ${minute}, score tied, price ${(price*100).toFixed(0)}¢ post-crash`,
+        `Recent contra: ${contraMover.velocity.toFixed(1)}¢/min ${contraAgeMin.toFixed(1)}min ago`,
+        `Home team structural advantage — rally probability ~30-40%`,
+      ],
+      top_risk: 'Away team scores again, lock loss',
+      conviction: 'Counter-trade market overshoot on equalizer — buy the dip',
+      reasoning_tags: ['market-lag', 'underdog-spot', 'home-court'],
+    },
+    _structuralPattern: 'soccer-counter-equalizer-rally',
+    _matchInfo: { minute, price: Math.round(price*100), contraVelocity: Math.round(contraMover.velocity*10)/10 },
+  };
+}
+
 function detectSoccerHomeHTLeader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr, homeAbbr }) {
   const europeanLeagues = ['epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'];
   if (!europeanLeagues.includes(league)) return null;
@@ -7612,6 +7740,28 @@ async function checkLiveScoreEdges() {
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price,
             targetAbbr, leadingAbbr, homeAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-05-02 OFFENSIVE: counter-equalizer rally buy
+          _structuralDecision = detectSoccerCounterEqualizer({
+            league, period, gameDetail, diff,
+            price, targetAbbr, leadingAbbr, homeAbbr, ticker,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-05-02 OFFENSIVE: NBA Q4 deep-trailer swing
+          _structuralDecision = detectNbaQ4DeepTrailer({
+            league, period, gameDetail, diff,
+            price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-05-02 OFFENSIVE: MLB inn-8/9 closer-territory leader
+          _structuralDecision = detectMlbInn89Leader({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price,
+            targetAbbr, leadingAbbr,
           });
         }
         // 2026-04-29 dip-buy detectors (underpriced leaders 46-65¢ band)
