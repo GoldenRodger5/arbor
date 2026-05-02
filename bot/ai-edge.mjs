@@ -989,12 +989,15 @@ function detectMlbInn4Leader({ league, period, gameDetail, diff, weTimeAdj, pric
   if (diff === 1 && price > 0.72) return null;
   if (diff === 2 && price > 0.78) return null;
   if (diff >= 3 && price > 0.82) return null;
+  // 2026-05-02 BUCKET-WR ANCHORING: dropped 8pt edge floor. The diff-aware caps
+  // already filter out the leaky 80-85¢ d=2 bucket. Within validated bands:
+  //   d=1 60-70¢: 100% WR (n=12) | 70-72¢: 79%
+  //   d=2 65-70¢: 100% (n=5) | 70-75¢: 79% (n=14) | 75-80¢: 81% (n=21)
+  //   d≥3 75-80¢: 50% small-sample / 80-85¢: 80% (n=10)
+  // Claude was double-counting situational risk against +EV cells. Anchor on
+  // empirical bucket data instead. Backstop: WE >= price-5pt sanity check.
   const edge = weTimeAdj - price;
-  // 2026-05-02: edge floor raised from 4pt to 8pt. Selection bias on structural
-  // detectors — they fire on Sonnet-rejected setups, which are the marginal end
-  // of every cell. 8pt edge requirement filters out the borderline Sonnet-NOs
-  // and only fires on clear mispricing.
-  if (edge < 0.08) return null;
+  if (edge < -0.05) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
@@ -1024,11 +1027,13 @@ function detectMlbInn1Leader3Plus({ league, period, gameDetail, diff, weTimeAdj,
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff < 3) return null;
-  // 2026-05-02: cap loosened 80¢ → 85¢. Bucket audit shows 80-85¢ at 100%
-  // WR (n=6); previous 80¢ cap was leaving these on the table.
   if (price > 0.85) return null;
+  // 2026-05-02 BUCKET-WR ANCHORING: dropped edge requirement. Cell shows 100% WR
+  // n=15 at 65-85¢ — buying at any price in band is +EV regardless of Claude's
+  // momentary WE adjustments. Backstop: WE must be within 5pt of price (catches
+  // catastrophic state shifts where WE genuinely drops below 50%).
   const edge = weTimeAdj - price;
-  if (edge < 0.04) return null;
+  if (edge < -0.05) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
@@ -1067,8 +1072,11 @@ function detectMlbInn3Leader2Run({ league, period, gameDetail, diff, weTimeAdj, 
   if (weTimeAdj == null || price == null) return null;
   if (diff !== 2) return null;
   if (price < 0.65 || price > 0.82) return null;
+  // 2026-05-02 BUCKET-WR ANCHORING: dropped 6pt edge floor. Cell shows uniform
+  // 75-83% WR across 65-85¢ band (n=45). Empirical bucket data trumps Claude's
+  // step-3 adjustments which double-count situational risks already in the data.
   const edge = weTimeAdj - price;
-  if (edge < 0.06) return null;
+  if (edge < -0.05) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
@@ -1137,8 +1145,11 @@ function detectMlbInn2Leader2Run({ league, period, gameDetail, diff, weTimeAdj, 
   if (weTimeAdj == null || price == null) return null;
   if (diff !== 2) return null; // EXACTLY 2-run lead — the proven cell
   if (price > 0.80) return null;
+  // 2026-05-02 BUCKET-WR ANCHORING: dropped 4pt edge floor. Cell shows 100% WR
+  // at 65-70¢ (n=13), 88% at 70-75 (n=17), 83% at 75-80 (n=6). Empirical bucket
+  // data >> Claude's situational adjustments. Backstop: WE >= price-5pt sanity.
   const edge = weTimeAdj - price;
-  if (edge < 0.04) return null;
+  if (edge < -0.05) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
@@ -1169,8 +1180,11 @@ function detectMlbInn5Leader3Plus({ league, period, gameDetail, diff, weTimeAdj,
   if (weTimeAdj == null || price == null) return null;
   if (diff < 3) return null;
   if (price > 0.88) return null;
+  // 2026-05-02 BUCKET-WR ANCHORING: dropped 4pt edge floor. Cell shows 100% WR
+  // at 80-85¢ (n=8) and 100% at 85-90¢ (n=4). 88¢ cap already filters; no edge
+  // requirement needed. Empirical data is the authority.
   const edge = weTimeAdj - price;
-  if (edge < 0.04) return null;
+  if (edge < -0.05) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
@@ -1300,9 +1314,16 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
     if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'diff-ge-3', ticker }); } catch {} }
     return null;
   }
+  // 2026-05-02 BUCKET-WR ANCHORING: dropped 8pt edge floor. The dead-zone
+  // carve-outs above filter to validated +EV bands. Within those bands:
+  //   inn 5 d=2 50-65: 67% / 75-80: 83% / 80-85: 82%
+  //   inn 6 d=2 75-80: 91% / 80-85: 100%
+  //   inn 7 d=2 50-72: 50-67% / 80-85: 83%
+  //   diff>=3: 100% in 80-90¢
+  // Edge requirement was double-counting Claude's situational adjustments
+  // against historically validated cells. Backstop: WE >= price-5pt sanity.
   const edge = weTimeAdj - price;
-  // 2026-05-02: edge floor raised 4pt → 8pt. Same selection-bias fix as inn-4.
-  if (edge < 0.08) return null;
+  if (edge < -0.05) return null;
   return {
     trade: true,
     side: 'yes',
@@ -13790,22 +13811,38 @@ async function managePositions() {
               : sport === 'MLB' ? `~${Math.max(0, 9 - (ctx?.period ?? 5))} innings left`
               : sport === 'NBA' ? `${Math.max(0, 4 - (ctx?.period ?? 3))} quarter(s) left (~${Math.max(0, 4 - (ctx?.period ?? 3)) * 12}min)`
               : `~${Math.max(0, 90 - (ctx?.period ?? 60))}min left`;
+            // 2026-05-02: thesis-state framing. SUN soccer loss exposed that
+            // generic "can team still win" prompts let Claude HOLD on equalized
+            // leader bets ("Wolves can equalize" — irrelevant when we're long
+            // SUN and Wolves ALREADY equalized). Force Claude to evaluate
+            // whether the entry thesis specifically still holds.
+            const _ourTeam = ticker.split('-').pop() ?? '';
+            const _isLeader = ctx?.leading === _ourTeam;
+            const _entryThesis = _isLeader
+              ? `Entry thesis: ${_ourTeam} was leading at entry — we bet they'd hold the lead.`
+              : `Entry thesis: ${_ourTeam} was undervalued at entry.`;
+            const _thesisStatusQuestion = _isLeader
+              ? `IS ${_ourTeam} STILL LEADING? If the score has equalized or ${_ourTeam} is now trailing, the original thesis is BROKEN and you should SELL even if the team can theoretically still win the game. "Game still winnable" ≠ "our entry thesis is intact."`
+              : `Is the price gap that justified entry still favorable, or has the situation flipped against us?`;
             const nuclearPrompt =
               `Pre-game bet down ${(pctChange*100).toFixed(0)}%. Should we SELL or HOLD?\n\n` +
               `CRITICAL CONTEXT: Our pre-game picks win 64% of the time when held to settlement. ` +
               `At current price ${(currentPrice*100).toFixed(0)}¢, selling saves only ${(currentPrice*100).toFixed(0)}¢/contract ` +
               `but if the team wins we gain ${((1-currentPrice)*100).toFixed(0)}¢/contract. ` +
-              `BIAS TOWARD HOLD unless the game is truly over.\n\n` +
+              `BIAS TOWARD HOLD unless the entry thesis has broken.\n\n` +
               `POSITION: Bought at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢ (down ${(pctChange*100).toFixed(0)}%).\n` +
               `Game: ${trade.title}\n` +
               (ctx ? `LIVE: ${ctx.detail} | Stage: ${stage.toUpperCase()} | Period: ${ctx.period}\n` : '') +
-              (ctx?.baselineWE != null ? `Win expectancy: ${(((ctx.leading === (ticker.split('-').pop() ?? '')) ? ctx.baselineWE : (1 - ctx.baselineWE))*100).toFixed(0)}%\n` : '') +
+              (ctx?.baselineWE != null ? `Win expectancy: ${(((ctx.leading === _ourTeam) ? ctx.baselineWE : (1 - ctx.baselineWE))*100).toFixed(0)}%\n` : '') +
+              `Currently leading: ${ctx?.leading ?? 'unknown'} | Our team: ${_ourTeam}\n` +
               `TIME LEFT: ${timeLeft}\n\n` +
+              `${_entryThesis}\n` +
+              `THESIS STATUS CHECK (mandatory): ${_thesisStatusQuestion}\n\n` +
               `COMEBACK RATES: ${comebackCtx}\n\n` +
-              `⚠️ BLOWUP SIGNATURE: If the opponent has scored 2+ unanswered since the game started AND WE is deteriorating fast, trajectory > scoreboard — SELL even if deficit looks 'recoverable'. A pre-game pick whose thesis is visibly breaking (starter blown up, key scorer injured, opponent on 2+ unanswered run) should be sold, not held.\n\n` +
-              `SELL if: WE < 10%, deficit is insurmountable (down 5+ runs in 8th, 4 goals in 80th min), OR blowup signature present.\n` +
-              `HOLD if: ANY realistic comeback path exists AND trajectory is stable/improving. 1-2 run/goal deficits with time left AND opponent not on a run = HOLD.\n\n` +
-              `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
+              `⚠️ BLOWUP SIGNATURE: If the opponent has scored 2+ unanswered since the game started AND WE is deteriorating fast, trajectory > scoreboard — SELL even if deficit looks 'recoverable'. A pre-game pick whose thesis is visibly breaking (starter blown up, key scorer injured, opponent on 2+ unanswered run, leader-bet got equalized) should be sold, not held.\n\n` +
+              `SELL if: entry thesis has broken (leader equalized/trailing, undervaluation reversed), WE < 10%, deficit is insurmountable, OR blowup signature present.\n` +
+              `HOLD if: entry thesis is intact AND a realistic recovery path exists AND trajectory is stable/improving.\n\n` +
+              `JSON: {"action":"sell"/"hold","reasoning":"1 sentence — must address whether ENTRY THESIS still holds, not just whether team can still win"}`;
             const evalText = await claudeScreen(nuclearPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:nuclear' });
             if (evalText) {
               try {
@@ -13953,21 +13990,32 @@ async function managePositions() {
                   MLB: 'MLB: 3-run comebacks happen 20% through 6 innings, 10% in the 7th+. 5+ run deficit after 6th = <3%.',
                   Soccer: 'Soccer: 1-goal deficits equalize ~20%. 2-goal deficit comeback ~5%. Down 2+ after 75th = essentially over.',
                 }[sport] ?? 'Comebacks get less likely as deficit grows and time runs out.';
+                // 2026-05-02: thesis-state framing for WE-reversal too. Same SUN
+                // soccer issue applies — bot bought a leader, leader got
+                // equalized, Claude said HOLD because "team can still win".
+                // Force explicit thesis-state evaluation.
+                const _weRevTeam = ticker.split('-').pop() ?? '';
+                const _weRevWasLeader = ctx?.leading === _weRevTeam;
+                const _entryDiff = trade.entryDiff;
+                const _thesisStatus = _weRevWasLeader
+                  ? `Currently leading: ${ctx.leading} | Our team: ${_weRevTeam} → ${ctx.leading === _weRevTeam ? 'STILL leading ✓' : 'NO LONGER leading — thesis broken'}`
+                  : `Our team: ${_weRevTeam} | Currently trailing: ${ctx.leading !== _weRevTeam}`;
                 const weRevPrompt =
                   `${isPlayoffWER ? `⚠️ THIS IS A PLAYOFF GAME — comeback rates are significantly higher than regular season. APPLY A STRONG HOLD BIAS.\n\n` : ''}` +
                   `Live ${sport}${isPlayoffWER ? ' PLAYOFF' : ''} bet — win expectancy dropped to ${(ourWE*100).toFixed(0)}%. Should we SELL or HOLD?\n\n` +
                   `POSITION: Bought at ${(entryPrice*100).toFixed(0)}¢, now ${(currentPrice*100).toFixed(0)}¢.\n` +
                   `Game: ${trade.title}\n` +
                   (ctx ? `LIVE: ${ctx.detail} | Stage: ${stage.toUpperCase()} | Period: ${ctx.period}\n` : '') +
-                  `Win expectancy: ${(ourWE*100).toFixed(0)}% | Score diff: ${ctx.diff}\n\n` +
+                  `Win expectancy: ${(ourWE*100).toFixed(0)}% | Score diff: ${ctx.diff}${_entryDiff != null ? ` (entered at diff ${_entryDiff})` : ''}\n` +
+                  `THESIS STATUS: ${_thesisStatus}\n\n` +
                   `SPORT-SPECIFIC COMEBACK RATES:\n${playoffComebacks}\n\n` +
-                  `At ${(ourWE*100).toFixed(0)}% WE, is a comeback realistic for ${sport} at this stage?\n` +
+                  `KEY QUESTION: Is the entry thesis still intact, or has it broken? "Team can still win" ≠ "thesis intact." If we bought a leader and they're now tied/trailing, the thesis is BROKEN.\n` +
                   `⚠️ BLOWUP SIGNATURE: If opponent has scored 2+ unanswered since entry AND WE has dropped 25+ points from entry, trajectory > scoreboard — SELL. Don't fight a visible momentum shift just because the comeback rate "looks fine" on paper.\n\n` +
                   (isPlayoffWER
-                    ? `HOLD unless WE < 12% OR final 5 min/period with 3+ deficit OR blowup signature present. Playoff WE underestimates comeback potential, but momentum still matters.\n`
-                    : `HOLD if deficit is recoverable AND trajectory is stable (1-goal NHL with period+ left, small MLB deficit mid-game, no 2+ unanswered).\n`) +
-                  `SELL if game is effectively decided OR blowup signature present (large deficit late, blowout, opponent on a run with WE collapsing).\n\n` +
-                  `JSON: {"action":"sell"/"hold","reasoning":"1 sentence"}`;
+                    ? `HOLD unless thesis broken OR WE < 12% OR final 5 min/period with 3+ deficit OR blowup signature present. Playoff WE underestimates comeback potential, but momentum still matters.\n`
+                    : `HOLD if entry thesis is intact AND deficit is recoverable AND trajectory is stable.\n`) +
+                  `SELL if entry thesis has broken (leader equalized/trailing, score-diff worse than at entry by 2+) OR game effectively decided OR blowup signature present.\n\n` +
+                  `JSON: {"action":"sell"/"hold","reasoning":"1 sentence — must address ENTRY THESIS state, not just whether team can still win the game"}`;
                 const weText = await claudeScreen(weRevPrompt, { maxTokens: 200, timeout: 8000, category: 'exit:we-reversal' });
                 if (weText) {
                   try {
