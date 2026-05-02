@@ -999,7 +999,14 @@ function detectMlbInn4Leader({ league, period, gameDetail, diff, weTimeAdj, pric
   //   d≥3: ≤82¢ (kept; bigger leads survive higher prices)
   if (diff === 1 && price > 0.72) return null;
   if (diff === 2 && price > 0.78) return null;
-  if (diff >= 3 && price > 0.82) return null;
+  // 2026-05-02 DEAD-ZONE for d=3: 75-80¢ shows 50% WR (n=4), 80-82¢ shows 80% (n=10).
+  // Allow 50-75¢ (lockdown lean) OR 80-82¢ (high-conviction band), block 75-80 dead zone.
+  if (diff === 3) {
+    const inLow = price >= 0.50 && price <= 0.75;
+    const inHigh = price >= 0.80 && price <= 0.82;
+    if (!inLow && !inHigh) return null;
+  }
+  if (diff >= 4 && price > 0.82) return null;
   // 2026-05-02 BUCKET-WR ANCHORING: dropped 8pt edge floor. The diff-aware caps
   // already filter out the leaky 80-85¢ d=2 bucket. Within validated bands:
   //   d=1 60-70¢: 100% WR (n=12) | 70-72¢: 79%
@@ -1273,8 +1280,12 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
   //   inn 7 d=1: ≤45¢ (NEW — close-game 7th, lockdown territory only at deep dip)
   //   inn 7 d=2: ≤72¢ (slight loosen, 2 innings left = stronger lockdown)
   //   inn 7 d≥3: ≤88¢ (kept)
-  if (period === 5 && diff === 1 && price > 0.50) {
-    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn5-1run', ticker }); } catch {} }
+  // 2026-05-02 BUCKET REFINEMENT for inn-5 d=1: extend allowed band to ≤60¢.
+  // Bucket profile: 50-55¢ = 100% (n=4), 55-60¢ = 80% (n=5) ✅
+  //                 60-65¢ = 50% (n=14), 65-70¢ = 41% (n=22) ⚠️ block
+  // Old gate ≤50¢ was over-tight — missed 9 winning samples in 50-60 range.
+  if (period === 5 && diff === 1 && price > 0.60) {
+    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn5-1run-above60', ticker }); } catch {} }
     return null;
   }
   // 2026-05-02 DEAD-ZONE CARVE-OUTS for d=2. Bucket audit revealed non-monotonic
@@ -1508,12 +1519,14 @@ function detectNhlP3ClosingOut({ league, period, gameDetail, diff, weTimeAdj, pr
   const minEdge = diff === 1 ? 0.07 : (diff === 2 ? 0.04 : 0.03);
   if (edge < minEdge) return null;
 
-  // 2026-05-02: diff-aware cap from bucket audit. Shadow data on NHL P3 d=1:
-  //   70-75¢: 50% WR (n=6) ⚠️ — coin flip, blocked
-  //   75-80¢: 75% WR (n=12) ✅ — sweet spot
-  //   80-85¢: 56% WR (n=18) ⚠️ — late-pulled-goalie variance, blocked
-  // d=2/3+ have stronger profiles, keep 90¢.
-  if (diff === 1 && price > 0.78) return null;
+  // 2026-05-02 v2: tightened d=1 cap further from 78¢ → 75¢. Bucket data:
+  //   70-75¢: 50% WR (n=6) ⚠️ — was inside old 78¢ cap, leaking
+  //   75-80¢: 75% WR (n=12) ✅ — sweet spot, but 75-78 is the ONLY allowed slice
+  //   80-85¢: 56% WR (n=18) ⚠️ — blocked
+  // Also block 70-75 explicitly: cap at 75¢ + minimum 70¢ for d=1 to skip the
+  // coin-flip range. Net allowed for d=1: 70-75¢ (the proven sub-band).
+  // Wait — better: cap at 78 BUT require >=75. Result: 75-78 only for d=1.
+  if (diff === 1 && (price < 0.75 || price > 0.78)) return null;
   if (diff >= 2 && price > 0.90) return null;
 
   return {
@@ -3495,7 +3508,12 @@ function getBucketSizingMult(sport, strategy) {
   // This was the missing piece: MLB pre-game had 18% tWR but 63% on the 15-19pt
   // edge bucket which lost -$9.18/trade due to high-priced favorites paying tiny
   // upside. WR-only check missed this.
-  if (stats.n >= 15 && stats.avgPnl < -2.00) return 0.00; // heavy bleeder → freeze
+  // 2026-05-02: lowered freeze threshold for catastrophic bleeders. Old rule
+  // (n>=15) let pre-game-edge-first slip through at n=7 with -$4.29 avg / 14% WR.
+  // New: any strategy at n>=5 with avg < -$3 freezes immediately. n>=10 with
+  // avg < -$2 also freezes (was n>=15). Faster reaction to clear failures.
+  if (stats.n >= 5 && stats.avgPnl < -3.00) return 0.00;  // catastrophic bleeder
+  if (stats.n >= 10 && stats.avgPnl < -2.00) return 0.00; // confirmed bleeder
   if (stats.avgPnl < -1.00) return 0.25;
   if (stats.avgPnl < -0.50) return 0.50;
   // WR-based throttle (existing logic)
@@ -8311,7 +8329,13 @@ async function checkLiveScoreEdges() {
 
         // Confidence-based gate — sport-specific floor if calibration override exists, else global
         let confidence = decision.confidence ?? 0;
-        const sportMinConf = CAL.minConfidenceLive?.[league] ?? MIN_CONFIDENCE;
+        // 2026-05-02: MLB live-prediction at 70% floor showed 46% WR / -$31 P&L over n=24.
+        // Claude is mis-calibrated on the borderline 70-74% confidence band. Raising
+        // floor to 75% filters the bottom-tier calls. Expected: ~30-40% volume drop,
+        // WR climbs from 46% toward 55-60%. NHL also lifted (was 41% WR n=17 → -$13).
+        const SPORT_FLOOR_OVERRIDES = { mlb: 0.75, nhl: 0.74 };
+        const _hardcodedFloor = SPORT_FLOOR_OVERRIDES[league] ?? null;
+        const sportMinConf = _hardcodedFloor ?? CAL.minConfidenceLive?.[league] ?? MIN_CONFIDENCE;
         // Tier 2: price×confidence floor (underdog/favorite band) if calibrated
         const priceBand = price < 0.50 ? 'underdog' : 'favorite';
         const priceBandFloor = CAL.priceConfFloors?.[league]?.[priceBand] ?? 0;
@@ -11039,16 +11063,15 @@ async function checkPreGamePredictions() {
     const PRE_GAME_MIN_CONF = isNhlNba
       ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.72)
       : pgSportKey === 'mlb'
-        // MLB tiers — aligned with NHL/NBA mid tier (65%). Prior 66% was a leftover
-        // safety buffer from a calibration bug that has since been fixed; 1pt gap was
-        // locking out legit 7-11pt edge trades where Sonnet naturally lands at 65%.
-        //   <50¢ (underdog):   63% — big edge zone, let value through
-        //   50-65¢ (mid):      65% — aligned with NHL/NBA
-        //   >65¢ (favorite):   68% — favorites still need conviction
-        // Disaster-tier exempt: -3pt across all price tiers (60/62/65 instead of 63/65/68)
+        // 2026-05-02: MLB pre-game-prediction at old floors showed 42% WR / -$22 P&L
+        // over n=19. Raised tiers across the board to filter borderline calls:
+        //   <50¢ (underdog):   65% (was 63) — slightly higher bar on swing-bands
+        //   50-65¢ (mid):      70% (was 65) — biggest gap, most leakage was here
+        //   >65¢ (favorite):   75% (was 68) — high price = need real conviction
+        // Disaster-tier exempt keeps a -5pt discount on all tiers.
         ? (_disasterTierExempt
-            ? (price < 0.50 ? 0.60 : price <= 0.65 ? 0.62 : 0.65)
-            : (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68))
+            ? (price < 0.50 ? 0.60 : price <= 0.65 ? 0.65 : 0.70)
+            : (price < 0.50 ? 0.65 : price <= 0.65 ? 0.70 : 0.75))
         : isSoccer
           ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68) // Soccer: unchanged
           : 0.65; // fallback for other sports
