@@ -15178,16 +15178,20 @@ async function main() {
             }
           }
 
-          await tg(
-            `📊 <b>DAILY CALIBRATION DIGEST</b>\n` +
-            `${settled.length} settled · total P&L $${totalPnL.toFixed(2)}\n\n` +
-            `🟢 <b>BEST BUCKETS (n≥5)</b>\n` +
-            best.map(fmt).join('\n') + '\n\n' +
-            `🔴 <b>WORST BUCKETS (n≥5)</b>\n` +
-            worst.map(fmt).join('\n') +
-            clvSection + '\n\n' +
-            `📁 Full stats: logs/calibration-stats.json`
-          );
+          // 2026-05-02: daily calibration digest Telegram disabled per user request.
+          // Stats still written to logs/calibration-stats.json + console-logged.
+          // Re-enable by un-commenting tg() below if needed.
+          // await tg(
+          //   `📊 <b>DAILY CALIBRATION DIGEST</b>\n` +
+          //   `${settled.length} settled · total P&L $${totalPnL.toFixed(2)}\n\n` +
+          //   `🟢 <b>BEST BUCKETS (n≥5)</b>\n` +
+          //   best.map(fmt).join('\n') + '\n\n' +
+          //   `🔴 <b>WORST BUCKETS (n≥5)</b>\n` +
+          //   worst.map(fmt).join('\n') +
+          //   clvSection + '\n\n' +
+          //   `📁 Full stats: logs/calibration-stats.json`
+          // );
+          void best; void worst; void clvSection; void totalPnL;
         }
       }
     } catch (e) {
