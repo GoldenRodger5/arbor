@@ -12515,19 +12515,33 @@ async function managePositions() {
             const priceStillFalling = prevSeen && currentPrice <= prevSeen.price + 0.01;  // flat or down
             if (tradeAgeMin >= minHoldMin && dropFromEntry >= dropThreshold && priceStillFalling) {
               const lossPct = (currentPrice - entryPrice) / entryPrice;
-              console.log(`[exit] 🩸 BLEED-OUT STOP: ${trade.ticker} entry=${(entryPrice*100).toFixed(0)}¢ → now=${(currentPrice*100).toFixed(0)}¢ (-${(dropFromEntry*100).toFixed(0)}¢, ${(lossPct*100).toFixed(0)}%) | open ${tradeAgeMin.toFixed(0)}min | thesis dead — attempting exit`);
-              const result = await executeSellAndNotify(trade, qty, currentPrice, 'bleed-out-stop', {
-                kind: 'BLEED-OUT STOP',
-                title: trade.title,
-                entry: entryPrice,
-                exit: currentPrice,
-                qty: qty,
-                pnl: qty * profitPerContract,
-                reason: `Price dropped ${(dropFromEntry*100).toFixed(0)}¢ from entry (${(lossPct*100).toFixed(0)}%) over ${tradeAgeMin.toFixed(0)} min and is still falling. Cutting losses before deeper drawdown.`,
-                isWin: false,
-              });
-              if (result) anyUpdated = true;
-              continue;
+              // 2026-05-02: velocity-confirmed bleed-out. Severe drops (≥-25%) exit
+              // immediately as before — collapse is collapse. Moderate drops require
+              // a recent cross-confirmed contra signal so we exit on real info, not
+              // slow drift on quiet positions. KC@SEA 2026-05-01 was a borderline
+              // case (had velocity, exit defensible); refinement protects against
+              // unobserved slow-grind failure mode.
+              const isSevereDrop = lossPct <= -0.25;
+              const _bvMover = recentCrossContraMovers.get(trade.ticker);
+              const _bvFresh = !!(_bvMover && (Date.now() - _bvMover.when) <= 5 * 60 * 1000);
+              if (!isSevereDrop && !_bvFresh) {
+                console.log(`[bleed-out-defer] ${trade.ticker} ${(lossPct*100).toFixed(0)}% drawdown but no fresh cross-contra velocity (last 5min) — holding for thesis (slow drift, not real info)`);
+              } else {
+                const _trigger = isSevereDrop ? 'SEVERE-DROP' : `velocity ${_bvMover.velocity.toFixed(1)}¢/min ${Math.round((Date.now()-_bvMover.when)/1000)}s ago`;
+                console.log(`[exit] 🩸 BLEED-OUT STOP (${_trigger}): ${trade.ticker} entry=${(entryPrice*100).toFixed(0)}¢ → now=${(currentPrice*100).toFixed(0)}¢ (-${(dropFromEntry*100).toFixed(0)}¢, ${(lossPct*100).toFixed(0)}%) | open ${tradeAgeMin.toFixed(0)}min | thesis dead — attempting exit`);
+                const result = await executeSellAndNotify(trade, qty, currentPrice, 'bleed-out-stop', {
+                  kind: 'BLEED-OUT STOP',
+                  title: trade.title,
+                  entry: entryPrice,
+                  exit: currentPrice,
+                  qty: qty,
+                  pnl: qty * profitPerContract,
+                  reason: `Price dropped ${(dropFromEntry*100).toFixed(0)}¢ from entry (${(lossPct*100).toFixed(0)}%) over ${tradeAgeMin.toFixed(0)} min. Trigger: ${_trigger}.`,
+                  isWin: false,
+                });
+                if (result) anyUpdated = true;
+                continue;
+              }
             }
           }
         }
