@@ -1022,7 +1022,9 @@ function detectMlbInn1Leader3Plus({ league, period, gameDetail, diff, weTimeAdj,
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff < 3) return null;
-  if (price > 0.80) return null;
+  // 2026-05-02: cap loosened 80¢ → 85¢. Bucket audit shows 80-85¢ at 100%
+  // WR (n=6); previous 80¢ cap was leaving these on the table.
+  if (price > 0.85) return null;
   const edge = weTimeAdj - price;
   if (edge < 0.04) return null;
   return {
@@ -1051,18 +1053,57 @@ function detectMlbInn1Leader3Plus({ league, period, gameDetail, diff, weTimeAdj,
 // but no structural detector to fast-path. Cell logic: inn-3 is "blowout track" — a 3+ run
 // lead 1/3 of game in is statistically very strong (~85-92% conversion). Cap at 88¢
 // matches the global MLB ceiling for diff>=4 and Fix A diff-aware approach for inn-5-7.
+// MLB inning 3 leader EXACTLY 2-run lead. Bucket audit 2026-05-02:
+// 65-70: 75% (n=8), 70-75: 78% (n=9), 75-80: 75% (n=20), 80-85: 83% (n=6).
+// Uniform 75-83% across the entire 65-85¢ band, n=45 — replaces volume from
+// the disabled inn-3-3run cell with a real +EV one. Cap at 82¢ to stay within
+// the validated band; 8pt edge floor for selection-bias filter.
+function detectMlbInn3Leader2Run({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period !== 3) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff !== 2) return null;
+  if (price < 0.65 || price > 0.82) return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.06) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `2-run lead in 3rd — early-mid game, lead validates pitcher control`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 3 leader 2-run, 75-83% WR n=45 shadow): 2-run lead in 3rd, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Inning 3, 2-run lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 45 shadow leaders, uniform 75-83% WR across 65-85¢`,
+      ],
+      top_risk: '6 innings remain — ample time for trailing offense to flip',
+      conviction: 'Structural pattern — replaces disabled inn-3-3run, 2-run subset is the real cell',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-inn-3-leader-2run',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
 function detectMlbInn3Leader3Plus({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  // 2026-05-02 DISABLED. Comprehensive bucket audit (n=27) shows EVERY price
+  // bucket on this cell is below break-even:
+  //   70-75¢: 60% WR (n=5)
+  //   75-80¢: 45% WR (n=11)
+  //   80-85¢: 50% WR (n=8)
+  // Cell is not +EV at any price. Return null unconditionally.
+  // Replaced volume by adding detectMlbInn3Leader2Run (uniform 75-83% WR cell).
+  return null;
+  // eslint-disable-next-line no-unreachable
   if (league !== 'mlb') return null;
   if (period !== 3) return null;
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff < 3) return null;
-  // 2026-05-02: cap tightened 88¢ → 78¢. Shadow audit shows inn3_d3 at 75-85¢
-  // is only 50% WR (n=19). The 60-75¢ band is where this cell is +EV. Above
-  // that it's a coin flip at high price = losing trade.
   if (price > 0.78) return null;
   const edge = weTimeAdj - price;
-  // 8pt edge floor (selection bias — see inn-4-leader)
   if (edge < 0.08) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
@@ -1209,26 +1250,49 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
     if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn5-1run', ticker }); } catch {} }
     return null;
   }
-  if (period === 5 && diff === 2 && price > 0.65) {
-    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn5-2run-tight', ticker }); } catch {} }
-    return null;
+  // 2026-05-02 DEAD-ZONE CARVE-OUTS for d=2. Bucket audit revealed non-monotonic
+  // WR profiles where the middle band (~65-75¢) is a money pit but the high
+  // band (75-85¢) is a sweet spot. Earlier flat-cap tightening blocked both.
+  // Now: allow low-band entries (deep mispricing) AND high-band entries
+  // (lockdown lean) but skip the dead zone in between.
+  //
+  //   inn 5 d=2 buckets: 60-65: 67% / 70-75: 60% (n=10) ⚠️ / 75-80: 83% (n=18) / 80-85: 82% (n=11)
+  //   inn 6 d=2 buckets: 70-75: 20% (n=5) ⚠️ / 75-80: 91% (n=11) / 80-85: 100% (n=3)
+  //   inn 7 d=2 buckets: 70-75: 50% (n=4) ⚠️ / 75-80: 60% (n=5) / 80-85: 83% (n=6)
+  if (period === 5 && diff === 2) {
+    // Allow 50-65¢ (low-band mispricing) OR 75-85¢ (lockdown sweet spot). Skip middle.
+    const inLow = price >= 0.50 && price < 0.65;
+    const inHigh = price >= 0.75 && price <= 0.85;
+    if (!inLow && !inHigh) {
+      if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn5-2run-deadzone', ticker }); } catch {} }
+      return null;
+    }
   }
   if (period === 6 && diff === 1 && price > 0.50) {
     if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn6-1run', ticker }); } catch {} }
     return null;
   }
   if (period === 6 && diff === 2) {
-    // Defer to inn-6-leader (100% WR detector, 46-65¢ band). Don't fire here.
-    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn6-2run-defer-to-inn6-leader', ticker }); } catch {} }
-    return null;
+    // Below 65¢: defer to inn-6-leader (100% WR n=6 in 46-65¢ band).
+    // 65-75¢: dead zone (20% WR n=5).
+    // 75-85¢: sweet spot (91-100% WR n=14).
+    if (price < 0.75 || price > 0.85) {
+      if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn6-2run-deadzone', ticker }); } catch {} }
+      return null;
+    }
   }
   if (period === 7 && diff === 1 && price > 0.45) {
     if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn7-1run-tight', ticker }); } catch {} }
     return null;
   }
-  if (period === 7 && diff === 2 && price > 0.72) {
-    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn7-2run', ticker }); } catch {} }
-    return null;
+  if (period === 7 && diff === 2) {
+    // Allow 50-72¢ (lockdown lean) OR 80-85¢ (deep lockdown). Block 72-80 dead zone.
+    const inLow = price >= 0.50 && price <= 0.72;
+    const inHigh = price >= 0.80 && price <= 0.85;
+    if (!inLow && !inHigh) {
+      if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn7-2run-deadzone', ticker }); } catch {} }
+      return null;
+    }
   }
   if (diff >= 3 && price > 0.88) {
     if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'diff-ge-3', ticker }); } catch {} }
@@ -7312,6 +7376,14 @@ async function checkLiveScoreEdges() {
           // 2026-05-01: MLB inn 3 leader 3+ run lead — live-edge gap detector
           // (TEX-DET tonight 4-0 inn-3 at 88¢ sat in gap between inn-1 and inn-4 detectors)
           _structuralDecision = detectMlbInn3Leader3Plus({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-05-02: MLB inn 3 leader 2-run — uniform 75-83% WR n=45 shadow @ 65-85¢
+          // Replaces disabled inn-3-3run volume with a real +EV cell.
+          _structuralDecision = detectMlbInn3Leader2Run({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
