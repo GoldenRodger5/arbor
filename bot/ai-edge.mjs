@@ -1202,6 +1202,16 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
     }
     return null;
   }
+  // Fix D-2 (2026-05-02): mirror inn-5 gate for inn-6 d=1. Shadow data 2026-05-01:
+  // 4 of 5 recent MLB live-edge LOSERS were inn-5/6 d=1 entries at 52-63¢. The
+  // structural inn-5-7 detector was the firing source. Inn-6 d=1 cell shadow shows
+  // 68% game-WR at avg 69¢ (-0.4pt EV — break-even at best). Same fragility as inn-5.
+  if (period === 6 && diff === 1 && price > 0.50) {
+    if (typeof logFixABlock === 'function') {
+      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-d2-inn6-1run', ticker }); } catch {}
+    }
+    return null;
+  }
   const edge = weTimeAdj - price;
   if (edge < 0.04) return null;
   return {
@@ -8739,6 +8749,14 @@ async function checkLiveScoreEdges() {
         if (g.league !== 'mlb') continue;
         if (g.diff < 1 || g.diff > 2) continue;
         if (g.period < 2 || g.period > 5) continue;
+
+        // Toxic-cell block (2026-05-02): shadow data shows two cells where buying
+        // the trailer at 25-40¢ destroys money:
+        //   mlb-trail-2run-P2: 20% game-WR n=10, ~0% recover ≥15¢, avg max-rec 2¢
+        //   mlb-trail-2run-P4: 10% game-WR n=10, ~0% recover ≥15¢, avg max-rec 1¢
+        // Even with ace ERA <3.5 the deficit doesn't shrink — early 2-run holes
+        // with no offensive momentum trend toward the trailer losing. Hard skip.
+        if (g.diff === 2 && (g.period === 2 || g.period === 4)) continue;
 
         const trailingIsHome = g.homeScore < g.awayScore;
         const trailingTeam  = trailingIsHome ? g.home : g.away;
