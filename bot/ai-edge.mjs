@@ -8909,9 +8909,12 @@ async function checkLiveScoreEdges() {
 
         // Swing mode: entry price must be ≤60¢ and confidence ≥72%
         // 2026-04-30: tightened from ≤65¢ / ≥68% — recent 8-game sample showed 33% gWR
-        // and clipped mean −$2.31 (worst-performing strategy by clipped mean). Trims the
-        // bottom quartile of swing entries; reversible if quality data appears at n≥15.
-        if (isSwingMode) {
+        // and clipped mean −$2.31 (worst-performing strategy by clipped mean).
+        // 2026-05-02: BYPASS swing-mode caps for STRUCTURAL detector matches.
+        // Score-event-arb fired on TB at 64¢ but was blocked by 60¢ swing cap.
+        // Structural detectors have their own per-cell caps; they should override
+        // generic swing-mode price/confidence floors.
+        if (isSwingMode && !item._structuralDecision) {
           if (price > 0.60) {
             console.log(`[live-swing] BLOCKED ${targetAbbr}: price ${(price*100).toFixed(0)}¢ > 60¢ cap for swing trades`);
             continue;
