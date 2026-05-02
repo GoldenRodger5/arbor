@@ -8828,7 +8828,10 @@ async function checkLiveScoreEdges() {
 
         // Standard live-prediction: block <50¢ entries. Data: 0/4 WR, -$33 on underdog live bets.
         // If sub-50¢ is the right call, swing mode is the vehicle (tighter gates, smaller size, +12¢ exit).
-        if (!isSwingMode && price < 0.50) {
+        // 2026-05-02: bypass when structural detector matches — detectNbaQ4DeepTrailer (15-25¢),
+        // detectSoccerCounterEqualizer (25-35¢), detectNbaQ4LeaderUnderdogPrice (40-55¢) all
+        // legitimately fire below 50¢ and have their own per-cell rules.
+        if (!isSwingMode && !item._structuralDecision && price < 0.50) {
           console.log(`[live-edge] BLOCKED ${targetAbbr}: price ${(price*100).toFixed(0)}¢ < 50¢ — underdog live entries have 0% historical WR; route via swing mode`);
           logScreen({ stage: 'live-edge-skip', result: 'skip-underdog-price', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `Entry price ${(price*100).toFixed(0)}¢ below 50¢ floor — underdog live bets have 0-for-4 historical WR. Route via swing mode or skip.` });
           continue;
@@ -8840,7 +8843,10 @@ async function checkLiveScoreEdges() {
         // is correctly pricing bullpen-collapse risk at 60-70¢ — our WE table doesn't model it.
         // Losers (LAA-NYY -$18, KC-DET -$18, MIA-ATL -$17) averaged $15; winners averaged $8.
         // The edge we think we have is the edge the market already priced. Just skip the setup.
-        if (!isSwingMode && league === 'mlb' && stage === 'late' && Math.abs(diff) <= 1 && targetAbbr === leadingAbbr) {
+        // 2026-05-02: bypass when structural detector matches — detectMlbInn89Leader d=1
+        // requires price ≥75¢ (closer-territory specific) and detectMlbInn5To7Leader has
+        // its own cell-aware d=1 rules. The generic 1-run block was preempting both.
+        if (!isSwingMode && !item._structuralDecision && league === 'mlb' && stage === 'late' && Math.abs(diff) <= 1 && targetAbbr === leadingAbbr) {
           console.log(`[live-edge] BLOCKED ${targetAbbr} (MLB late-inning 1-run lead pattern): inning ${period}, diff ${diff}, WE-table overvalues bullpen protection — historical 36% WR, -$19 net. Skipping.`);
           logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-late-1run', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `MLB late-inning 1-run leads: 11 historical trades, 36% WR, -$19 net. Market correctly prices bullpen risk; WE table doesn't.` });
           continue;
@@ -8854,7 +8860,10 @@ async function checkLiveScoreEdges() {
         // Shadow data confirms early-period NHL is heavily miscalibrated (Sonnet
         // overconfident by 30-50pts). P3 is where the bot has shown actual edge.
         // Don't pause NHL entirely; just keep the winning sub-cell.
-        if (!isSwingMode && league === 'nhl' && (period === 1 || period === 2) && targetAbbr === leadingAbbr) {
+        // 2026-05-02: bypass when structural detector matches — NHL early-period
+        // structural cells (if any fire) have their own data; the generic block
+        // was a Sonnet-only guard.
+        if (!isSwingMode && !item._structuralDecision && league === 'nhl' && (period === 1 || period === 2) && targetAbbr === leadingAbbr) {
           console.log(`[live-edge] BLOCKED ${targetAbbr}: NHL P${period} live-prediction — historical 40-50% WR (P1: 5 trades, P2: 2 trades). Only P3 has shown edge.`);
           logScreen({ stage: 'live-edge-skip', result: 'skip-nhl-early-period', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `NHL early-period live-prediction historical: P1 40% WR, P2 50% WR, both net negative. Only P3 (75% WR) is profitable.` });
           continue;
