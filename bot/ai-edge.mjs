@@ -1573,9 +1573,14 @@ function detectSoccerHomeHTLeader({ league, period, gameDetail, diff, weTimeAdj,
   const m = (gameDetail || '').match(/^(\d+)/);
   if (!m) return null;
   const minute = parseInt(m[1], 10);
-  if (minute < 45 || minute > 65) return null; // early 2H window only
+  // 2026-05-02 v2: tightened minimum minute from 45 → 55. ALA@ATH 2026-05-02
+  // bought at minute 46 with lead held for ~0 minutes of 2H, equalized 60
+  // seconds later, -63% nuclear stop. The "100% WR n=5 historical" cell was
+  // measured at later minutes when lead had been held longer. Minute 45-55
+  // is the danger zone — halftime tactical reset hasn't played out yet.
+  if (minute < 55 || minute > 65) return null;
 
-  // 2026-05-02: add price cap from bucket audit. Shadow soccer-2H d=1:
+  // Price cap from bucket audit. Shadow soccer-2H d=1:
   //   65-70¢: 60% WR (n=5) borderline
   //   70-75¢: 56% WR (n=9) ⚠️
   // Sub-65 sample is thin (n=3, 100% WR) but the trend is clear:
@@ -8376,12 +8381,14 @@ async function checkLiveScoreEdges() {
 
         // Confidence-based gate — sport-specific floor if calibration override exists, else global
         let confidence = decision.confidence ?? 0;
-        // 2026-05-02: MLB live-prediction at 70% floor showed 46% WR / -$31 P&L over n=24.
-        // Claude is mis-calibrated on the borderline 70-74% confidence band. Raising
-        // floor to 75% filters the bottom-tier calls. Expected: ~30-40% volume drop,
-        // WR climbs from 46% toward 55-60%. NHL also lifted (was 41% WR n=17 → -$13).
-        // MLS lifted to 78% — historical 50% WR / -$61 P&L across all strategies.
-        const SPORT_FLOOR_OVERRIDES = { mlb: 0.75, nhl: 0.74, mls: 0.78 };
+        // 2026-05-02: per-sport + per-league live-prediction confidence floors.
+        // MLB live: 70% → 75% (was 46% WR, -$31 P&L over n=24)
+        // NHL live: 70% → 74% (was 41% WR, -$13 over n=17 — partly stale data)
+        // MLS live: 70% → 78% (50% WR, -$61 across all MLS strategies)
+        // EPL live: 70% (kept — small sample, mostly draw-bet drives EPL P&L)
+        // LaLiga live: 70% → 73% (40% WR, +$28 mostly variance, conservative)
+        // SerieA/Bundesliga/Ligue1: rare, default to standard 70%
+        const SPORT_FLOOR_OVERRIDES = { mlb: 0.75, nhl: 0.74, mls: 0.78, laliga: 0.73 };
         const _hardcodedFloor = SPORT_FLOOR_OVERRIDES[league] ?? null;
         const sportMinConf = _hardcodedFloor ?? CAL.minConfidenceLive?.[league] ?? MIN_CONFIDENCE;
 
@@ -10060,11 +10067,26 @@ async function checkPreGamePredictions() {
   // Used to anchor Sonnet's pre-game reasoning so it can't claim "edge" when
   // sharp consensus already prices the matchup at the same probability.
   const espnSportsbookMap = new Map();
+  // 2026-05-02: team form + season record map. ESPN's competitor object includes
+  // `form` (5-char W/L/D string of last 5 results) and `records[0].summary` (e.g.
+  // "14-9-12"). Pre-fetched and injected into soccer prompts so Claude doesn't
+  // have to web-search for form (unreliable) or guess. Big edge for MLS/EPL/etc.
+  // Key: team abbr UPPERCASE → { form, recordSummary, teamName }
+  const espnTeamFormMap = new Map();
+  // 2026-05-02: added EPL, LaLiga, Serie A, Bundesliga, Ligue 1 paths so the
+  // sportsbook-gap detector can actually fire for European soccer. Was 0 fires
+  // ever because we never fetched their odds. Highest-edge pre-game signal we
+  // have (no-vig sportsbook consensus vs Kalshi) — now active for all soccer.
   const espnSportPaths = [
     { key: 'MLB', path: 'baseball/mlb' },
     { key: 'NHL', path: 'hockey/nhl' },
     { key: 'NBA', path: 'basketball/nba' },
     { key: 'MLS', path: 'soccer/usa.1' },
+    { key: 'EPL', path: 'soccer/eng.1' },
+    { key: 'LALIGA', path: 'soccer/esp.1' },
+    { key: 'SERIEA', path: 'soccer/ita.1' },
+    { key: 'BUNDESLIGA', path: 'soccer/ger.1' },
+    { key: 'LIGUE1', path: 'soccer/fra.1' },
   ];
   // espnRosterMap: team abbr (lowercase) → { active: string[], inactive: string[] }
   // Used to inject confirmed roster/lineup into prompts so Claude can't hallucinate wrong players
@@ -10120,6 +10142,23 @@ async function checkPreGamePredictions() {
               }
             }
           } catch { /* odds optional; skip silently */ }
+        }
+        // 2026-05-02: capture team form (last 5 results) + season record per team.
+        // ESPN provides this on every soccer scoreboard competitor.
+        for (const team of competitors) {
+          try {
+            const abbrUpper = (team.team?.abbreviation ?? '').toUpperCase();
+            if (!abbrUpper) continue;
+            const form = typeof team.form === 'string' ? team.form : null;
+            const recordSummary = team.records?.[0]?.summary ?? null;
+            if (form || recordSummary) {
+              espnTeamFormMap.set(abbrUpper, {
+                form,
+                recordSummary,
+                teamName: team.team?.displayName ?? abbrUpper,
+              });
+            }
+          } catch { /* form data is best-effort */ }
         }
         for (const team of competitors) {
           const abbr = (team.team?.abbreviation ?? '').toLowerCase();
@@ -10384,6 +10423,31 @@ async function checkPreGamePredictions() {
         `📊 SPORTSBOOK CONSENSUS: not available for this game (ESPN scoreboard didn't return odds).\n` +
         `  Without a sharp anchor, BE EXTRA CAUTIOUS. Generic confidence in "team X is better" is exactly what sportsbooks already priced. Apply 5pt downward bias to your confidence.\n\n`;
     }
+
+    // 2026-05-02: TEAM FORM context — pre-fetched from ESPN scoreboard. Last 5
+    // results (W/L/D pattern) + season record summary. Reliable, fresh, no
+    // web search required. Gives Claude concrete form data instead of guessing.
+    let teamFormCtx = '';
+    try {
+      const f1 = espnTeamFormMap.get(_t1);
+      const f2 = espnTeamFormMap.get(_t2);
+      if (f1 || f2) {
+        const fmtForm = (s) => {
+          if (!s) return null;
+          // ESPN form is ordered MOST-RECENT-FIRST. e.g. "WLDDD" = last:W prev:L
+          const parts = s.split('').map(c => c === 'W' ? '✓W' : c === 'L' ? '✗L' : '–D');
+          return parts.join(' ');
+        };
+        teamFormCtx = `📋 TEAM FORM (ESPN — verified, do NOT contradict via web search):\n`;
+        if (f1) {
+          teamFormCtx += `  ${market.team1.team}: form=${fmtForm(f1.form) ?? '?'} | season=${f1.recordSummary ?? '?'}\n`;
+        }
+        if (f2) {
+          teamFormCtx += `  ${market.team2.team}: form=${fmtForm(f2.form) ?? '?'} | season=${f2.recordSummary ?? '?'}\n`;
+        }
+        teamFormCtx += `  CALIBRATION: 5-loss-streak teams are not "due for a win" — the streak is information about quality. 5-win-streak teams have momentum priced in already; only +EV when market underprices their dominance vs current opponent's actual form.\n\n`;
+      }
+    } catch { /* form is best-effort */ }
     // Hard anti-hallucination preamble — injected before every prompt.
     const antiHallucinationHeader =
       `🛑 ZERO-FABRICATION RULES — violations invalidate your analysis and the trade will be blocked:\n` +
@@ -10507,7 +10571,7 @@ async function checkPreGamePredictions() {
       // Order: anti-hallucination → LINEUP CHANGE (highest priority) → sportsbook anchor → starters → analysis.
       // Lineup change first because it's the BIGGEST signal — if the starter
       // just changed, Sonnet should react to that before any other consideration.
-      prompt: antiHallucinationHeader + lineupChangeCtx + sportsbookCtx + starterCtx + pgPromptText,
+      prompt: antiHallucinationHeader + lineupChangeCtx + sportsbookCtx + teamFormCtx + starterCtx + pgPromptText,
     };
   });
 
