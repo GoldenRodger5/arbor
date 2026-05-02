@@ -1569,6 +1569,51 @@ function detectMlbLateInningLockdown({ league, period, gameDetail, diff, leading
 // Excludes 1-goal leads in last 2 min (pulled-goalie chaos — high variance,
 // market correctly prices). Excludes 1-goal leads in first 8 min of P3 (still
 // 12+ min to play — too much variance to call this "closing out").
+// 2026-05-02 OFFENSIVE: SCORE-EVENT ARB — fires the moment a score changes.
+// Hypothesis: ESPN scoreboard updates on score events 30-90s before Kalshi
+// market makers fully reprice. We exploit the lag by firing fast-path at the
+// current (still-stale) leader price.
+//
+// Validation: price-tape data shows 5.5% of polling intervals contain ≥10¢
+// price moves, mostly clustered around score events. ~5-10 such events per
+// active game × 4-6 games/night = 30-60 opportunities/day.
+//
+// Sized small (3% bankroll cap). Quick exit (swing at +5¢, not hold).
+// Only fires when _scoreChanged is true on the cycle, indicating fresh signal.
+function detectScoreEventArb({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr, scoreChanged }) {
+  if (!scoreChanged) return null;
+  if (targetAbbr !== leadingAbbr) return null; // bet leader only after score change
+  if (diff < 1) return null;
+  if (weTimeAdj == null || price == null) return null;
+  // Asymmetric pay band: 45-78¢. Below 45¢ leader bets are too random,
+  // above 78¢ the lag arb is already pricing in (market caught up).
+  if (price < 0.45 || price > 0.78) return null;
+  // Sport gates: only fire on sports where score events have fast info
+  const validSports = ['mlb','nba','nhl'];
+  if (!validSports.includes(league)) return null;
+  const edge = weTimeAdj - price;
+  if (edge < 0.04) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `Score JUST changed; leader ${targetAbbr} now at ${(price*100).toFixed(0)}¢ but Kalshi MM may not have fully repriced`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (score-event arb): _scoreChanged=true on this cycle, leader ${targetAbbr} priced ${(price*100).toFixed(0)}¢, WE ${(weTimeAdj*100).toFixed(0)}% (${(edge*100).toFixed(0)}pt edge). Kalshi MM lags ESPN by 30-90s on score events; we capture the window.`,
+      key_facts: [
+        `Score event detected this cycle (${diff}-run/pt/goal lead)`,
+        `Leader ${targetAbbr} at ${(price*100).toFixed(0)}¢ vs WE ${(weTimeAdj*100).toFixed(0)}%`,
+        `Strategy: swing-exit at +5¢ on next cycle reprice`,
+      ],
+      top_risk: 'False score event (data anomaly) or Kalshi already repriced',
+      conviction: 'Mechanical — pure information-lag arb, no game-state analysis needed',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'score-event-arb',
+    _isScoreEventArb: true,
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
 // 2026-05-02 OFFENSIVE: NHL P3 empty-net pull window — TRAILER side bet.
 // When NHL trailer is down 1-2 in P3 final 2 min, they pull the goalie for
 // extra attacker. Scoring rate spikes ~5x normal (open net + 6v5 attackers).
@@ -7711,7 +7756,15 @@ async function checkLiveScoreEdges() {
         // Each detector returns null or a synthetic decision; first match wins. Bypasses
         // Sonnet entirely — saves ~$0.30/call and reacts faster. Bot Kelly-sizes from
         // the confidence in the synthetic decision; existing margin/risk gates still apply.
-        let _structuralDecision = detectNbaQ4ColdShooting({
+        // 2026-05-02: SCORE-EVENT ARB runs FIRST — info-lag arb, time-sensitive.
+        // _scoreChanged is destructured at the outer for-of (line 6457).
+        let _structuralDecision = detectScoreEventArb({
+          league, period, gameDetail, diff,
+          weTimeAdj: _weTimeAdj, price,
+          targetAbbr, leadingAbbr,
+          scoreChanged: _scoreChanged ?? false,
+        });
+        if (!_structuralDecision) _structuralDecision = detectNbaQ4ColdShooting({
           league, period, gameDetail, diff,
           leadingFGNum, trailingFGNum,
           weTimeAdj: _weTimeAdj, price,
@@ -14105,6 +14158,68 @@ async function managePositions() {
                 `Now in inning ${ctx.period} — past P2 swing thesis\n` +
                 `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢\n` +
                 `${tsProfit >= 0 ? `Profit: +$${(qty * tsProfit).toFixed(2)}` : `Loss: $${(qty * tsProfit).toFixed(2)}`}`
+              );
+            }
+            continue;
+          }
+
+          // Otherwise: hold for swing — skip all other exit paths
+          continue;
+        }
+
+        // === SCORE-EVENT ARB EXIT PATHS (2026-05-02) ===
+        // This strategy fires the moment a score changes. Kalshi MM lag = ~30-90s.
+        // We capture the lag arb, then EXIT FAST before market reprices fully.
+        // Don't hold to settlement — the edge is the lag, not the outcome.
+        if (trade.strategy === 'structural-score-event-arb' || trade._structuralPattern === 'score-event-arb') {
+          const seProfit = currentPrice - entryPrice;
+          const tradeAgeMin = (Date.now() - new Date(trade.timestamp ?? 0).getTime()) / 60000;
+
+          // 1. PROFIT-LOCK at +5¢: arb realized, exit immediately
+          if (seProfit >= 0.05) {
+            const gainPct = Math.round((seProfit / entryPrice) * 100);
+            console.log(`[exit] ⚡💰 SCORE-EVENT-ARB PROFIT-LOCK: ${trade.ticker} +${(seProfit*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
+            const result = await executeSell(trade, qty, currentPrice, 'score-event-arb-profit-lock');
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `⚡💰 <b>SCORE-EVENT-ARB PROFIT-LOCK</b>\n\n` +
+                `${trade.title}\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Exit: ${(currentPrice*100).toFixed(0)}¢ (+${(seProfit*100).toFixed(0)}¢, +${gainPct}%)\n` +
+                `Profit: <b>+$${(qty * seProfit).toFixed(2)}</b>\n\n` +
+                `💬 Score-event arb captured — exit fast`
+              );
+            }
+            continue;
+          }
+
+          // 2. TIME EXIT: if open >5 min, the arb window is closed — exit at market
+          if (tradeAgeMin > 5) {
+            console.log(`[exit] ⚡⏰ SCORE-EVENT-ARB TIME-EXIT: ${trade.ticker} open ${tradeAgeMin.toFixed(0)}min — arb window closed, exit at market ${(currentPrice*100).toFixed(0)}¢`);
+            const result = await executeSell(trade, qty, currentPrice, 'score-event-arb-time-exit');
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `⚡⏰ <b>SCORE-EVENT-ARB TIME-EXIT</b>\n\n` +
+                `${trade.title}\n` +
+                `Entry: ${Math.round(entryPrice*100)}¢ → Now: ${(currentPrice*100).toFixed(0)}¢\n` +
+                `${seProfit >= 0 ? `Profit: +$${(qty * seProfit).toFixed(2)}` : `Loss: $${(qty * seProfit).toFixed(2)}`}\n\n` +
+                `💬 5min arb window closed — exit`
+              );
+            }
+            continue;
+          }
+
+          // 3. HARD STOP at -8¢: defensive exit
+          if (seProfit <= -0.08) {
+            console.log(`[exit] ⚡🚨 SCORE-EVENT-ARB HARD STOP: ${trade.ticker} ${(seProfit*100).toFixed(0)}¢ — cutting`);
+            const result = await executeSell(trade, qty, currentPrice, 'score-event-arb-hard-stop');
+            if (result) {
+              anyUpdated = true;
+              await tg(
+                `⚡🚨 <b>SCORE-EVENT-ARB HARD STOP</b>\n\n` +
+                `${trade.title}\n` +
+                `Loss: $${(qty * seProfit).toFixed(2)} — score-event signal failed`
               );
             }
             continue;
