@@ -977,9 +977,22 @@ function detectMlbInn4Leader({ league, period, gameDetail, diff, weTimeAdj, pric
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff < 1) return null;
-  if (price < 0.50 || price > 0.82) return null;
+  if (price < 0.50) return null;
+  // 2026-05-02: diff-aware caps from bucket-level shadow analysis. Real-bet WR
+  // was 33% n=3 with the old 82¢ blanket cap because LAA tonight at 81¢ was in
+  // the 80-85¢ bucket where shadow shows only 55% WR (n=11). Tighter caps:
+  //   d=1: ≤72¢ (single-run leads in 4th are fragile, 5 innings remain)
+  //   d=2: ≤78¢ (block the 80-85 trap; 70-80 band shows 80%+ WR)
+  //   d≥3: ≤82¢ (kept; bigger leads survive higher prices)
+  if (diff === 1 && price > 0.72) return null;
+  if (diff === 2 && price > 0.78) return null;
+  if (diff >= 3 && price > 0.82) return null;
   const edge = weTimeAdj - price;
-  if (edge < 0.04) return null;
+  // 2026-05-02: edge floor raised from 4pt to 8pt. Selection bias on structural
+  // detectors — they fire on Sonnet-rejected setups, which are the marginal end
+  // of every cell. 8pt edge requirement filters out the borderline Sonnet-NOs
+  // and only fires on clear mispricing.
+  if (edge < 0.08) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
@@ -1044,9 +1057,13 @@ function detectMlbInn3Leader3Plus({ league, period, gameDetail, diff, weTimeAdj,
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff < 3) return null;
-  if (price > 0.88) return null;
+  // 2026-05-02: cap tightened 88¢ → 78¢. Shadow audit shows inn3_d3 at 75-85¢
+  // is only 50% WR (n=19). The 60-75¢ band is where this cell is +EV. Above
+  // that it's a coin flip at high price = losing trade.
+  if (price > 0.78) return null;
   const edge = weTimeAdj - price;
-  if (edge < 0.04) return null;
+  // 8pt edge floor (selection bias — see inn-4-leader)
+  if (edge < 0.08) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
@@ -1175,45 +1192,51 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff < 1) return null;
-  // Fix A (2026-04-30): diff-aware price cap. Initial 70¢ cap was too blunt.
-  // Shadow data (2026-04-30): MLB-p5-d3 cell shows 100% WR n=12 at avg 83¢ entry,
-  // +17pt edge. MLB-p1-d3 shows 100% WR n=10 at 76¢. Capping these at 70¢ leaves
-  // proven winners on the table. But MLB-p6-d2 (today's ATL) is a -8pt trap cell.
-  //   diff <= 2: 70¢ cap holds (variance too high at higher prices)
-  //   diff >= 3: 88¢ cap (data shows these settle YES at 100¢ on near-100% rate)
-  if (diff <= 2 && price > 0.70) {
-    if (typeof logFixABlock === 'function') {
-      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-a-diff-le-2', ticker }); } catch {}
-    }
+  // 2026-05-02 MAJOR REWORK: this detector was the worst performer (n=9, 56% WR,
+  // -$14.27 P&L). Selection bias: it fires on Sonnet-rejected setups, which are
+  // the marginal end of every cell. Tightening per inning + diff:
+  //
+  //   inn 5 d=1: ≤50¢ (existing fix-D — 4 innings remain, fragile)
+  //   inn 5 d=2: ≤65¢ (was 70¢ — 70-75 bucket showed only 60% WR shadow)
+  //   inn 5 d≥3: ≤88¢ (kept — 100% shadow WR at higher prices)
+  //   inn 6 d=1: ≤50¢ (existing fix-D-2)
+  //   inn 6 d=2: SKIP — let inn-6-leader (100% real WR n=6 at 46-65¢) handle it
+  //   inn 6 d≥3: ≤88¢ (kept)
+  //   inn 7 d=1: ≤45¢ (NEW — close-game 7th, lockdown territory only at deep dip)
+  //   inn 7 d=2: ≤72¢ (slight loosen, 2 innings left = stronger lockdown)
+  //   inn 7 d≥3: ≤88¢ (kept)
+  if (period === 5 && diff === 1 && price > 0.50) {
+    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn5-1run', ticker }); } catch {} }
+    return null;
+  }
+  if (period === 5 && diff === 2 && price > 0.65) {
+    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn5-2run-tight', ticker }); } catch {} }
+    return null;
+  }
+  if (period === 6 && diff === 1 && price > 0.50) {
+    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn6-1run', ticker }); } catch {} }
+    return null;
+  }
+  if (period === 6 && diff === 2) {
+    // Defer to inn-6-leader (100% WR detector, 46-65¢ band). Don't fire here.
+    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn6-2run-defer-to-inn6-leader', ticker }); } catch {} }
+    return null;
+  }
+  if (period === 7 && diff === 1 && price > 0.45) {
+    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn7-1run-tight', ticker }); } catch {} }
+    return null;
+  }
+  if (period === 7 && diff === 2 && price > 0.72) {
+    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn7-2run', ticker }); } catch {} }
     return null;
   }
   if (diff >= 3 && price > 0.88) {
-    if (typeof logFixABlock === 'function') {
-      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-a-diff-ge-3', ticker }); } catch {}
-    }
-    return null;
-  }
-  // Fix D (2026-04-30): 1-run leads in inning 5 above 50¢ are fragile — 4 innings
-  // remain, one big inning flips it. COL@CIN: maxFav=entry (never ticked up), stopped at 26¢.
-  // Require either 2+ run lead OR price ≤ 50¢ for inn-5 single-run entries.
-  if (period === 5 && diff === 1 && price > 0.50) {
-    if (typeof logFixABlock === 'function') {
-      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-d-inn5-1run', ticker }); } catch {}
-    }
-    return null;
-  }
-  // Fix D-2 (2026-05-02): mirror inn-5 gate for inn-6 d=1. Shadow data 2026-05-01:
-  // 4 of 5 recent MLB live-edge LOSERS were inn-5/6 d=1 entries at 52-63¢. The
-  // structural inn-5-7 detector was the firing source. Inn-6 d=1 cell shadow shows
-  // 68% game-WR at avg 69¢ (-0.4pt EV — break-even at best). Same fragility as inn-5.
-  if (period === 6 && diff === 1 && price > 0.50) {
-    if (typeof logFixABlock === 'function') {
-      try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'fix-d2-inn6-1run', ticker }); } catch {}
-    }
+    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'diff-ge-3', ticker }); } catch {} }
     return null;
   }
   const edge = weTimeAdj - price;
-  if (edge < 0.04) return null;
+  // 2026-05-02: edge floor raised 4pt → 8pt. Same selection-bias fix as inn-4.
+  if (edge < 0.08) return null;
   return {
     trade: true,
     side: 'yes',
