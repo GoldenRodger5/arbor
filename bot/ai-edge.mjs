@@ -3507,20 +3507,27 @@ function getBucketSizingMult(sport, strategy) {
     }
   }
   const stats = _bucketMultCache.data?.[`${sport}|${strategy}`];
-  if (!stats || stats.n < 10) return 1; // not enough samples — full sizing
+  // 2026-05-02 v3: don't fully exempt sub-n=10 detectors from sizing rules.
+  // Apply evidenceMult of 0.6 below n=10. Was returning 1.0 (full sizing)
+  // which over-exposed unproven detectors.
+  if (!stats) return 1;
+  if (stats.n < 5) return 0.6; // Tiny sample, halve sizing
   // P&L-based throttle (NEW 2026-04-27): even if WR looks fine, asymmetric losses
   // (small wins, big losses) destroy a strategy. Auto-throttle on negative avg P&L.
   // This was the missing piece: MLB pre-game had 18% tWR but 63% on the 15-19pt
   // edge bucket which lost -$9.18/trade due to high-priced favorites paying tiny
   // upside. WR-only check missed this.
-  // 2026-05-02: lowered freeze threshold for catastrophic bleeders. Old rule
-  // (n>=15) let pre-game-edge-first slip through at n=7 with -$4.29 avg / 14% WR.
-  // New: any strategy at n>=5 with avg < -$3 freezes immediately. n>=10 with
-  // avg < -$2 also freezes (was n>=15). Faster reaction to clear failures.
+  // 2026-05-02: lowered freeze threshold for catastrophic bleeders.
   if (stats.n >= 5 && stats.avgPnl < -3.00) return 0.00;  // catastrophic bleeder
   if (stats.n >= 10 && stats.avgPnl < -2.00) return 0.00; // confirmed bleeder
-  if (stats.avgPnl < -1.00) return 0.25;
-  if (stats.avgPnl < -0.50) return 0.50;
+
+  // 2026-05-02 v3: require n>=10 placed bets for FULL sizing. Below n=10,
+  // max 0.6x — matches sizing to evidence. Shadow data isn't ground truth;
+  // placed-bet outcomes are. Be smaller while we accumulate per-detector data.
+  const evidenceMult = stats.n < 10 ? 0.6 : 1.0;
+
+  if (stats.avgPnl < -1.00) return 0.25 * evidenceMult;
+  if (stats.avgPnl < -0.50) return 0.50 * evidenceMult;
   // WR-based throttle (existing logic)
   if (stats.wr >= 0.50) return 1.00;
   if (stats.wr >= 0.35) return 0.50;
@@ -3706,7 +3713,7 @@ function checkHighConviction(confidence, league, stage, diff, period, price = nu
   return { isHighConv: true, tier, reason };
 }
 
-function getPositionSize(exchange = 'kalshi', confidenceMargin = 0, highConvTier = 0, sport = null) {
+function getPositionSize(exchange = 'kalshi', confidenceMargin = 0, highConvTier = 0, sport = null, entryPrice = null) {
   const bankroll = getBankroll();
 
   // High-conviction tier: 25-30% of bankroll instead of 10%
@@ -3732,10 +3739,7 @@ function getPositionSize(exchange = 'kalshi', confidenceMargin = 0, highConvTier
     const scaledSize = size * multiplier;
     const ceiling = getTradeCapCeiling();
     // 2026-05-02: BANKROLL HARD CAP — even with confidence multiplier, no single
-    // trade exceeds 15% of bankroll. ALA@ATH 2026-05-02 sized at $22 (26% of $84
-    // bankroll) on a 16pt edge. Cell crashed -55% in 1min. Single-game variance
-    // at small bankroll is too dangerous to size that aggressively. Was relying
-    // on getTradeCapCeiling ($200) which doesn't scale with bankroll.
+    // trade exceeds 15% of bankroll. Tightened earlier from $200 ceiling.
     const bankrollCap = bankroll * 0.15;
     size = Math.min(scaledSize, ceiling, bankrollCap);
     if (multiplier > 1.1) console.log(`[sizing] High confidence (+${(confidenceMargin*100).toFixed(0)}%): ${multiplier.toFixed(1)}x → $${size.toFixed(2)} (15%-bankroll cap=$${bankrollCap.toFixed(2)})`);
@@ -3745,6 +3749,26 @@ function getPositionSize(exchange = 'kalshi', confidenceMargin = 0, highConvTier
   if (consecutiveLosses >= MAX_CONSECUTIVE_LOSSES) {
     size = size * 0.5;
     console.log(`[risk] Reduced position size to $${size.toFixed(2)} (50%) after ${consecutiveLosses} consecutive losses`);
+  }
+
+  // 2026-05-02: PRICE-TIERED HARD CAP. Asymmetric loss profile means
+  // high-priced bets need precise WR — small mis-calibration kills us.
+  //   Bet at 80¢: lose 80¢, win 20¢ — need ~80% WR to break even
+  //   Bet at 50¢: lose 50¢, win 50¢ — need 50% WR
+  //   Bet at 30¢: lose 30¢, win 70¢ — need 30% WR
+  // If real placed-bet WR is 50-60% (per recent loss streak evidence vs
+  // shadow's 75-85% claims), buying favorites systematically loses money.
+  // This cap forces smaller bet size at higher prices regardless of edge.
+  if (entryPrice != null && entryPrice > 0) {
+    let priceCap;
+    if (entryPrice >= 0.80) priceCap = bankroll * 0.04;
+    else if (entryPrice >= 0.65) priceCap = bankroll * 0.06;
+    else if (entryPrice >= 0.50) priceCap = bankroll * 0.10;
+    else priceCap = bankroll * 0.15; // underdog asymmetric pay covers WR misses
+    if (size > priceCap) {
+      console.log(`[sizing] 🛡️ PRICE-TIERED CAP at ${(entryPrice*100).toFixed(0)}¢: $${size.toFixed(2)} → $${priceCap.toFixed(2)}`);
+      size = priceCap;
+    }
   }
 
   return Math.max(1, size); // minimum $1
@@ -8746,8 +8770,8 @@ async function checkLiveScoreEdges() {
           period === 1 ? 'early' : 'late';
         const hcCheck = isSwingMode ? { isHighConv: false } : checkHighConviction(confidence, league, liveStage, diff, period, bestPrice);
         let maxBetLE = hcCheck.isHighConv
-          ? getPositionSize(best.platform, bestEdge, hcCheck.tier, league)
-          : getPositionSize(best.platform, bestEdge, 0, league);
+          ? getPositionSize(best.platform, bestEdge, hcCheck.tier, league, bestPrice)
+          : getPositionSize(best.platform, bestEdge, 0, league, bestPrice);
         if (isSwingMode) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for swing trades
         if (reentryHalfSize) maxBetLE = Math.floor(maxBetLE * 0.5); // half sizing for 3rd/4th entry on same game
 
@@ -11359,7 +11383,7 @@ async function checkPreGamePredictions() {
     // Edge-first tier: half-size — entry is EV+ but below standard conf floor, so size down.
     // Soccer pre-calibration: quarter-size until league has n≥10 settled pg trades.
     const soccerSizeMult = (isSoccerPg && !soccerCalibrated) ? 0.25 : 1.0;
-    let betAmount = Math.min(getPositionSize('kalshi', edge, 0, pgSportKey), pgMaxTrade) * (isEdgeFirst ? 0.5 : 1.0) * soccerSizeMult;
+    let betAmount = Math.min(getPositionSize('kalshi', edge, 0, pgSportKey, price), pgMaxTrade) * (isEdgeFirst ? 0.5 : 1.0) * soccerSizeMult;
 
     // 2026-04-30 GRANULAR BUCKET THROTTLE for pre-game.
     // Documented bleeder: "MLB | pre-game-prediction | 15-19pt | 65-69%": -$9.18/trade.
