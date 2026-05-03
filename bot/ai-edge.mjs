@@ -9204,8 +9204,12 @@ async function checkLiveScoreEdges() {
 
         const claudeBet = decision.betAmount ?? 0;
         const safeBet = hcCheck.isHighConv ? maxBetLE : Math.min(claudeBet > 0 ? claudeBet : maxBetLE, maxBetLE);
-        if (safeBet < 1) {
-          console.log(`[live-edge] BLOCKED ${targetAbbr}: bet too small (max=$${maxBetLE.toFixed(2)} Claude=$${claudeBet})`);
+        // 2026-05-02: minimum trade size $3 (was $1). Tonight's STL game saw 4
+        // structural fires in 21 min as game cap re-allocated; the 4th was $1.64
+        // x2 contracts @ 82¢ = max upside $0.36. Below variance + fees threshold.
+        // Floor at $3 keeps absolute upside ≥ ~$0.50 on hold-to-settle wins.
+        if (safeBet < 3) {
+          console.log(`[live-edge] BLOCKED ${targetAbbr}: bet too small ($${safeBet.toFixed(2)} < $3 min — game cap likely exhausted; max=$${maxBetLE.toFixed(2)} Claude=$${claudeBet})`);
           continue;
         }
         if (!canDeployMore(safeBet)) { console.log(`[live-edge] BLOCKED ${targetAbbr}: deployment cap (safeBet=$${safeBet.toFixed(2)})`); continue; }
