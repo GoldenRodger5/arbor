@@ -1435,6 +1435,15 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
   // against historically validated cells. Backstop: WE >= price-5pt sanity.
   const edge = weTimeAdj - price;
   if (edge < -0.05) return null;
+  // 2026-05-02 SELECTION-BIAS FLOOR: 75-85¢ "sweet spot" cells (inn 5/6/7 d=2)
+  // showed 80-91% shadow WR but real-bet placed-WR is ~33% (1/3 over $-10 P&L).
+  // Per memory: when shadow WR >> placed-bet WR, raise edge floor to filter
+  // borderline Sonnet-rejected setups that fire structural. Require ≥6pt edge
+  // for these cells — keeps the data-validated band but cuts marginal entries.
+  if (diff === 2 && price >= 0.75 && price <= 0.85 && edge < 0.06) {
+    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn5-7-2run-75-85-edge-floor', ticker }); } catch {} }
+    return null;
+  }
   return {
     trade: true,
     side: 'yes',
@@ -1782,7 +1791,10 @@ function detectSoccerCounterEqualizer({ league, period, gameDetail, diff, price,
 }
 
 function detectSoccerHomeHTLeader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr, homeAbbr }) {
-  const europeanLeagues = ['epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'];
+  // 2026-05-02: laliga removed — 0/2 placed -$18.73 over 7d. ALA@ATH single
+  // -$13.69 hit at $21.83 size; pattern not generalizing from EPL data.
+  // Re-enable when shadow data confirms cell-level edge in laliga specifically.
+  const europeanLeagues = ['epl', 'seriea', 'bundesliga', 'ligue1'];
   if (!europeanLeagues.includes(league)) return null;
   if (period !== 2) return null; // 2nd half (includes HT)
   if (targetAbbr !== leadingAbbr) return null; // leader only
