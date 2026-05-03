@@ -13495,7 +13495,20 @@ async function managePositions() {
               const isSevereDrop = lossPct <= -0.25;
               const _bvMover = recentCrossContraMovers.get(trade.ticker);
               const _bvFresh = !!(_bvMover && (Date.now() - _bvMover.when) <= 5 * 60 * 1000);
-              if (!isSevereDrop && !_bvFresh) {
+              // 2026-05-03: MLB structural-leader thesis is "leader holds outs/innings".
+              // Intra-inning price drops without a run scored are noise — let them
+              // mean-revert instead of stopping out. ATL@COL today: bot stopped at
+              // -$2.04, ATL settled at 100¢ minutes later. Skip defer if SEVERE drop
+              // (real collapse) — but moderate drop with score unchanged = noise.
+              const _isMlbStructural = (_strat.startsWith('structural-mlb-')) && _ctxLeague === 'mlb';
+              const _entryScoreMatch = (trade.liveScore || '').match(/[A-Z]{2,3}\s+(\d+)\s*[-–]\s*[A-Z]{2,3}\s+(\d+)/);
+              const _entryScoreKey = _entryScoreMatch ? `${_entryScoreMatch[1]}-${_entryScoreMatch[2]}` : null;
+              const _currScoreKey = ctx?.homeScore != null && ctx?.awayScore != null ? `${ctx.homeScore}-${ctx.awayScore}` : null;
+              const _scoreUnchanged = _entryScoreKey && _currScoreKey && _entryScoreKey === _currScoreKey;
+              const _mlbStructuralNoiseHold = _isMlbStructural && _scoreUnchanged && !isSevereDrop;
+              if (_mlbStructuralNoiseHold) {
+                console.log(`[bleed-out-defer] ${trade.ticker} ${(lossPct*100).toFixed(0)}% drawdown but score unchanged since entry (${_entryScoreKey}) — MLB structural thesis intact, holding`);
+              } else if (!isSevereDrop && !_bvFresh) {
                 console.log(`[bleed-out-defer] ${trade.ticker} ${(lossPct*100).toFixed(0)}% drawdown but no fresh cross-contra velocity (last 5min) — holding for thesis (slow drift, not real info)`);
               } else {
                 const _trigger = isSevereDrop ? 'SEVERE-DROP' : `velocity ${_bvMover.velocity.toFixed(1)}¢/min ${Math.round((Date.now()-_bvMover.when)/1000)}s ago`;
@@ -14272,8 +14285,15 @@ async function managePositions() {
             continue;
           }
 
-          // 3. HARD STOP at -8¢: defensive exit
-          if (seProfit <= -0.08) {
+          // 3. HARD STOP at -15¢: defensive exit
+          // 2026-05-03: was -8¢ but that's exactly the noise window the strategy
+          // is harvesting. HOU@BOS today: bought 76¢, hard-stopped at 67¢ (-9¢)
+          // 16:59, price hit 100¢ at 17:02 — three-minute round trip cost +$3.63
+          // swing. ATH@CLE same shape. Score-event-arb is info-lag arb: Kalshi
+          // MM lags ESPN 30-90s; the price oscillates before snapping. -15¢ keeps
+          // a real defensive stop (severe collapses still exit) while letting
+          // typical mean-reversion play out. 5-min time-exit is the upper bound.
+          if (seProfit <= -0.15) {
             console.log(`[exit] ⚡🚨 SCORE-EVENT-ARB HARD STOP: ${trade.ticker} ${(seProfit*100).toFixed(0)}¢ — cutting`);
             const result = await executeSell(trade, qty, currentPrice, 'score-event-arb-hard-stop');
             if (result) {
