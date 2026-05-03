@@ -10387,13 +10387,16 @@ async function checkPreGamePredictions() {
     return;
   }
 
-  const sportsSeries = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME', 'KXEPLGAME', 'KXLALIGAGAME'];
+  // 2026-05-02: kept in sync with live-edge seriesList (line ~6320). Was missing
+  // SerieA/Bundesliga/Ligue1 — pre-game scanner was blind to those leagues entirely.
+  const sportsSeries = ['KXMLBGAME', 'KXNBAGAME', 'KXNHLGAME', 'KXMLSGAME', 'KXEPLGAME', 'KXLALIGAGAME', 'KXSERIAA', 'KXBUNDESLIGA', 'KXLIGUE1'];
   const etTmrw = new Date(etNow.getTime() + 24 * 60 * 60 * 1000);
   const toShort = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
   const todayStr = toShort(etNow);
-  // Only include tomorrow's date after 10pm ET (late games that cross midnight)
+  // 2026-05-02: same fix as live-edge 0bcbd33. Was 22:00 ET, missed evening NBA/NHL
+  // games whose UTC start crosses midnight (Kalshi tickers carry tomorrow's date).
   const etHr = etNow.getHours();
-  const tonightStr = etHr >= 22 ? toShort(etTmrw) : null;
+  const tonightStr = etHr >= 17 ? toShort(etTmrw) : null;
 
   // Collect today's pre-game markets — group both tickers per game
   const gameMap = new Map(); // base → { tickers: [{ticker, team, yesAsk}], title, base, series }
