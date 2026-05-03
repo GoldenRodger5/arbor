@@ -13495,19 +13495,23 @@ async function managePositions() {
               const isSevereDrop = lossPct <= -0.25;
               const _bvMover = recentCrossContraMovers.get(trade.ticker);
               const _bvFresh = !!(_bvMover && (Date.now() - _bvMover.when) <= 5 * 60 * 1000);
-              // 2026-05-03: MLB structural-leader thesis is "leader holds outs/innings".
-              // Intra-inning price drops without a run scored are noise — let them
+              // 2026-05-03: structural-leader thesis is "leader holds outs/innings/period".
+              // Intra-period price drops without a score change are noise — let them
               // mean-revert instead of stopping out. ATL@COL today: bot stopped at
-              // -$2.04, ATL settled at 100¢ minutes later. Skip defer if SEVERE drop
-              // (real collapse) — but moderate drop with score unchanged = noise.
-              const _isMlbStructural = (_strat.startsWith('structural-mlb-')) && _ctxLeague === 'mlb';
+              // -$2.04, ATL settled at 100¢ minutes later. Applies to discrete-scoring
+              // sports (MLB, NHL, soccer) where a goal/run is a real thesis change but
+              // price drift between scores is noise. NBA excluded — continuous scoring
+              // makes score-unchanged check meaningless. Skip defer if SEVERE drop
+              // (real collapse) — moderate drop with score unchanged = noise.
+              const _structThesisSports = ['mlb','nhl','mls','epl','laliga','seriea','bundesliga','ligue1'];
+              const _isStructuralLeader = _strat.startsWith('structural-') && _structThesisSports.includes(_ctxLeague);
               const _entryScoreMatch = (trade.liveScore || '').match(/[A-Z]{2,3}\s+(\d+)\s*[-–]\s*[A-Z]{2,3}\s+(\d+)/);
               const _entryScoreKey = _entryScoreMatch ? `${_entryScoreMatch[1]}-${_entryScoreMatch[2]}` : null;
               const _currScoreKey = ctx?.homeScore != null && ctx?.awayScore != null ? `${ctx.homeScore}-${ctx.awayScore}` : null;
               const _scoreUnchanged = _entryScoreKey && _currScoreKey && _entryScoreKey === _currScoreKey;
-              const _mlbStructuralNoiseHold = _isMlbStructural && _scoreUnchanged && !isSevereDrop;
-              if (_mlbStructuralNoiseHold) {
-                console.log(`[bleed-out-defer] ${trade.ticker} ${(lossPct*100).toFixed(0)}% drawdown but score unchanged since entry (${_entryScoreKey}) — MLB structural thesis intact, holding`);
+              const _structuralNoiseHold = _isStructuralLeader && _scoreUnchanged && !isSevereDrop;
+              if (_structuralNoiseHold) {
+                console.log(`[bleed-out-defer] ${trade.ticker} ${(lossPct*100).toFixed(0)}% drawdown but score unchanged since entry (${_entryScoreKey}) — ${_ctxLeague.toUpperCase()} structural thesis intact, holding`);
               } else if (!isSevereDrop && !_bvFresh) {
                 console.log(`[bleed-out-defer] ${trade.ticker} ${(lossPct*100).toFixed(0)}% drawdown but no fresh cross-contra velocity (last 5min) — holding for thesis (slow drift, not real info)`);
               } else {
