@@ -6920,10 +6920,15 @@ async function checkLiveScoreEdges() {
         const etNowLE = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
         const toShortLE = (d) => `${String(d.getFullYear() % 100)}${['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
         const todayStr = toShortLE(etNowLE);
-        // Late night: if it's after 10pm ET, also accept tomorrow's date (game started tonight, ticker is next day UTC)
+        // Evening: if it's after 5pm ET, also accept tomorrow's date (game started tonight,
+        // ticker is next day UTC). Was 22 — but 8-10pm ET NBA/NHL games have UTC start
+        // 00-02:00 next-day, so their Kalshi tickers carry tomorrow's date string. The
+        // tonightStarted() guard below restricts to UTC-start < 0800 = 4am ET, which already
+        // filters out genuinely pre-game tomorrow markets. PHI@BOS 2026-05-02 NBA at 20:00 ET
+        // was a live-swing candidate every cycle but blocked because tonightStr was null.
         const etHourLE = etNowLE.getHours();
         const etTmrwLE = new Date(etNowLE.getTime() + 24 * 60 * 60 * 1000);
-        const tonightStr = etHourLE >= 22 ? toShortLE(etTmrwLE) : null;
+        const tonightStr = etHourLE >= 17 ? toShortLE(etTmrwLE) : null;
         // Early morning (midnight-4am ET): also accept yesterday date for late-night games still live
         const etYestLE = new Date(etNowLE.getTime() - 24 * 60 * 60 * 1000);
         const yesterdayStr = etHourLE < 4 ? toShortLE(etYestLE) : null;
