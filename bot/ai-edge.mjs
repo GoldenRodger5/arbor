@@ -9203,7 +9203,18 @@ async function checkLiveScoreEdges() {
         }
 
         const claudeBet = decision.betAmount ?? 0;
-        const safeBet = hcCheck.isHighConv ? maxBetLE : Math.min(claudeBet > 0 ? claudeBet : maxBetLE, maxBetLE);
+        let safeBet = hcCheck.isHighConv ? maxBetLE : Math.min(claudeBet > 0 ? claudeBet : maxBetLE, maxBetLE);
+        // 2026-05-02: DYNAMIC ABSOLUTE CAP — scales with bankroll, $15 floor.
+        // Formula: max($15, bankroll × 15%). Caps single-trade-loss exposure
+        // at any bankroll size. Tonight LaLiga ALA@ATH at $21.83 lost $13.69
+        // = 24% of $90 bankroll. Under this cap that trade would have been
+        // $15 (16.7% of bankroll) and the loss ~$9.40. As bankroll grows,
+        // cap scales: $200 → $30, $500 → $75, $1000 → $150.
+        const ABSOLUTE_TRADE_CAP = Math.max(15, Math.floor(getBankroll() * 0.15));
+        if (safeBet > ABSOLUTE_TRADE_CAP) {
+          console.log(`[sizing] 🧱 ABSOLUTE CAP: $${safeBet.toFixed(2)} → $${ABSOLUTE_TRADE_CAP} (max($15, 15%×bankroll) — single-trade hard ceiling)`);
+          safeBet = ABSOLUTE_TRADE_CAP;
+        }
         // 2026-05-02: minimum trade size $3 (was $1). Tonight's STL game saw 4
         // structural fires in 21 min as game cap re-allocated; the 4th was $1.64
         // x2 contracts @ 82¢ = max upside $0.36. Below variance + fees threshold.
