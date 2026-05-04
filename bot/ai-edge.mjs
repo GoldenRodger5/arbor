@@ -13612,6 +13612,25 @@ async function managePositions() {
           } else {
             bleedOutEnabled = false;  // unknown strategy — don't trigger
           }
+          // 2026-05-04: STRATEGY_RR per-strategy + per-sport stop-loss override.
+          // Applies on top of the sport-aware defaults above. Used to:
+          //  - Widen NBA stops to -20¢ (67% of NBA stops were premature in audit)
+          //  - Tighten MLS stops to -8¢ (75% WR but -$11.70 from oversized losses)
+          //  - Match per-strategy R:R for inn-6, inn-4, q2 leaders, etc.
+          if (bleedOutEnabled) {
+            const _rrLeague = ctx?.league;
+            let _rrStop = null;
+            if (_strat === 'live-prediction' && _rrLeague && LIVE_PREDICTION_RR[_rrLeague]) {
+              _rrStop = LIVE_PREDICTION_RR[_rrLeague].stopLoss;
+            } else if (STRATEGY_RR[_strat]) {
+              _rrStop = STRATEGY_RR[_strat].stopLoss;
+            }
+            if (_rrStop != null && _rrStop !== dropThreshold) {
+              const _before = dropThreshold;
+              dropThreshold = _rrStop;
+              console.log(`[exit] 🔧 STRATEGY_RR stop override on ${trade.ticker}: ${(_before*100).toFixed(0)}¢ → ${(dropThreshold*100).toFixed(0)}¢ (${_strat}${_rrLeague?'|'+_rrLeague:''})`);
+            }
+          }
           if (bleedOutEnabled && trade.side === 'yes') {
             const tradeAgeMin = (Date.now() - new Date(trade.timestamp ?? 0).getTime()) / 60000;
             const dropFromEntry = entryPrice - currentPrice;
