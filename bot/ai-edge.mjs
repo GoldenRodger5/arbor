@@ -4748,7 +4748,17 @@ async function settleShadowDecisions() {
         // For base-ticker pgrej records: query result is for team1 side.
         // result === 'yes' means team1 won, 'no' means team2 won.
         r.gameWinner = result === 'yes' ? r.team1Abbr : r.team2Abbr;
-        // ourPickWon stays null — no pick was placed
+        // 2026-05-04: populate ourPickWon when Claude DID evaluate and picked a side.
+        // targetAbbr is set when Sonnet looked at a specific team (decision='trade' or
+        // 'no-trade' on a specific side). When set, we can compute "would Claude's
+        // pick have settled win?" — unlocks ~200 settled pre-game shadow records for
+        // pick-accuracy analysis by sport.
+        if (r.targetAbbr) {
+          r.ourPickWon = r.gameWinner === r.targetAbbr;
+        }
+        // If targetAbbr is null (cycle-cap-dropped before Sonnet, or Sonnet rejected
+        // without picking a side), ourPickWon remains null — we genuinely don't know
+        // which side Claude would have looked at.
       } else {
         // We log every shadow as the YES side of targetAbbr — won iff result === 'yes'
         r.ourPickWon = result === 'yes';
