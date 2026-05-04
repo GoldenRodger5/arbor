@@ -3202,11 +3202,14 @@ function clearStructuralEntry(ticker) {
   structuralOpenEntries.delete(ticker);
 }
 
-// MFE (Maximum Favorable Excursion) tracker — highest favorable price reached per
-// open trade. Persisted to trades.jsonl on exit/settlement. Enables price-move
-// calibration alongside game-outcome calibration: even when a game flips, did the
-// model find a real mispricing that the price moved toward?
-const mfeTracking = new Map(); // tradeId → { maxPrice, maxMove }
+// MFE (Maximum Favorable Excursion) tracker — favorable + adverse price extremes
+// per open trade. Persisted incrementally to trades.jsonl so long-held pre-game
+// trades survive pm2 restarts (was the data gap that blocked profit-lock analysis).
+// Tracks both maxPrice (best price reached) AND minPrice (worst price reached) so
+// stop-loss and profit-lock counterfactuals are answerable from a single field set.
+// Map value: { maxPrice, maxMove, maxAt, minPrice, minMove, minAt, ticks,
+//              lastPersistedMax, lastPersistedMin }
+const mfeTracking = new Map();
 
 // CLV (Closing Line Value) tracker — pre-game trades only. The single most important
 // metric for measuring real edge: did we get a better price than the market at game
@@ -3344,12 +3347,84 @@ function applyMFE(trade, persistedRecord = null) {
   if (mfe) {
     trade.maxFavorablePrice = mfe.maxPrice;
     trade.maxFavorableMove = Math.round(mfe.maxMove * 10000) / 10000;
+    trade.maxFavorableAt = mfe.maxAt ? new Date(mfe.maxAt).toISOString() : null;
+    trade.minFavorablePrice = mfe.minPrice;
+    trade.minFavorableMove = Math.round((mfe.minMove ?? 0) * 10000) / 10000;
+    trade.minFavorableAt = mfe.minAt ? new Date(mfe.minAt).toISOString() : null;
+    trade.mfeTicks = mfe.ticks ?? 0;
     if (persistedRecord) {
       persistedRecord.maxFavorablePrice = trade.maxFavorablePrice;
       persistedRecord.maxFavorableMove = trade.maxFavorableMove;
+      persistedRecord.maxFavorableAt = trade.maxFavorableAt;
+      persistedRecord.minFavorablePrice = trade.minFavorablePrice;
+      persistedRecord.minFavorableMove = trade.minFavorableMove;
+      persistedRecord.minFavorableAt = trade.minFavorableAt;
+      persistedRecord.mfeTicks = trade.mfeTicks;
     }
     mfeTracking.delete(trade.id);
   }
+}
+
+// Incremental MFE persistence — writes max/min back to trades.jsonl whenever the
+// peak or trough moves ≥1¢ from the last persisted value. Lets long-held pre-game
+// trades survive pm2 restarts with their full MFE history intact. Cheap because
+// most ticks don't cross the 1¢ threshold (~5-10 writes per trade lifetime).
+function persistMfeToTrade(tradeId, mfe) {
+  if (!tradeId || !mfe || !existsSync(TRADES_LOG)) return;
+  try {
+    const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+    let changed = false;
+    const updated = lines.map(l => {
+      try {
+        const t = JSON.parse(l);
+        if (t.id !== tradeId) return l;
+        t.maxFavorablePrice = mfe.maxPrice;
+        t.maxFavorableMove = Math.round(mfe.maxMove * 10000) / 10000;
+        t.maxFavorableAt = mfe.maxAt ? new Date(mfe.maxAt).toISOString() : null;
+        t.minFavorablePrice = mfe.minPrice;
+        t.minFavorableMove = Math.round((mfe.minMove ?? 0) * 10000) / 10000;
+        t.minFavorableAt = mfe.minAt ? new Date(mfe.minAt).toISOString() : null;
+        t.mfeTicks = mfe.ticks ?? 0;
+        changed = true;
+        return JSON.stringify(t);
+      } catch { return l; }
+    });
+    if (changed) writeFileSync(TRADES_LOG, updated.join('\n') + '\n');
+  } catch { /* best-effort — next tick will retry */ }
+}
+
+// On startup, prime mfeTracking from any open trades' persisted MFE fields so we
+// don't lose history across restarts. Without this, a pm2 restart mid-trade
+// resets the in-memory peak to entryPrice and the next 1¢ move falsely re-persists.
+function primeMfeFromOpenTrades() {
+  if (!existsSync(TRADES_LOG)) return;
+  try {
+    const lines = readFileSync(TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
+    let primed = 0;
+    for (const l of lines) {
+      try {
+        const t = JSON.parse(l);
+        if (t.status !== 'open') continue;
+        if (!t.id || !Number.isFinite(t.entryPrice)) continue;
+        const side = t.side ?? 'yes';
+        const maxPrice = Number.isFinite(t.maxFavorablePrice) ? t.maxFavorablePrice : t.entryPrice;
+        const minPrice = Number.isFinite(t.minFavorablePrice) ? t.minFavorablePrice : t.entryPrice;
+        const maxMove = side === 'yes' ? (maxPrice - t.entryPrice) : (t.entryPrice - maxPrice);
+        const minMove = side === 'yes' ? (t.entryPrice - minPrice) : (minPrice - t.entryPrice);
+        const maxAt = t.maxFavorableAt ? new Date(t.maxFavorableAt).getTime() : null;
+        const minAt = t.minFavorableAt ? new Date(t.minFavorableAt).getTime() : null;
+        mfeTracking.set(t.id, {
+          maxPrice, maxMove, maxAt,
+          minPrice, minMove, minAt,
+          ticks: t.mfeTicks ?? 0,
+          lastPersistedMax: maxPrice,
+          lastPersistedMin: minPrice,
+        });
+        primed++;
+      } catch { /* skip malformed line */ }
+    }
+    if (primed > 0) console.log(`[mfe] Primed ${primed} open-trade MFE entries from trades.jsonl`);
+  } catch (e) { console.error('[mfe] prime error:', e.message); }
 }
 
 // Claude HOLD memo — structured record of the last HOLD decision per ticker.
@@ -3495,6 +3570,7 @@ try {
 
 // Load persisted scan timers and high-conviction state
 loadState();
+primeMfeFromOpenTrades();
 
 // Score-state helper — a compact "home-away" key so we can detect whether the
 // score has changed between scale-in cycles. If it has, the game state is
@@ -13567,19 +13643,49 @@ async function managePositions() {
         const profitPerContract = currentPrice - entryPrice;
         const pctChange = profitPerContract / entryPrice;
 
-        // MFE update — track max favorable price move over the trade's lifetime.
-        // YES side: favorable = price up. NO side: favorable = price down.
-        // Persisted on exit/settlement; in-memory between updates.
+        // MFE update — track max favorable AND min favorable (max adverse) price
+        // moves over the trade's lifetime. YES side: favorable = price up; adverse
+        // = price down. NO side: inverted. Persisted incrementally to trades.jsonl
+        // when peak/trough crosses ≥1¢ from last persisted value, so long-held
+        // pre-game trades survive pm2 restarts. Closes the data gap for
+        // profit-lock / stop-loss counterfactual analysis.
         {
           const favorableMove = trade.side === 'yes'
             ? (currentPrice - entryPrice)
             : (entryPrice - currentPrice);
+          const adverseMove = -favorableMove;
           const prev = mfeTracking.get(trade.id);
-          if (!prev || favorableMove > prev.maxMove) {
-            mfeTracking.set(trade.id, {
-              maxPrice: currentPrice,
-              maxMove: favorableMove,
-            });
+          const now = Date.now();
+          let next;
+          if (!prev) {
+            next = {
+              maxPrice: currentPrice, maxMove: favorableMove, maxAt: now,
+              minPrice: currentPrice, minMove: adverseMove, minAt: now,
+              ticks: 1,
+              lastPersistedMax: currentPrice, lastPersistedMin: currentPrice,
+            };
+          } else {
+            next = { ...prev, ticks: (prev.ticks ?? 0) + 1 };
+            if (favorableMove > prev.maxMove) {
+              next.maxPrice = currentPrice;
+              next.maxMove = favorableMove;
+              next.maxAt = now;
+            }
+            if (adverseMove > (prev.minMove ?? -Infinity)) {
+              next.minPrice = currentPrice;
+              next.minMove = adverseMove;
+              next.minAt = now;
+            }
+          }
+          mfeTracking.set(trade.id, next);
+          // Persist when peak/trough has moved ≥1¢ from last persisted value.
+          // Cheap: most ticks don't cross the threshold.
+          const persistMax = Math.abs(next.maxPrice - (next.lastPersistedMax ?? next.maxPrice)) >= 0.01;
+          const persistMin = Math.abs(next.minPrice - (next.lastPersistedMin ?? next.minPrice)) >= 0.01;
+          if (persistMax || persistMin || !prev) {
+            next.lastPersistedMax = next.maxPrice;
+            next.lastPersistedMin = next.minPrice;
+            persistMfeToTrade(trade.id, next);
           }
         }
 
