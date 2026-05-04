@@ -14523,8 +14523,11 @@ async function managePositions() {
           const seProfit = currentPrice - entryPrice;
           const tradeAgeMin = (Date.now() - new Date(trade.timestamp ?? 0).getTime()) / 60000;
 
-          // 1. PROFIT-LOCK at +5¢: arb realized, exit immediately
-          if (seProfit >= 0.05) {
+          // 1. PROFIT-LOCK at +10¢: arb realized, exit. Was +5¢ but audit showed
+          // +10¢ captures more value (+$0.230/share vs +$0.142 sim). Score-event-arb
+          // hits +10¢ window 67% of the time per placed-trade data — only +5¢ vs
+          // +10¢ if 100% of trades hit both, otherwise +10¢ wins on the gain side.
+          if (seProfit >= 0.10) {
             const gainPct = Math.round((seProfit / entryPrice) * 100);
             console.log(`[exit] ⚡💰 SCORE-EVENT-ARB PROFIT-LOCK: ${trade.ticker} +${(seProfit*100).toFixed(0)}¢ / +${gainPct}% — selling ALL ${qty}`);
             const result = await executeSell(trade, qty, currentPrice, 'score-event-arb-profit-lock');
