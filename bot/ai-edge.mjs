@@ -13671,7 +13671,11 @@ async function managePositions() {
           } else if (_strat === 'pre-game-edge-first') {
             dropThreshold = 0.15; minHoldMin = 30;
           } else if (_strat === 'pre-game-prediction') {
-            dropThreshold = 0.20; minHoldMin = 45;
+            // 2026-05-04: bleed-out DISABLED for pre-game-prediction. Audit data:
+            // 16 stop events, 50% premature, net -$243 cost, $341 alpha lost.
+            // MLB pre-game would have made +$234 if held to settle (67% pick rate).
+            // Nuclear stop at -90% still fires as catastrophe protection.
+            bleedOutEnabled = false;
           } else if (_strat === 'live-prediction' || _strat.startsWith('structural-')) {
             // 2026-04-30: SPORT-AWARE bleed-out for structural detectors. Bleed-out
             // calibrated for MLB (1-run lead loss = real thesis death; outs running out)
