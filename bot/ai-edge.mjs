@@ -2858,6 +2858,27 @@ function _isClaudeBillingError(status, errBody) {
   return errBody.includes('credit balance') || errBody.includes('credits') || errBody.includes('billing');
 }
 
+// 2026-05-04: Track Claude billing-out state. When Claude returns billing
+// errors, we mark a 6-hour window during which Sonnet-driven paths are PAUSED
+// (live-prediction + pre-game). Structural detectors continue firing normally
+// because they don't use Sonnet. GPT-5 fallback is still used for exit
+// management (profit-lock, hard-stop) where having ANY decision is better
+// than none — but we don't open NEW Sonnet-driven trades on untested
+// GPT-5 calibration.
+let _claudeBillingOutUntilMs = 0;
+const CLAUDE_BILLING_OUT_PAUSE_MS = 6 * 60 * 60 * 1000;
+function markClaudeBillingOut() {
+  const wasOut = _claudeBillingOutUntilMs > Date.now();
+  _claudeBillingOutUntilMs = Date.now() + CLAUDE_BILLING_OUT_PAUSE_MS;
+  if (!wasOut) {
+    console.log(`[claude-out] 🚫 Anthropic credits exhausted — pausing Sonnet-driven NEW entries for 6h. Structural detectors continue. Top up to resume.`);
+    try { tg(`🚫 <b>CLAUDE CREDITS OUT</b>\n\nSonnet-driven NEW entries paused for 6h.\nStructural detectors continue normally.\nTop up Anthropic credits to resume full coverage:\nhttps://console.anthropic.com/settings/plans`); } catch {}
+  }
+}
+function isClaudePausedForBilling() {
+  return _claudeBillingOutUntilMs > Date.now();
+}
+
 async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system = null, category = 'sonnet', cacheSystem = false } = {}) {
   try {
     const body = {
@@ -2886,6 +2907,7 @@ async function claudeSonnet(prompt, { maxTokens = 1024, timeout = 30000, system 
       // 2026-05-02: fallback to OpenAI on credit/auth errors. Returns OpenAI
       // response with _openaiFallback marker in the JSON for downstream tagging.
       if (_isClaudeBillingError(res.status, errBody)) {
+        markClaudeBillingOut();
         console.log(`[claude-sonnet] → falling back to GPT-5 (cat=${category})`);
         return await openaiSonnet(prompt, { maxTokens, timeout, system, category: `${category}-openai` });
       }
@@ -8141,6 +8163,12 @@ async function checkLiveScoreEdges() {
         if (item._structuralDecision) {
           return JSON.stringify(item._structuralDecision);
         }
+        // 2026-05-04: pause Sonnet-driven NEW entries when Claude billing is out.
+        // Structural fast-path above still runs. Returns null so downstream
+        // parses to "no decision" and skips this candidate.
+        if (isClaudePausedForBilling()) {
+          return null;
+        }
         if (item._useSearch) {
           // item.prompt is an array of content blocks (cached prefix + dynamic).
           // For the search path, append a third block with the breaking-news
@@ -11245,6 +11273,10 @@ async function checkPreGamePredictions() {
         // Saves the API call and reacts in zero time.
         if (item._structuralDecision) {
           return Promise.resolve(JSON.stringify(item._structuralDecision));
+        }
+        // 2026-05-04: pause Sonnet-driven pre-game entries when Claude billing is out.
+        if (isClaudePausedForBilling()) {
+          return Promise.resolve(null);
         }
         // 2026-04-29 COST OPTIMIZATION — switched from claudeWithSearch to claudeSonnet.
         // Pre-game web search added ~$0.01/call ($14 over 10d at 1433 calls). The bot
