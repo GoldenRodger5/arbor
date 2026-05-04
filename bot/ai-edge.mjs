@@ -12220,13 +12220,14 @@ async function checkPreGamePredictions() {
       continue;
     }
 
-    // 🛑 SOCCER PRE-GAME PERMANENTLY DISABLED (2026-04-28): MLS/EPL/LaLiga pre-game
-    // is -$34.83 over 4 trades. Soccer underdog asymmetry + draw tax makes pre-game
-    // structurally unfavorable. Re-enable only when we have a confirmed soccer edge
-    // (e.g., lineup scraper) — generic Sonnet pre-game analysis loses money here.
-    if (['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(pgSportKey)) {
-      console.log(`[pre-game] 🛑 SOCCER PRE-GAME DISABLED: ${market.base} (${pgSportKey.toUpperCase()}) — strategy net -$34.83 historically. Need lineup-scraper edge to re-enable.`);
-      logScreen({ stage: 'pre-game-skip', result: 'skip-soccer-disabled', ticker: market.base, sport: pgSportKey, reasoning: 'Soccer pre-game-prediction permanently disabled — losing strategy with no confirmed edge source' });
+    // 2026-05-04: MLS re-enabled. Original -$34.83 loss was from early exits (bleed-out),
+    // not bad picks — hold-to-settle on same 4 trades = 75% WR +$34.29. With pre-game
+    // bleed-out disabled, exits are gone. MLS has fewer draws than EPL (~15% vs ~25%)
+    // making it closer to a 2-outcome market. Re-enabled at 40-60¢ band + 55¢ floor below.
+    // EPL/LaLiga/SerieA/Bundesliga/Ligue1 remain disabled — zero pre-game prediction data.
+    if (['epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(pgSportKey)) {
+      console.log(`[pre-game] 🛑 ${pgSportKey.toUpperCase()} PRE-GAME DISABLED: no pre-game prediction data — re-enable when n≥5 settled trades.`);
+      logScreen({ stage: 'pre-game-skip', result: 'skip-soccer-disabled', ticker: market.base, sport: pgSportKey, reasoning: `${pgSportKey} pre-game disabled — zero prediction data` });
       logPregameRejection(market, 'post-sonnet-gate', 'soccer-pregame-disabled', { team: matchedSide.team, price, confidence, league: pgSportKey, sport: 'Soccer' });
       continue;
     }
@@ -12382,14 +12383,12 @@ async function checkPreGamePredictions() {
       console.log(`[pre-game] ❌ MLB edge-first rejected for ${market.base}: no cited edge source (injury/weather/starter-change/bullpen-game) in reasoning`);
     }
 
-    // 2026-05-04 PRE-GAME PRICE BAND: per audit of 39 pre-game-prediction trades,
-    // <40¢ entries: 0/3 = 0% WR. 60-70¢ entries: 0/5 = 0% WR. 40-50¢ band is
-    // the only profitable cell (+$14 / n=31 / 39% WR with asymmetric pay).
-    // Restrict pre-game-prediction to 40-55¢ band entirely. (MLB sub-band
-    // 45-49¢ block remains active below.)
-    if (price < 0.40 || price > 0.55) {
-      console.log(`[pre-game] BLOCKED ${market.base}: pre-game-prediction outside 40-55¢ band (price=${(price*100).toFixed(0)}¢) — audit shows <40¢ and 60+¢ are 0% WR cells`);
-      logPregameRejection(market, 'post-sonnet-gate', 'pre-game-price-band', { team: matchedSide.team, price, confidence, sport: pgSportKey, gateContext: { band: '40-55-only' } });
+    // 2026-05-04 PRE-GAME PRICE BAND: audit of 36 settled trades shows <40¢ = 0/3 (0% WR)
+    // and 60-69¢ = 2/5 (40% WR, -$63.80). 55-59¢ = 4/5 (80% WR, +$46.71) — profitable,
+    // so upper bound raised from 55¢ to 60¢ on 2026-05-04. Band: 40-60¢.
+    if (price < 0.40 || price > 0.60) {
+      console.log(`[pre-game] BLOCKED ${market.base}: pre-game-prediction outside 40-60¢ band (price=${(price*100).toFixed(0)}¢) — audit shows <40¢ and 60+¢ are losing cells`);
+      logPregameRejection(market, 'post-sonnet-gate', 'pre-game-price-band', { team: matchedSide.team, price, confidence, sport: pgSportKey, gateContext: { band: '40-60-only' } });
       continue;
     }
 
@@ -12414,15 +12413,9 @@ async function checkPreGamePredictions() {
       continue;
     }
 
-    // 2026-04-27 audit: MLB pre-game-prediction at 45-49¢ entry has 33% WR over n=9,
-    // -$54 net. Mid-priced underdog dead-zone — these are the trades where neither side
-    // is a clear favorite and the market is correctly uncertain. Block this band entirely.
-    // Sub-45¢ has 50% WR +$55 (extreme underdog with cited catalyst). 50¢+ is OK.
-    if (pgSportKey === 'mlb' && price >= 0.45 && price < 0.50) {
-      console.log(`[pre-game] BLOCKED ${market.base}: MLB pre-game 45-49¢ entry — historical 33% WR over 9 trades, -$54 net. Mid-priced underdog dead-zone.`);
-      logPregameRejection(market, 'post-sonnet-gate', 'mlb-price-band-45-49', { team: matchedSide.team, price, confidence, sport: pgSportKey, gateContext: { band: '45-49' } });
-      continue;
-    }
+    // 2026-05-04: MLB 45-49¢ block removed. Original -$54 realized PnL was from early
+    // exits (bleed-out), not bad picks. Hold-to-settle on same n=8 trades = 50% WR +$15.70.
+    // With bleed-out disabled for pre-game-prediction, the exit penalty is gone.
 
     if (existsSync(PAPER_TRADES_LOG)) {
       const paperLines = readFileSync(PAPER_TRADES_LOG, 'utf-8').split('\n').filter(l => l.trim());
