@@ -3830,6 +3830,54 @@ const STRATEGY_KILLSWITCH = new Set([
   'live-swing',                    // 0.34 ratio (needs 75% WR), has 43%, -$14/8 trades
 ]);
 
+// 2026-05-04: PER-STRATEGY R:R MAP (profit-lock thresholds)
+// Each strategy gets its own profit-lock target sized to its empirical WR.
+// High-WR strategies use tight locks (+5¢) for fast turns.
+// Low-WR strategies need asymmetric pay (+15-20¢) to clear break-even.
+// Stop-loss values documented for future application via exit pipeline.
+const STRATEGY_RR = {
+  'structural-mlb-inn-6-leader':       { profitLock: 0.05, stopLoss: 0.10 }, // 83% WR → tight lock OK
+  'structural-nba-q2-leader':          { profitLock: 0.08, stopLoss: 0.15 }, // 67% WR + NBA volatility
+  'structural-nba-q4-leader':          { profitLock: 0.08, stopLoss: 0.20 }, // NBA wider stops (67% premature)
+  'structural-mlb-inn-4-leader':       { profitLock: 0.15, stopLoss: 0.10 }, // 50% WR → asymmetric
+  'structural-mlb-inn-89-leader':      { profitLock: 0.05, stopLoss: 0.10 }, // closer-territory tight
+  'structural-mlb-inn-2-leader':       { profitLock: 0.10, stopLoss: 0.10 }, // 71% WR symmetric
+  'structural-mlb-inn-2-leader-2run':  { profitLock: 0.10, stopLoss: 0.10 }, // 87% WR
+  'structural-score-event-arb':        { profitLock: 0.08, stopLoss: 0.15 }, // 100% pick + info-lag
+  'structural-mlb-inn-5-leader-3run':  { profitLock: 0.05, stopLoss: 0.10 },
+  'structural-mlb-inn-3-leader-3run':  { profitLock: 0.10, stopLoss: 0.10 },
+  'structural-mlb-inn-1-leader-3run':  { profitLock: 0.10, stopLoss: 0.10 },
+  'structural-soccer-2h-home-leader':  { profitLock: 0.20, stopLoss: 0.08 }, // asymmetric for soccer
+  'structural-soccer-1h-home-leader':  { profitLock: 0.10, stopLoss: 0.10 },
+  'comeback-buy':                      { profitLock: 0.15, stopLoss: 0.10 }, // 50% WR + asymmetric pay
+  // live-prediction profit-lock varies by sport — see getLivePredictionRR()
+};
+
+// Sport-specific R:R for live-prediction (Sonnet-driven). NBA gets wider
+// stops because audit showed 67% of NBA stops were premature (team won).
+// Soccer gets asymmetric pay (large lock + tight stop) because MLS had
+// 75% WR but lost money — losses were bigger than wins.
+const LIVE_PREDICTION_RR = {
+  mlb:    { profitLock: 0.10, stopLoss: 0.10 },
+  nba:    { profitLock: 0.10, stopLoss: 0.20 }, // 67% premature stops → wider
+  nhl:    { profitLock: 0.10, stopLoss: 0.15 }, // 50% premature stops
+  mls:    { profitLock: 0.20, stopLoss: 0.08 }, // 75% WR -$11.70 → asymmetric
+  epl:    { profitLock: 0.15, stopLoss: 0.10 },
+  laliga: { profitLock: 0.15, stopLoss: 0.10 },
+  seriea: { profitLock: 0.15, stopLoss: 0.10 },
+  bundesliga: { profitLock: 0.15, stopLoss: 0.10 },
+  ligue1: { profitLock: 0.15, stopLoss: 0.10 },
+  default: { profitLock: 0.12, stopLoss: 0.10 },
+};
+
+function getStrategyProfitLock(strategy, league) {
+  if (strategy === 'live-prediction') {
+    return (LIVE_PREDICTION_RR[league] ?? LIVE_PREDICTION_RR.default).profitLock;
+  }
+  if (STRATEGY_RR[strategy]) return STRATEGY_RR[strategy].profitLock;
+  return null; // fall back to legacy default
+}
+
 function isStrategyDisabled(strategy) {
   if (STRATEGY_KILLSWITCH.has(strategy)) return true;
   const ctrl = readUIControl();
@@ -13846,7 +13894,12 @@ async function managePositions() {
         // where capturing the variance is the strategy, not holding to settlement.
         const _isStructTrade = trade.strategy?.startsWith?.('structural-');
         const _isLowPriceEntry = entryPrice <= 0.60;
-        const _profitLockTrigger = _isLowPriceEntry ? 0.12 : 0.15;
+        // 2026-05-04: per-strategy + per-sport R:R from STRATEGY_RR / LIVE_PREDICTION_RR.
+        // Falls back to legacy default (+12¢ low-price / +15¢ high-price) when no entry.
+        const _strategyLock = getStrategyProfitLock(trade.strategy, ctx?.league ?? trade.league ?? null);
+        const _profitLockTrigger = _strategyLock != null
+          ? _strategyLock
+          : (_isLowPriceEntry ? 0.12 : 0.15);
         if ((trade.strategy === 'live-prediction' || _isStructTrade) && profitPerContract >= _profitLockTrigger) {
           const gainPct = Math.round((profitPerContract / entryPrice) * 100);
           const lockProfit = (profitPerContract * 100).toFixed(0);
