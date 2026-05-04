@@ -4805,20 +4805,42 @@ async function settleShadowDecisions() {
           const tapeLines = readFileSync(PRICE_TAPE_LOG, 'utf-8').split('\n').filter(l => l.trim());
           const entryMs = Date.parse(r.ts ?? '');
           let maxAfter = r.decisionPrice;
+          let minAfter = r.decisionPrice;
+          let maxAfterTs = entryMs;
+          let minAfterTs = entryMs;
+          let lastPriceAtSettle = r.decisionPrice;
+          let lastTs = entryMs;
           for (const tl of tapeLines) {
             try {
               const t = JSON.parse(tl);
               if (t.ticker !== r.ticker) continue;
-              if (Date.parse(t.ts ?? '') <= entryMs) continue;
-              if (typeof t.price === 'number' && t.price > maxAfter) maxAfter = t.price;
+              const tts = Date.parse(t.ts ?? '');
+              if (tts <= entryMs) continue;
+              if (typeof t.price !== 'number') continue;
+              if (t.price > maxAfter) { maxAfter = t.price; maxAfterTs = tts; }
+              if (t.price < minAfter) { minAfter = t.price; minAfterTs = tts; }
+              if (tts > lastTs) { lastTs = tts; lastPriceAtSettle = t.price; }
             } catch { /* skip */ }
           }
+          // Existing fields (max-side recovery)
           r.maxPriceAfterEntry = maxAfter;
           r.maxRecoveryFromEntry = Math.round((maxAfter - r.decisionPrice) * 10000) / 10000;
           r.recoveryReached10c = (maxAfter - r.decisionPrice) >= 0.10;
           r.recoveryReached12c = (maxAfter - r.decisionPrice) >= 0.12;
           r.recoveryReached15c = (maxAfter - r.decisionPrice) >= 0.15;
           r.recoveryReached20c = (maxAfter - r.decisionPrice) >= 0.20;
+          // 2026-05-04: NEW min-side tracking + stop-loss counterfactuals + timing
+          r.minPriceAfterEntry = minAfter;
+          r.maxDrawdownFromEntry = Math.round((minAfter - r.decisionPrice) * 10000) / 10000;
+          r.stopHit5c  = (r.decisionPrice - minAfter) >= 0.05;
+          r.stopHit10c = (r.decisionPrice - minAfter) >= 0.10;
+          r.stopHit15c = (r.decisionPrice - minAfter) >= 0.15;
+          r.stopHit20c = (r.decisionPrice - minAfter) >= 0.20;
+          r.stopHit25c = (r.decisionPrice - minAfter) >= 0.25;
+          r.timeToMaxMin = Math.round((maxAfterTs - entryMs) / 1000); // seconds
+          r.timeToMinMin = Math.round((minAfterTs - entryMs) / 1000);
+          r.maxBeforeMin = maxAfterTs <= minAfterTs; // did max happen first?
+          r.lastPriceObserved = lastPriceAtSettle;
         } catch { /* best-effort */ }
       }
       updated = true;
