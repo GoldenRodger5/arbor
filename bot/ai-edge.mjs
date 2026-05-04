@@ -7166,6 +7166,23 @@ async function checkLiveScoreEdges() {
           else if (league === 'mlb' && diff <= 2 && period <= 5) underdogAllowed = true;
           else if (['mls', 'epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(league) && diff === 1 && period <= 1) underdogAllowed = true;
         }
+        // 2026-05-04: STRUCTURAL TRAILER DETECTORS — these target trailer-side
+        // entries for asymmetric-pay strategies. They had 0 fires ever because
+        // the underdog-allowed rules above are early-game only. Widen to allow
+        // candidate flip to trailer when the corresponding detector's price band
+        // applies. detectNbaQ4DeepTrailer / detectNhlEmptyNetTrailer / detectSoccerCounterEqualizer
+        // each return null if conditions don't match — so this only opens the door,
+        // doesn't force trades.
+        if (!underdogAllowed && trailMarket) {
+          // NBA Q4 deep trailer: 8-15pt deficit at 10-25¢
+          if (league === 'nba' && period === 4 && diff >= 8 && diff <= 15 && trailPrice >= 0.10 && trailPrice <= 0.25) {
+            underdogAllowed = true;
+          }
+          // NHL P3 empty-net trailer: any trailer at 6-20¢ (price band catches end-of-game pulls)
+          else if (league === 'nhl' && period === 3 && trailPrice >= 0.06 && trailPrice <= 0.20) {
+            underdogAllowed = true;
+          }
+        }
 
         if (underdogAllowed) {
           const trailRec = trailing.records?.[0]?.summary ?? '';
