@@ -8261,6 +8261,30 @@ async function checkLiveScoreEdges() {
         // Structural fast-path above still runs. Returns null so downstream
         // parses to "no decision" and skips this candidate.
         if (isClaudePausedForBilling()) {
+          // Log a shadow record so we don't lose audit trail during pause.
+          // This captures candidates that WOULD have been evaluated.
+          try {
+            logShadowDecision({
+              stage: 'live-edge',
+              subStage: 'claude-out-paused',
+              ticker: item.ticker,
+              sport: item.league?.toUpperCase() ?? null,
+              league: item.league ?? null,
+              decision: 'no-trade',
+              rejectReason: 'claude-out-paused',
+              claudeConfidence: null,
+              decisionPrice: item.price ?? null,
+              edge: null,
+              scoreDiff: item.diff ?? null,
+              period: item.period ?? null,
+              gameDetail: item.gameDetail ?? null,
+              leadingAbbr: item.leadingAbbr ?? null,
+              targetAbbr: item.targetAbbr ?? null,
+              homeAbbr: item.homeAbbr ?? null,
+              awayAbbr: item.awayAbbr ?? null,
+              liveStage: item.stage ?? null,
+            });
+          } catch { /* best-effort */ }
           return null;
         }
         if (item._useSearch) {
