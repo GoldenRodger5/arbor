@@ -11975,12 +11975,19 @@ async function checkPreGamePredictions() {
             || ((market.team1?.price ?? 0) >= (market.team2?.price ?? 0)
                 ? (market.team1?.team ?? '').toUpperCase()
                 : (market.team2?.team ?? '').toUpperCase());
+          // Resolve the price of the team Claude was evaluating so decisionPrice is populated.
+          // Claude no-trade responses don't include targetPrice, so derive from team match.
+          const _pgRejectPrice = _pgRejectTeam
+            ? (_pgRejectTeam === (market.team1?.team ?? '').toUpperCase()
+                ? market.team1?.price
+                : market.team2?.price)
+            : (decision.targetPrice ?? null);
           logPregameRejection(market, isEspnMiss ? 'sonnet-espn-miss' : 'sonnet-claude-no', 'claude-no', {
             team: _pgRejectTeam || null,
             sport: market.sport ?? null,
             league: market.league ?? null,
             confidence: decision.confidence ?? null,
-            price: decision.targetPrice ?? null,
+            price: _pgRejectPrice ?? null,
             edge: decision.edge ?? null,
             reasoningPreview: (decision.reasoning ?? '').slice(0, 300),
             reasoningTags: decision.reasoningStructured?.reasoning_tags ?? null,
