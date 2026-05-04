@@ -9243,15 +9243,18 @@ async function checkLiveScoreEdges() {
 
         const claudeBet = decision.betAmount ?? 0;
         let safeBet = hcCheck.isHighConv ? maxBetLE : Math.min(claudeBet > 0 ? claudeBet : maxBetLE, maxBetLE);
-        // 2026-05-02: DYNAMIC ABSOLUTE CAP — scales with bankroll, $15 floor.
-        // Formula: max($15, bankroll × 15%). Caps single-trade-loss exposure
-        // at any bankroll size. Tonight LaLiga ALA@ATH at $21.83 lost $13.69
-        // = 24% of $90 bankroll. Under this cap that trade would have been
-        // $15 (16.7% of bankroll) and the loss ~$9.40. As bankroll grows,
-        // cap scales: $200 → $30, $500 → $75, $1000 → $150.
-        const ABSOLUTE_TRADE_CAP = Math.max(15, Math.floor(getBankroll() * 0.15));
+        // 2026-05-04: ABSOLUTE CAP REVERSED to data-justified levels.
+        // Original cap of $15 was anti-pattern: trade-size band data shows
+        // $20-35 trades win (+$0.91/trade) while $10-20 lose (-$1.35/trade).
+        // The $15 cap pushed us into the bleeder band. New floor is $30
+        // default; $40 for asymmetric strategies (draw-bet, comeback-buy).
+        // Scales upward with bankroll growth.
+        const _stratForCap = item._structuralDecision ? `structural-${item._structuralDecision._structuralPattern}` : (isSwingMode ? 'live-swing' : 'live-prediction');
+        const _isAsymmetricStrategy = ['draw-bet','comeback-buy'].includes(_stratForCap);
+        const _capFloor = _isAsymmetricStrategy ? 40 : 30;
+        const ABSOLUTE_TRADE_CAP = Math.max(_capFloor, Math.floor(getBankroll() * 0.30));
         if (safeBet > ABSOLUTE_TRADE_CAP) {
-          console.log(`[sizing] 🧱 ABSOLUTE CAP: $${safeBet.toFixed(2)} → $${ABSOLUTE_TRADE_CAP} (max($15, 15%×bankroll) — single-trade hard ceiling)`);
+          console.log(`[sizing] 🧱 ABSOLUTE CAP: $${safeBet.toFixed(2)} → $${ABSOLUTE_TRADE_CAP} (max($${_capFloor}, 30%×bankroll) — ${_isAsymmetricStrategy ? 'asymmetric' : 'default'} ceiling)`);
           safeBet = ABSOLUTE_TRADE_CAP;
         }
         // 2026-05-02: minimum trade size $3 (was $1). Tonight's STL game saw 4
