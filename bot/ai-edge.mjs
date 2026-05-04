@@ -4761,7 +4761,10 @@ async function settleShadowDecisions() {
       // 2026-04-30: pre-compute price recovery on synthetic-trail AND live-edge shadows.
       // For live-edge: tells us how often Sonnet-rejected setups would have hit +12¢
       // intra-game (the swing exit threshold). Critical for tuning swing-mode floors.
-      if ((r.stage === 'live-edge-trailer-synthetic' || r.stage === 'live-edge')
+      // 2026-05-04: extended to pre-game shadows. Pre-game-prediction held-to-settle
+      // shows +$5.76/trade alpha vs profit-lock per outlier-stripped audit. Tracking
+      // maxPriceAfterEntry for pre-game shadows lets us validate this going forward.
+      if ((r.stage === 'live-edge-trailer-synthetic' || r.stage === 'live-edge' || r.stage === 'pre-game')
           && existsSync(PRICE_TAPE_LOG) && r.decisionPrice) {
         try {
           const tapeLines = readFileSync(PRICE_TAPE_LOG, 'utf-8').split('\n').filter(l => l.trim());
