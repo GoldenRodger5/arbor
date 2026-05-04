@@ -140,11 +140,29 @@ function isStrategyAutoDisabledByCAL(strategy) {
  *  Returns null if all tags are clean / not enough data; returns { tag, stats }
  *  for the worst-offending tag if blocking is warranted.
  */
+// 2026-05-04: HARDCODED BAD TAGS — identified via loser deep-dive audit.
+// These persist in code regardless of calibration-overrides.json availability.
+// Each entry has data backing in PLAN_2026-05-04.md.
+const HARDCODED_BAD_TAGS = {
+  'starter-mismatch':  { n: 13, wins: 3, ciLo: 0.06, note: 'Loser-deep-dive: 23% pick across n=13' },
+  'bullpen-mismatch':  { n: 5, wins: 1, ciLo: 0.046, note: 'Calibration ciLo 0.046 (CAL stats)' },
+};
+
 function evaluateTagCredibility(tags) {
   if (!Array.isArray(tags) || tags.length === 0) return null;
-  const stats = CAL.reasoningTagStats;
-  if (!stats) return null;
   let worst = null;
+  // First check hardcoded list — these are confirmed bad regardless of calibration state
+  for (const tag of tags) {
+    const hc = HARDCODED_BAD_TAGS[tag];
+    if (hc) {
+      const candidate = { tag, stats: { n: hc.n, wins: hc.wins, winRate: hc.wins/hc.n, ciLo: hc.ciLo, hardcoded: true } };
+      if (!worst || hc.ciLo < worst.stats.ciLo) worst = candidate;
+    }
+  }
+  // Then fall through to calibration-driven check (catches any new bad tags
+  // that emerge in shadow data before we manually add them here)
+  const stats = CAL.reasoningTagStats;
+  if (!stats) return worst;
   for (const tag of tags) {
     const s = stats[tag];
     if (!s || (s.n ?? 0) < 5) continue; // need statistical signal
