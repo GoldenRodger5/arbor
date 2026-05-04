@@ -3820,7 +3820,18 @@ function readUIControl() {
     return JSON.parse(readFileSync(CONTROL_FILE, 'utf-8'));
   } catch { return { paused: false, disabledStrategies: [] }; }
 }
+// 2026-05-04: HARDCODED KILLSWITCH — strategies disabled based on full audit
+// of past 178 placed trades. Each entry has data backing in PLAN_2026-05-03.md.
+// To re-enable: comment out the entry here AND wait for new shadow data.
+const STRATEGY_KILLSWITCH = new Set([
+  'pre-game-edge-first',           // 22% WR, -$34/10 trades, 0.51 win/loss ratio (needs 66% WR)
+  'structural-mlb-inn-5-7-leader', // 0.17 ratio (needs 86% WR), has 45%, -$22/12 trades
+  'structural-mlb-inn-3-leader-2run', // n=1 0% WR, no edge (rebuild after data)
+  'live-swing',                    // 0.34 ratio (needs 75% WR), has 43%, -$14/8 trades
+]);
+
 function isStrategyDisabled(strategy) {
+  if (STRATEGY_KILLSWITCH.has(strategy)) return true;
   const ctrl = readUIControl();
   if ((ctrl.disabledStrategies ?? []).includes(strategy)) return true;
   // Tier 1 auto-calibration can also pause a strategy for sustained -EV runs
@@ -7985,6 +7996,13 @@ async function checkLiveScoreEdges() {
           console.log(`[live-edge] 🎯 STRUCTURAL DETECTOR matched (${_structuralDecision._structuralPattern}): ${targetAbbr} — ${summary}, conf=${(_structuralDecision.confidence*100).toFixed(0)}% — skipping Sonnet`);
           // 2026-04-30 throttles — prevent 4-min burst-fire pattern (today's losses)
           const _structStrategy = 'structural-' + _structuralDecision._structuralPattern;
+          // 2026-05-04: enforce STRATEGY_KILLSWITCH at fire-time — kills structural detectors
+          // disabled by audit (e.g., structural-mlb-inn-5-7-leader at 0.17 win/loss ratio).
+          if (isStrategyDisabled(_structStrategy)) {
+            console.log(`[live-edge] 🚫 STRUCTURAL KILLSWITCH: ${_structStrategy} disabled by audit — skipping`);
+            logScreen({ stage: 'live-edge-skip', result: 'skip-structural-killswitch', ticker, reasoning: `${_structStrategy} disabled by STRATEGY_KILLSWITCH` });
+            continue;
+          }
           const _throttle = checkStructuralThrottles({ league, strategy: _structStrategy, ticker });
           if (_throttle.blocked) {
             console.log(`[live-edge] 🚦 STRUCTURAL THROTTLE: ${targetAbbr} — ${_throttle.reason}`);
@@ -8639,6 +8657,16 @@ async function checkLiveScoreEdges() {
               continue;
             }
           }
+          // 2026-05-04 HALLUCINATION ZONE BLOCK: live-prediction at conf ≥90% has
+          // been catastrophic in placed-bet history. live-prediction|90+: 1/3
+          // wins, -$23.95. conf=90-100% edge=15+pt: 0/4 wins, -$32. Sonnet's
+          // max-confidence is when it's most wrong. Structural detectors are
+          // exempt because their confidence is the WE table baseline, not Sonnet.
+          if (!item._structuralDecision && (decision.confidence ?? 0) >= 0.90) {
+            console.log(`[live-edge] 🚫 HALLUCINATION-ZONE BLOCKED ${targetAbbr}: live-prediction at ${((decision.confidence ?? 0)*100).toFixed(0)}% conf — historical 33% WR, -$8/trade. Sonnet over-confident.`);
+            logScreen({ stage: 'live-edge', ticker, result: 'hallucination-zone-block', reasoning: `Sonnet conf ${((decision.confidence ?? 0)*100).toFixed(0)}% in hallucination zone (≥90%) — placed-bet history -$23.95 / 3 trades` });
+            continue;
+          }
         }
 
         // 2026-04-27 — TAG CREDIBILITY BLOCK. The auto-calibration system has been
@@ -9057,6 +9085,17 @@ async function checkLiveScoreEdges() {
         const bestPrice = best.price;
         const bestEdge = confidence - bestPrice;
         if (confidence - bestPrice < reqMargin) { console.log(`[live-edge] BLOCKED ${targetAbbr}: cross-platform recheck failed (bestPrice=${(bestPrice*100).toFixed(0)}¢)`); continue; }
+
+        // 2026-05-04 SUB-40¢ ENTRY BLOCK: per audit of placed-bet history,
+        // entries below 40¢ had 22% pick accuracy (n=9). Structural detectors
+        // (NBA Q4 deep-trailer, NHL empty-net trailer, soccer counter-equalizer)
+        // are EXEMPT — they target 6-35¢ entries with built-in asymmetric-pay
+        // rules. Only Sonnet-driven (live-prediction/swing) entries blocked.
+        if (!item._structuralDecision && bestPrice < 0.40) {
+          console.log(`[live-edge] 🚫 SUB-40¢ BLOCKED ${targetAbbr}: ${(bestPrice*100).toFixed(0)}¢ entry — placed-bet history 22% pick accuracy (n=9). Structural-only band.`);
+          logScreen({ stage: 'live-edge', ticker, result: 'sub-40-block', reasoning: `Sonnet-driven entry below 40¢ — historical 22% pick accuracy bans this band` });
+          continue;
+        }
 
         // Check for high-conviction tier (late-game blowouts → 25-30% sizing)
         // Determine game stage from period (ctx is not available in live-edge — it's from managePositions)
@@ -11804,6 +11843,17 @@ async function checkPreGamePredictions() {
       console.log(`[pre-game] 🧊 edge-first FROZEN (ALL sports): ${market.base} would qualify (conf=${(confidence*100).toFixed(0)}%, edge=${(_edgeAbs*100).toFixed(0)}pt, price=${(price*100).toFixed(0)}¢) — tier paused after 2W/8L total`);
     } else if (pgSportKey === 'mlb' && confidence >= 0.58 && _edgeAbs >= _edgeFirstFloor && price <= 0.55 && confidence < PRE_GAME_MIN_CONF && !_hasEdgeSource) {
       console.log(`[pre-game] ❌ MLB edge-first rejected for ${market.base}: no cited edge source (injury/weather/starter-change/bullpen-game) in reasoning`);
+    }
+
+    // 2026-05-04 PRE-GAME PRICE BAND: per audit of 39 pre-game-prediction trades,
+    // <40¢ entries: 0/3 = 0% WR. 60-70¢ entries: 0/5 = 0% WR. 40-50¢ band is
+    // the only profitable cell (+$14 / n=31 / 39% WR with asymmetric pay).
+    // Restrict pre-game-prediction to 40-55¢ band entirely. (MLB sub-band
+    // 45-49¢ block remains active below.)
+    if (price < 0.40 || price > 0.55) {
+      console.log(`[pre-game] BLOCKED ${market.base}: pre-game-prediction outside 40-55¢ band (price=${(price*100).toFixed(0)}¢) — audit shows <40¢ and 60+¢ are 0% WR cells`);
+      logPregameRejection(market, 'post-sonnet-gate', 'pre-game-price-band', { team: matchedSide.team, price, confidence, sport: pgSportKey, gateContext: { band: '40-55-only' } });
+      continue;
     }
 
     if ((confidence < PRE_GAME_MIN_CONF || _edgeAbs < pgReqMargin) && !isEdgeFirst) {
