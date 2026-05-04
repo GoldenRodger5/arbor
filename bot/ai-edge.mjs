@@ -2761,6 +2761,44 @@ function detectPregameSportsbookGap(market, sportsbookData, sport) {
   // Compute gaps for each side: positive = Kalshi UNDERPRICES (we buy)
   const t1Gap = t1Prob - t1Price;
   const t2Gap = t2Prob - t2Price;
+
+  // Log ALL gaps found (above AND below threshold) as shadow data.
+  // This lets us tune the 5pt threshold empirically — we may be missing
+  // 3-4pt gaps that are still profitable, or 5pt gaps in bad price bands.
+  // Logged regardless of whether we actually trade.
+  try {
+    const _sbShadowBase = market.base ?? '';
+    for (const [_gap, _prob, _price, _team] of [[t1Gap, t1Prob, t1Price, market.team1.team], [t2Gap, t2Prob, t2Price, market.team2.team]]) {
+      if (Math.abs(_gap) >= 0.02) { // only log gaps ≥ 2pt (filter noise)
+        const _clears = _gap >= 0.05 && _gap <= 0.15 && _price >= 0.30 && _price <= 0.68;
+        logShadowDecision({
+          stage: 'sportsbook-gap-candidate',
+          ticker: `${_sbShadowBase}-${_team}`,
+          sport: sport ?? null,
+          league: (sport ?? '').toLowerCase(),
+          decision: _clears ? 'trade' : 'no-trade',
+          rejectReason: _clears ? null : (
+            _gap < 0.05 ? 'gap-below-5pt' :
+            _gap > 0.15 ? 'gap-above-15pt' :
+            _price < 0.30 ? 'price-below-30c' :
+            'price-above-68c'
+          ),
+          claudeConfidence: _prob,
+          decisionPrice: _price,
+          scoreDiff: null,
+          period: null,
+          gapPt: parseFloat((_gap * 100).toFixed(1)),
+          sportsbookProb: parseFloat((_prob * 100).toFixed(1)),
+          kalshiPrice: parseFloat((_price * 100).toFixed(1)),
+          sbSource: source ?? null,
+          clearsThreshold: _clears,
+          targetAbbr: _team,
+          reasoningPreview: `sportsbook-gap: ${_team} ${(_prob*100).toFixed(0)}% vs ${(_price*100).toFixed(0)}¢ = ${(_gap*100).toFixed(1)}pt gap (${_clears ? 'FIRES' : 'below threshold'})`,
+        });
+      }
+    }
+  } catch { /* best-effort */ }
+
   let pick = null;
   if (t1Gap >= 0.05 && t1Gap <= 0.15 && t1Price >= 0.30 && t1Price <= 0.68) {
     pick = { team: market.team1, gap: t1Gap, prob: t1Prob };
@@ -4613,6 +4651,66 @@ function logPaperTrade(entry) {
 // Shadow decisions fire many times per game cycle as Sonnet re-evaluates; we only need
 // one shadow record per state-change to track outcome.
 const recentShadowKeys = new Map(); // key → ts
+
+// Post-exit price watch: after any close (profit-lock, stop, settle), watch the price
+// for 20 minutes to validate whether our exit was optimal. tradeId → watch state.
+const exitPriceWatch = new Map();
+const EXIT_WATCH_WINDOW_MS = 20 * 60 * 1000; // 20 minutes
+
+// Update a single exit-price-watch entry with the latest price, then flush to shadow
+// if the 20-min window has elapsed or the game has ended.
+// Called from managePositions on every cycle for recently-closed tickers.
+async function tickExitPriceWatch(watch, currentPrice, gameEnded) {
+  if (watch.logged) return;
+  const now = Date.now();
+  watch.pricesAfter.push({ price: currentPrice, ts: now });
+  if (currentPrice > watch.maxPriceAfter) watch.maxPriceAfter = currentPrice;
+  if (currentPrice < watch.minPriceAfter) watch.minPriceAfter = currentPrice;
+
+  const elapsed = now - watch.exitTs;
+  if (elapsed < EXIT_WATCH_WINDOW_MS && !gameEnded) return; // keep watching
+
+  // Window closed — flush shadow record
+  watch.logged = true;
+  const priceGoesHigherAfter = watch.maxPriceAfter > watch.exitPrice + 0.01;
+  const priceReversesBelowExit = watch.minPriceAfter < watch.exitPrice - 0.01;
+  const exitWasNearPeak = watch.maxPriceAfter <= watch.exitPrice + 0.03; // within 3¢ of our exit
+  const upleftOnTable = Math.max(0, watch.maxPriceAfter - watch.exitPrice);
+  const profitPerContract = watch.exitPrice - watch.entryPrice;
+
+  try {
+    logShadowDecision({
+      stage: 'post-exit-watch',
+      ticker: watch.ticker,
+      sport: watch.sport,
+      league: watch.league,
+      strategy: watch.exitReason.includes('stop') ? watch.strategy + '-stop' : watch.strategy,
+      decision: 'post-exit',
+      rejectReason: null,
+      claudeConfidence: null,
+      decisionPrice: watch.entryPrice,
+      scoreDiff: null,
+      period: null,
+      // core fields
+      entryPrice: watch.entryPrice,
+      exitPrice: watch.exitPrice,
+      exitReason: watch.exitReason,
+      exitTs: new Date(watch.exitTs).toISOString(),
+      profitPerContract: parseFloat(profitPerContract.toFixed(4)),
+      profitPct: parseFloat((profitPerContract / (watch.entryPrice || 1) * 100).toFixed(1)),
+      // post-exit price behavior
+      maxPriceAfterExit: parseFloat(watch.maxPriceAfter.toFixed(3)),
+      minPriceAfterExit: parseFloat(watch.minPriceAfter.toFixed(3)),
+      upleftOnTable: parseFloat(upleftOnTable.toFixed(3)),
+      priceGoesHigherAfter,    // true = price kept rising after we sold (we may have exited too early)
+      priceReversesBelowExit,  // true = price dropped below our exit price (exit was correct)
+      exitWasNearPeak,         // true = our exit was within 3¢ of the observed peak
+      watchWindowMs: elapsed,
+      tickCount: watch.pricesAfter.length,
+    });
+  } catch { /* best-effort */ }
+  exitPriceWatch.delete(watch.tradeId);
+}
 
 // Build enriched shadow-context fields from available state (2026-04-27 expansion).
 // Adds dimensions the shadow tracker wasn't capturing — each one a candidate for
@@ -14352,6 +14450,36 @@ async function managePositions() {
                   } else {
                     console.log(`[exit] 🧠🛡️ CLAUDE HOLD at profit-lock (live, ${stage}): ${trade.ticker} up ${lockProfit}¢ — holding for settlement | ${d.reasoning?.slice(0,80)}`);
                     tradeCooldowns.set('claude-hold:' + trade.ticker, Date.now());
+                    // Log the hold decision as a shadow record so we can validate it at settle.
+                    // Fields: price when Claude held, WE, how far up we were, Claude's reasoning.
+                    // ourPickWon is filled by settleShadowDecisions when the game ends.
+                    try {
+                      const _holdTeam = trade.ticker?.split('-').pop() ?? '';
+                      const _holdWE = ctx?.leading === _holdTeam ? (ctx?.baselineWE ?? 0.5) : (1 - (ctx?.baselineWE ?? 0.5));
+                      logShadowDecision({
+                        stage: 'profit-lock-hold',
+                        ticker: trade.ticker,
+                        sport: ctx ? (trade.league ?? null) : null,
+                        league: trade.league ?? null,
+                        strategy: trade.strategy,
+                        decision: 'hold',
+                        rejectReason: 'claude-hold',
+                        claudeConfidence: _holdWE,
+                        decisionPrice: currentPrice,
+                        entryPrice,
+                        profitPerContract: parseFloat(profitPerContract.toFixed(4)),
+                        profitCents: parseInt(lockProfit, 10),
+                        gainPct,
+                        weAtHold: parseFloat((_holdWE * 100).toFixed(1)),
+                        holdEV,
+                        gameStage: stage,
+                        scoreDiff: ctx?.diff ?? null,
+                        period: ctx?.period ?? null,
+                        claudeReasoning: d.reasoning?.slice(0, 200) ?? null,
+                        targetAbbr: _holdTeam,
+                        leadingAbbr: ctx?.leading ?? null,
+                      });
+                    } catch { /* best-effort */ }
                   }
                 }
               } catch { /* skip */ }
@@ -15634,6 +15762,29 @@ async function managePositions() {
     if (anyUpdated) {
       writeFileSync(TRADES_LOG, trades.map(t => JSON.stringify(t)).join('\n') + '\n');
     }
+
+    // Tick the post-exit price watch for any recently-closed trades.
+    // We already have kalshiPrices for open trades; for closed-but-watched tickers
+    // we fetch their current price (cheap: only fires for up to ~5 recently-closed trades).
+    if (exitPriceWatch.size > 0) {
+      const now = Date.now();
+      for (const [tradeId, watch] of exitPriceWatch) {
+        if (watch.logged) { exitPriceWatch.delete(tradeId); continue; }
+        // Expire stale watches (>25 min with no price data)
+        if (now - watch.exitTs > EXIT_WATCH_WINDOW_MS + 5 * 60 * 1000) {
+          watch.logged = true; exitPriceWatch.delete(tradeId); continue;
+        }
+        try {
+          const priceData = await kalshiGet(`/markets/${watch.ticker}`);
+          const m = priceData.market ?? priceData;
+          const currentWatchPrice = m.yes_ask_dollars ? parseFloat(m.yes_ask_dollars) : null;
+          if (currentWatchPrice != null) {
+            const gameEnded = currentWatchPrice >= 0.98 || currentWatchPrice <= 0.02;
+            await tickExitPriceWatch(watch, currentWatchPrice, gameEnded);
+          }
+        } catch { /* best-effort — never disrupt position management */ }
+      }
+    }
   } catch (e) {
     console.error('[exit] error:', e.message);
   }
@@ -15889,6 +16040,35 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
         console.log(`[exit] 🧹 Cleared gameEntries for ${gb} after full exit`);
       }
     }
+    // Post-exit price watch: track price for 20min after close so we can answer
+    // "was our exit optimal?" — see flushExitPriceWatch() for the shadow log flush.
+    // Only watch live-prediction, structural, live-swing, and pre-game strategies.
+    // Don't watch draw-bets or high-conviction (different exit dynamics).
+    const _watchableStrategy = trade.strategy && (
+      trade.strategy === 'live-prediction' ||
+      trade.strategy === 'live-swing' ||
+      trade.strategy === 'pre-game-prediction' ||
+      trade.strategy.startsWith('structural-')
+    );
+    if (_watchableStrategy) {
+      exitPriceWatch.set(trade.id, {
+        tradeId: trade.id,
+        ticker: trade.ticker,
+        entryPrice: trade.entryPrice ?? 0,
+        exitPrice: currentPrice,
+        exitReason: reason,
+        exitTs: Date.now(),
+        strategy: trade.strategy,
+        league: trade.league ?? null,
+        sport: trade.sport ?? null,
+        quantity: effectiveQty,
+        pricesAfter: [],  // { price, ts, detail } up to 20min
+        maxPriceAfter: currentPrice,
+        minPriceAfter: currentPrice,
+        logged: false,
+      });
+    }
+
     // After any stop-loss, lock out re-entry on this game for 30 min (BOTH sides).
     // Persisted in state.json so restarts don't clear the lock.
     if (isStopLoss) {
