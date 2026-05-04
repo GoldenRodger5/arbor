@@ -10865,8 +10865,22 @@ async function checkPreGamePredictions() {
           try {
             const oddsArr = comp.odds ?? [];
             for (const o of oddsArr) {
-              const homeMl = o.homeTeamOdds?.moneyLine;
-              const awayMl = o.awayTeamOdds?.moneyLine;
+              // 2026-05-04: ESPN moneyline data lives at o.moneyline.home/away.close.odds
+              // (string like "+119" / "-143"), NOT o.homeTeamOdds.moneyLine which was
+              // dead path. Parser fix unlocks detectPregameSportsbookGap which had
+              // 0 fires ever despite ESPN providing the data on every game.
+              const homeMlStr = o?.moneyline?.home?.close?.odds ?? o?.moneyline?.home?.open?.odds;
+              const awayMlStr = o?.moneyline?.away?.close?.odds ?? o?.moneyline?.away?.open?.odds;
+              const parseAmericanML = (s) => {
+                if (typeof s === 'number') return s;
+                if (typeof s !== 'string') return null;
+                const cleaned = s.replace(/^\+/, '').trim();
+                const n = parseInt(cleaned, 10);
+                return Number.isFinite(n) ? n : null;
+              };
+              // Fallback to the legacy path if new path missing
+              const homeMl = parseAmericanML(homeMlStr) ?? (typeof o.homeTeamOdds?.moneyLine === 'number' ? o.homeTeamOdds.moneyLine : null);
+              const awayMl = parseAmericanML(awayMlStr) ?? (typeof o.awayTeamOdds?.moneyLine === 'number' ? o.awayTeamOdds.moneyLine : null);
               if (typeof homeMl === 'number' && typeof awayMl === 'number') {
                 // American moneyline → implied probability:
                 //   negative odds:  P = -ml / (-ml + 100)
