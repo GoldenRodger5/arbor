@@ -12353,7 +12353,9 @@ async function checkPreGamePredictions() {
                               : pgSportKey === 'nba' ? 0.03
                               : pgSportKey === 'nhl' ? 0.02
                               : 0.02; // soccer/other
-    if (_calibrationHaircut > 0 && confidence > _calibrationHaircut) {
+    // Sportsbook-gap decisions use sharp-market probability, not Claude's confidence —
+    // the calibration haircut corrects Claude overconfidence and must not apply here.
+    if (_calibrationHaircut > 0 && confidence > _calibrationHaircut && !_sportsbookGapExempt) {
       const _preHaircut = confidence;
       confidence = Math.max(0, confidence - _calibrationHaircut);
       console.log(`[pre-game] calibration haircut: ${(_preHaircut*100).toFixed(0)}% → ${(confidence*100).toFixed(0)}% (${pgSportKey} -${(_calibrationHaircut*100).toFixed(0)}pt)`);
