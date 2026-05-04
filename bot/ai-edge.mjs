@@ -3867,7 +3867,13 @@ const STRATEGY_KILLSWITCH = new Set([
   'pre-game-edge-first',           // 22% WR, -$34/10 trades, 0.51 win/loss ratio (needs 66% WR)
   'structural-mlb-inn-5-7-leader', // 0.17 ratio (needs 86% WR), has 45%, -$22/12 trades
   'structural-mlb-inn-3-leader-2run', // n=1 0% WR, no edge (rebuild after data)
-  'live-swing',                    // 0.34 ratio (needs 75% WR), has 43%, -$14/8 trades
+  // 2026-05-04: REMOVED live-swing from killswitch. Re-audit showed kill was
+  // outlier-driven (1 NHL trade -$13.09 on n=8). Outlier-stripped: 7 trades,
+  // 50% WR, -$1.42 net (-$0.20/trade — basically break-even). NBA live-swing
+  // was 2/2 wins. n=8 too small for permanent disable. MLS live-swing remains
+  // disabled separately (line 8857 — different gate). Re-enabling for
+  // MLB/NBA/NHL/EPL with current swing-mode gates intact.
+  // 'live-swing' — kept enabled, accumulating data
 ]);
 
 // 2026-05-04: PER-STRATEGY R:R MAP (profit-lock thresholds)
