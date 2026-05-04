@@ -9230,6 +9230,23 @@ async function checkLiveScoreEdges() {
           }
         }
 
+        // 2026-05-04: STRONG-TAG SIZING BOOST 1.3x.
+        // Reasoning tags `playoff-home-fav` (77% WR n=13) and `line-movement`
+        // (83% WR n=6) are validated win signals from the audit. When Sonnet
+        // cites them as the edge source, bump sizing 1.3x within the existing
+        // cap to capture more value on high-conviction setups.
+        // Note: lineup-cold dropped from boost set — only 57% WR after audit.
+        if (!hcCheck.isHighConv && !item._structuralDecision) {
+          const _tags = decision.reasoningStructured?.reasoning_tags ?? [];
+          const _strongTags = ['playoff-home-fav', 'line-movement'];
+          const _hasStrongTag = Array.isArray(_tags) && _tags.some(t => _strongTags.includes(t));
+          if (_hasStrongTag) {
+            const before = maxBetLE;
+            maxBetLE = Math.floor(maxBetLE * 1.3);
+            console.log(`[sizing] 🔥 STRONG-TAG BOOST: $${before.toFixed(2)} → $${maxBetLE.toFixed(2)} (tag-validated 67-77% WR signal: ${_tags.filter(t=>_strongTags.includes(t)).join(',')})`);
+          }
+        }
+
         // 2026-04-29 PROFIT LOCK-IN — protect today's earned gains from a single
         // adverse trade. Once up ≥5% on the day, cap any new trade at 30% of profit.
         // Today's NBA-Q3 ($15.66 deploy → -$10.73 loss) erased 6 prior wins. With
