@@ -11621,7 +11621,16 @@ async function checkPreGamePredictions() {
         // zero visibility. Now pregame claude-no decisions land in shadow with full
         // context so we can see the rejection histogram (sport, conf, price, tags).
         try {
+          // 2026-05-04: pass team so settle code can compute ourPickWon. Sonnet's
+          // output `decision.team` indicates which side it was evaluating. Falls
+          // back to the higher-priced team (Sonnet's implicit favorite) when team
+          // isn't explicitly set. Unlocks pick-accuracy stats for pre-game shadows.
+          const _pgRejectTeam = (decision.team ?? '').toUpperCase()
+            || ((market.team1?.price ?? 0) >= (market.team2?.price ?? 0)
+                ? (market.team1?.team ?? '').toUpperCase()
+                : (market.team2?.team ?? '').toUpperCase());
           logPregameRejection(market, isEspnMiss ? 'sonnet-espn-miss' : 'sonnet-claude-no', 'claude-no', {
+            team: _pgRejectTeam || null,
             sport: market.sport ?? null,
             league: market.league ?? null,
             confidence: decision.confidence ?? null,
