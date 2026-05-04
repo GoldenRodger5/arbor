@@ -3858,14 +3858,19 @@ const STRATEGY_KILLSWITCH = new Set([
 // Low-WR strategies need asymmetric pay (+15-20¢) to clear break-even.
 // Stop-loss values documented for future application via exit pipeline.
 const STRATEGY_RR = {
-  'structural-mlb-inn-6-leader':       { profitLock: 0.05, stopLoss: 0.10 }, // 83% WR → tight lock OK
-  'structural-nba-q2-leader':          { profitLock: 0.08, stopLoss: 0.15 }, // 67% WR + NBA volatility
+  // 2026-05-04 audit: 100% of placed trades hit +15¢ window. 33% settle WR
+  // confirms early exit essential. Bumping +5¢ → +15¢ captures 3x gain per trade.
+  'structural-mlb-inn-6-leader':       { profitLock: 0.15, stopLoss: 0.10 }, // 83% WR / 100% +15¢ window
+  // 2026-05-04 audit: 100% hold WR (n=3) — sim shows hold +$0.48/share vs lock +$0.27.
+  // Effective hold-to-settle: profit-lock at 30¢ (nearly settlement at 50-65¢ entry).
+  'structural-nba-q2-leader':          { profitLock: 0.30, stopLoss: 0.15 }, // hold-to-settle effectively
   'structural-nba-q4-leader':          { profitLock: 0.08, stopLoss: 0.20 }, // NBA wider stops (67% premature)
   'structural-mlb-inn-4-leader':       { profitLock: 0.15, stopLoss: 0.10 }, // 50% WR → asymmetric
   'structural-mlb-inn-89-leader':      { profitLock: 0.05, stopLoss: 0.10 }, // closer-territory tight
   'structural-mlb-inn-2-leader':       { profitLock: 0.10, stopLoss: 0.10 }, // 71% WR symmetric
   'structural-mlb-inn-2-leader-2run':  { profitLock: 0.10, stopLoss: 0.10 }, // 87% WR
-  'structural-score-event-arb':        { profitLock: 0.08, stopLoss: 0.15 }, // 100% pick + info-lag
+  // 2026-05-04 audit: sim shows +10¢ best (+$0.230/share vs +$0.142 at +5¢).
+  'structural-score-event-arb':        { profitLock: 0.10, stopLoss: 0.15 }, // 100% pick + info-lag
   'structural-mlb-inn-5-leader-3run':  { profitLock: 0.05, stopLoss: 0.10 },
   'structural-mlb-inn-3-leader-3run':  { profitLock: 0.10, stopLoss: 0.10 },
   'structural-mlb-inn-1-leader-3run':  { profitLock: 0.10, stopLoss: 0.10 },
@@ -3880,7 +3885,9 @@ const STRATEGY_RR = {
 // Soccer gets asymmetric pay (large lock + tight stop) because MLS had
 // 75% WR but lost money — losses were bigger than wins.
 const LIVE_PREDICTION_RR = {
-  mlb:    { profitLock: 0.10, stopLoss: 0.10 },
+  // 2026-05-04 audit: MLB live-prediction at 70-85% conf has 64% WR. Sim shows
+  // +15¢ lock beats +10¢. Bumping for modest improvement.
+  mlb:    { profitLock: 0.15, stopLoss: 0.10 },
   nba:    { profitLock: 0.10, stopLoss: 0.20 }, // 67% premature stops → wider
   nhl:    { profitLock: 0.10, stopLoss: 0.15 }, // 50% premature stops
   mls:    { profitLock: 0.20, stopLoss: 0.08 }, // 75% WR -$11.70 → asymmetric
