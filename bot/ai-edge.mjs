@@ -9067,13 +9067,29 @@ async function checkLiveScoreEdges() {
         if (!canTrade()) { console.log(`[live-edge] BLOCKED ${targetAbbr}: canTrade() failed`); continue; }
 
         // Stop-lock check — blocks BOTH sides of a game for 30 min after any stop-loss.
-        // Persisted across restarts so a quick bot restart doesn't clear the protection.
+        // 2026-05-04 SAME-GAME MOMENTUM: per audit, subsequent trade WR after a
+        // loss on a game is 54% (basically coin flip), vs 89% after a win.
+        // Modify: keep the lock UNLESS the score has changed since the stop
+        // (genuinely new game state). With score change, require min 5 min
+        // since stop to avoid same-cycle re-entries on noise-driven scoring.
+        // Persisted across restarts so a quick bot restart doesn't clear protection.
         const liveEdgeBase = ticker.lastIndexOf('-') > 0 ? ticker.slice(0, ticker.lastIndexOf('-')) : ticker;
         const lockUntil = stopLocks.get(liveEdgeBase);
         if (lockUntil && Date.now() < lockUntil) {
-          const minsLeft = Math.ceil((lockUntil - Date.now()) / 60000);
-          console.log(`[live-edge] 🔒 BLOCKED ${targetAbbr}: stop-lock on ${liveEdgeBase} — ${minsLeft}min remaining (no re-entry either side after stop)`);
-          continue;
+          const stoppedInfo = stoppedBets.get(liveEdgeBase);
+          const stopAge = stoppedInfo?.stoppedAt ? (Date.now() - stoppedInfo.stoppedAt) : null;
+          const stopScoreKey = stoppedInfo?.scoreKeyAtStop ?? null;
+          const _scoreChangedSinceStop = stopScoreKey && currentScoreKey && stopScoreKey !== currentScoreKey;
+          const _earlyOverrideOk = _scoreChangedSinceStop && stopAge != null && stopAge >= 5 * 60 * 1000;
+          if (_earlyOverrideOk) {
+            console.log(`[live-edge] 🔓 STOP-LOCK OVERRIDE on ${liveEdgeBase}: score changed (${stopScoreKey}→${currentScoreKey}) and ${Math.floor(stopAge/60000)}min since stop — allowing re-entry`);
+            stopLocks.delete(liveEdgeBase);
+          } else {
+            const minsLeft = Math.ceil((lockUntil - Date.now()) / 60000);
+            const reason = !_scoreChangedSinceStop ? 'score unchanged since stop' : `only ${Math.floor((stopAge ?? 0)/60000)}min since stop (need 5+)`;
+            console.log(`[live-edge] 🔒 BLOCKED ${targetAbbr}: stop-lock on ${liveEdgeBase} — ${minsLeft}min remaining (${reason})`);
+            continue;
+          }
         }
 
         // === CROSS-PLATFORM PRICE CHECK — buy on cheaper platform ===
@@ -15433,7 +15449,15 @@ async function executeSell(trade, sellQty, currentPrice, reason) {
       // always reactive emotion, not signal.
       const isDrawBet = trade.strategy === 'draw-bet';
       const lockKey = isDrawBet ? `${stoppedBase}-TIE` : stoppedBase;
-      stoppedBets.set(stoppedBase, { team: stoppedTeam, stoppedAt: Date.now(), entryPrice });
+      // Capture scoreKey at stop time so the same-game momentum gate (in
+      // checkLiveScoreEdges) can detect whether the score has changed since stop.
+      const _scoreKeyAtStop = (() => {
+        try {
+          const m = (trade.liveScore || '').match(/[A-Z]{2,3}\s+(\d+)\s*[-–]\s*[A-Z]{2,3}\s+(\d+)/);
+          return m ? `${m[1]}-${m[2]}` : null;
+        } catch { return null; }
+      })();
+      stoppedBets.set(stoppedBase, { team: stoppedTeam, stoppedAt: Date.now(), entryPrice, scoreKeyAtStop: _scoreKeyAtStop });
       // Soccer re-entry lock shortened to 10min: soccer swings violently on goals/disallowed goals,
       // RVCESP-type scenarios (ESP scored, RVC crashed, 60s later ESP disallowed and RVC bounced to 90¢)
       // deserve faster re-entry. Other sports stay at 30min — MLB/NHL/NBA reversals are rarer and
