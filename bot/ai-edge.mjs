@@ -1617,9 +1617,12 @@ function detectScoreEventArb({ league, period, gameDetail, diff, weTimeAdj, pric
   if (targetAbbr !== leadingAbbr) return null; // bet leader only after score change
   if (diff < 1) return null;
   if (weTimeAdj == null || price == null) return null;
-  // Asymmetric pay band: 45-78¢. Below 45¢ leader bets are too random,
-  // above 78¢ the lag arb is already pricing in (market caught up).
-  if (price < 0.45 || price > 0.78) return null;
+  // Extra innings/OT: market is laser-focused, MM reprices instantly — 0¢ MFE in both P10
+  // shadow records, both placed P10 trades hit hard stops. No lag exists in extras.
+  if (period >= 9) return null;
+  // Asymmetric pay band: 45-73¢. Below 45¢ leader bets are too random.
+  // Above 73¢: shadow shows only +2-6¢ MFE — +10¢ profit target unreachable from 74¢+.
+  if (price < 0.45 || price > 0.73) return null;
   // Sport gates: only fire on sports where score events have fast info
   const validSports = ['mlb','nba','nhl'];
   if (!validSports.includes(league)) return null;
@@ -7291,6 +7294,40 @@ async function checkLiveScoreEdges() {
         } else {
           console.log(`[live-edge] Skipping low-WE: ${away.team?.abbreviation}@${home.team?.abbreviation} — ${league.toUpperCase()} ${diff}-${league === 'nba' ? 'pt' : league === 'mlb' ? 'run' : 'goal'} lead P${period}, WE=${(baseWE*100).toFixed(0)}% (need ${(MIN_WE_FOR_SONNET*100).toFixed(0)}%+ for ${league.toUpperCase()} ${diff === 1 ? '1-goal' : ''})`);
           logScreen({ stage: 'live-edge-skip', result: 'skip-we-floor', league, homeAbbr: home.team?.abbreviation ?? '', awayAbbr: away.team?.abbreviation ?? '', homeScore, awayScore, diff, period, winExpectancy: baseWE, reasoning: `WE=${(baseWE*100).toFixed(0)}% is below the ${(MIN_WE_FOR_SONNET*100).toFixed(0)}% floor for ${league.toUpperCase()}${diff === 1 && league === 'nhl' ? ' 1-goal leads' : ''} — need stronger lead or later period to justify analysis` });
+          continue;
+        }
+      }
+
+      // SWING-MODE QUALITY GATES (data-validated 2026-05-04, n=109 shadow)
+      if (isSwingMode) {
+        const awayA = away.team?.abbreviation ?? '';
+        const homeA = home.team?.abbreviation ?? '';
+        // Look up the leading team's cached Kalshi price for the price gate below.
+        // Uses the same series prefix + team suffix pattern as the full market finder.
+        const _leadingA = leading?.team?.abbreviation ?? '';
+        let _cachedLeadPrice = null;
+        if (_leadingA) {
+          for (const [tk, td] of cachedPrices.entries()) {
+            if (tk.startsWith(series) && tk.endsWith('-' + _leadingA) && td.yes > 0.01 && td.yes < 0.99) {
+              _cachedLeadPrice = td.yes;
+              break;
+            }
+          }
+        }
+        // Gate 1: market overprices vs our WE model — don't swing against our signal.
+        // 71-80¢ swing entries: 0/42 hit +12¢ profit-lock, avg MFE only +4¢, -$0.053/contract EV.
+        // Break-even WR = entry price. At 75¢ we need 75% WR; we run 69%. Block unless
+        // WE is ≥6pt above price (genuine underpricing, not noise).
+        if (_cachedLeadPrice != null && _cachedLeadPrice > 0.70 && baseWE < _cachedLeadPrice + 0.06) {
+          console.log(`[live-swing] Skipping high-price swing: ${awayA}@${homeA} — price=${(_cachedLeadPrice*100).toFixed(0)}¢ WE=${(baseWE*100).toFixed(0)}% gap=${((baseWE-_cachedLeadPrice)*100).toFixed(0)}pt (need ≥6pt for >70¢ entries)`);
+          isSwingMode = false;
+          continue;
+        }
+        // Gate 2: afternoon MLB 1-run leads are noise — 64% WR vs 76-81% evening.
+        // Concentrated in diff=1 where one hit erases the thesis. Require diff≥2 before 5pm ET.
+        if (league === 'mlb' && etHour() < 17 && diff < 2) {
+          console.log(`[live-swing] Skipping afternoon MLB 1-run swing: ${awayA}@${homeA} P${period} — 64% WR in afternoon diff=1, need diff≥2 before 5pm ET`);
+          isSwingMode = false;
           continue;
         }
       }
