@@ -6011,6 +6011,98 @@ async function checkLiveScoreEdges() {
     }
   }
 
+  // === SOCCER TICK SHADOW (2026-05-04) ===
+  // Logs every soccer scan tick — TIE price + drawProb + score + minute — to build
+  // the dataset for an early-entry draw-momentum strategy. Existing live-edge logs
+  // were leader-side only (zero tied-game records in 21 days). Internal dedup in
+  // logShadowDecision (stage|ticker|diff|period|5¢-price-bucket within 5min) keeps
+  // record volume sane: ~1 record per game per (score-state, minute-bucket).
+  {
+    const soccerLiveGames = liveGames.filter(g => g.isSoccer);
+    if (soccerLiveGames.length > 0) {
+      try {
+        const soccerSeries = ['KXMLSGAME','KXEPLGAME','KXLALIGAGAME','KXSERIAA','KXBUNDESLIGA','KXLIGUE1'];
+        const socFetches = await Promise.allSettled(
+          soccerSeries.map(s => kalshiGet(`/markets?series_ticker=${s}&status=open&limit=1000`).catch(() => ({ markets: [] })))
+        );
+        const socPrices = new Map();
+        for (const r of socFetches) {
+          for (const m of (r.status === 'fulfilled' ? (r.value?.markets ?? []) : [])) {
+            if (m.ticker && m.yes_ask_dollars) {
+              socPrices.set(m.ticker, parseFloat(m.yes_ask_dollars));
+            }
+          }
+        }
+        const socSeriesMap = { mls: 'KXMLSGAME', epl: 'KXEPLGAME', laliga: 'KXLALIGAGAME', seriea: 'KXSERIAA', bundesliga: 'KXBUNDESLIGA', ligue1: 'KXLIGUE1' };
+        for (const g of soccerLiveGames) {
+          const minMatch = (g.detail || '').match(/(\d+)/);
+          const minutes = minMatch ? parseInt(minMatch[1]) : 0;
+          const effectiveMin = g.period === 2 ? Math.max(minutes, 45) : minutes;
+          const minuteBucket = Math.floor(effectiveMin / 5) * 5;
+          const scoreState = `${g.homeScore}-${g.awayScore}`;
+          const tieTicker = `${socSeriesMap[g.league]}-${g.ev?.id ?? ''}-TIE`;
+          const tiePrice = socPrices.get(tieTicker) ?? null;
+          // Replicate draw-bet drawProb (extended below 60' for tick-logging only —
+          // these tick records don't drive trades, just calibrate future thresholds).
+          const isHighGoal = g.league === 'mls';
+          const drawAdj = isHighGoal ? -0.03 : 0;
+          let drawProb = 0;
+          if (g.diff === 0) {
+            if (g.homeScore === 0 && g.awayScore === 0) {
+              if (effectiveMin >= 80) drawProb = 0.88;
+              else if (effectiveMin >= 75) drawProb = 0.85;
+              else if (effectiveMin >= 70) drawProb = 0.78;
+              else if (effectiveMin >= 65) drawProb = 0.70;
+              else if (effectiveMin >= 60) drawProb = 0.60;
+              else if (effectiveMin >= 50) drawProb = 0.45;
+              else if (effectiveMin >= 30) drawProb = 0.30;
+              else if (effectiveMin >= 1)  drawProb = 0.20;
+            } else {
+              if (effectiveMin >= 80) drawProb = 0.84;
+              else if (effectiveMin >= 75) drawProb = 0.80;
+              else if (effectiveMin >= 70) drawProb = 0.72;
+              else if (effectiveMin >= 65) drawProb = 0.62;
+              else if (effectiveMin >= 50) drawProb = 0.40;
+              else if (effectiveMin >= 30) drawProb = 0.25;
+              else if (effectiveMin >= 1)  drawProb = 0.18;
+            }
+            if (drawProb > 0) drawProb = Math.max(0, drawProb + drawAdj);
+          }
+          const homeAbbr = g.home.team?.abbreviation ?? '';
+          const awayAbbr = g.away.team?.abbreviation ?? '';
+          logShadowDecision({
+            stage: 'soccer-tick',
+            ticker: tieTicker,
+            sport: 'Soccer', league: g.league,
+            decision: 'soccer-tick',
+            rejectReason: 'tick-baseline',
+            claudeConfidence: null,
+            decisionPrice: tiePrice,
+            edge: null,
+            scoreDiff: g.diff,
+            period: g.period,
+            gameDetail: g.detail,
+            leadingAbbr: g.diff > 0 ? (g.leading?.team?.abbreviation ?? null) : null,
+            targetAbbr: 'TIE',
+            homeAbbr,
+            awayAbbr,
+            homeScore: g.homeScore,
+            awayScore: g.awayScore,
+            liveStage: g.period === 1 ? 'first-half' : 'second-half',
+            effectiveMin,
+            minuteBucket,
+            scoreState,
+            drawProb,
+            tiePrice,
+            reasoningPreview: `soccer-tick ${homeAbbr}@${awayAbbr} ${scoreState} min${effectiveMin} TIE@${tiePrice ? Math.round(tiePrice*100) : '?'}¢ drawProb=${(drawProb*100).toFixed(0)}%`,
+            isSoccerTick: true,
+            strategy: 'soccer-tick-shadow',
+          });
+        }
+      } catch (e) { console.error('[soccer-tick] error:', e.message); }
+    }
+  }
+
   // Update active-live-games set so pre-game scanner skips in-progress matchups.
   // IMPORTANT: must be built from ALL in-progress ESPN games — including tied games that
   // live-edge skips for betting (diff===0 above). A tied game is still LIVE and the
