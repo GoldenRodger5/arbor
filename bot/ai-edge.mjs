@@ -11910,7 +11910,13 @@ async function checkPreGamePredictions() {
       const _oppStarter = espnStarterMap.get(`MLB:${(otherSide?.team ?? '').toLowerCase()}`);
       console.log(`[pre-game] 🎯 DISASTER-TIER EXEMPTION: ${market.base} — opponent ${_oppStarter?.name ?? '?'} ERA ${_oppStarter?.era ?? '?'} > 6.0 (historical 4-1, 80% WR). Lowering MIN_CONF floor.`);
     }
-    const PRE_GAME_MIN_CONF = isNhlNba
+    // 2026-05-04 SPORT-SPECIFIC PRE-GAME FLOORS (separated NBA from NHL):
+    // NBA pre-game audit: 22-29% pick accuracy across n=9 trades. Strikingly bad
+    // even allowing for small sample. Raise NBA pre-game floor to 80% to require
+    // high conviction. NHL pre-game keeps current floors (67% pick rate works).
+    const PRE_GAME_MIN_CONF = pgSportKey === 'nba'
+      ? (price < 0.50 ? 0.78 : price <= 0.65 ? 0.80 : 0.85)
+      : pgSportKey === 'nhl'
       ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.72)
       : pgSportKey === 'mls'
         // 2026-05-02: MLS pre-game DISABLED. Historical: n=4 trades, 50% WR, -$34.83
