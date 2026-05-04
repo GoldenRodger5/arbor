@@ -3570,7 +3570,7 @@ try {
 
 // Load persisted scan timers and high-conviction state
 loadState();
-primeMfeFromOpenTrades();
+// primeMfeFromOpenTrades is called after TRADES_LOG is declared (see below)
 
 // Score-state helper — a compact "home-away" key so we can detect whether the
 // score has changed between scale-in cycles. If it has, the game state is
@@ -4356,6 +4356,7 @@ function checkDrawdownBreaker() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const TRADES_LOG = './logs/trades.jsonl';
+primeMfeFromOpenTrades();
 const DAILY_LOG = './logs/daily-snapshots.jsonl';
 const SCREENS_LOG = './logs/screens.jsonl';
 const PAPER_TRADES_LOG = './logs/paper-trades.jsonl';
