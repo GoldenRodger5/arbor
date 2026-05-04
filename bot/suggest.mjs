@@ -159,11 +159,18 @@ function calibratable(t) {
 }
 
 function isLiveSport(t) {
-  return ['live-prediction', 'high-conviction'].includes(t.strategy);
+  if (!t.strategy) return false;
+  // Include all structural detector strategies alongside Claude-driven live-prediction paths.
+  // Previously only matched 'live-prediction' + 'high-conviction' — all 15 structural cells were invisible to calibration.
+  return t.strategy === 'live-prediction' ||
+    t.strategy === 'high-conviction' ||
+    t.strategy === 'live-swing' ||
+    t.strategy.startsWith('structural-');
 }
 
 function isPreGame(t) {
-  return t.strategy === 'pre-game-prediction';
+  // pre-game-edge-first was previously excluded — its trades were invisible to all calibration analysis.
+  return t.strategy === 'pre-game-prediction' || t.strategy === 'pre-game-edge-first';
 }
 
 // Normalize tag taxonomy: lowercase, underscores → hyphens, trim.
@@ -173,7 +180,12 @@ function normalizeTag(tag) {
 }
 
 function getSport(t) {
-  if (t.league) return t.league.toLowerCase();
+  if (t.league) {
+    const lg = t.league.toLowerCase();
+    // Normalize soccer sub-leagues to a single 'soccer' bucket for calibration
+    if (['laliga', 'seriea', 'bundesliga', 'ligue1'].includes(lg)) return 'soccer';
+    return lg;
+  }
   const tk = (t.ticker ?? '').toUpperCase();
   if (tk.includes('NHL') || tk.includes('NHK') || tk.includes('-NHL-')) return 'nhl';
   if (tk.includes('NBA') || tk.includes('NBK') || tk.includes('-NBA-')) return 'nba';
@@ -210,12 +222,12 @@ const CONF_BUCKETS = [
 const DEFAULT_MARGINS = { nhl: 0.03, nba: 0.04, mlb: 0.05, mls: 0.05, epl: 0.05, laliga: 0.05 };
 const DEFAULT_MIN_CONF = 0.65;
 const MIN_TRADES_FOR_SUGGESTION = 15;
-const CONFIDENT_THRESHOLD = 30;
+const CONFIDENT_THRESHOLD = 15; // was 30 — NHL/soccer never reached it; at n=15 Wilson CI is reliable with conservative lower-bound sizing
 const MAX_STEP = 0.05;
 
 // Tier 1: exit calibration thresholds
 const EXIT_MIN_SAMPLES = 10;   // need 10+ exits per sport/playoff to suggest
-const STRATEGY_MIN_SAMPLES = 20; // need 20+ trades per strategy before auto-disable
+const STRATEGY_MIN_SAMPLES = 10; // need 10+ trades per strategy before auto-disable (was 20 — bleeders ran 2-4 days unchecked)
 
 // ─── Per-sport confidence/margin analysis (legacy) ────────────────────────────
 function analyzeSport(sport, trades) {
@@ -416,7 +428,12 @@ function analyzeStrategies(trades) {
   return { disabled, stats };
 }
 
-// ─── TIER 1C: Reasoning tag stats (informational — Tier 3 fuel) ──────────────
+// ─── TIER 1C: Reasoning tag stats + auto-block ───────────────────────────────
+// Tags whose Wilson CI upper bound is below their avg entry breakeven at n≥5
+// are auto-added to blockedReasoningTags in the overrides file.
+// ai-edge.mjs reads blockedReasoningTags and rejects entries that cite them.
+// The hardcoded list in ai-edge.mjs acts as a permanent floor; this adds dynamic blocks.
+const TAG_AUTO_BLOCK_MIN_N = 5;
 function analyzeReasoningTags(trades) {
   const byTag = {};
   for (const t of trades) {
@@ -433,23 +450,27 @@ function analyzeReasoningTags(trades) {
     }
   }
   const result = {};
+  const autoBlocked = [];
   for (const [tag, s] of Object.entries(byTag)) {
     const avgEntry = s.n > 0 ? s.entryPriceSum / s.n : null;
     const [ciLo, ciHi] = wilsonCI(s.wins, s.n);
+    const shouldBlock = s.n >= TAG_AUTO_BLOCK_MIN_N && avgEntry != null && ciHi < avgEntry;
+    if (shouldBlock) autoBlocked.push(tag);
     result[tag] = {
       n: s.n, wins: s.wins,
       winRate: s.n > 0 ? parseFloat((s.wins / s.n).toFixed(3)) : null,
       avgEntry: avgEntry != null ? parseFloat(avgEntry.toFixed(3)) : null,
       ciLo: parseFloat(ciLo.toFixed(3)), ciHi: parseFloat(ciHi.toFixed(3)),
+      autoBlocked: shouldBlock,
     };
   }
-  return result;
+  return { stats: result, autoBlocked };
 }
 
 // ─── TIER 2A: Kelly fraction per sport (downward-only) ───────────────────────
 function analyzeKellyFraction(trades) {
   const out = {};
-  for (const sport of ['nhl', 'nba', 'mlb', 'mls', 'epl']) {
+  for (const sport of ['nhl', 'nba', 'mlb', 'mls', 'epl', 'soccer']) {
     const sportTrades = trades.filter(t => getSport(t) === sport && calibratable(t));
     if (sportTrades.length < CONFIDENT_THRESHOLD) continue;
     const wins = sportTrades.filter(t => isWin(t)).length;
@@ -520,14 +541,13 @@ function analyzePartialTake(trades) {
         ((isPlayoff(t) ? 'playoff' : 'regular') === bucket));
       if (sportTrades.length < 15) continue;
 
-      // peakPrice is not logged on our trades. Use realized exitPrice on
-      // winners that already took partial profit as the best available proxy —
-      // these reflect prices at which we actually locked gains historically.
-      // Fall back to conservative 65¢ when the sample is sparse.
-      const winnersWithExit = sportTrades.filter(t => isWin(t) && t.exitPrice != null && t.entryPrice != null);
+      // Use maxFavorablePrice (persisted MFE) when available — it reflects the true peak,
+      // not just the exit price. Fall back to exitPrice for older trades that predate MFE tracking.
+      const winnersWithExit = sportTrades.filter(t => isWin(t) && t.entryPrice != null &&
+        (t.maxFavorablePrice != null || t.exitPrice != null));
       if (winnersWithExit.length < 8) continue;
       const avgExitGain = winnersWithExit
-        .map(t => (t.exitPrice ?? 0.65) - (t.entryPrice ?? 0.50))
+        .map(t => ((t.maxFavorablePrice ?? t.exitPrice ?? 0.65) - (t.entryPrice ?? 0.50)))
         .filter(g => g > 0)
         .reduce((s, g, _, arr) => arr.length ? s + g / arr.length : s, 0);
 
@@ -566,7 +586,7 @@ if (Object.keys(exitByStrategy).length > 0) {
   exitThresholds._byStrategy = exitByStrategy;
 }
 const strategyAnalysis = analyzeStrategies(real);
-const reasoningTagStats = analyzeReasoningTags(real);
+const { stats: reasoningTagStats, autoBlocked: autoBlockedTags } = analyzeReasoningTags(real);
 
 // ─── Run Tier 2 analyses (gated) ──────────────────────────────────────────────
 const kellyFraction = tier2Enabled ? analyzeKellyFraction(real) : null;
@@ -680,17 +700,23 @@ if (Object.keys(strategyAnalysis.stats).length === 0) {
   }
 }
 
-// Tier 1: Reasoning tags (info only)
+// Tier 1: Reasoning tags + auto-block
 console.log('\n' + thin);
-console.log('TIER 1 — REASONING TAG STATS (informational — not gated)');
+console.log('TIER 1 — REASONING TAG STATS + AUTO-BLOCK');
 console.log(thin);
 if (Object.keys(reasoningTagStats).length === 0) {
   console.log('  No reasoning tags logged yet (will populate as new trades emit reasoning_tags).');
 } else {
   for (const [tag, s] of Object.entries(reasoningTagStats)) {
-    console.log(`  ${tag.padEnd(24)} n=${String(s.n).padStart(3)} wr=${((s.winRate ?? 0) * 100).toFixed(0).padStart(3)}% ci=[${(s.ciLo * 100).toFixed(0).padStart(3)}%, ${(s.ciHi * 100).toFixed(0).padStart(3)}%]`);
+    const blockFlag = s.autoBlocked ? '  🛑 AUTO-BLOCK' : '';
+    console.log(`  ${tag.padEnd(24)} n=${String(s.n).padStart(3)} wr=${((s.winRate ?? 0) * 100).toFixed(0).padStart(3)}% ci=[${(s.ciLo * 100).toFixed(0).padStart(3)}%, ${(s.ciHi * 100).toFixed(0).padStart(3)}%]${blockFlag}`);
   }
   newOverrides.reasoningTagStats = reasoningTagStats;
+  if (autoBlockedTags.length > 0) {
+    newOverrides.blockedReasoningTags = autoBlockedTags;
+    console.log(`\n  Auto-blocked tags (ciHi < avgEntry at n≥${TAG_AUTO_BLOCK_MIN_N}): ${autoBlockedTags.join(', ')}`);
+    hasAnySuggestion = true;
+  }
 }
 
 // Tier 2: Kelly, price×conf, partial-take
