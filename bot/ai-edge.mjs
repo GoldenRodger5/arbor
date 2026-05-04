@@ -5025,7 +5025,14 @@ async function settleShadowDecisions() {
         } catch { /* best-effort */ }
       }
       updated = true;
-    } catch { /* network error or market not found — try next cycle */ }
+    } catch {
+      // Market not found (404) or network error. If the record is >48h old, expire it
+      // so it doesn't permanently jam the front of the queue and block newer records.
+      if (Date.parse(r.ts ?? '') < Date.now() - 48 * 3600 * 1000) {
+        r.status = 'expired';
+        updated = true;
+      }
+    }
   }
 
   if (!updated) return;
