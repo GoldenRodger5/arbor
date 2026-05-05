@@ -564,7 +564,7 @@ function getRequiredMargin(price, { sport = '', live = false, scoreChanged = fal
   const sportBase = {
     nhl: 0.03,    // low-scoring, binary outcomes, goalie variance
     nba: 0.04,    // high-scoring but 15-pt comebacks happen 13%
-    mlb: 0.05,    // most random sport — best team wins 60% over a season
+    mlb: 0.04,    // 2026-05-05: 0.05 → 0.04. With bleed-out + score-defer + contra-block, thinner edges are protected. Recent volume collapse traced to 4pt edges at conf=74% being rejected (would pass at 0.04).
     mls: 0.05, epl: 0.05, laliga: 0.05, seriea: 0.05, bundesliga: 0.05, ligue1: 0.05,  // draws kill, need conviction
     ufc: 0.02,    // least efficient market, biggest edges
     crypto: 0.04, economics: 0.04, politics: 0.04,
@@ -1515,12 +1515,20 @@ function detectMlbInn89Leader({ league, period, gameDetail, diff, weTimeAdj, pri
   };
 }
 
-function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr, ticker }) {
+function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr, ticker, leadingBullpenTier }) {
   if (league !== 'mlb') return null;
   if (period < 5 || period > 7) return null;
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff < 1) return null;
+  // 2026-05-05: BULLPEN QUALITY GATE for late-inning cell. Late-game leads with
+  // poor bullpens are the recipe for blown saves. Block firing if leading team's
+  // bullpen tier is 'poor' or 'below'. May 2-5 audit: 4/5 inn-5-7 losses were
+  // games with weak-bullpen leaders (CLE, NYM, ATL via tier check).
+  const _bullpenTier = (leadingBullpenTier || '').toLowerCase();
+  if (_bullpenTier === 'poor' || _bullpenTier === 'below') {
+    return null;
+  }
   // 2026-05-02 MAJOR REWORK: this detector was the worst performer (n=9, 56% WR,
   // -$14.27 P&L). Selection bias: it fires on Sonnet-rejected setups, which are
   // the marginal end of every cell. Tightening per inning + diff:
@@ -8488,6 +8496,17 @@ async function checkLiveScoreEdges() {
         // the confidence in the synthetic decision; existing margin/risk gates still apply.
         // 2026-05-02: SCORE-EVENT ARB runs FIRST — info-lag arb, time-sensitive.
         // _scoreChanged is destructured at the outer for-of (line 6457).
+        // 2026-05-05: STRUCTURAL CELL MOMENTUM GATE.
+        // Block ALL non-SEA structural cells if there was a recent score change AND we're
+        // about to bet the leader. Reasoning: if the score changed in the last cycle and
+        // we're betting the leader, the most likely scenario is the OPPONENT just scored
+        // (cutting into the lead). That's adverse momentum — the cell's pattern is no longer
+        // intact. SEA itself is exempt (it's specifically designed to fire on score events).
+        // May 2-5 losses concentrated in this exact pattern: leader cell fires shortly
+        // after opponent scoring, then the leader collapses (CLE-KC, CIN-CHC, ATL-COL).
+        // Threat-wait already handles bases-loaded; this adds the post-score-event check.
+        const _scoreMomentumBlocked = (_scoreChanged === true) && (targetAbbr === leadingAbbr);
+
         let _structuralDecision = detectScoreEventArb({
           league, period, gameDetail, diff,
           weTimeAdj: _weTimeAdj, price,
@@ -8495,13 +8514,21 @@ async function checkLiveScoreEdges() {
           scoreChanged: _scoreChanged ?? false,
           lastSeenPrice: lastSeenPrices.get(ticker)?.price ?? null,
         });
-        if (!_structuralDecision) _structuralDecision = detectNbaQ4ColdShooting({
+        // Apply momentum gate to non-SEA path: if SEA didn't fire AND there was a
+        // recent score change AND we're about to bet the leader, skip ALL other
+        // structural cell evaluations. The cells fire on game-state pattern but
+        // can't see "opponent just scored" — this gate handles that explicitly.
+        const _applyMomentumGate = _scoreMomentumBlocked && !_structuralDecision;
+        if (_applyMomentumGate) {
+          console.log(`[live-edge] ⏸️ MOMENTUM GATE: skipping structural cells for ${targetAbbr} (${league.toUpperCase()}) — recent score change with leader pick (likely opponent scored, momentum adverse)`);
+        }
+        if (!_structuralDecision && !_applyMomentumGate) _structuralDecision = detectNbaQ4ColdShooting({
           league, period, gameDetail, diff,
           leadingFGNum, trailingFGNum,
           weTimeAdj: _weTimeAdj, price,
           targetAbbr, leadingAbbr,
         });
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // Broader NBA Q4 leader detector — catches the bigger 89% WR cell
           // that doesn't require the 8pt FG gap (rare). Same time window + leader rule.
           _structuralDecision = detectNbaQ4Leader({
@@ -8510,7 +8537,7 @@ async function checkLiveScoreEdges() {
             targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-04-29: NBA Q4 underdog-priced leader — fires when leader is at 40-55¢
           // (Kalshi misprices as coin-flip). 4/4 shadow wins on this cell.
           _structuralDecision = detectNbaQ4LeaderUnderdogPrice({
@@ -8519,28 +8546,28 @@ async function checkLiveScoreEdges() {
             targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           _structuralDecision = detectSoccerHomeHTLeader({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price,
             targetAbbr, leadingAbbr, homeAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-05-02 OFFENSIVE: counter-equalizer rally buy
           _structuralDecision = detectSoccerCounterEqualizer({
             league, period, gameDetail, diff,
             price, targetAbbr, leadingAbbr, homeAbbr, ticker,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-05-02 OFFENSIVE: NBA Q4 deep-trailer swing
           _structuralDecision = detectNbaQ4DeepTrailer({
             league, period, gameDetail, diff,
             price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-05-02 OFFENSIVE: MLB inn-8/9 closer-territory leader
           _structuralDecision = detectMlbInn89Leader({
             league, period, gameDetail, diff,
@@ -8549,61 +8576,61 @@ async function checkLiveScoreEdges() {
           });
         }
         // 2026-04-29 dip-buy detectors (underpriced leaders 46-65¢ band)
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           _structuralDecision = detectMlbInn6Leader({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-05-05: MLB inn 2 leader 3+ run lead — 100% WR n=9 settle play (priority over broader inn-2-leader)
           _structuralDecision = detectMlbInn2Leader3Plus({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           _structuralDecision = detectMlbInn2Leader({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-04-30: MLB inn 4 leader — uncovered cell from audit, 100% WR n=22
           _structuralDecision = detectMlbInn4Leader({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-05-01: MLB inn 1 leader 3+ run lead — shadow 100% WR n=10 @ avg 76¢
           _structuralDecision = detectMlbInn1Leader3Plus({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-05-04: MLB inn 1 leader 2-run — shadow 80% WR n=25 at 60-82¢
           _structuralDecision = detectMlbInn1Leader2Run({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-05-05: MLB inn 1 leader 1-run — MFE 80% hit +5c, 60% hit +10c (n=10)
           _structuralDecision = detectMlbInn1Leader1Run({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-05-05: NHL P2 leader 1-goal — MFE 80% hit +5c, 60% hit +15c (n=5)
           _structuralDecision = detectNhlP2Leader1Run({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-05-01: MLB inn 3 leader 3+ run lead — live-edge gap detector
           // (TEX-DET tonight 4-0 inn-3 at 88¢ sat in gap between inn-1 and inn-4 detectors)
           _structuralDecision = detectMlbInn3Leader3Plus({
@@ -8611,7 +8638,7 @@ async function checkLiveScoreEdges() {
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-05-02: MLB inn 3 leader 2-run — uniform 75-83% WR n=45 shadow @ 65-85¢
           // Replaces disabled inn-3-3run volume with a real +EV cell.
           _structuralDecision = detectMlbInn3Leader2Run({
@@ -8619,14 +8646,14 @@ async function checkLiveScoreEdges() {
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-05-01: MLB inn 2 leader 2-run — shadow's biggest +EV cell, 92% WR n=40 @ avg 71¢
           _structuralDecision = detectMlbInn2Leader2Run({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-05-01: MLB inn 5 leader 3+ run — shadow 100% WR n=12 @ avg 83¢
           // Cell sits in the 80-88¢ band that Fix A diff-aware permits for diff≥3
           _structuralDecision = detectMlbInn5Leader3Plus({
@@ -8634,40 +8661,40 @@ async function checkLiveScoreEdges() {
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           _structuralDecision = detectNbaQ2Leader({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           _structuralDecision = detectNbaQ3Leader({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           _structuralDecision = detectSoccer1HHomeLeader({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price,
             targetAbbr, leadingAbbr, homeAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           _structuralDecision = detectNhlP3ClosingOut({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price,
             targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-05-02 OFFENSIVE: NHL empty-net trailer pull window
           _structuralDecision = detectNhlEmptyNetTrailer({
             league, period, gameDetail, diff,
             price, targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           _structuralDecision = detectMlbMidGameLead({
             league, period, gameDetail, diff,
             leadingBullpenTier,
@@ -8675,7 +8702,7 @@ async function checkLiveScoreEdges() {
             targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // 2026-04-29: broader MLB inn 5-7 leader (no bullpen-tier requirement)
           // Shadow data: 28 cases at 80% WR, +9-23% EV.
           _structuralDecision = detectMlbInn5To7Leader({
@@ -8683,9 +8710,10 @@ async function checkLiveScoreEdges() {
             weTimeAdj: _weTimeAdj, price,
             targetAbbr, leadingAbbr,
             ticker, // 2026-05-01: pass ticker so Fix A/D telemetry can record it
+            leadingBullpenTier, // 2026-05-05: bullpen quality gate
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // MLB late-inning lockdown — period 8-9 with elite/good bullpen
           _structuralDecision = detectMlbLateInningLockdown({
             league, period, gameDetail, diff,
@@ -8694,7 +8722,7 @@ async function checkLiveScoreEdges() {
             targetAbbr, leadingAbbr,
           });
         }
-        if (!_structuralDecision) {
+        if (!_structuralDecision && !_applyMomentumGate) {
           // Shadow-mined pattern (2026-04-27): broader MLB early-mid leader detector,
           // 81% WR n=48 in shadow data. Catches inning 2 (existing detector starts at 3),
           // 1-run leads, and any bullpen tier. Lower price ceiling 72¢ avoids gamma traps.
