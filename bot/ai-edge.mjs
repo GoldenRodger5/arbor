@@ -1614,12 +1614,16 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
   // Bucket profile: 50-55¢ = 100% (n=4), 55-60¢ = 80% (n=5) ✅
   //                 60-65¢ = 50% (n=14), 65-70¢ = 41% (n=22) ⚠️ block
   // Old gate ≤50¢ was over-tight — missed 9 winning samples in 50-60 range.
-  // 2026-05-05: KILL inn-5 diff=1 entirely. Shadow shows 0% WR (n=3) at 55-60c,
-  // 29% WR overall for inn-5 diff=1 at 64c avg entry (-EV by 35pt). The cell was
-  // firing at the wrong end of the price curve. The real alpha for inn-5 d=1 is at
-  // 65c+ (65% WR n=124 in claude-no shadow) which Claude handles via live-prediction.
-  if (period === 5 && diff === 1) {
-    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn5-1run-killed', ticker }); } catch {} }
+  // 2026-05-05 v2: SURGICAL inn-5 d=1 carve-out. Earlier kill (v1) blocked the
+  // entire price band. Auto-discovery script (auto-discover-cells.mjs) found
+  // the 65-70c sub-band has 73% WR on n=11 unique games — genuinely +EV at
+  // optimal lock +14c (best EV +6.9c per fire). Only the 50-65c sub-band is
+  // catastrophic (0-29% WR). Allow 65-70c, kill the rest.
+  //   <65c: kill (validated losing) — historical 50-55c=100% n=4 was overfit
+  //   65-70c: ALLOW (new auto-discovery: 73% WR n=11)
+  //   >70c: kill (closer-territory has its own cell)
+  if (period === 5 && diff === 1 && (price < 0.65 || price > 0.70)) {
+    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn5-1run-out-of-band', ticker }); } catch {} }
     return null;
   }
   // 2026-05-02 DEAD-ZONE CARVE-OUTS for d=2. Bucket audit revealed non-monotonic
