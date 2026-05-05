@@ -4174,13 +4174,20 @@ const STRATEGY_RR = {
   // Gap = exits. Stop at -10c fires on normal 5-inning game variance; lock at +15c requires
   // 85-96c mid-game price = unreachable. Fix: widen stop to -15c, lower lock to +8c.
   // At 93% WR: 0.93*0.08 - 0.07*0.15 = +$0.064/contract expected value.
-  'structural-mlb-inn-4-leader':       { profitLock: 0.08, stopLoss: 0.15 }, // 93% shadow WR, exit-fixed
+  // 2026-05-05: inn-4-leader lock 8c→5c. d=1 placed shows 100% hit +15c (avg +25c MFE).
+  // d=2 expanded inversion P4 d=2: only 8% hit +5c MFE. Cell is settle-driven for d=2,
+  // price-spike for d=1. 5c lock catches the d=1 spikes; d=2 falls through to settlement.
+  'structural-mlb-inn-4-leader':       { profitLock: 0.05, stopLoss: 0.15 }, // 100% WR n=7; settle for d=2
   'structural-mlb-inn-89-leader':      { profitLock: 0.05, stopLoss: 0.10 }, // closer-territory tight
-  'structural-mlb-inn-2-leader':       { profitLock: 0.10, stopLoss: 0.10 }, // 78-82% WR; extended to 78¢
+  // 2026-05-05: inn-2-leader lock 10c→5c. MFE inversion P2 d=2: 86% hit +5c, 29% hit +10c.
+  // 86% × 5c = +4.3c expected, beats 29% × 10c = +2.9c.
+  'structural-mlb-inn-2-leader':       { profitLock: 0.05, stopLoss: 0.10 }, // 78-82% WR; lock at 5c per MFE
   'structural-mlb-inn-2-leader-2run':  { profitLock: 0.10, stopLoss: 0.10 }, // 87% WR
   // 2026-05-05: re-enabled cell with claude-no shadow data n=81, WR=81%, avg entry 74c.
   // Lock at +10c (target 84c) achievable on 81% of fires.
-  'structural-mlb-inn-3-leader-2run':  { profitLock: 0.10, stopLoss: 0.10 }, // 81% WR n=81 shadow
+  // 2026-05-05: inn-3-leader-2run lock 10c→5c. MFE inversion P3 d=2: 64% hit +5c, 14% hit +10c.
+  // 64% × 5c = +3.2c expected, beats 14% × 10c = +1.4c.
+  'structural-mlb-inn-3-leader-2run':  { profitLock: 0.05, stopLoss: 0.10 }, // 81% WR; lock at 5c per MFE
   // 2026-05-05: new cells based on MFE audit
   'structural-mlb-inn-1-leader-1run':  { profitLock: 0.05, stopLoss: 0.10 }, // 80% hit +5c MFE
   'structural-nhl-p2-leader-1goal':    { profitLock: 0.10, stopLoss: 0.12 }, // 80% hit +5c, 60% hit +15c
