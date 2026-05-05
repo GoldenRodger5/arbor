@@ -3230,6 +3230,17 @@ function checkStructuralThrottles({ league, strategy, ticker }) {
       return { blocked: true, reason: `concurrent bleed: ${t.split('-').pop()} underwater ${Math.round(drawdown*100)}¢ from entry (${Math.round(info.entryPrice*100)}¢ → ${Math.round(last.price*100)}¢)` };
     }
   }
+  // Throttle D: same-game concentration — block if any other structural position is
+  // already open on this exact game (different team or different strategy).
+  // Prevents double-exposure on one game outcome (e.g., score-event-arb + inn-4-leader
+  // both open on CIN@CHC simultaneously = concentrated single-game risk).
+  const _gameTicker = ticker.replace(/-[A-Z0-9]+$/, '');
+  for (const [t] of structuralOpenEntries.entries()) {
+    if (t === ticker) continue;
+    if (t.replace(/-[A-Z0-9]+$/, '') === _gameTicker) {
+      return { blocked: true, reason: `same-game concentration: ${t.split('-').pop()} already open on ${_gameTicker.split('-').slice(-1)[0]}` };
+    }
+  }
   return { blocked: false };
 }
 
@@ -14122,6 +14133,12 @@ async function managePositions() {
             // Nuclear stop at -90% still fires as catastrophe protection.
             bleedOutEnabled = false;
           } else if (_strat === 'live-prediction' || _strat.startsWith('structural-')) {
+            // 2026-05-04: inn-6-leader bleed-out disabled. Shadow audit: 100% pick
+            // accuracy (n=3), 0¢ avg MFE — bleed-out fires on normal game variance
+            // before settlement confirms the pick. Nuclear stop still active.
+            if (_strat === 'structural-mlb-inn-6-leader') {
+              bleedOutEnabled = false;
+            }
             // 2026-04-30: SPORT-AWARE bleed-out for structural detectors. Bleed-out
             // calibrated for MLB (1-run lead loss = real thesis death; outs running out)
             // misfires on NBA where Q2 leads flip 6-8x/game routinely. DEN@MIN tonight:
