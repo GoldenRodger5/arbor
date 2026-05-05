@@ -12462,6 +12462,60 @@ async function checkPreGamePredictions() {
     // Without a proven tag, Sonnet is regurgitating sportsbook consensus = no edge.
     const _pgTags = Array.isArray(decision.reasoning_tags) ? decision.reasoning_tags : [];
 
+    // 2026-05-05: SHADOW CONVICTION-LOCK LOGGER — captures Claude's high-conviction
+    // MLB/NHL pre-game picks for prospective 70%+ WR validation as a side-product
+    // ("Claude lock of the day"). PURE LOGGING — does NOT trade, does NOT affect any
+    // decision flow. Existing settler auto-populates ourPickWon when game settles.
+    //
+    // Loose entry filter (broad capture for post-hoc analysis):
+    //   - MLB or NHL only (NBA disabled separately, MLS sample too small)
+    //   - confidence >= 72% (matches existing MIN_CONFIDENCE bar)
+    //   - edge >= 5pt
+    //   - price 40-60c (existing pre-game band)
+    //   - no hard-banned tag (starter-mismatch / bullpen-mismatch / lineup-cold)
+    //
+    // Tier flags for post-hoc filter analysis at strict/medium/loose levels.
+    {
+      const _convBoostTags = ['playoff-home-fav','line-movement','era-gap','star-injury','home-court'];
+      const _convBlockTags = ['starter-mismatch','bullpen-mismatch','lineup-cold'];
+      const _convHasBoost = _pgTags.some(t => _convBoostTags.includes(t));
+      const _convHasBlock = _pgTags.some(t => _convBlockTags.includes(t));
+      const _convEdge = confidence - price;
+      const _convEdgeAbs = Math.abs(_convEdge);
+      const _convEligible =
+        ['mlb','nhl'].includes(pgSportKey) &&
+        confidence >= 0.72 &&
+        _convEdgeAbs >= 0.05 &&
+        price >= 0.40 && price <= 0.60 &&
+        !_convHasBlock;
+      if (_convEligible) {
+        try {
+          logShadowDecision({
+            stage: 'pre-game-conviction-shadow',
+            ticker: `${market.base}-${chosenTeam}`,
+            league: pgSportKey,
+            sport: pgSportKey?.toUpperCase(),
+            decision: 'paper-trade',
+            strategy: 'pre-game-conviction-lock',
+            claudeConfidence: confidence,
+            decisionPrice: price,
+            edgePt: parseFloat((_convEdgeAbs * 100).toFixed(1)),
+            targetAbbr: chosenTeam,
+            reasoningTags: _pgTags,
+            reasoningPreview: (decision.reasoning ?? '').slice(0, 250),
+            // Tier flags for post-hoc analysis (strict/medium/loose filter combos)
+            tierStrict: confidence >= 0.78 && _convEdgeAbs >= 0.08 && _convHasBoost,
+            tierMedium: confidence >= 0.75 && _convEdgeAbs >= 0.05 && _convHasBoost,
+            tierLoose: confidence >= 0.72 && _convEdgeAbs >= 0.05,
+            hasBoostTag: _convHasBoost,
+          });
+          const _tierLabel = (confidence >= 0.78 && _convEdgeAbs >= 0.08 && _convHasBoost) ? 'STRICT'
+                           : (confidence >= 0.75 && _convHasBoost) ? 'MED' : 'LOOSE';
+          console.log(`[lock-shadow] 🔒 ${_tierLabel}: ${market.base} ${chosenTeam} @${Math.round(price*100)}¢ conf=${Math.round(confidence*100)}% edge=${Math.round(_convEdgeAbs*100)}pt tags=[${_pgTags.slice(0,3).join(',')}]`);
+        } catch { /* shadow logging is best-effort, never disrupt trading */ }
+      }
+    }
+
     // 🛑 HARD-BANNED TAG CHECK (2026-04-29): Even if other proven tags also present,
     // reject if any hard-banned tag appears. Prevents "stack a winner with a loser
     // to sneak through" gaming. bullpen-mismatch / starter-mismatch / lineup-cold
