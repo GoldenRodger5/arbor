@@ -945,6 +945,70 @@ function detectMlbInn2Leader({ league, period, gameDetail, diff, weTimeAdj, pric
 // spike that lets us swing-exit at +15¢):
 //   25% × +$0.15 + 75% × (price-stays-flat-or-down) ≈ +$0.04/contract = +20% ROI
 // Asymmetric pay structure works in our favor.
+// 2026-05-05: MLB late-game trailer (P5-7 d=1) — INVERSION cell.
+// Per-game shadow MFE on n=15 P5 d=1 buckets shows trailer-WR=40%, optimal
+// lock at +30c, best EV +13c per fire. Markets systematically overprice 1-run
+// leads in MLB. Cell holds for comeback-flip, locks at +30c when trailer
+// price doubles (e.g., 30c → 60c on flip).
+function detectMlbLateTrailerD1({ league, period, gameDetail, diff, price, targetAbbr, leadingAbbr, weTimeAdj }) {
+  if (league !== 'mlb') return null;
+  if (period < 5 || period > 7) return null;
+  if (diff !== 1) return null;
+  if (targetAbbr === leadingAbbr) return null; // TRAILER only
+  if (price == null) return null;
+  if (price < 0.25 || price > 0.40) return null;
+  // No edge floor — empirical 40% WR at avg entry 31c gives +EV (40% × 69c - 60% × 31c = +9c)
+  // Plus +30c lock captures additional +EV from comeback price spikes.
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj || 0.40, betAmount: null,
+    reasoning: {
+      steel_man: `1-run deficit in inning ${period} — comeback windows still real, market has overpriced the leader`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inversion P${period} d=1 trailer): n=15 shadow trailer-WR 40% at 31c avg, MFE 12c, optimal lock +30c. Market overpricing the leader; trailer +EV.`,
+      key_facts: [
+        `Inning ${period}, 1-run deficit`,
+        `Entry ${(price*100).toFixed(0)}¢ (cheap side)`,
+        `Cell history: trailer-WR 40% (n=15), 47% hit +5c MFE, 20% hit +30c`,
+      ],
+      top_risk: 'Opponent extends lead — bleed-out + score-unchanged defer protect',
+      conviction: 'Inversion cell — leaders systematically overpriced in close late-game MLB',
+      reasoning_tags: ['underdog-spot', 'market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-late-trailer-d1',
+    _matchInfo: { period, diff, price: Math.round(price*100) },
+  };
+}
+
+// 2026-05-05: MLB early-game trailer (P1-2 d=1) — INVERSION cell.
+// Per-game shadow on n=8 P1 d=1: trailer-WR=38%, optimal lock +28c, best EV
+// +6.2c. Higher drawdown (15c avg) than late-game cells — needs tighter stop.
+function detectMlbEarlyTrailerD1({ league, period, gameDetail, diff, price, targetAbbr, leadingAbbr, weTimeAdj }) {
+  if (league !== 'mlb') return null;
+  if (period < 1 || period > 2) return null;
+  if (diff !== 1) return null;
+  if (targetAbbr === leadingAbbr) return null; // TRAILER only
+  if (price == null) return null;
+  if (price < 0.30 || price > 0.45) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj || 0.38, betAmount: null,
+    reasoning: {
+      steel_man: `1-run deficit in inning ${period} — 7+ innings remain, comeback math strongly favors trailer at this price`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inversion P${period} d=1 trailer): n=8 shadow trailer-WR 38% at 39c avg, MFE 10c, optimal lock +28c. Early-game lead overpricing.`,
+      key_facts: [
+        `Inning ${period}, 1-run deficit`,
+        `Entry ${(price*100).toFixed(0)}¢`,
+        `Cell history: trailer-WR 38% (n=8), 50% hit +5c MFE, 25% hit +15c`,
+      ],
+      top_risk: 'Higher drawdown (avg 15c) — early-game variance is real',
+      conviction: 'Inversion — early MLB games highly random, market overconfident in 1-run leads',
+      reasoning_tags: ['underdog-spot', 'market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-early-trailer-d1',
+    _matchInfo: { period, diff, price: Math.round(price*100) },
+  };
+}
+
 function detectNbaQ4DeepTrailer({ league, period, gameDetail, diff, price, targetAbbr, leadingAbbr }) {
   if (league !== 'nba') return null;
   if (period !== 4) return null;
@@ -4233,6 +4297,12 @@ const STRATEGY_RR = {
   'structural-mlb-inn-2-leader-2run':  { profitLock: 0.10, stopLoss: 0.10 }, // 87% WR
   // 2026-05-05: inn-2-leader-3plus — 100% game-WR settle play. Lock at 15c only catches 11%; settle EV +21c.
   'structural-mlb-inn-2-leader-3plus': { profitLock: 0.15, stopLoss: 0.10 }, // hold-to-settle
+  // 2026-05-05: MLB INVERSION TRAILER CELLS — exit policy calibrated from real MFE data.
+  // P5-7 d=1 trailer: optimal lock +30c (best EV 13c), avg drawdown only 4c (rare bleed),
+  // trailing stop will protect peaks via existing ladder mechanism (activates at +10c MFE).
+  'structural-mlb-late-trailer-d1':    { profitLock: 0.30, stopLoss: 0.10 }, // n=15, WR 40%, MFE 12c avg
+  // P1-2 d=1 trailer: tighter lock +25c (slightly more variance), wider stop -12c for early-game swings.
+  'structural-mlb-early-trailer-d1':   { profitLock: 0.25, stopLoss: 0.12 }, // n=8, WR 38%, drawdown 15c
   // 2026-05-05: re-enabled cell with claude-no shadow data n=81, WR=81%, avg entry 74c.
   // Lock at +10c (target 84c) achievable on 81% of fires.
   // 2026-05-05: inn-3-leader-2run lock 10c→5c. MFE inversion P3 d=2: 64% hit +5c, 14% hit +10c.
@@ -7737,6 +7807,19 @@ async function checkLiveScoreEdges() {
             underdogAllowed = true;
             _structuralTrailerFlip = true;
           }
+          // 2026-05-05: MLB INVERSION TRAILER CELLS. Per-game shadow MFE analysis
+          // shows MLB d=1 close-game situations are systematically OVERPRICING the
+          // leader. Betting the trailer at the cheap side has +EV, optimal lock +30c.
+          // P5-7 d=1: leader at 60-75% market price, true WR 60-69% — trailer +EV at 25-40c
+          // P1-2 d=1: leader at 60-75% market price, true WR 50-63% — trailer +EV at 30-45c
+          else if (league === 'mlb' && period >= 5 && period <= 7 && diff === 1 && trailPrice >= 0.25 && trailPrice <= 0.40) {
+            underdogAllowed = true;
+            _structuralTrailerFlip = true;
+          }
+          else if (league === 'mlb' && period >= 1 && period <= 2 && diff === 1 && trailPrice >= 0.30 && trailPrice <= 0.45) {
+            underdogAllowed = true;
+            _structuralTrailerFlip = true;
+          }
         }
 
         if (_structuralTrailerFlip) {
@@ -8569,6 +8652,22 @@ async function checkLiveScoreEdges() {
           _structuralDecision = detectNbaQ4DeepTrailer({
             league, period, gameDetail, diff,
             price, targetAbbr, leadingAbbr,
+          });
+        }
+        // 2026-05-05: MLB INVERSION TRAILER CELLS — bet trailer when leader overpriced.
+        // Note: momentum gate doesn't apply to TRAILER cells the same way — trailers
+        // benefit from market mispricing of LEADERS, score events affect leader cells.
+        // We deliberately SKIP momentum gate for trailer flips since target ≠ leader.
+        if (!_structuralDecision && targetAbbr !== leadingAbbr) {
+          _structuralDecision = detectMlbLateTrailerD1({
+            league, period, gameDetail, diff, price,
+            targetAbbr, leadingAbbr, weTimeAdj: _weTimeAdj,
+          });
+        }
+        if (!_structuralDecision && targetAbbr !== leadingAbbr) {
+          _structuralDecision = detectMlbEarlyTrailerD1({
+            league, period, gameDetail, diff, price,
+            targetAbbr, leadingAbbr, weTimeAdj: _weTimeAdj,
           });
         }
         if (!_structuralDecision && !_applyMomentumGate) {
