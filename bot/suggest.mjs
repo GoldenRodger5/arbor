@@ -229,8 +229,21 @@ const MAX_STEP = 0.05;
 const EXIT_MIN_SAMPLES = 10;   // need 10+ exits per sport/playoff to suggest
 const STRATEGY_MIN_SAMPLES = 10; // need 10+ trades per strategy before auto-disable (was 20 — bleeders ran 2-4 days unchecked)
 
-// ─── Per-sport confidence/margin analysis (legacy) ────────────────────────────
-function analyzeSport(sport, trades) {
+// ─── Per-sport confidence/margin analysis (BIDIRECTIONAL — 2026-05-05) ────────
+// Loads CURRENT overrides as baseline (not DEFAULTS), allowing the gate to
+// LOOSEN when recent buckets are profitable. Previously this script only
+// ratcheted gates tighter — once tightened they stayed tight forever even
+// if Claude's behavior calibrated. That caused the 9-day live-prediction
+// drought (Apr 27 → May 4) where MLB live floor was stuck at 75% but Claude
+// had self-corrected to return conf 70-74% on legitimate +EV picks.
+//
+// SAFETY BOUNDS (hardcoded, can't be exceeded):
+//   minConfidenceLive: 0.65 - 0.85 per sport
+//   requiredMarginLive: 0.02 - 0.08 per sport
+//   Max change per cycle: 0.02 confidence, 0.01 margin (gradual)
+//
+// Logs every suggestion (including no-ops) for full visibility in calibration-log.json.
+function analyzeSport(sport, trades, currentOverrides = {}) {
   const live = trades.filter(t => calibratable(t) && isLiveSport(t));
   const n = live.length;
 
@@ -250,25 +263,79 @@ function analyzeSport(sport, trades) {
   });
 
   const suggestions = {};
+  const reasoning = []; // for calibration-log.json visibility
 
   if (n < MIN_TRADES_FOR_SUGGESTION) {
-    return { sport, n, buckets, suggestions, status: 'insufficient-data' };
+    return { sport, n, buckets, suggestions, reasoning, status: 'insufficient-data' };
   }
 
-  const currentMinConf = DEFAULT_MIN_CONF;
-  const currentMargin = DEFAULT_MARGINS[sport] ?? 0.04;
+  // 2026-05-05: Read CURRENT overrides as baseline. Falls back to DEFAULT only
+  // if no override set. This is the key fix — previously each cycle started fresh
+  // from DEFAULT, losing memory of previous tightenings AND preventing loosening.
+  const currentMinConf = currentOverrides.minConfidenceLive?.[sport] ?? DEFAULT_MIN_CONF;
+  const currentMargin = currentOverrides.requiredMarginLive?.[sport] ?? DEFAULT_MARGINS[sport] ?? 0.04;
 
-  let suggestedMinConf = currentMinConf;
+  // SAFETY BOUNDS — hardcoded, can't be exceeded by suggestions
+  const MIN_CONF_FLOOR = 0.65;
+  const MIN_CONF_CEIL = 0.85;
+  const MARGIN_FLOOR = 0.02;
+  const MARGIN_CEIL = 0.08;
+  const MAX_CONF_STEP_PER_CYCLE = 0.02;
+  const MAX_MARGIN_STEP_PER_CYCLE = 0.01;
+
+  // ─── DIRECTION 1: TIGHTEN IF HIGH BUCKETS ARE LOSING ───────────────────────
+  // (Original behavior — kept for safety on actual losing patterns)
+  let tightenSignal = null;
   for (const b of buckets) {
     if (b.total < 3) continue;
     if (b.ciHi == null || b.breakevenWR == null) continue;
-    if (b.ciHi < b.breakevenWR) {
-      const candidate = Math.min(currentMinConf + MAX_STEP, b.hi);
-      if (candidate > suggestedMinConf) suggestedMinConf = candidate;
+    // Bucket must be ABOVE current floor (so it's actively trading) AND showing
+    // CI95-hi below breakeven (genuinely losing, not just variance)
+    if (b.lo >= currentMinConf && b.ciHi < b.breakevenWR) {
+      tightenSignal = { bucket: b.label, reason: `CI95-hi ${(b.ciHi*100).toFixed(0)}% < breakeven ${(b.breakevenWR*100).toFixed(0)}%`, n: b.total };
+      break;
     }
   }
-  if (suggestedMinConf > currentMinConf) suggestions.minConfidenceLive = suggestedMinConf;
 
+  // ─── DIRECTION 2: LOOSEN IF JUST-BELOW-FLOOR BUCKETS ARE PROFITABLE ────────
+  // 2026-05-05 NEW: If a bucket just below the current floor (e.g. 70-74%
+  // when floor is 75%) has CI95-lo > breakeven, the floor is too tight.
+  // Loosen by 1-2pt to capture this profitable band.
+  let loosenSignal = null;
+  for (const b of buckets) {
+    if (b.total < 5) continue; // need bigger sample for loosen than tighten (asymmetric caution)
+    if (b.ciLo == null || b.breakevenWR == null) continue;
+    // Bucket is BELOW current floor (currently being rejected) AND CI95-lo
+    // is above breakeven (genuinely profitable, not just noise)
+    if (b.hi <= currentMinConf && b.ciLo > b.breakevenWR + 0.02) {
+      loosenSignal = { bucket: b.label, reason: `CI95-lo ${(b.ciLo*100).toFixed(0)}% > breakeven ${(b.breakevenWR*100).toFixed(0)}% + buffer`, n: b.total };
+      // Take the highest-bucket-below-floor that qualifies (least aggressive loosen)
+    }
+  }
+
+  // ─── APPLY conf decision (tighten wins over loosen — safety bias) ──────────
+  let suggestedMinConf = currentMinConf;
+  if (tightenSignal) {
+    const candidate = Math.min(currentMinConf + MAX_CONF_STEP_PER_CYCLE, MIN_CONF_CEIL);
+    if (candidate > currentMinConf) {
+      suggestedMinConf = candidate;
+      reasoning.push(`TIGHTEN minConf ${(currentMinConf*100).toFixed(0)} → ${(candidate*100).toFixed(0)}: ${tightenSignal.bucket} ${tightenSignal.reason}`);
+    }
+  } else if (loosenSignal) {
+    const candidate = Math.max(currentMinConf - MAX_CONF_STEP_PER_CYCLE, MIN_CONF_FLOOR);
+    if (candidate < currentMinConf) {
+      suggestedMinConf = candidate;
+      reasoning.push(`LOOSEN minConf ${(currentMinConf*100).toFixed(0)} → ${(candidate*100).toFixed(0)}: ${loosenSignal.bucket} ${loosenSignal.reason}`);
+    }
+  } else {
+    reasoning.push(`HOLD minConf at ${(currentMinConf*100).toFixed(0)} (no actionable signal)`);
+  }
+  if (suggestedMinConf !== currentMinConf) suggestions.minConfidenceLive = suggestedMinConf;
+
+  // ─── MARGIN — bidirectional same logic ─────────────────────────────────────
+  // Tighten margin: if recent losses cluster around current margin (median loss-edge
+  // close to current threshold), bump margin up to filter them.
+  let marginTighten = null;
   const losingLive = live.filter(t => !isWin(t));
   if (losingLive.length >= 5) {
     const lossEdges = losingLive
@@ -278,14 +345,49 @@ function analyzeSport(sport, trades) {
     if (lossEdges.length > 0) {
       const medianLossEdge = lossEdges[Math.floor(lossEdges.length / 2)];
       if (medianLossEdge <= currentMargin + 0.02) {
-        const candidate = Math.min(currentMargin + 0.02, currentMargin + MAX_STEP);
-        if (candidate > currentMargin) suggestions.requiredMarginLive = parseFloat(candidate.toFixed(2));
+        marginTighten = { medianLossEdge, count: losingLive.length };
       }
     }
   }
 
+  // 2026-05-05 NEW: Loosen margin if recent thin-edge band is actually profitable.
+  // Look at trades with edge between (currentMargin - 0.02) and currentMargin
+  // — these are RIGHT at the gate. If they would have won, we're too tight.
+  let marginLoosen = null;
+  const thinEdge = live.filter(t => {
+    const e = t.confidence - (t.entryPrice ?? t.confidence);
+    return e != null && e >= Math.max(0, currentMargin - 0.02) && e < currentMargin;
+  });
+  if (thinEdge.length >= 5) {
+    const wins = thinEdge.filter(t => isWin(t)).length;
+    const [ciLo] = wilsonCI(wins, thinEdge.length);
+    const avgEntry = thinEdge.reduce((s, t) => s + (t.entryPrice ?? 0.5), 0) / thinEdge.length;
+    if (ciLo > avgEntry + 0.02) {
+      marginLoosen = { wr: wins / thinEdge.length, ciLo, n: thinEdge.length, avgEntry };
+    }
+  }
+
+  // ─── APPLY margin decision ─────────────────────────────────────────────────
+  let suggestedMargin = currentMargin;
+  if (marginTighten) {
+    const candidate = Math.min(currentMargin + MAX_MARGIN_STEP_PER_CYCLE, MARGIN_CEIL);
+    if (candidate > currentMargin) {
+      suggestedMargin = candidate;
+      reasoning.push(`TIGHTEN margin ${(currentMargin*100).toFixed(0)}pt → ${(candidate*100).toFixed(0)}pt: ${marginTighten.count} losses with median edge ${(marginTighten.medianLossEdge*100).toFixed(0)}pt`);
+    }
+  } else if (marginLoosen) {
+    const candidate = Math.max(currentMargin - MAX_MARGIN_STEP_PER_CYCLE, MARGIN_FLOOR);
+    if (candidate < currentMargin) {
+      suggestedMargin = candidate;
+      reasoning.push(`LOOSEN margin ${(currentMargin*100).toFixed(0)}pt → ${(candidate*100).toFixed(0)}pt: thin-edge band CI95-lo ${(marginLoosen.ciLo*100).toFixed(0)}% > breakeven ${(marginLoosen.avgEntry*100).toFixed(0)}% (n=${marginLoosen.n})`);
+    }
+  } else {
+    reasoning.push(`HOLD margin at ${(currentMargin*100).toFixed(0)}pt (no actionable signal)`);
+  }
+  if (suggestedMargin !== currentMargin) suggestions.requiredMarginLive = parseFloat(suggestedMargin.toFixed(3));
+
   const status = n >= CONFIDENT_THRESHOLD ? 'confident' : 'tentative';
-  return { sport, n, buckets, suggestions, status };
+  return { sport, n, buckets, suggestions, reasoning, status, currentMinConf, currentMargin };
 }
 
 // ─── TIER 1A: Exit threshold calibration ──────────────────────────────────────
@@ -571,8 +673,14 @@ for (const t of real) {
   sportMap.get(sport).push(t);
 }
 
+// 2026-05-05: Load existing overrides BEFORE analyzeSport so bidirectional logic
+// can read current state as baseline (instead of DEFAULTS — that's the ratchet bug).
+let existingOverrides = {};
+try { existingOverrides = JSON.parse(readFileSync(overridesPath, 'utf-8')); }
+catch { /* no file yet */ }
+
 const analyses = [...sportMap.entries()]
-  .map(([sport, trades]) => analyzeSport(sport, trades))
+  .map(([sport, trades]) => analyzeSport(sport, trades, existingOverrides))
   .sort((a, b) => b.n - a.n);
 
 // ─── Fetch bankroll (for Tier 2 gate) ─────────────────────────────────────────
@@ -592,11 +700,6 @@ const { stats: reasoningTagStats, autoBlocked: autoBlockedTags } = analyzeReason
 const kellyFraction = tier2Enabled ? analyzeKellyFraction(real) : null;
 const priceConfFloors = tier2Enabled ? analyzePriceConfFloors(real) : null;
 const partialTakePrice = tier2Enabled ? analyzePartialTake(real) : null;
-
-// ─── Load existing overrides to show diffs ────────────────────────────────────
-let existingOverrides = {};
-try { existingOverrides = JSON.parse(readFileSync(overridesPath, 'utf-8')); }
-catch { /* no file yet */ }
 
 // ─── Print report ─────────────────────────────────────────────────────────────
 const divider = '═'.repeat(66);
@@ -621,6 +724,21 @@ const newOverrides = {
 };
 
 let hasAnySuggestion = false;
+
+// 2026-05-05: Print per-sport bidirectional decisions BEFORE applying.
+// Shows the reasoning behind every TIGHTEN/LOOSEN/HOLD per sport.
+console.log('\n' + thin);
+console.log('TIER 1 — CONFIDENCE & MARGIN (BIDIRECTIONAL)');
+console.log(thin);
+for (const analysis of analyses) {
+  const { sport, n, status, currentMinConf, currentMargin, suggestions, reasoning } = analysis;
+  if (status === 'insufficient-data') {
+    console.log(`  ${sport.toUpperCase()}: n=${n} — insufficient data (need ${MIN_TRADES_FOR_SUGGESTION}+)`);
+    continue;
+  }
+  console.log(`  ${sport.toUpperCase()}: n=${n} (${status}) — current minConf=${(currentMinConf*100).toFixed(0)}% margin=${(currentMargin*100).toFixed(0)}pt`);
+  for (const r of reasoning) console.log(`    • ${r}`);
+}
 
 // Tier 1 / legacy: minConfidenceLive & requiredMarginLive
 for (const analysis of analyses) {
@@ -774,6 +892,34 @@ if (!hasAnySuggestion) {
     atomicWrite(overridesPath, JSON.stringify(newOverrides, null, 2) + '\n');
     console.log(`\n✓ Written to ${overridesPath}`);
     console.log('  ai-edge.mjs hot-reloads the file each calibration cycle.\n');
+
+    // 2026-05-05: write calibration-log.json with full reasoning per sport.
+    // This is the audit trail — shows exactly WHY each gate was changed (or held).
+    // Read this file to debug "why didn't a trade fire" in the future.
+    try {
+      const calibLog = {
+        _generated: new Date().toISOString(),
+        _bankroll: bankroll,
+        _tradesAnalyzed: real.length,
+        _bidirectional: true, // marker for new behavior post-2026-05-05
+        sportDecisions: {},
+      };
+      for (const a of analyses) {
+        calibLog.sportDecisions[a.sport] = {
+          n: a.n,
+          status: a.status,
+          currentMinConf: a.currentMinConf,
+          currentMargin: a.currentMargin,
+          suggestions: a.suggestions,
+          reasoning: a.reasoning,
+        };
+      }
+      const calibLogPath = overridesPath.replace('calibration-overrides.json', 'logs/calibration-log.json');
+      writeFileSync(calibLogPath, JSON.stringify(calibLog, null, 2) + '\n');
+      console.log(`✓ Decision log written to ${calibLogPath}\n`);
+    } catch (e) {
+      console.error(`Calibration log write failed (non-fatal): ${e.message}`);
+    }
   } else {
     console.log('\n  Dry run — file not written. Re-run with --apply to write.\n');
   }
