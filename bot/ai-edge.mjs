@@ -896,7 +896,9 @@ function detectMlbInn2Leader({ league, period, gameDetail, diff, weTimeAdj, pric
   if (period !== 2) return null;
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
-  if (diff < 1) return null;
+  // 2026-05-05: skip diff>=3 — handled by detectMlbInn2Leader3Plus (hold-to-settle).
+  // 5c lock here is wrong for d=3 (33% hit +5c, settles at +21c avg).
+  if (diff < 1 || diff >= 3) return null;
   // 2026-05-04: extended cap from 65¢ to 78¢. Shadow no-trades at 65-70¢ show 81.8% WR
   // (n=33, +15.5% EV); 70-79¢ band shows 77.6% WR (n=67, +3.3% EV). Both profitable.
   // 2026-05-05: extended cap to 88¢ + loosened edge check. Shadow claude-no for inn-2 d=2:
@@ -1185,6 +1187,40 @@ function detectMlbInn1Leader2Run({ league, period, gameDetail, diff, weTimeAdj, 
       reasoning_tags: ['market-lag', 'we-undervalued'],
     },
     _structuralPattern: 'mlb-inn-1-leader-2run',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
+// MLB inning 2 leader with 3+ run lead. 2026-05-05 audit: 9 unique games shadow,
+// 100% game-WR, avg entry 79c, only 33% hit +5c MFE but settles at +21c avg.
+// HOLD-TO-SETTLE play — broader inn-2-leader cell would lock at 5c, capturing
+// only ~1.65c per fire vs +21c potential. Dedicated cell with high lock.
+function detectMlbInn2Leader3Plus({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period !== 2) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff < 3) return null;
+  // Cap at 88c — matches inn-1-leader-3plus and inn-3-leader-3plus standards
+  if (price < 0.55 || price > 0.88) return null;
+  const edge = weTimeAdj - price;
+  if (edge < -0.08) return null; // sanity only — empirical 100% game-WR
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `${diff}-run lead in 2nd — early blowout track, market significantly underprices`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 2 leader 3+): 100% game-WR n=9 unique games, avg entry 79c, settles +21c. Hold-to-settle play.`,
+      key_facts: [
+        `Inning 2, ${diff}-run lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 100% WR n=9 unique games, avg settle gain +21c`,
+      ],
+      top_risk: 'Early game — opponent has 7+ innings to mount comeback',
+      conviction: 'Structural pattern — high game-WR + low MFE = settlement play',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-inn-2-leader-3plus',
     _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
   };
 }
@@ -4183,6 +4219,8 @@ const STRATEGY_RR = {
   // 86% × 5c = +4.3c expected, beats 29% × 10c = +2.9c.
   'structural-mlb-inn-2-leader':       { profitLock: 0.05, stopLoss: 0.10 }, // 78-82% WR; lock at 5c per MFE
   'structural-mlb-inn-2-leader-2run':  { profitLock: 0.10, stopLoss: 0.10 }, // 87% WR
+  // 2026-05-05: inn-2-leader-3plus — 100% game-WR settle play. Lock at 15c only catches 11%; settle EV +21c.
+  'structural-mlb-inn-2-leader-3plus': { profitLock: 0.15, stopLoss: 0.10 }, // hold-to-settle
   // 2026-05-05: re-enabled cell with claude-no shadow data n=81, WR=81%, avg entry 74c.
   // Lock at +10c (target 84c) achievable on 81% of fires.
   // 2026-05-05: inn-3-leader-2run lock 10c→5c. MFE inversion P3 d=2: 64% hit +5c, 14% hit +10c.
@@ -8513,6 +8551,13 @@ async function checkLiveScoreEdges() {
         // 2026-04-29 dip-buy detectors (underpriced leaders 46-65¢ band)
         if (!_structuralDecision) {
           _structuralDecision = detectMlbInn6Leader({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-05-05: MLB inn 2 leader 3+ run lead — 100% WR n=9 settle play (priority over broader inn-2-leader)
+          _structuralDecision = detectMlbInn2Leader3Plus({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
