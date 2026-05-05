@@ -1655,7 +1655,7 @@ function detectMlbLateInningLockdown({ league, period, gameDetail, diff, leading
 //
 // Sized small (3% bankroll cap). Quick exit (swing at +5¢, not hold).
 // Only fires when _scoreChanged is true on the cycle, indicating fresh signal.
-function detectScoreEventArb({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr, scoreChanged }) {
+function detectScoreEventArb({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr, scoreChanged, lastSeenPrice }) {
   if (!scoreChanged) return null;
   if (targetAbbr !== leadingAbbr) return null; // bet leader only after score change
   if (diff < 1) return null;
@@ -1663,12 +1663,25 @@ function detectScoreEventArb({ league, period, gameDetail, diff, weTimeAdj, pric
   // Extra innings/OT: market is laser-focused, MM reprices instantly — 0¢ MFE in both P10
   // shadow records, both placed P10 trades hit hard stops. No lag exists in extras.
   if (period >= 9) return null;
+  // 2026-05-04: block diff=1 for MLB. Both hard-stops were 1-run leads — opponent
+  // scores back immediately, price drops -12c. MFE only +4c. Not worth the risk.
+  // diff≥2 provides a cushion: opponent needs two events to flip, market lag window is real.
+  if (league === 'mlb' && diff < 2) return null;
+  // 2026-05-04: block NBA entirely. Q4 3-pt leads are not information-lag plays —
+  // NBA score events price instantly and 3-pt leads flip every 30s. Our NBA SEA trade:
+  // entry 0.46, MFE +3c, exit -21c (hard-stop). Not a repeatable edge.
+  if (league === 'nba') return null;
   // Asymmetric pay band: 45-73¢. Below 45¢ leader bets are too random.
-  // Above 73¢: shadow shows only +2-6¢ MFE — +10¢ profit target unreachable from 74¢+.
+  // Above 73¢: shadow shows only +2-6¢ MFE — profit target unreachable from 74¢+.
   if (price < 0.45 || price > 0.73) return null;
-  // Sport gates: only fire on sports where score events have fast info
-  const validSports = ['mlb','nba','nhl'];
+  // Sport gates: only fire on sports where score events have real info lag
+  const validSports = ['mlb','nhl'];
   if (!validSports.includes(league)) return null;
+  // 2026-05-04: entry timing gate — only enter if price is still rising from the
+  // score event. If lastSeenPrice ≥ currentPrice, the spike peaked before our entry
+  // (e.g., CIN@CHC: bot entered at 69¢ while price was already falling from 72¢).
+  // Require price at least flat vs last seen — skip if clearly on the way back down.
+  if (lastSeenPrice != null && price < lastSeenPrice - 0.01) return null;
   const edge = weTimeAdj - price;
   if (edge < 0.04) return null;
   return {
@@ -4086,7 +4099,7 @@ const STRATEGY_RR = {
   // Shadow audit: 78-81% WR at 60-79¢. Entry ~70¢ avg: profit-lock at +8¢ (target 78¢).
   'structural-mlb-inn-1-leader-2run':  { profitLock: 0.08, stopLoss: 0.12 }, // 80% WR shadow n=25
   // 2026-05-04 audit: sim shows +10¢ best (+$0.230/share vs +$0.142 at +5¢).
-  'structural-score-event-arb':        { profitLock: 0.10, stopLoss: 0.15 }, // 100% pick + info-lag
+  'structural-score-event-arb':        { profitLock: 0.07, stopLoss: 0.15 }, // 100% pick + info-lag; lowered 0.10→0.07 (MFE peaks 6-7c)
   'structural-mlb-inn-5-leader-3run':  { profitLock: 0.05, stopLoss: 0.10 },
   'structural-mlb-inn-3-leader-3run':  { profitLock: 0.10, stopLoss: 0.10 },
   'structural-mlb-inn-1-leader-3run':  { profitLock: 0.10, stopLoss: 0.10 },
@@ -8346,6 +8359,7 @@ async function checkLiveScoreEdges() {
           weTimeAdj: _weTimeAdj, price,
           targetAbbr, leadingAbbr,
           scoreChanged: _scoreChanged ?? false,
+          lastSeenPrice: lastSeenPrices.get(ticker)?.price ?? null,
         });
         if (!_structuralDecision) _structuralDecision = detectNbaQ4ColdShooting({
           league, period, gameDetail, diff,
