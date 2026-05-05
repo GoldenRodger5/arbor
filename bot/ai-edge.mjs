@@ -4121,7 +4121,7 @@ const STRATEGY_RR = {
   // Shadow audit: 78-81% WR at 60-79¢. Entry ~70¢ avg: profit-lock at +8¢ (target 78¢).
   'structural-mlb-inn-1-leader-2run':  { profitLock: 0.08, stopLoss: 0.12 }, // 80% WR shadow n=25
   // 2026-05-04 audit: sim shows +10¢ best (+$0.230/share vs +$0.142 at +5¢).
-  'structural-score-event-arb':        { profitLock: 0.07, stopLoss: 0.15 }, // 100% pick + info-lag; lowered 0.10→0.07 (MFE peaks 6-7c)
+  'structural-score-event-arb':        { profitLock: 0.05, stopLoss: 0.15 }, // 2026-05-05: MFE audit shows 27% hit 6c, 0% hit 8c+. Lock at 5c to capture 55% reach rate.
   'structural-mlb-inn-5-leader-3run':  { profitLock: 0.05, stopLoss: 0.10 },
   'structural-mlb-inn-3-leader-3run':  { profitLock: 0.10, stopLoss: 0.10 },
   'structural-mlb-inn-1-leader-3run':  { profitLock: 0.10, stopLoss: 0.10 },
