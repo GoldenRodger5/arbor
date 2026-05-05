@@ -3993,6 +3993,10 @@ const STRATEGY_KILLSWITCH = new Set([
   // 2026-05-04: zero shadow backing. Single placed trade -$10.73. NBA Q3 is high-
   // variance with no data to anchor structural patterns. Kill until shadow accumulates.
   'structural-nba-q3-leader',      // 0% placed WR (n=1), -$10.73, no shadow data
+  // 2026-05-04: 165 synthetic shadow records show 29-39% WR at every price band.
+  // 30-39c bucket (n=70): needs 35% WR to break even, running 29%. -EV across all bands.
+  // No MFE data to validate a profit-lock thesis. Kill until rebuilt with fresh data.
+  'comeback-buy',                  // 29-39% shadow WR (n=165), -EV at all price bands
   // 2026-05-04: REMOVED live-swing from killswitch. Re-audit showed kill was
   // outlier-driven (1 NHL trade -$13.09 on n=8). Outlier-stripped: 7 trades,
   // 50% WR, -$1.42 net (-$0.20/trade — basically break-even). NBA live-swing
@@ -12451,7 +12455,11 @@ async function checkPreGamePredictions() {
       continue;
     }
 
-    if ((confidence < PRE_GAME_MIN_CONF || _edgeAbs < pgReqMargin) && !isEdgeFirst) {
+    // 2026-05-04: sportsbook-gap decisions bypass the confidence floor + edge margin.
+    // The gap itself IS the edge (DraftKings/FanDuel sharp market vs Kalshi lag).
+    // Applying Claude's overconfidence correction floor (PRE_GAME_MIN_CONF=68%) to a
+    // sportsbook probability is wrong — 55% from DraftKings means 55%, not Claude saying 55%.
+    if ((confidence < PRE_GAME_MIN_CONF || _edgeAbs < pgReqMargin) && !isEdgeFirst && !_sportsbookGapExempt) {
       console.log(`[pre-game] Margin check failed: conf=${(confidence*100).toFixed(0)}% price=${(price*100).toFixed(0)}¢ edge=${(_edgeAbs*100).toFixed(1)}% need=${(pgReqMargin*100).toFixed(0)}% min=${(PRE_GAME_MIN_CONF*100).toFixed(0)}% (${pgSportKey})`);
       preGameRejectCache.set(market.base, Date.now());
       preGameRejectPrice.set(market.base, {
