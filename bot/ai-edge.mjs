@@ -3982,8 +3982,17 @@ function readUIControl() {
 // To re-enable: comment out the entry here AND wait for new shadow data.
 const STRATEGY_KILLSWITCH = new Set([
   'pre-game-edge-first',           // 22% WR, -$34/10 trades, 0.51 win/loss ratio (needs 66% WR)
-  'structural-mlb-inn-5-7-leader', // 0.17 ratio (needs 86% WR), has 45%, -$22/12 trades
-  'structural-mlb-inn-3-leader-2run', // n=1 0% WR, no edge (rebuild after data)
+  'structural-mlb-inn-5-7-leader', // 42% WR placed, -$22.79/12 trades (needs 86% WR at price range)
+  'structural-mlb-inn-3-leader-2run', // 50% shadow WR, 0% placed WR, n=1 — no edge
+  // 2026-05-04: shadow vs placed audit. 50% shadow WR = coin flip at 60c entry.
+  // Break-even needs 60% WR. Kill until shadow data shows real edge.
+  'structural-mlb-inn-2-leader',   // 50% shadow WR (n=6), 50% placed WR (n=2), net -$0.64 — no edge
+  // 2026-05-04: shadow vs placed audit. Only 50% WR on both shadow and placed.
+  // No real structural edge in 2H home advantage at these prices.
+  'structural-soccer-2h-home-leader', // 50% shadow WR (n=2), 50% placed WR (n=2), net -$3.05 — no edge
+  // 2026-05-04: zero shadow backing. Single placed trade -$10.73. NBA Q3 is high-
+  // variance with no data to anchor structural patterns. Kill until shadow accumulates.
+  'structural-nba-q3-leader',      // 0% placed WR (n=1), -$10.73, no shadow data
   // 2026-05-04: REMOVED live-swing from killswitch. Re-audit showed kill was
   // outlier-driven (1 NHL trade -$13.09 on n=8). Outlier-stripped: 7 trades,
   // 50% WR, -$1.42 net (-$0.20/trade — basically break-even). NBA live-swing
@@ -4006,7 +4015,11 @@ const STRATEGY_RR = {
   // Effective hold-to-settle: profit-lock at 30¢ (nearly settlement at 50-65¢ entry).
   'structural-nba-q2-leader':          { profitLock: 0.30, stopLoss: 0.15 }, // hold-to-settle effectively
   'structural-nba-q4-leader':          { profitLock: 0.08, stopLoss: 0.20 }, // NBA wider stops (67% premature)
-  'structural-mlb-inn-4-leader':       { profitLock: 0.15, stopLoss: 0.10 }, // 50% WR → asymmetric
+  // 2026-05-04 shadow vs placed audit: 93% shadow pick accuracy (n=14) but 40% placed WR (n=5).
+  // Gap = exits. Stop at -10c fires on normal 5-inning game variance; lock at +15c requires
+  // 85-96c mid-game price = unreachable. Fix: widen stop to -15c, lower lock to +8c.
+  // At 93% WR: 0.93*0.08 - 0.07*0.15 = +$0.064/contract expected value.
+  'structural-mlb-inn-4-leader':       { profitLock: 0.08, stopLoss: 0.15 }, // 93% shadow WR, exit-fixed
   'structural-mlb-inn-89-leader':      { profitLock: 0.05, stopLoss: 0.10 }, // closer-territory tight
   'structural-mlb-inn-2-leader':       { profitLock: 0.10, stopLoss: 0.10 }, // 71% WR symmetric
   'structural-mlb-inn-2-leader-2run':  { profitLock: 0.10, stopLoss: 0.10 }, // 87% WR
@@ -8489,7 +8502,7 @@ async function checkLiveScoreEdges() {
         // 2026-04-29 — MLB INN 7+ SONNET BLOCK. Trade-level analysis shows
         // Sonnet-driven MLB live-prediction in inn 7+ is -$72.79 cumulative
         // (MLB-P7 25% WR -$45, MLB-P9 0% WR -$28). The structural detectors
-        // (mlb-late-inning-lockdown, mlb-inn-5-7-leader) cover the +EV cases.
+        // (mlb-late-inning-lockdown) covers the +EV late cases. mlb-inn-5-7-leader is killed.
         // Block any inn 7+ MLB trade that ISN'T a structural detector match.
         if (!_structuralDecision && league === 'mlb' && period >= 7) {
           console.log(`[live-edge] 🚫 MLB-INN${period}-SONNET-BLOCK: ${targetAbbr} — Sonnet-only MLB inn 7+ has -$72 cumulative. Only structural detector matches allowed.`);
