@@ -4841,13 +4841,42 @@ function logTrade(entry) {
   }
   // Auto-register CLV capture for pre-game-style trades. Live trades skip — entry IS the live price.
   // Strategy prefix `pre-game-` covers prediction/edge-first/paper/structural pre-entries.
-  // We look up game start via pgGameStartTimes (keyed by marketBase, ie ticker without trailing -TEAM).
+  // 2026-05-05: BUG FIX — was 0/99 captures because pgGameStartTimes lookup failed when
+  // ESPN team-pair key didn't match (e.g., bot just restarted, ESPN data not yet loaded).
+  // Fallback to ticker-time parsing for MLB tickers like KXMLBGAME-26MAY051940CINCHC.
   try {
     const strat = String(record.strategy ?? '');
     const isPreGameLike = strat.startsWith('pre-game-') || strat === 'claude-prediction' || strat === 'ufc-prediction' || strat === 'draw-bet';
     if (isPreGameLike && record.exchange === 'kalshi' && record.ticker) {
       const marketBase = record.ticker.includes('-') ? record.ticker.slice(0, record.ticker.lastIndexOf('-')) : record.ticker;
-      const gsm = pgGameStartTimes.get(marketBase);
+      let gsm = pgGameStartTimes.get(marketBase);
+      // 2026-05-05: fallback — parse game start from ticker format. MLB tickers
+      // embed game start as YYMMM(YY)(HHMM) like 26MAY051940 = 7:40pm ET on 2026-05-05.
+      // NBA/NHL/Soccer don't always have this in their tickers; for those we rely on ESPN.
+      if (!Number.isFinite(gsm)) {
+        const tickerMatch = marketBase.match(/(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})/);
+        if (tickerMatch) {
+          const [, yy, monStr, dd, hh, mm] = tickerMatch;
+          const monthMap = { JAN:0, FEB:1, MAR:2, APR:3, MAY:4, JUN:5, JUL:6, AUG:7, SEP:8, OCT:9, NOV:10, DEC:11 };
+          const month = monthMap[monStr];
+          if (month != null) {
+            // Construct date in ET, then convert to UTC ms.
+            // Note: this is approximate (DST edge cases) but accurate within ~1hr.
+            const year = 2000 + parseInt(yy, 10);
+            const day = parseInt(dd, 10);
+            const hour = parseInt(hh, 10);
+            const minute = parseInt(mm, 10);
+            // ET is UTC-4 (DST) or UTC-5 (standard). Use UTC-4 for game season (Mar-Nov).
+            const isDst = month >= 2 && month <= 10; // approximate DST window
+            const utcOffset = isDst ? 4 : 5;
+            const ms = Date.UTC(year, month, day, hour + utcOffset, minute);
+            if (ms > Date.now() - 6 * 60 * 60 * 1000 && ms < Date.now() + 24 * 60 * 60 * 1000) {
+              gsm = ms;
+              console.log(`[clv] fallback parsed game start from ticker ${marketBase}: ${new Date(ms).toISOString()}`);
+            }
+          }
+        }
+      }
       if (Number.isFinite(gsm) && gsm > Date.now() - 5 * 60 * 1000) {
         registerClvCapture(record.id, {
           ticker: record.ticker,
@@ -4856,9 +4885,12 @@ function logTrade(entry) {
           gameStartMs: gsm,
           strategy: strat,
         });
+        console.log(`[clv] registered ${record.ticker} for capture at ${new Date(gsm).toISOString()}`);
+      } else {
+        console.log(`[clv] could NOT register ${record.ticker} — no game start time found (pgGameStartTimes: ${pgGameStartTimes.size} entries, ticker fallback failed)`);
       }
     }
-  } catch { /* CLV registration is best-effort */ }
+  } catch (e) { console.log('[clv] registration error:', e.message); }
   return record.id;
 }
 
