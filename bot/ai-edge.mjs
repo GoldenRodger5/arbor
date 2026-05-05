@@ -14133,10 +14133,12 @@ async function managePositions() {
             // Nuclear stop at -90% still fires as catastrophe protection.
             bleedOutEnabled = false;
           } else if (_strat === 'live-prediction' || _strat.startsWith('structural-')) {
-            // 2026-05-04: inn-6-leader bleed-out disabled. Shadow audit: 100% pick
-            // accuracy (n=3), 0¢ avg MFE — bleed-out fires on normal game variance
-            // before settlement confirms the pick. Nuclear stop still active.
-            if (_strat === 'structural-mlb-inn-6-leader') {
+            // 2026-05-04: inn-6-leader + inn-4-leader bleed-out disabled.
+            // Inn-6: 100% shadow pick accuracy (n=3), bleed-out fires on variance.
+            // Inn-4: 93% shadow pick accuracy (n=6 shadow), 3 bleed-outs cost -$10.19
+            // on picks that mostly won (CIN@CHC: stopped at 37¢, settled ~70¢).
+            // Contra-line-move remains as backstop for real thesis failures.
+            if (_strat === 'structural-mlb-inn-6-leader' || _strat === 'structural-mlb-inn-4-leader') {
               bleedOutEnabled = false;
             }
             // 2026-04-30: SPORT-AWARE bleed-out for structural detectors. Bleed-out
