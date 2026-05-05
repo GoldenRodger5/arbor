@@ -858,22 +858,30 @@ function detectMlbInn6Leader({ league, period, gameDetail, diff, weTimeAdj, pric
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff < 1) return null;
-  if (price < 0.46 || price > 0.65) return null; // only fires in the underpriced band
+  if (price < 0.46) return null;
+  // 2026-05-04: extended diff=1 cap from 65¢ to 70¢. Shadow no-trades at 65-70¢ show
+  // 87% WR (20/23) — Claude was passing on this band. diff>=2 stays at 65¢ cap (deadzone
+  // carve-out in inn-5-7 applies above 65¢ for higher diffs).
+  if (diff === 1 && price > 0.70) return null;
+  if (diff > 1 && price > 0.65) return null;
   const edge = weTimeAdj - price;
-  if (edge < 0.04) return null;
+  // For the original 46-65¢ band: require 4pt WE edge (validates the structural cell).
+  // For the 65-70¢ extension: sanity check only — WR evidence is structural, not edge-based.
+  if (price <= 0.65 && edge < 0.04) return null;
+  if (price > 0.65 && edge < -0.03) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
       steel_man: `${diff}-run lead in 6th — only 3 innings left for trailing team to come back`,
       edge_source: 'market_lag',
-      edge_argument: `STRUCTURAL DETECTOR (MLB inn 6 leader 46-65¢, jackpot cell 93% WR n=14): ${diff}-run lead in 6th, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 6 leader 46-70¢ d=1, 87-93% WR): ${diff}-run lead in 6th, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
       key_facts: [
         `Inning 6, ${diff}-run lead`,
         `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
-        `Cell history: 14 games, 13 won (93%) at avg 62¢`,
+        `Cell history: 93% WR 46-65¢ (n=14), 87% WR 65-70¢ (n=20 shadow no-trades)`,
       ],
       top_risk: 'Late-inning bullpen blow-up or trailing rally',
-      conviction: 'Structural pattern — highest-WR cell in 4-day shadow audit',
+      conviction: 'Structural pattern — highest-WR cell in shadow audit',
       reasoning_tags: ['market-lag', 'we-undervalued'],
     },
     _structuralPattern: 'mlb-inn-6-leader',
