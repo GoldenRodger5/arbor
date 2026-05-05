@@ -897,19 +897,24 @@ function detectMlbInn2Leader({ league, period, gameDetail, diff, weTimeAdj, pric
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff < 1) return null;
-  if (price < 0.50 || price > 0.65) return null;
+  // 2026-05-04: extended cap from 65¢ to 78¢. Shadow no-trades at 65-70¢ show 81.8% WR
+  // (n=33, +15.5% EV); 70-79¢ band shows 77.6% WR (n=67, +3.3% EV). Both profitable.
+  if (price < 0.50 || price > 0.78) return null;
   const edge = weTimeAdj - price;
-  if (edge < 0.04) return null;
+  // Original 50-65¢ band: require 4pt edge. Extended 65-78¢ band: sanity check only
+  // (same approach as inn-6 extension — WR evidence is structural not edge-dependent).
+  if (price <= 0.65 && edge < 0.04) return null;
+  if (price > 0.65 && edge < -0.03) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
       steel_man: `${diff}-run lead in 2nd — early but trailing team has full game to come back`,
       edge_source: 'market_lag',
-      edge_argument: `STRUCTURAL DETECTOR (MLB inn 2 leader 50-65¢, 78% WR n=9): ${diff}-run lead in 2nd, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 2 leader 50-78¢, 78-82% WR): ${diff}-run lead in 2nd, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
       key_facts: [
         `Inning 2, ${diff}-run lead`,
         `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
-        `Cell history: 9 games, 7 won (78%) at avg 61¢`,
+        `Cell history: 78% WR 50-65¢ (n=9), 82% WR 65-70¢ (n=33), 78% WR 70-78¢ (n=67)`,
       ],
       top_risk: 'Plenty of innings left for trailing team rally',
       conviction: 'Structural pattern — early-lead market underpricing',
@@ -1140,6 +1145,39 @@ function detectMlbInn1Leader3Plus({ league, period, gameDetail, diff, weTimeAdj,
       reasoning_tags: ['market-lag', 'we-undervalued'],
     },
     _structuralPattern: 'mlb-inn-1-leader-3run',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
+// MLB inning 1 leader with exactly 2-run lead at 60-82¢.
+// detectMlbInn1Leader3Plus handles diff≥3. Shadow audit 2026-05-04 reveals diff=2 is a
+// genuine gap: no-trades at 60-69¢ show 77.8% WR (n=9), 70-79¢ show 81.2% WR (n=16),
+// 80¢+ show ~85% WR (n partial). Claude passes on all of these — adding structural cell.
+function detectMlbInn1Leader2Run({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period !== 1) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff !== 2) return null;
+  if (price < 0.60 || price > 0.82) return null;
+  const edge = weTimeAdj - price;
+  if (edge < -0.03) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `2-run lead in 1st — early cushion, trailing team needs full-game rally across 8 innings`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 1 leader 2-run 60-82¢, 80% WR n=25+): 2-run lead in 1st, WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢ = ${(edge*100).toFixed(0)}pt edge.`,
+      key_facts: [
+        `Inning 1, 2-run lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 78% WR 60-70¢ (n=9), 81% WR 70-79¢ (n=16) — shadow no-trades`,
+      ],
+      top_risk: '8 innings remaining — 2-run early lead can be overcome',
+      conviction: 'Structural pattern — early 2-run lead market underpricing',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-inn-1-leader-2run',
     _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
   };
 }
@@ -4042,8 +4080,11 @@ const STRATEGY_RR = {
   // At 93% WR: 0.93*0.08 - 0.07*0.15 = +$0.064/contract expected value.
   'structural-mlb-inn-4-leader':       { profitLock: 0.08, stopLoss: 0.15 }, // 93% shadow WR, exit-fixed
   'structural-mlb-inn-89-leader':      { profitLock: 0.05, stopLoss: 0.10 }, // closer-territory tight
-  'structural-mlb-inn-2-leader':       { profitLock: 0.10, stopLoss: 0.10 }, // 71% WR symmetric
+  'structural-mlb-inn-2-leader':       { profitLock: 0.10, stopLoss: 0.10 }, // 78-82% WR; extended to 78¢
   'structural-mlb-inn-2-leader-2run':  { profitLock: 0.10, stopLoss: 0.10 }, // 87% WR
+  // 2026-05-04: new cell for inn-1 diff=2 leaders (diff≥3 handled by inn-1-leader-3run).
+  // Shadow audit: 78-81% WR at 60-79¢. Entry ~70¢ avg: profit-lock at +8¢ (target 78¢).
+  'structural-mlb-inn-1-leader-2run':  { profitLock: 0.08, stopLoss: 0.12 }, // 80% WR shadow n=25
   // 2026-05-04 audit: sim shows +10¢ best (+$0.230/share vs +$0.142 at +5¢).
   'structural-score-event-arb':        { profitLock: 0.10, stopLoss: 0.15 }, // 100% pick + info-lag
   'structural-mlb-inn-5-leader-3run':  { profitLock: 0.05, stopLoss: 0.10 },
@@ -8382,6 +8423,13 @@ async function checkLiveScoreEdges() {
         if (!_structuralDecision) {
           // 2026-05-01: MLB inn 1 leader 3+ run lead — shadow 100% WR n=10 @ avg 76¢
           _structuralDecision = detectMlbInn1Leader3Plus({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-05-04: MLB inn 1 leader 2-run — shadow 80% WR n=25 at 60-82¢
+          _structuralDecision = detectMlbInn1Leader2Run({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
@@ -14144,7 +14192,8 @@ async function managePositions() {
             // Inn-4: 93% shadow pick accuracy (n=6 shadow), 3 bleed-outs cost -$10.19
             // on picks that mostly won (CIN@CHC: stopped at 37¢, settled ~70¢).
             // Contra-line-move remains as backstop for real thesis failures.
-            if (_strat === 'structural-mlb-inn-6-leader' || _strat === 'structural-mlb-inn-4-leader' || _strat === 'structural-mlb-inn-5-7-leader') {
+            if (_strat === 'structural-mlb-inn-6-leader' || _strat === 'structural-mlb-inn-4-leader' || _strat === 'structural-mlb-inn-5-7-leader'
+                || _strat === 'structural-mlb-inn-1-leader-2run' || _strat === 'structural-mlb-inn-2-leader') {
               bleedOutEnabled = false;
             }
             // 2026-04-30: SPORT-AWARE bleed-out for structural detectors. Bleed-out
