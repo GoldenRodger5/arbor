@@ -3206,30 +3206,28 @@ let massDisappearStreak = 0; // consecutive sync cycles where ALL Kalshi positio
 const recentCrossContraMovers = new Map(); // ticker → { velocity, when } — cross-confirmed drops for pg-guard
 // 2026-04-30 — structural entry throttles (prevent 4-min burst-fire pattern from 4/30)
 const structuralEntryStamps = new Map(); // `${league}:${strategy}` → lastEntryMs (for 5-min same-sport-strategy spacing)
-const structuralOpenEntries = new Map(); // ticker → { league, strategy, entryPrice, entryTs } (for concurrent-bleed check)
+const structuralOpenEntries = new Map(); // ticker → { league, strategy, entryPrice, entryTs } (for same-game concentration check)
+// 2026-05-04: score-event-arb uses 90s spacing (each score event is independent —
+// two games scoring 3 min apart should both fire). Leader cells keep 5-min (guard
+// against firing 3+ positions simultaneously on a data-stale day).
 const STRUCTURAL_SPACING_MS = 5 * 60 * 1000;
-const STRUCTURAL_BLEED_THRESHOLD = 0.05; // 5¢ underwater triggers throttle on new entries
+const STRUCTURAL_SPACING_ARB_MS = 90 * 1000;
 
 function checkStructuralThrottles({ league, strategy, ticker }) {
   const now = Date.now();
-  // Throttle C: 5-min spacing same-sport same-strategy
+  // Throttle C: spacing same-sport same-strategy (90s for score-event-arb, 5-min for leaders)
   const stampKey = `${league}:${strategy}`;
   const lastStamp = structuralEntryStamps.get(stampKey) ?? 0;
-  if (now - lastStamp < STRUCTURAL_SPACING_MS) {
-    const remainSec = Math.ceil((STRUCTURAL_SPACING_MS - (now - lastStamp)) / 1000);
-    return { blocked: true, reason: `5-min spacing: another ${strategy} fired ${Math.floor((now-lastStamp)/1000)}s ago in ${league.toUpperCase()} (need ${remainSec}s more)` };
+  const spacingMs = strategy === 'structural-score-event-arb' ? STRUCTURAL_SPACING_ARB_MS : STRUCTURAL_SPACING_MS;
+  if (now - lastStamp < spacingMs) {
+    const remainSec = Math.ceil((spacingMs - (now - lastStamp)) / 1000);
+    return { blocked: true, reason: `spacing: another ${strategy} fired ${Math.floor((now-lastStamp)/1000)}s ago in ${league.toUpperCase()} (need ${remainSec}s more)` };
   }
-  // Throttle B: any same-sport structural position currently underwater ≥5¢
-  for (const [t, info] of structuralOpenEntries.entries()) {
-    if (t === ticker) continue;
-    if (info.league !== league) continue;
-    const last = lastSeenPrices.get(t);
-    if (!last || typeof last.price !== 'number') continue;
-    const drawdown = info.entryPrice - last.price;
-    if (drawdown >= STRUCTURAL_BLEED_THRESHOLD) {
-      return { blocked: true, reason: `concurrent bleed: ${t.split('-').pop()} underwater ${Math.round(drawdown*100)}¢ from entry (${Math.round(info.entryPrice*100)}¢ → ${Math.round(last.price*100)}¢)` };
-    }
-  }
+  // Throttle B (REMOVED 2026-05-04): concurrent-bleed throttle blocked new entries when any
+  // same-sport structural position was ≥5¢ underwater. With inn-4 and inn-6 bleed-outs
+  // disabled, a 5¢ dip is routine variance — not a warning signal. Audit showed NYY
+  // winner at 79¢ blocked by AZ bleeding; LAD losses at 18¢ that were "correctly" blocked
+  // are now from killed strategies anyway. Throttle D (same-game) handles real concentration risk.
   // Throttle D: same-game concentration — block if any other structural position is
   // already open on this exact game (different team or different strategy).
   // Prevents double-exposure on one game outcome (e.g., score-event-arb + inn-4-leader
