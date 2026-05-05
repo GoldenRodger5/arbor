@@ -36,7 +36,7 @@ function atomicWrite(path, contents) {
 // Validate structure of generated overrides before writing. Any issue → abort.
 function validateOverrides(o) {
   if (!o || typeof o !== 'object') return 'not an object';
-  for (const key of ['minConfidenceLive', 'requiredMarginLive', 'kellyFraction']) {
+  for (const key of ['minConfidenceLive', 'requiredMarginLive', 'kellyFraction', 'preGameMinConfidenceOffset', 'preGameMarginOffset', 'preGameHaircutOffset']) {
     if (o[key] != null) {
       if (typeof o[key] !== 'object') return `${key} must be an object`;
       for (const [sport, v] of Object.entries(o[key])) {
@@ -390,6 +390,114 @@ function analyzeSport(sport, trades, currentOverrides = {}) {
   return { sport, n, buckets, suggestions, reasoning, status, currentMinConf, currentMargin };
 }
 
+// ─── PRE-GAME bidirectional calibration (2026-05-05) ───────────────────────────
+// Mirrors analyzeSport but for pre-game-prediction + pre-game-edge-first trades.
+// Output: per-sport OFFSETS to apply to hardcoded base values in ai-edge.mjs.
+//   preGameMinConfidenceOffset[sport]: -0.05 to +0.05 (shifts price-tier floors)
+//   preGameMarginOffset[sport]:        -0.02 to +0.03
+//   preGameHaircutOffset[sport]:       -0.03 to +0.05 (shifts overconfidence haircut)
+// Offsets preserve the price-tier hardcoded logic (NBA 78/80/85 by price band stays).
+// Pre-game has small sample (~13 settled trades total) — be conservative on adjustment magnitude.
+function analyzePreGame(sport, trades, currentOverrides = {}) {
+  const pre = trades.filter(t => calibratable(t) && isPreGame(t));
+  const n = pre.length;
+
+  const reasoning = [];
+  const suggestions = {}; // populated only when offset != 0
+
+  if (n < 8) {
+    return { sport, n, suggestions, reasoning, status: 'insufficient-data' };
+  }
+
+  // Read CURRENT offsets as baseline (default 0 if not set).
+  const currentConfOffset = currentOverrides.preGameMinConfidenceOffset?.[sport] ?? 0;
+  const currentMarginOffset = currentOverrides.preGameMarginOffset?.[sport] ?? 0;
+  const currentHaircutOffset = currentOverrides.preGameHaircutOffset?.[sport] ?? 0;
+
+  // Safety bounds on offsets
+  const CONF_OFFSET_MIN = -0.05, CONF_OFFSET_MAX = 0.05;
+  const MARGIN_OFFSET_MIN = -0.02, MARGIN_OFFSET_MAX = 0.03;
+  const HAIRCUT_OFFSET_MIN = -0.03, HAIRCUT_OFFSET_MAX = 0.05;
+  const MAX_STEP = 0.01; // pre-game adjusts more cautiously than live (smaller sample)
+
+  // Compute placed-trade WR overall and by Claude-confidence band.
+  const wins = pre.filter(t => isWin(t)).length;
+  const losses = pre.filter(t => !isWin(t)).length;
+  const totalKnown = wins + losses;
+  if (totalKnown === 0) {
+    return { sport, n, suggestions, reasoning, status: 'no-outcomes' };
+  }
+  const overallWR = wins / totalKnown;
+  const avgEntry = pre.reduce((s, t) => s + (t.entryPrice ?? 0.5), 0) / pre.length;
+  const [overallCiLo] = wilsonCI(wins, totalKnown);
+
+  // ─── DIRECTION 1: TIGHTEN if pre-game is bleeding ────────────────────────────
+  // CI95-hi below avg-entry breakeven → losing money on average.
+  const [, overallCiHi] = wilsonCI(wins, totalKnown);
+  if (overallCiHi < avgEntry && totalKnown >= 8) {
+    // Increase confidence floor (raise PRE_GAME_MIN_CONF) AND increase haircut (more discount)
+    const candidate = Math.min(CONF_OFFSET_MAX, currentConfOffset + MAX_STEP);
+    if (candidate > currentConfOffset) {
+      suggestions.preGameMinConfidenceOffset = candidate;
+      reasoning.push(`TIGHTEN preGameMinConfidenceOffset ${(currentConfOffset*100).toFixed(0)} → ${(candidate*100).toFixed(0)}: WR ${(overallWR*100).toFixed(0)}% (CI95-hi ${(overallCiHi*100).toFixed(0)}%) < avgEntry ${(avgEntry*100).toFixed(0)}%`);
+    }
+    const haircutCandidate = Math.min(HAIRCUT_OFFSET_MAX, currentHaircutOffset + MAX_STEP);
+    if (haircutCandidate > currentHaircutOffset) {
+      suggestions.preGameHaircutOffset = haircutCandidate;
+      reasoning.push(`TIGHTEN preGameHaircutOffset ${(currentHaircutOffset*100).toFixed(0)} → ${(haircutCandidate*100).toFixed(0)}: increase overconfidence discount`);
+    }
+  } else if (overallCiLo > avgEntry + 0.05 && totalKnown >= 8) {
+    // ─── DIRECTION 2: LOOSEN if pre-game is genuinely winning ─────────────────
+    // CI95-lo well above breakeven → tight gates leaving wins on the table.
+    const candidate = Math.max(CONF_OFFSET_MIN, currentConfOffset - MAX_STEP);
+    if (candidate < currentConfOffset) {
+      suggestions.preGameMinConfidenceOffset = candidate;
+      reasoning.push(`LOOSEN preGameMinConfidenceOffset ${(currentConfOffset*100).toFixed(0)} → ${(candidate*100).toFixed(0)}: WR ${(overallWR*100).toFixed(0)}% (CI95-lo ${(overallCiLo*100).toFixed(0)}%) > avgEntry ${(avgEntry*100).toFixed(0)}% + buffer`);
+    }
+    // Reduce haircut (Claude has earned credibility on this sport pre-game)
+    const haircutCandidate = Math.max(HAIRCUT_OFFSET_MIN, currentHaircutOffset - MAX_STEP);
+    if (haircutCandidate < currentHaircutOffset) {
+      suggestions.preGameHaircutOffset = haircutCandidate;
+      reasoning.push(`LOOSEN preGameHaircutOffset ${(currentHaircutOffset*100).toFixed(0)} → ${(haircutCandidate*100).toFixed(0)}: reduce overconfidence discount (Claude calibrated)`);
+    }
+  } else {
+    reasoning.push(`HOLD pre-game offsets (sport=${sport} n=${totalKnown} WR=${(overallWR*100).toFixed(0)}% avgEntry=${(avgEntry*100).toFixed(0)}%, no actionable signal)`);
+  }
+
+  // ─── MARGIN: same bidirectional pattern ──────────────────────────────────────
+  // For pre-game, look at edge buckets. If thin-edge (3-5pt) is profitable, lower margin.
+  // If thin-edge is losing, raise margin.
+  const thinEdge = pre.filter(t => {
+    const e = (t.confidence ?? 0) - (t.entryPrice ?? 0.5);
+    return e >= 0.03 && e < 0.06;
+  });
+  if (thinEdge.length >= 5) {
+    const teWins = thinEdge.filter(t => isWin(t)).length;
+    const [teCiLo, teCiHi] = wilsonCI(teWins, thinEdge.length);
+    const teAvgEntry = thinEdge.reduce((s, t) => s + (t.entryPrice ?? 0.5), 0) / thinEdge.length;
+    if (teCiHi < teAvgEntry) {
+      const candidate = Math.min(MARGIN_OFFSET_MAX, currentMarginOffset + MAX_STEP);
+      if (candidate > currentMarginOffset) {
+        suggestions.preGameMarginOffset = candidate;
+        reasoning.push(`TIGHTEN preGameMarginOffset ${(currentMarginOffset*100).toFixed(0)} → ${(candidate*100).toFixed(0)}: thin-edge band losing (CI95-hi ${(teCiHi*100).toFixed(0)}% < ${(teAvgEntry*100).toFixed(0)}%)`);
+      }
+    } else if (teCiLo > teAvgEntry + 0.05) {
+      const candidate = Math.max(MARGIN_OFFSET_MIN, currentMarginOffset - MAX_STEP);
+      if (candidate < currentMarginOffset) {
+        suggestions.preGameMarginOffset = candidate;
+        reasoning.push(`LOOSEN preGameMarginOffset ${(currentMarginOffset*100).toFixed(0)} → ${(candidate*100).toFixed(0)}: thin-edge band profitable (CI95-lo ${(teCiLo*100).toFixed(0)}% > ${(teAvgEntry*100).toFixed(0)}%)`);
+      }
+    }
+  }
+
+  return {
+    sport, n, suggestions, reasoning,
+    status: totalKnown >= 15 ? 'confident' : 'tentative',
+    currentConfOffset, currentMarginOffset, currentHaircutOffset,
+    overallWR, avgEntry, totalKnown,
+  };
+}
+
 // ─── TIER 1A: Exit threshold calibration ──────────────────────────────────────
 // For each sport × playoff flag, measure how often exit triggers led to
 // locked-in losses. A "bad stop" is one where realizedPnL was negative AND
@@ -683,6 +791,14 @@ const analyses = [...sportMap.entries()]
   .map(([sport, trades]) => analyzeSport(sport, trades, existingOverrides))
   .sort((a, b) => b.n - a.n);
 
+// 2026-05-05: Pre-game analysis runs separately. Same bidirectional pattern
+// as live (analyzeSport) but applies offsets to hardcoded sport-tier floors
+// in ai-edge.mjs. See analyzePreGame() docstring for safety bounds.
+const preGameAnalyses = [...sportMap.entries()]
+  .map(([sport, trades]) => analyzePreGame(sport, trades, existingOverrides))
+  .filter(a => a.status !== 'insufficient-data' && a.status !== 'no-outcomes')
+  .sort((a, b) => b.n - a.n);
+
 // ─── Fetch bankroll (for Tier 2 gate) ─────────────────────────────────────────
 const bankroll = await fetchKalshiBalance();
 const tier2Enabled = bankroll != null && bankroll >= TIER2_BANKROLL_MIN;
@@ -756,7 +872,7 @@ for (const analysis of analyses) {
 }
 
 // Preserve carry-forwards
-for (const key of ['minConfidenceLive', 'requiredMarginLive']) {
+for (const key of ['minConfidenceLive', 'requiredMarginLive', 'preGameMinConfidenceOffset', 'preGameMarginOffset', 'preGameHaircutOffset']) {
   if (existingOverrides[key]) {
     for (const [sport, val] of Object.entries(existingOverrides[key])) {
       if (!newOverrides[key]?.[sport]) {
@@ -764,6 +880,38 @@ for (const key of ['minConfidenceLive', 'requiredMarginLive']) {
         newOverrides[key][sport] = val;
       }
     }
+  }
+}
+
+// 2026-05-05: Pre-game offsets — print decisions then apply
+console.log('\n' + thin);
+console.log('TIER 1 — PRE-GAME (BIDIRECTIONAL OFFSETS)');
+console.log(thin);
+if (preGameAnalyses.length === 0) {
+  console.log('  Insufficient pre-game data per sport (need 8+ settled with outcome)');
+} else {
+  for (const a of preGameAnalyses) {
+    const offsetSummary = `confOffset=${((a.currentConfOffset ?? 0)*100).toFixed(0)}pt marginOffset=${((a.currentMarginOffset ?? 0)*100).toFixed(0)}pt haircutOffset=${((a.currentHaircutOffset ?? 0)*100).toFixed(0)}pt`;
+    console.log(`  ${a.sport.toUpperCase()}: n=${a.n} (${a.status}) — ${offsetSummary}`);
+    for (const r of a.reasoning) console.log(`    • ${r}`);
+  }
+}
+
+for (const a of preGameAnalyses) {
+  if (a.suggestions.preGameMinConfidenceOffset != null) {
+    newOverrides.preGameMinConfidenceOffset = newOverrides.preGameMinConfidenceOffset ?? {};
+    newOverrides.preGameMinConfidenceOffset[a.sport] = a.suggestions.preGameMinConfidenceOffset;
+    hasAnySuggestion = true;
+  }
+  if (a.suggestions.preGameMarginOffset != null) {
+    newOverrides.preGameMarginOffset = newOverrides.preGameMarginOffset ?? {};
+    newOverrides.preGameMarginOffset[a.sport] = a.suggestions.preGameMarginOffset;
+    hasAnySuggestion = true;
+  }
+  if (a.suggestions.preGameHaircutOffset != null) {
+    newOverrides.preGameHaircutOffset = newOverrides.preGameHaircutOffset ?? {};
+    newOverrides.preGameHaircutOffset[a.sport] = a.suggestions.preGameHaircutOffset;
+    hasAnySuggestion = true;
   }
 }
 
@@ -910,6 +1058,20 @@ if (!hasAnySuggestion) {
           status: a.status,
           currentMinConf: a.currentMinConf,
           currentMargin: a.currentMargin,
+          suggestions: a.suggestions,
+          reasoning: a.reasoning,
+        };
+      }
+      calibLog.preGameDecisions = {};
+      for (const a of preGameAnalyses) {
+        calibLog.preGameDecisions[a.sport] = {
+          n: a.n,
+          status: a.status,
+          currentConfOffset: a.currentConfOffset,
+          currentMarginOffset: a.currentMarginOffset,
+          currentHaircutOffset: a.currentHaircutOffset,
+          overallWR: a.overallWR,
+          avgEntry: a.avgEntry,
           suggestions: a.suggestions,
           reasoning: a.reasoning,
         };

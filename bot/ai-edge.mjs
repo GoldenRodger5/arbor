@@ -588,8 +588,12 @@ function getRequiredMargin(price, { sport = '', live = false, scoreChanged = fal
   if (price >= 0.70) priceAdj = 0.03;         // 70¢+ pre-game favorite: need 3% more conviction
   else if (price >= 0.55) priceAdj = 0.01;     // mid-range: slight bump
 
+  // 2026-05-05: CAL OFFSET for pre-game margin. Bidirectional — calibration
+  // can adjust per sport based on recent pre-game placed-trade WR by edge band.
+  // Safety bounds [-0.02, +0.03] applied in suggest.mjs. Default offset = 0.
+  const _calOffset = CAL.preGameMarginOffset?.[sport] ?? 0;
   // Pre-game always needs +1% vs live (market has had time to settle)
-  const margin = Math.max(0.02, sportBase + priceAdj + 0.01);
+  const margin = Math.max(0.02, Math.min(0.10, sportBase + priceAdj + 0.01 + _calOffset));
   return margin;
 }
 const MAX_PRICE = 0.75;           // Default ceiling — use getMaxPrice(league, period) for sport-specific limits
@@ -12702,7 +12706,14 @@ async function checkPreGamePredictions() {
     // NBA pre-game audit: 22-29% pick accuracy across n=9 trades. Strikingly bad
     // even allowing for small sample. Raise NBA pre-game floor to 80% to require
     // high conviction. NHL pre-game keeps current floors (67% pick rate works).
-    const PRE_GAME_MIN_CONF = pgSportKey === 'nba'
+    // 2026-05-05: CAL OFFSET applied to hardcoded floors. Calibration loop
+    // can now bidirectionally adjust pre-game floors per sport based on
+    // recent placed-trade WR. Offset preserves price-tier logic (NBA still
+    // uses 78/80/85 progression) but shifts the BASE up or down.
+    // Safety bounds in suggest.mjs: offset clamped to [-0.05, +0.05].
+    // Default offset = 0 → behavior identical to pre-2026-05-05 version.
+    const _pgCalConfOffset = CAL.preGameMinConfidenceOffset?.[pgSportKey] ?? 0;
+    const _pgBaseFloor = pgSportKey === 'nba'
       ? (price < 0.50 ? 0.78 : price <= 0.65 ? 0.80 : 0.85)
       : pgSportKey === 'nhl'
       ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.72)
@@ -12728,6 +12739,10 @@ async function checkPreGamePredictions() {
         : isSoccer
           ? (price < 0.50 ? 0.63 : price <= 0.65 ? 0.65 : 0.68) // Soccer: unchanged
           : 0.65; // fallback for other sports
+    // Apply CAL offset (preserves MLS=0.99 disable since offset is bounded ±0.05)
+    const PRE_GAME_MIN_CONF = pgSportKey === 'mls'
+      ? _pgBaseFloor // MLS stays disabled (offset can't lower 0.99 enough to matter)
+      : Math.max(0.50, Math.min(0.90, _pgBaseFloor + _pgCalConfOffset));
     // EDGE-FIRST TIER: a clear edge with moderate conviction is still a bet worth making,
     // just at reduced size. Pros don't need 65% conf to bet a 51¢ line with 12pt edge —
     // the math says +EV even after a 5pt calibration haircut. Sit-out days (like today)
@@ -12741,10 +12756,16 @@ async function checkPreGamePredictions() {
     // had already absorbed. Apply sport-specific haircut before gate/edge-first so floors and
     // Kelly sizing both reflect realistic probability. Live markets are not adjusted here
     // (their edges come from Kalshi book lag on WE, which is a different dynamic).
-    const _calibrationHaircut = pgSportKey === 'mlb' ? 0.05
-                              : pgSportKey === 'nba' ? 0.03
-                              : pgSportKey === 'nhl' ? 0.02
-                              : 0.02; // soccer/other
+    // 2026-05-05: CAL OFFSET applied to haircut. Bidirectional — if pre-game
+    // is performing well at current haircut, calibration can REDUCE haircut
+    // (= more confidence reaches the gate). If still over-confident, INCREASE.
+    // Safety bounds [-0.03, +0.05] applied in suggest.mjs.
+    const _haircutBase = pgSportKey === 'mlb' ? 0.05
+                       : pgSportKey === 'nba' ? 0.03
+                       : pgSportKey === 'nhl' ? 0.02
+                       : 0.02; // soccer/other
+    const _haircutOffset = CAL.preGameHaircutOffset?.[pgSportKey] ?? 0;
+    const _calibrationHaircut = Math.max(0, Math.min(0.10, _haircutBase + _haircutOffset));
     // Sportsbook-gap decisions use sharp-market probability, not Claude's confidence —
     // the calibration haircut corrects Claude overconfidence and must not apply here.
     if (_calibrationHaircut > 0 && confidence > _calibrationHaircut && !_sportsbookGapExempt) {
