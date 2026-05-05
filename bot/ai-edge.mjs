@@ -14235,14 +14235,20 @@ async function managePositions() {
             // Inn-4: 93% shadow pick accuracy (n=6 shadow), 3 bleed-outs cost -$10.19
             // on picks that mostly won (CIN@CHC: stopped at 37¢, settled ~70¢).
             // Contra-line-move remains as backstop for real thesis failures.
-            // 2026-05-05: blanket disable bleed-out for ALL structural-mlb-* leader cells.
-            // Score-unchanged defer (below) is the safety net — stops only fire if score
-            // actually changed (real thesis death). Severe-drop catastrophe stop (-25%)
-            // still fires regardless. Future structural cells get this protection
-            // automatically without needing to update an explicit list.
-            if (_strat.startsWith('structural-mlb-inn-')) {
-              bleedOutEnabled = false;
-            }
+            // 2026-05-05 REV: blanket disable was based on inflated per-record WR.
+            // Per-GAME analysis (records collapsed to unique games) shows NO structural
+            // cell currently meets CI95-lo > 75% AND n >= 10 unique games. The "100% WR"
+            // claim for inn-4 was 7 unique games (CI95-lo = 65%). At 65% game-WR,
+            // bleed-out is +EV vs hold-to-settle.
+            //
+            // Keep bleed-out ENABLED for all structural cells. The score-unchanged defer
+            // (below) is the smart filter — stops only fire when (a) price drop AND
+            // (b) score actually changed = real thesis death. Severe-drop (-25%) still
+            // fires regardless. This combination protects winners from noise drops
+            // while limiting damage on genuinely wrong picks.
+            //
+            // Re-enable disable per-cell ONLY when CI95-lo > 75% AND n >= 10 unique games
+            // accumulates. None qualify yet.
             // 2026-04-30: SPORT-AWARE bleed-out for structural detectors. Bleed-out
             // calibrated for MLB (1-run lead loss = real thesis death; outs running out)
             // misfires on NBA where Q2 leads flip 6-8x/game routinely. DEN@MIN tonight:
