@@ -9507,7 +9507,15 @@ async function checkLiveScoreEdges() {
         // safer than it was at the original audit.
         const SPORT_FLOOR_OVERRIDES = { mlb: 0.72, nhl: 0.74, mls: 0.78, laliga: 0.73 };
         const _hardcodedFloor = SPORT_FLOOR_OVERRIDES[league] ?? null;
-        const sportMinConf = _hardcodedFloor ?? CAL.minConfidenceLive?.[league] ?? MIN_CONFIDENCE;
+        // 2026-05-05: PRIORITY ORDER FIXED. Was: hardcoded → CAL → MIN_CONFIDENCE
+        // (so CAL.minConfidenceLive was IGNORED for MLB/NHL/MLS/LaLiga because
+        // hardcoded always won). Bidirectional calibration would write CAL values
+        // that ai-edge silently ignored — defeating the auto-tuning purpose.
+        // New order: CAL → hardcoded → MIN_CONFIDENCE. CAL wins when set.
+        // The hardcoded floors remain as STARTING values + safety fallback when
+        // CAL hasn't accumulated enough samples to suggest. Safety bounds in
+        // suggest.mjs (0.65-0.85) prevent CAL from going wild.
+        const sportMinConf = CAL.minConfidenceLive?.[league] ?? _hardcodedFloor ?? MIN_CONFIDENCE;
 
         // 2026-05-02: MLS live-swing DISABLED. n=2, -$11.19 over single trade in MLS.
         // Combined with MLS-wide 50% WR / -$61 P&L across all strategies, MLS is
