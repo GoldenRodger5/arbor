@@ -8737,14 +8737,15 @@ async function checkLiveScoreEdges() {
           }
         }
 
-        // 2026-04-29 — MLB INN 7+ SONNET BLOCK. Trade-level analysis shows
-        // Sonnet-driven MLB live-prediction in inn 7+ is -$72.79 cumulative
-        // (MLB-P7 25% WR -$45, MLB-P9 0% WR -$28). The structural detectors
-        // (mlb-late-inning-lockdown) covers the +EV late cases. mlb-inn-5-7-leader is killed.
-        // Block any inn 7+ MLB trade that ISN'T a structural detector match.
-        if (!_structuralDecision && league === 'mlb' && period >= 7) {
-          console.log(`[live-edge] 🚫 MLB-INN${period}-SONNET-BLOCK: ${targetAbbr} — Sonnet-only MLB inn 7+ has -$72 cumulative. Only structural detector matches allowed.`);
-          logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-late-sonnet', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `MLB inn ${period} Sonnet-only blocked — must be structural detector match` });
+        // 2026-04-29 — MLB INN 7+ SONNET BLOCK (RELAXED 2026-05-05).
+        // Original: blocked all Sonnet MLB inn 7+ on -$72 cumulative (small sample).
+        // 2026-05-05: bleed-out re-enabled, contra-block on structural, score-defer all live —
+        // those exit fixes target the original loss pattern. Re-enable Sonnet on
+        // MLB inn 7+ but require strict 80% conf + 8pt edge floor (only the highest-
+        // conviction picks). Block remains for low-conf entries.
+        if (!_structuralDecision && league === 'mlb' && period >= 7 && confidence < 0.80) {
+          console.log(`[live-edge] 🚫 MLB-INN${period}-SONNET-FLOOR: ${targetAbbr} conf=${(confidence*100).toFixed(0)}% — late-inning MLB needs ≥80% (was full block, now floor)`);
+          logScreen({ stage: 'live-edge-skip', result: 'skip-mlb-late-sonnet-low-conf', ticker, league, homeAbbr, awayAbbr, homeScore, awayScore, diff, period, price, targetAbbr, reasoning: `MLB inn ${period} Sonnet floor 80% (relaxed from full block) — current ${Math.round(confidence*100)}%` });
           continue;
         }
 
@@ -9470,7 +9471,13 @@ async function checkLiveScoreEdges() {
         // EPL live: 70% (kept — small sample, mostly draw-bet drives EPL P&L)
         // LaLiga live: 70% → 73% (40% WR, +$28 mostly variance, conservative)
         // SerieA/Bundesliga/Ligue1: rare, default to standard 70%
-        const SPORT_FLOOR_OVERRIDES = { mlb: 0.75, nhl: 0.74, mls: 0.78, laliga: 0.73 };
+        // 2026-05-05: MLB live floor 75% → 72%. May 3 plan data: 70-80% conf was
+        // sweet spot (+$134/60 trades). 70-75% conf bucket had +$2.64/trade. Current
+        // 75% floor was excluding 72-74% picks where the data was profitable. Recent
+        // volume collapse (Apr 27+) tied to over-conservative confidence. With current
+        // bleed-out + score-defer + contra-block protections in place, 72% floor is
+        // safer than it was at the original audit.
+        const SPORT_FLOOR_OVERRIDES = { mlb: 0.72, nhl: 0.74, mls: 0.78, laliga: 0.73 };
         const _hardcodedFloor = SPORT_FLOOR_OVERRIDES[league] ?? null;
         const sportMinConf = _hardcodedFloor ?? CAL.minConfidenceLive?.[league] ?? MIN_CONFIDENCE;
 
