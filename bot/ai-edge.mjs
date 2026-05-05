@@ -1300,23 +1300,19 @@ function detectMlbInn3Leader2Run({ league, period, gameDetail, diff, weTimeAdj, 
 }
 
 function detectMlbInn3Leader3Plus({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
-  // 2026-05-02 DISABLED. Comprehensive bucket audit (n=27) shows EVERY price
-  // bucket on this cell is below break-even:
-  //   70-75¢: 60% WR (n=5)
-  //   75-80¢: 45% WR (n=11)
-  //   80-85¢: 50% WR (n=8)
-  // Cell is not +EV at any price. Return null unconditionally.
-  // Replaced volume by adding detectMlbInn3Leader2Run (uniform 75-83% WR cell).
-  return null;
-  // eslint-disable-next-line no-unreachable
+  // 2026-05-05 RE-ENABLED. Original 2026-05-02 kill was based on per-RECORD WR
+  // (60%/45%/50%) which inflated counts via multiple firings per game. Per-GAME
+  // shadow audit on claude-no inversion data shows 91% game-WR on 11 unique games.
+  // The cell IS profitable at hold-to-settle; the kill was based on bad math.
+  // Cap at 88c to match other inn diff>=3 cells (validated band).
   if (league !== 'mlb') return null;
   if (period !== 3) return null;
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff < 3) return null;
-  if (price > 0.78) return null;
+  if (price > 0.88) return null;
   const edge = weTimeAdj - price;
-  if (edge < 0.08) return null;
+  if (edge < -0.08) return null; // sanity only — empirical 91% game-WR justifies it
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
@@ -2912,7 +2908,7 @@ function detectPregameSportsbookGap(market, sportsbookData, sport) {
     const _sbShadowBase = market.base ?? '';
     for (const [_gap, _prob, _price, _team] of [[t1Gap, t1Prob, t1Price, market.team1.team], [t2Gap, t2Prob, t2Price, market.team2.team]]) {
       if (Math.abs(_gap) >= 0.02) { // only log gaps ≥ 2pt (filter noise)
-        const _clears = _gap >= 0.05 && _gap <= 0.15 && _price >= 0.30 && _price <= 0.68;
+        const _clears = _gap >= 0.04 && _gap <= 0.15 && _price >= 0.30 && _price <= 0.68;
         logShadowDecision({
           stage: 'sportsbook-gap-candidate',
           ticker: `${_sbShadowBase}-${_team}`,
@@ -2942,9 +2938,11 @@ function detectPregameSportsbookGap(market, sportsbookData, sport) {
   } catch { /* best-effort */ }
 
   let pick = null;
-  if (t1Gap >= 0.05 && t1Gap <= 0.15 && t1Price >= 0.30 && t1Price <= 0.68) {
+  // 2026-05-05: lowered threshold 5pt → 4pt. Shadow had 6 candidates at 4-5pt range
+  // that were blocked. With mechanical detector (no Claude), threshold is pure tunable.
+  if (t1Gap >= 0.04 && t1Gap <= 0.15 && t1Price >= 0.30 && t1Price <= 0.68) {
     pick = { team: market.team1, gap: t1Gap, prob: t1Prob };
-  } else if (t2Gap >= 0.05 && t2Gap <= 0.15 && t2Price >= 0.30 && t2Price <= 0.68) {
+  } else if (t2Gap >= 0.04 && t2Gap <= 0.15 && t2Price >= 0.30 && t2Price <= 0.68) {
     pick = { team: market.team2, gap: t2Gap, prob: t2Prob };
   }
   if (!pick) return null;
