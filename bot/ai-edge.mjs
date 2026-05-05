@@ -899,12 +899,15 @@ function detectMlbInn2Leader({ league, period, gameDetail, diff, weTimeAdj, pric
   if (diff < 1) return null;
   // 2026-05-04: extended cap from 65¢ to 78¢. Shadow no-trades at 65-70¢ show 81.8% WR
   // (n=33, +15.5% EV); 70-79¢ band shows 77.6% WR (n=67, +3.3% EV). Both profitable.
-  if (price < 0.50 || price > 0.78) return null;
+  // 2026-05-05: extended cap to 88¢ + loosened edge check. Shadow claude-no for inn-2 d=2:
+  // 60-70c=86% (n=28), 70-80c=80% (n=46), 80-92c=100% (n=5). The -0.03 edge check was
+  // blocking 79 valid entries because WE model underestimates structural WR by 10-15pt.
+  if (price < 0.50 || price > 0.88) return null;
   const edge = weTimeAdj - price;
-  // Original 50-65¢ band: require 4pt edge. Extended 65-78¢ band: sanity check only
-  // (same approach as inn-6 extension — WR evidence is structural not edge-dependent).
+  // Original 50-65¢ band: require 4pt edge. Extended 65-88¢ band: loose sanity only
+  // (WE model systematically underestimates structural WR; -8pt sanity = real catastrophe filter).
   if (price <= 0.65 && edge < 0.04) return null;
-  if (price > 0.65 && edge < -0.03) return null;
+  if (price > 0.65 && edge < -0.08) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
@@ -1075,7 +1078,9 @@ function detectMlbInn4Leader({ league, period, gameDetail, diff, weTimeAdj, pric
   //   d=2: ≤78¢ (block the 80-85 trap; 70-80 band shows 80%+ WR)
   //   d≥3: ≤82¢ (kept; bigger leads survive higher prices)
   if (diff === 1 && price > 0.72) return null;
-  if (diff === 2 && price > 0.78) return null;
+  // 2026-05-05: extended d=2 cap 78→80c. Shadow claude-no for inn-4 d=2 (n=75):
+  // 60-70c=100% (n=7), 70-80c=83% (n=52), 80-92c=67% (n=15) — block above 80c.
+  if (diff === 2 && price > 0.80) return null;
   // 2026-05-02 DEAD-ZONE for d=3: 75-80¢ shows 50% WR (n=4), 80-82¢ shows 80% (n=10).
   // Allow 50-75¢ (lockdown lean) OR 80-82¢ (high-conviction band), block 75-80 dead zone.
   if (diff === 3) {
@@ -1090,9 +1095,11 @@ function detectMlbInn4Leader({ league, period, gameDetail, diff, weTimeAdj, pric
   //   d=2 65-70¢: 100% (n=5) | 70-75¢: 79% (n=14) | 75-80¢: 81% (n=21)
   //   d≥3 75-80¢: 50% small-sample / 80-85¢: 80% (n=10)
   // Claude was double-counting situational risk against +EV cells. Anchor on
-  // empirical bucket data instead. Backstop: WE >= price-5pt sanity check.
+  // empirical bucket data instead.
+  // 2026-05-05: loosened sanity from -5 to -8. WE model systematically underestimates
+  // structural cell WR (75 inn-4 d=2 claude-no records at 81% WR were being rejected).
   const edge = weTimeAdj - price;
-  if (edge < -0.05) return null;
+  if (edge < -0.08) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
@@ -1199,12 +1206,13 @@ function detectMlbInn3Leader2Run({ league, period, gameDetail, diff, weTimeAdj, 
   if (targetAbbr !== leadingAbbr) return null;
   if (weTimeAdj == null || price == null) return null;
   if (diff !== 2) return null;
-  if (price < 0.65 || price > 0.82) return null;
-  // 2026-05-02 BUCKET-WR ANCHORING: dropped 6pt edge floor. Cell shows uniform
-  // 75-83% WR across 65-85¢ band (n=45). Empirical bucket data trumps Claude's
-  // step-3 adjustments which double-count situational risks already in the data.
+  // 2026-05-05: extended floor 65→60c, cap 82→88c. Updated shadow (n=81 claude-no):
+  // 60-70c=80% (n=15), 70-80c=81% (n=54), 80-92c=91% (n=11). All profitable, all
+  // currently being rejected by Claude. Loosened edge check from -5 to -8 because
+  // 81 records show WE model is too conservative for this exact pattern.
+  if (price < 0.60 || price > 0.88) return null;
   const edge = weTimeAdj - price;
-  if (edge < -0.05) return null;
+  if (edge < -0.08) return null;
   return {
     trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
     reasoning: {
@@ -1432,8 +1440,12 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
   // Bucket profile: 50-55¢ = 100% (n=4), 55-60¢ = 80% (n=5) ✅
   //                 60-65¢ = 50% (n=14), 65-70¢ = 41% (n=22) ⚠️ block
   // Old gate ≤50¢ was over-tight — missed 9 winning samples in 50-60 range.
-  if (period === 5 && diff === 1 && price > 0.60) {
-    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn5-1run-above60', ticker }); } catch {} }
+  // 2026-05-05: KILL inn-5 diff=1 entirely. Shadow shows 0% WR (n=3) at 55-60c,
+  // 29% WR overall for inn-5 diff=1 at 64c avg entry (-EV by 35pt). The cell was
+  // firing at the wrong end of the price curve. The real alpha for inn-5 d=1 is at
+  // 65c+ (65% WR n=124 in claude-no shadow) which Claude handles via live-prediction.
+  if (period === 5 && diff === 1) {
+    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn5-1run-killed', ticker }); } catch {} }
     return null;
   }
   // 2026-05-02 DEAD-ZONE CARVE-OUTS for d=2. Bucket audit revealed non-monotonic
@@ -1485,7 +1497,9 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
       return null;
     }
   }
-  if (diff >= 3 && price > 0.88) {
+  // 2026-05-05: extended diff>=3 cap 88→92c. Shadow claude-no inn-5 d=3 (n=13) shows
+  // 100% WR including 12 records at 80-92c. Cap was over-tight.
+  if (diff >= 3 && price > 0.92) {
     if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'diff-ge-3', ticker }); } catch {} }
     return null;
   }
@@ -1496,9 +1510,12 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
   //   inn 7 d=2 50-72: 50-67% / 80-85: 83%
   //   diff>=3: 100% in 80-90¢
   // Edge requirement was double-counting Claude's situational adjustments
-  // against historically validated cells. Backstop: WE >= price-5pt sanity.
+  // against historically validated cells.
+  // 2026-05-05: loosened sanity from -5 to -8. WE model systematically underestimates
+  // structural WR by 10-15pt for "leader holding outs" patterns; -8 is a real
+  // catastrophe filter, not an edge filter.
   const edge = weTimeAdj - price;
-  if (edge < -0.05) return null;
+  if (edge < -0.08) return null;
   // 2026-05-05: edge-floor REMOVED for diff=2 at 75-85¢. Original reason was
   // "placed-WR 33% vs shadow-WR 80-91%" but audit proved that gap was entirely
   // from bleed-out stops (now disabled for inn-4 + inn-6). Fix-block shadow data
