@@ -1189,6 +1189,72 @@ function detectMlbInn1Leader2Run({ league, period, gameDetail, diff, weTimeAdj, 
   };
 }
 
+// MLB inning 1 leader with 1-run lead. 2026-05-05 audit: shadow MFE shows 80% hit +5c,
+// 60% hit +10c, 50% hit +15c on 10 unique games. Game-WR is only 60% (marginal at hold)
+// but the cell is a PRICE-MOVEMENT play, not a settlement play. Lock at +5c captures
+// 80% of fires for guaranteed +5c gain. Without lock, the cell is -EV at 60% game-WR
+// against ~70c entries.
+function detectMlbInn1Leader1Run({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'mlb') return null;
+  if (period !== 1) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff !== 1) return null;
+  // Price band 55-75c — covers most claude-no rejections in this cell
+  if (price < 0.55 || price > 0.75) return null;
+  const edge = weTimeAdj - price;
+  if (edge < -0.10) return null; // very loose sanity — cell is price-movement-driven, not edge-driven
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `1-run lead in 1st — narrow but early cushion, market mispricing the lead`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (MLB inn 1 leader 1-run 55-75¢): 1-run lead in 1st, MFE shows 80% hit +5c on 10 unique games shadow. Price-movement cell.`,
+      key_facts: [
+        `Inning 1, 1-run lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 80% hit +5c MFE, 60% hit +10c, 50% hit +15c (n=10 unique games)`,
+      ],
+      top_risk: '60% game-WR — relies on profit-lock to capture price spike, not settlement',
+      conviction: 'Structural pattern — price-movement-driven, lock at +5c essential',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'mlb-inn-1-leader-1run',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
+// NHL P2 d=1 leader. 2026-05-05 audit: shadow MFE shows 80% hit +5c, 60% hit +10c+15c
+// on 5 unique games. Game-WR 80%. NHL prices reprice fast on lead validation in P2.
+function detectNhlP2Leader1Run({ league, period, gameDetail, diff, weTimeAdj, price, targetAbbr, leadingAbbr }) {
+  if (league !== 'nhl') return null;
+  if (period !== 2) return null;
+  if (targetAbbr !== leadingAbbr) return null;
+  if (weTimeAdj == null || price == null) return null;
+  if (diff !== 1) return null;
+  if (price < 0.50 || price > 0.78) return null;
+  const edge = weTimeAdj - price;
+  if (edge < -0.08) return null;
+  return {
+    trade: true, side: 'yes', confidence: weTimeAdj, betAmount: null,
+    reasoning: {
+      steel_man: `1-goal lead in P2 — NHL leads stick at much higher rates than market prices`,
+      edge_source: 'market_lag',
+      edge_argument: `STRUCTURAL DETECTOR (NHL P2 leader 1-goal 50-78¢): 1-goal lead in 2nd period, MFE 80% hit +5c, 60% hit +15c on 5 unique games shadow. Game-WR 80%.`,
+      key_facts: [
+        `P2, 1-goal lead`,
+        `WE ${(weTimeAdj*100).toFixed(0)}% vs market ${(price*100).toFixed(0)}¢`,
+        `Cell history: 80% hit +5c, 60% hit +10c, 60% hit +15c (n=5 unique games)`,
+      ],
+      top_risk: 'Small sample n=5 — wider confidence interval',
+      conviction: 'Strong MFE profile — both +5c lock and hold-to-settle viable',
+      reasoning_tags: ['market-lag', 'we-undervalued'],
+    },
+    _structuralPattern: 'nhl-p2-leader-1goal',
+    _matchInfo: { period, diff, edge: edge * 100, price: Math.round(price*100) },
+  };
+}
+
 // MLB inning 3 leader with 3+ run lead: live-edge gap detector identified 2026-05-01.
 // Inn-3 was uncovered between detectMlbInn1Leader3Plus (inn 1) and detectMlbInn4Leader (inn 4).
 // TEX-DET tonight (TEX 4-0 inn-3 at 88¢) sat in this gap — global price ceiling caught it
@@ -4117,6 +4183,9 @@ const STRATEGY_RR = {
   // 2026-05-05: re-enabled cell with claude-no shadow data n=81, WR=81%, avg entry 74c.
   // Lock at +10c (target 84c) achievable on 81% of fires.
   'structural-mlb-inn-3-leader-2run':  { profitLock: 0.10, stopLoss: 0.10 }, // 81% WR n=81 shadow
+  // 2026-05-05: new cells based on MFE audit
+  'structural-mlb-inn-1-leader-1run':  { profitLock: 0.05, stopLoss: 0.10 }, // 80% hit +5c MFE
+  'structural-nhl-p2-leader-1goal':    { profitLock: 0.10, stopLoss: 0.12 }, // 80% hit +5c, 60% hit +15c
   // 2026-05-04: new cell for inn-1 diff=2 leaders (diff≥3 handled by inn-1-leader-3run).
   // Shadow audit: 78-81% WR at 60-79¢. Entry ~70¢ avg: profit-lock at +8¢ (target 78¢).
   'structural-mlb-inn-1-leader-2run':  { profitLock: 0.08, stopLoss: 0.12 }, // 80% WR shadow n=25
@@ -8466,6 +8535,20 @@ async function checkLiveScoreEdges() {
         if (!_structuralDecision) {
           // 2026-05-04: MLB inn 1 leader 2-run — shadow 80% WR n=25 at 60-82¢
           _structuralDecision = detectMlbInn1Leader2Run({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-05-05: MLB inn 1 leader 1-run — MFE 80% hit +5c, 60% hit +10c (n=10)
+          _structuralDecision = detectMlbInn1Leader1Run({
+            league, period, gameDetail, diff,
+            weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
+          });
+        }
+        if (!_structuralDecision) {
+          // 2026-05-05: NHL P2 leader 1-goal — MFE 80% hit +5c, 60% hit +15c (n=5)
+          _structuralDecision = detectNhlP2Leader1Run({
             league, period, gameDetail, diff,
             weTimeAdj: _weTimeAdj, price, targetAbbr, leadingAbbr,
           });
