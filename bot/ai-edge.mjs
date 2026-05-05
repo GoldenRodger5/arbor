@@ -14196,14 +14196,15 @@ async function managePositions() {
               // makes score-unchanged check meaningless. Skip defer if SEVERE drop
               // (real collapse) — moderate drop with score unchanged = noise.
               const _structThesisSports = ['mlb','nhl','mls','epl','laliga','seriea','bundesliga','ligue1'];
-              const _isStructuralLeader = _strat.startsWith('structural-') && _structThesisSports.includes(_ctxLeague);
+              const _bleedLeague = ctx?.league;
+              const _isStructuralLeader = _strat.startsWith('structural-') && _structThesisSports.includes(_bleedLeague);
               const _entryScoreMatch = (trade.liveScore || '').match(/[A-Z]{2,3}\s+(\d+)\s*[-–]\s*[A-Z]{2,3}\s+(\d+)/);
               const _entryScoreKey = _entryScoreMatch ? `${_entryScoreMatch[1]}-${_entryScoreMatch[2]}` : null;
               const _currScoreKey = ctx?.homeScore != null && ctx?.awayScore != null ? `${ctx.homeScore}-${ctx.awayScore}` : null;
               const _scoreUnchanged = _entryScoreKey && _currScoreKey && _entryScoreKey === _currScoreKey;
               const _structuralNoiseHold = _isStructuralLeader && _scoreUnchanged && !isSevereDrop;
               if (_structuralNoiseHold) {
-                console.log(`[bleed-out-defer] ${trade.ticker} ${(lossPct*100).toFixed(0)}% drawdown but score unchanged since entry (${_entryScoreKey}) — ${_ctxLeague.toUpperCase()} structural thesis intact, holding`);
+                console.log(`[bleed-out-defer] ${trade.ticker} ${(lossPct*100).toFixed(0)}% drawdown but score unchanged since entry (${_entryScoreKey}) — ${(_bleedLeague||'').toUpperCase()} structural thesis intact, holding`);
               } else if (!isSevereDrop && !_bvFresh) {
                 console.log(`[bleed-out-defer] ${trade.ticker} ${(lossPct*100).toFixed(0)}% drawdown but no fresh cross-contra velocity (last 5min) — holding for thesis (slow drift, not real info)`);
               } else {
