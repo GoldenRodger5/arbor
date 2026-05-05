@@ -14060,10 +14060,17 @@ async function managePositions() {
             ? (ctx.leading === ourTeamAbbrCt ? ctx.baselineWE : (1 - ctx.baselineWE))
             : null;
           const pgEarlyWeOk = isPgLikeCt && stage === 'early' && ourWECt != null && ourWECt > 0.30;
+          // GATE 3: structural cells fire on game-state pattern (inning + diff + price),
+          // not on Claude's narrative. A price-velocity drop doesn't invalidate the
+          // structural thesis — the game state is still intact. Inn-4 lost $4.60 to
+          // a contra-line-move exit on a pick the 100% shadow WR says was correct.
+          const isStructuralCt = trade.strategy?.startsWith?.('structural-');
           if (moveAgeSec <= 120 && claudeHoldActive) {
             console.log(`[exit] 🛡️ CONTRA BLOCKED on ${trade.ticker}: Claude HOLD ${Math.round(claudeHoldAgeSec)}s ago overrides price-velocity signal`);
           } else if (moveAgeSec <= 120 && pgEarlyWeOk) {
             console.log(`[exit] 🛡️ CONTRA BLOCKED on ${trade.ticker}: ${trade.strategy} in ${stage} stage, WE=${(ourWECt*100).toFixed(0)}% still recoverable — market overreaction, not thesis death`);
+          } else if (moveAgeSec <= 120 && isStructuralCt) {
+            console.log(`[exit] 🛡️ CONTRA BLOCKED on ${trade.ticker}: structural cell — game-state thesis intact, price-velocity signal doesn't override`);
           } else if (moveAgeSec <= 120) {
             console.log(`[exit] ⚠️ CONTRA EXIT: ${trade.ticker} — cross-confirmed ${contraMove.velocity.toFixed(1)}¢/min drop ${Math.round(moveAgeSec)}s ago, attempting to scratch full position @ ${(currentPrice*100).toFixed(0)}¢`);
             const result = await executeSellAndNotify(trade, qty, currentPrice, 'contra-line-move', {
