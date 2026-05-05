@@ -1453,15 +1453,12 @@ function detectMlbInn5To7Leader({ league, period, gameDetail, diff, weTimeAdj, p
   // against historically validated cells. Backstop: WE >= price-5pt sanity.
   const edge = weTimeAdj - price;
   if (edge < -0.05) return null;
-  // 2026-05-02 SELECTION-BIAS FLOOR: 75-85¢ "sweet spot" cells (inn 5/6/7 d=2)
-  // showed 80-91% shadow WR but real-bet placed-WR is ~33% (1/3 over $-10 P&L).
-  // Per memory: when shadow WR >> placed-bet WR, raise edge floor to filter
-  // borderline Sonnet-rejected setups that fire structural. Require ≥6pt edge
-  // for these cells — keeps the data-validated band but cuts marginal entries.
-  if (diff === 2 && price >= 0.75 && price <= 0.85 && edge < 0.06) {
-    if (typeof logFixABlock === 'function') { try { logFixABlock({ league, period, diff, price, targetAbbr, gate: 'inn5-7-2run-75-85-edge-floor', ticker }); } catch {} }
-    return null;
-  }
+  // 2026-05-05: edge-floor REMOVED for diff=2 at 75-85¢. Original reason was
+  // "placed-WR 33% vs shadow-WR 80-91%" but audit proved that gap was entirely
+  // from bleed-out stops (now disabled for inn-4 + inn-6). Fix-block shadow data
+  // shows 100% WR on 23 settled games at this price band — all were winners we
+  // were blocking. No edge floor needed; dead-zone carve-outs above already
+  // filter the genuinely bad sub-bands.
   return {
     trade: true,
     side: 'yes',
@@ -3991,7 +3988,10 @@ function readUIControl() {
 // To re-enable: comment out the entry here AND wait for new shadow data.
 const STRATEGY_KILLSWITCH = new Set([
   'pre-game-edge-first',           // 22% WR, -$34/10 trades, 0.51 win/loss ratio (needs 66% WR)
-  'structural-mlb-inn-5-7-leader', // 42% WR placed, -$22.79/12 trades (needs 86% WR at price range)
+  // 'structural-mlb-inn-5-7-leader' — RE-ENABLED 2026-05-05. Kill reason was
+  // 42% placed-WR but that was 100% bleed-out exits destroying good picks.
+  // Fix-block shadow: diff=2 75-85c = 100% WR n=23. Dead-zone gates + diff caps
+  // already block the genuinely bad sub-bands (diff=1 >60c, 65-75c dead zones).
   'structural-mlb-inn-3-leader-2run', // 50% shadow WR, 0% placed WR, n=1 — no edge
   // 2026-05-04: shadow vs placed audit. 50% shadow WR = coin flip at 60c entry.
   // Break-even needs 60% WR. Kill until shadow data shows real edge.
@@ -14136,7 +14136,7 @@ async function managePositions() {
             // Inn-4: 93% shadow pick accuracy (n=6 shadow), 3 bleed-outs cost -$10.19
             // on picks that mostly won (CIN@CHC: stopped at 37¢, settled ~70¢).
             // Contra-line-move remains as backstop for real thesis failures.
-            if (_strat === 'structural-mlb-inn-6-leader' || _strat === 'structural-mlb-inn-4-leader') {
+            if (_strat === 'structural-mlb-inn-6-leader' || _strat === 'structural-mlb-inn-4-leader' || _strat === 'structural-mlb-inn-5-7-leader') {
               bleedOutEnabled = false;
             }
             // 2026-04-30: SPORT-AWARE bleed-out for structural detectors. Bleed-out
