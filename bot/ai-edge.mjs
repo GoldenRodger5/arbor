@@ -2886,7 +2886,8 @@ WIN PROBABILITY BASELINE: MLB home teams win ~54% of games. An ace (ERA < 3.0) p
 
 ═══ STEP 2 — HARD NOs (respond {"trade":false} immediately if ANY apply) ═══
 ⛔ THESE ARE ABSOLUTE. If ANY Hard NO applies, respond {"trade":false} immediately. Do NOT continue reasoning.
-❌ Starting pitcher for the team you want to bet cannot be confirmed by ESPN OR by ≥2 independent web sources (MLB.com, Baseball-Reference, team site, ESPN article) → NO. NOTE: if ESPN is silent but 2+ web sources name the starter, that IS confirmed — proceed. Also NOTE: if this is an opener/bullpen game (both sides have no designated starter in ESPN), skip this rule and analyze at the team level.
+❌ Starting pitcher for BOTH teams cannot be confirmed (neither ESPN nor 2+ independent web sources for EITHER side) → NO. NOTE: if ESPN is silent but 2+ web sources name the starter, that IS confirmed — proceed. Also NOTE: if this is an opener/bullpen game (both sides have no designated starter in ESPN), skip this rule and analyze at the team level.
+✅ EXCEPTION (2026-05-05): If your starter is unconfirmed but the OPPONENT'S starter IS confirmed (ESPN or 2+ web sources) AND a sportsbook consensus is available, do NOT auto-reject. Proceed with reduced confidence: anchor on sportsbook prob (no-vig), apply -8pt haircut for unknown side pitcher, require ≥75% confidence (vs 70% normal floor) AND ≥6pt edge to fire. This unlocks valid trades for teams (esp. CWS) whose starters consistently miss ESPN data even minutes before game start. Half-size sizing applies as additional protection.
 ⚠️ PITCHING MATCHUP GUIDANCE (NOT Hard NOs — these are confidence adjustments, not vetoes):
   • Your starter ERA > 5.0 AND opponent starter ERA < 3.5 → apply -6-10% adjustment, but do NOT auto-veto. Even bad pitchers sometimes hang 4-5 innings and the price can still swing +12¢ if their team scores early.
   • Both starters ERA 4.5-5.5 → coin-flip game. If WE-price edge is ≥ 8pt, a +12¢ swing is still reachable on early-inning luck. Don't auto-pass — assess the actual edge.
@@ -11492,6 +11493,36 @@ async function checkPreGamePredictions() {
     if (team1.yesAsk < 0.15 && team2.yesAsk < 0.15) {
       logPregameRejection({ base, title: game.title, team1: { price: team1.yesAsk, team: team1.team }, team2: { price: team2.yesAsk, team: team2.team } }, 'pre-sonnet', 'both-prices-too-low', { gateContext: { team1Price: team1.yesAsk, team2Price: team2.yesAsk } });
       continue;
+    }
+
+    // 2026-05-05: Defer MLB pre-game analysis until T-4h. ESPN starter data
+    // typically posts 3-4 hours before first pitch. 67% of ESPN-miss rejections
+    // (152/227) happened >6h before game — pure waste. Saves ~50% of pre-game
+    // Claude API calls without losing actionable trades (we wouldn't have placed
+    // before pitching data anyway).
+    if (game.tickers[0]?.ticker?.startsWith('KXMLBGAME')) {
+      const startMs = pgGameStartTimes.get(base);
+      if (Number.isFinite(startMs)) {
+        const hoursUntilStart = (startMs - Date.now()) / 3600000;
+        if (hoursUntilStart > 4) {
+          // Don't reject in shadow log — this is a defer, not a rejection. Just skip silently.
+          continue;
+        }
+      } else {
+        // Fall back to ticker-time parse for first scan
+        const tickerMatch = base.match(/(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})/);
+        if (tickerMatch) {
+          const monthMap = { JAN:0, FEB:1, MAR:2, APR:3, MAY:4, JUN:5, JUL:6, AUG:7, SEP:8, OCT:9, NOV:10, DEC:11 };
+          const [, yy, monStr, dd, hh, mm] = tickerMatch;
+          const month = monthMap[monStr];
+          if (month != null) {
+            const isDst = month >= 2 && month <= 10;
+            const ms = Date.UTC(2000 + parseInt(yy), month, parseInt(dd), parseInt(hh) + (isDst ? 4 : 5), parseInt(mm));
+            const hoursUntilStart = (ms - Date.now()) / 3600000;
+            if (hoursUntilStart > 4) continue;
+          }
+        }
+      }
     }
 
     preGameMarkets.push({
