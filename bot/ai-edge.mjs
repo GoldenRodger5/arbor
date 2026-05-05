@@ -4068,10 +4068,12 @@ const STRATEGY_KILLSWITCH = new Set([
   // 42% placed-WR but that was 100% bleed-out exits destroying good picks.
   // Fix-block shadow: diff=2 75-85c = 100% WR n=23. Dead-zone gates + diff caps
   // already block the genuinely bad sub-bands (diff=1 >60c, 65-75c dead zones).
-  'structural-mlb-inn-3-leader-2run', // 50% shadow WR, 0% placed WR, n=1 — no edge
-  // 2026-05-04: shadow vs placed audit. 50% shadow WR = coin flip at 60c entry.
-  // Break-even needs 60% WR. Kill until shadow data shows real edge.
-  'structural-mlb-inn-2-leader',   // 50% shadow WR (n=6), 50% placed WR (n=2), net -$0.64 — no edge
+  // 'structural-mlb-inn-3-leader-2run' — RE-ENABLED 2026-05-05. Original kill was
+  // n=1 placed trade. New claude-no shadow data: n=81, WR=81% (60-70c=80%, 70-80c=81%,
+  // 80-92c=91%). Cell expanded to 60-88c with -8pt edge sanity (looser).
+  // 'structural-mlb-inn-2-leader' — RE-ENABLED 2026-05-05. Original kill was n=6
+  // shadow / n=2 placed. New claude-no shadow: n=79, WR=84% (60-70c=86%, 70-80c=80%,
+  // 80-92c=100%). Cell expanded to 50-88c.
   // 2026-05-04: shadow vs placed audit. Only 50% WR on both shadow and placed.
   // No real structural edge in 2H home advantage at these prices.
   'structural-soccer-2h-home-leader', // 50% shadow WR (n=2), 50% placed WR (n=2), net -$3.05 — no edge
@@ -4112,6 +4114,9 @@ const STRATEGY_RR = {
   'structural-mlb-inn-89-leader':      { profitLock: 0.05, stopLoss: 0.10 }, // closer-territory tight
   'structural-mlb-inn-2-leader':       { profitLock: 0.10, stopLoss: 0.10 }, // 78-82% WR; extended to 78¢
   'structural-mlb-inn-2-leader-2run':  { profitLock: 0.10, stopLoss: 0.10 }, // 87% WR
+  // 2026-05-05: re-enabled cell with claude-no shadow data n=81, WR=81%, avg entry 74c.
+  // Lock at +10c (target 84c) achievable on 81% of fires.
+  'structural-mlb-inn-3-leader-2run':  { profitLock: 0.10, stopLoss: 0.10 }, // 81% WR n=81 shadow
   // 2026-05-04: new cell for inn-1 diff=2 leaders (diff≥3 handled by inn-1-leader-3run).
   // Shadow audit: 78-81% WR at 60-79¢. Entry ~70¢ avg: profit-lock at +8¢ (target 78¢).
   'structural-mlb-inn-1-leader-2run':  { profitLock: 0.08, stopLoss: 0.12 }, // 80% WR shadow n=25
@@ -14230,8 +14235,12 @@ async function managePositions() {
             // Inn-4: 93% shadow pick accuracy (n=6 shadow), 3 bleed-outs cost -$10.19
             // on picks that mostly won (CIN@CHC: stopped at 37¢, settled ~70¢).
             // Contra-line-move remains as backstop for real thesis failures.
-            if (_strat === 'structural-mlb-inn-6-leader' || _strat === 'structural-mlb-inn-4-leader' || _strat === 'structural-mlb-inn-5-7-leader'
-                || _strat === 'structural-mlb-inn-1-leader-2run' || _strat === 'structural-mlb-inn-2-leader') {
+            // 2026-05-05: blanket disable bleed-out for ALL structural-mlb-* leader cells.
+            // Score-unchanged defer (below) is the safety net — stops only fire if score
+            // actually changed (real thesis death). Severe-drop catastrophe stop (-25%)
+            // still fires regardless. Future structural cells get this protection
+            // automatically without needing to update an explicit list.
+            if (_strat.startsWith('structural-mlb-inn-')) {
               bleedOutEnabled = false;
             }
             // 2026-04-30: SPORT-AWARE bleed-out for structural detectors. Bleed-out
